@@ -871,6 +871,32 @@ attachment_accesses(const struct stela_metal_specialization *specialization,
    return true;
 }
 
+/* Thread memory of at most this many 32-bit words lives in registers. */
+#define REGISTER_THREAD_WORDS 16
+
+/* Moves small thread memory out of scratch into registers. The front end
+ * lays a function's thread memory out as scratch; when it fits in
+ * REGISTER_THREAD_WORDS words, scratch becomes one array of words, every
+ * dynamic index into it a select tree over its elements, and each element
+ * an SSA value. Larger thread memory stays in scratch: more registers per
+ * thread would cost occupancy. Thread memory is private to its thread, so
+ * only its storage changes, never a value. */
+static void
+thread_memory_to_registers(nir_shader *shader)
+{
+   if (!shader->scratch_size || shader->scratch_size > REGISTER_THREAD_WORDS * 4)
+      return;
+   nir_lower_scratch_to_var(shader);
+   nir_lower_indirect_derefs_to_if_else_trees(shader, nir_var_function_temp,
+                                              REGISTER_THREAD_WORDS);
+   nir_lower_vars_to_ssa(shader);
+   nir_remove_dead_variables(shader, nir_var_function_temp, NULL);
+   /* Words read before any store become undefined values carried through
+    * loops; zero is one of their values, and what NAK picks for them too. */
+   nir_lower_undef_to_zero(shader, NULL);
+   nir_opt_dce(shader);
+}
+
 nir_shader *
 stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
                               const struct stela_metal_target *target,
@@ -1069,6 +1095,8 @@ stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
    };
    shader = stela_air_metal_stage_to_nir(air, size, entry, target->nir, &options, error);
 done:
+   if (shader)
+      thread_memory_to_registers(shader);
    free(owned_reflection);
    return shader;
 }

@@ -4015,6 +4015,94 @@ run_summed(nir_shader *shader)
    return store.values[0].u32;
 }
 
+/* A thread array of N words: a fixed loop stores 3i + tid to word i, then
+ * the word the buffer's first value names, masked into the array, replaces
+ * that value. */
+#define THREAD_ARRAY_KERNEL(N, MASK)                                                          \
+   "define void @thread_array(ptr addrspace(1) %data, i32 %tid) {\n"                          \
+   "entry:\n"                                                                                  \
+   "%arr = alloca [" #N " x i32], align 4\n"                                                   \
+   "br label %fill\n"                                                                          \
+   "fill:\n"                                                                                   \
+   "%i = phi i32 [0, %entry], [%next, %fill]\n"                                                \
+   "%wide = zext i32 %i to i64\n"                                                              \
+   "%slot = getelementptr inbounds [" #N " x i32], ptr %arr, i64 0, i64 %wide\n"               \
+   "%triple = mul i32 %i, 3\n"                                                                 \
+   "%value = add i32 %triple, %tid\n"                                                          \
+   "store i32 %value, ptr %slot, align 4\n"                                                    \
+   "%next = add i32 %i, 1\n"                                                                   \
+   "%more = icmp ult i32 %next, " #N "\n"                                                      \
+   "br i1 %more, label %fill, label %read\n"                                                   \
+   "read:\n"                                                                                   \
+   "%k = load i32, ptr addrspace(1) %data, align 4\n"                                          \
+   "%m = and i32 %k, " #MASK "\n"                                                              \
+   "%mw = zext i32 %m to i64\n"                                                                \
+   "%at = getelementptr inbounds [" #N " x i32], ptr %arr, i64 0, i64 %mw\n"                   \
+   "%x = load i32, ptr %at, align 4\n"                                                         \
+   "store i32 %x, ptr addrspace(1) %data, align 4\n"                                           \
+   "ret void\n}\n"                                                                             \
+   "!air.kernel = !{!2}\n"                                                                     \
+   "!2 = !{ptr @thread_array, !3, !4}\n!3 = !{}\n!4 = !{!40, !41}\n"                           \
+   "!40 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read_write\"," \
+   " !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4,"                      \
+   " !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"data\"}\n"                       \
+   "!41 = !{i32 1, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint\","        \
+   " !\"air.arg_name\", !\"tid\"}\n"
+
+/* The value thread_array stores, run as one invocation whose buffer at OUT
+ * starts with first. */
+static uint32_t
+run_thread_array(nir_shader *shader, uint32_t first)
+{
+   static uint8_t memory[0x900];
+   static uint8_t scratch[512];
+   uint8_t push[STELA_METAL_PUSH_BYTES] = {0};
+   memset(memory, 0, sizeof(memory));
+   memset(scratch, 0, sizeof(scratch));
+   put64(push + STELA_METAL_PUSH_TABLES, BASE + TABLE);
+   put64(memory + TABLE + STELA_METAL_TABLE_BUFFER_ADDRESSES, BASE + OUT);
+   put32(memory + OUT, first);
+   const struct air_effect_environment environment = {
+      .base = BASE, .bytes = memory, .size = sizeof(memory), .push = push,
+      .push_size = sizeof(push), .scratch = scratch, .scratch_size = sizeof(scratch),
+   };
+   struct air_effect_store store;
+   struct air_effect_run run = air_effect_execute_in(shader, 100000, &store, 1, &environment);
+   if (run.status != AIR_EFFECT_COMPLETE)
+      fprintf(stderr, "thread array: %s\n", run.detail);
+   assert(run.status == AIR_EFFECT_COMPLETE && run.stores == 1 && store.address == BASE + OUT);
+   return store.values[0].u32;
+}
+
+/* A thread array of up to 16 words lives in registers, its dynamic index a
+ * select over its words; a larger one stays in scratch. Both read the same
+ * values. */
+static void
+small_thread_arrays_live_in_registers(void)
+{
+   const struct stela_metal_specialization specialization = {.workgroup_size = {64, 1, 1}};
+   struct stela_air_error error;
+   nir_shader *shader = compile(THREAD_ARRAY_KERNEL(16, 15), "thread_array", &specialization, &error);
+   if (!shader)
+      fprintf(stderr, "thread array: %u %s\n", error.kind, error.detail);
+   assert(shader && !shader->scratch_size);
+   assert(!count_intrinsic(shader, nir_intrinsic_load_scratch) &&
+          !count_intrinsic(shader, nir_intrinsic_store_scratch));
+   assert(!count_intrinsic(shader, nir_intrinsic_load_deref) &&
+          !count_intrinsic(shader, nir_intrinsic_store_deref));
+   for (uint32_t k = 0; k < 16; k++)
+      assert(run_thread_array(shader, k) == 3 * k);
+   stela_metal_release(shader);
+
+   shader = compile(THREAD_ARRAY_KERNEL(17, 15), "thread_array", &specialization, &error);
+   if (!shader)
+      fprintf(stderr, "thread array: %u %s\n", error.kind, error.detail);
+   assert(shader && shader->scratch_size > 16 * 4);
+   assert(count_intrinsic(shader, nir_intrinsic_load_scratch));
+   assert(run_thread_array(shader, 13) == 39);
+   stela_metal_release(shader);
+}
+
 /* MPS's shapes: setup() returns a struct its callers take coerced to its
  * fields, constant() returns its function constant k in a struct through
  * sret, and added() and extracted() take such structs through pointers to
@@ -4897,6 +4985,7 @@ main(void)
    function_constants_select_outputs();
    older_kernels_compile();
    unoptimized_kernels_compile();
+   small_thread_arrays_live_in_registers();
    undefined_lanes_read_as_anything();
    function_constants_select_arguments();
    specialized_fragment_calls_preserve_graph_admission();
