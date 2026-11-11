@@ -211,6 +211,7 @@ pub(crate) fn page_fault(
     address: u64,
     saved: &super::super::interrupts::SavedState<'_>,
 ) {
+    let entered = rdtsc();
     let write = frame.error & 2 != 0;
     #[cfg(feature = "nvk")]
     if super::super::gpu::client::serve_fault(address, write) {
@@ -303,6 +304,7 @@ pub(crate) fn page_fault(
     // whose tags are checked maps only the passed page.
     if tag_checks[half] && translation.attributes == mmu::attributes::TAGGED {
         state.fills += 1;
+        state.fill_ticks += rdtsc().wrapping_sub(entered);
         return;
     }
     const { assert!(FILL_WINDOW.is_power_of_two() && FILL_WINDOW <= tables::LARGE) };
@@ -346,6 +348,7 @@ pub(crate) fn page_fault(
         }
     }
     state.fills += 1;
+    state.fill_ticks += rdtsc().wrapping_sub(entered);
 }
 
 /// #GP or #UD inside native code ends the block; elsewhere it is fatal.

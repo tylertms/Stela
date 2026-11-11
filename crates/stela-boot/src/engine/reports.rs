@@ -90,7 +90,7 @@ impl TranslatedSeen {
 /// The host's shadow counters at the last heartbeat.
 #[derive(Default)]
 pub(super) struct ShadowSeen {
-    pub(super) counts: [u64; 12],
+    pub(super) counts: [u64; 13],
     pub(super) causes: [u64; 7],
     pub(super) fields: [u64; 9],
 }
@@ -121,6 +121,7 @@ impl ShadowSeen {
             host.bank_misses,
             host.scoped,
             host.view_switches,
+            host.fill_ns,
         ];
         let [
             fills,
@@ -135,8 +136,10 @@ impl ShadowSeen {
             bank_misses,
             scoped,
             view_switches,
+            fill_ns,
         ] = core::array::from_fn(|index| counts[index] - self.counts[index]);
         self.counts = counts;
+        let fill_ns_each = fill_ns / fills.max(1);
         let [_, sprr, table, controls, tags, invalidated, maintained] =
             core::array::from_fn(|index| host.reset_causes[index] - self.causes[index]);
         self.causes = host.reset_causes;
@@ -161,7 +164,7 @@ impl ShadowSeen {
              lower_resets={lower_resets} lower_switches={lower_switches} \
              lower_found={lower_found} kept_dropped={kept_dropped} \
              bank_switches={bank_switches} bank_misses={bank_misses} scoped={scoped} \
-             view_switches={view_switches}\n"
+             view_switches={view_switches} fill_ns_each={fill_ns_each}\n"
         ));
         if let Some((from, to)) = host.last_controls
             && controls > 0

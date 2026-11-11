@@ -529,6 +529,8 @@ pub struct State {
     pub scoped: u64,
     /// Pages mapped beside a fault's from the same leaf.
     pub prefills: u64,
+    /// TSC ticks from a filled #PF's handler entry to its return.
+    pub fill_ticks: u64,
     pub stray: u64,
     /// TSC ticks spent in compiled guest code, its exits and faults.
     pub native_ticks: u64,
@@ -729,6 +731,7 @@ pub unsafe fn install(config: Config) -> Result<HostOwner> {
             kept_dropped: 0,
             scoped: 0,
             prefills: 0,
+            fill_ticks: 0,
             stray: 0,
             placement: config.placement,
             tlb: Tlb::default(),
@@ -754,6 +757,9 @@ pub struct Statistics {
     /// same leaves.
     pub fills: u64,
     pub prefills: u64,
+    /// Nanoseconds the filled faults' handlers took, entry to return
+    /// (without the exception's delivery and IRETQ).
+    pub fill_ns: u64,
     /// Resets of the whole shadow, those because a half ran out of frames,
     /// of the lower half alone, and TLBIs that unmapped ranges instead.
     pub resets: u64,
@@ -800,6 +806,8 @@ pub fn statistics() -> Statistics {
     Statistics {
         fills: state.fills,
         prefills: state.prefills,
+        fill_ns: (u128::from(state.fill_ticks) * 1_000_000_000 / u128::from(state.tsc_hz.max(1)))
+            as u64,
         resets: state.resets,
         exhausted: state.exhausted,
         lower_resets: state.lower_resets,
