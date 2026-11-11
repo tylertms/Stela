@@ -918,6 +918,8 @@ pub struct Runtime<const N: usize> {
     firmware_cursor: Cell<usize>,
     service_domain: ManuallyDrop<UnsafeCell<Option<Arc<service::Domain<N>>>>>,
     execution: Arc<accounting::ExecutionView>,
+    /// The dispatcher's caller's bound on its steps ([`Runtime::bound_steps`]).
+    step_bound: Cell<Option<fn() -> bool>>,
     _local: PhantomData<*mut ()>,
     _pinned: PhantomPinned,
 }
@@ -1059,6 +1061,7 @@ impl<const N: usize> Runtime<N> {
             firmware_turn: Cell::new(true),
             firmware_cursor: Cell::new(0),
             service_domain: ManuallyDrop::new(UnsafeCell::new(None)),
+            step_bound: Cell::new(None),
             _local: PhantomData,
             _pinned: PhantomPinned,
         });

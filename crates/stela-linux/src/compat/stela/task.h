@@ -97,6 +97,8 @@ void stela_linux_lease_snapshot(struct stela_linux_lease *lease);
 bool stela_linux_lease_matches(const struct stela_linux_lease *lease);
 void stela_linux_lease_suspend(const struct stela_linux_lease *lease);
 bool stela_linux_lease_resume(const struct stela_linux_lease *lease);
+/* A preemption point after a delay in preemptible task context. */
+void stela_linux_delay_point(void);
 
 /* Allocation/release run in qualified process context, outside Linux entry.
  * Attach/leave/arrive/complete/detach are bounded IF=0 Runtime switch hooks.

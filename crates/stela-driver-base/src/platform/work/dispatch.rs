@@ -22,14 +22,28 @@ impl<const N: usize> Runtime<N> {
     pub fn reschedule_requested(self: Pin<&Self>) -> Result<bool, WorkError> {
         self.current_id()?;
         let Some(domain) = self.domain() else {
-            return Ok(false);
+            return Ok(self.step_bound_reached());
         };
         if self.service_current()? {
             return Ok(false);
         }
         // Capture before inspection. A later wake must survive this query.
         let requested = self.queue.inspection.swap(false, Ordering::AcqRel);
-        Ok(domain.inspect_and_wake()? || requested)
+        Ok(domain.inspect_and_wake()? || requested || self.step_bound_reached())
+    }
+
+    /// Bound the steps of this dispatcher's caller: while `leave` is set and
+    /// returns true, each reschedule point of a running continuation (where
+    /// [`Self::reschedule_requested`] is asked) suspends it, so the caller's
+    /// [`Self::step`] returns there instead of when the continuation parks.
+    /// `None` removes the bound. The caller sets it on the dispatcher, around
+    /// its own steps; a continuation never sees a bound of another caller.
+    pub fn bound_steps(self: Pin<&Self>, leave: Option<fn() -> bool>) {
+        self.step_bound.set(leave);
+    }
+
+    fn step_bound_reached(&self) -> bool {
+        self.step_bound.get().is_some_and(|leave| leave())
     }
 
     /// Suspend once only if the foreign predicate is still blocked.

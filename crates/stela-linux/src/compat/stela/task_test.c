@@ -420,6 +420,25 @@ void stela_linux_task_test_runnable_boundary(void *context)
 		assert(call->ticks(call->context) == 1);
 		assert(current->__state == TASK_RUNNING && stela_linux_quiescent());
 	}
+	if (call->mode == 3) {
+		/* A delay point never switches or queries where it cannot. */
+		u64 reads = call->reads(call->context);
+		preempt_disable();
+		stela_linux_delay_point();
+		preempt_enable();
+		local_irq_disable();
+		stela_linux_delay_point();
+		local_irq_enable();
+		set_current_state(TASK_UNINTERRUPTIBLE);
+		stela_linux_delay_point();
+		__set_current_state(TASK_RUNNING);
+		assert(call->reads(call->context) == reads);
+		assert(!call->ticks(call->context));
+		/* In preemptible context it switches as cond_resched does. */
+		stela_linux_delay_point();
+		assert(call->ticks(call->context) == 1);
+		assert(current->__state == TASK_RUNNING && stela_linux_quiescent());
+	}
 	if (call->mode == 2)
 		scope_end_target = current;
 	/* mode2 performs no cooperative switch in its body: scope-end must

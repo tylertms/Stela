@@ -2099,6 +2099,37 @@ int __cond_resched(void)
 	return 1;
 }
 
+/* A delay in preemptible task context is a preemption point, as it is in a
+ * preemptible kernel: the dispatcher's caller (a GPU pump past its budget, or
+ * with a core waiting for its lock) may end its step here and resume the task
+ * on a later step. Spinlocks, RCU readers and disabled interrupts keep
+ * preempt_count or the IRQ flag set, so they never reach a switch; a task
+ * between set_current_state and schedule keeps its delay plain. Unlike
+ * __cond_resched this never traps: what it cannot switch stays a delay. */
+void stela_linux_delay_point(void)
+{
+	if (!__atomic_load_n(&active, __ATOMIC_ACQUIRE) || !stela_linux_quiescent())
+		return;
+	struct stela_linux_task *task = current_record();
+	if (!task->scope || task->scope_boundary || task->prepared || task->suspended ||
+	    READ_ONCE(task->linux_task->__state) != TASK_RUNNING)
+		return;
+	/* prepare's own refusals, checked first, so a request the query
+	 * consumes is followed by its switch. */
+	struct stela_linux_lease lease;
+	stela_linux_lease_snapshot(&lease);
+	if (!live_here(task, &task->context) || !lease.owner ||
+	    lease.irq_flags != ARCH_IRQ_ENABLED)
+		return;
+	if (!task->scope_ops->reschedule_requested(task->scope))
+		return;
+	/* Not reached after the checks above; were it, the request stays for
+	 * the dispatcher's next step, which inspects its domain itself. */
+	if (prepare(task, 0))
+		return;
+	(void)finish_prepared(task, task->scope_ops->reschedule(task->scope));
+}
+
 void yield(void)
 {
 	__set_current_state(TASK_RUNNING);

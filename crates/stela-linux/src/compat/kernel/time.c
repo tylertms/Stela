@@ -29,6 +29,7 @@ static void atomic_minimum_us(u64 minimum)
     if (!owner->services->minimum_delay_us)
         stela_linux_fatal("missing actual atomic minimum provider");
     owner->services->minimum_delay_us(owner->context, minimum);
+    stela_linux_delay_point();
 }
 
 static const struct stela_linux_owner *sleep_context(unsigned int state,

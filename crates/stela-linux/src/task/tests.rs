@@ -464,6 +464,7 @@ fn trees_child() {
     clock_service_roundtrip(0);
     clock_service_roundtrip(1);
     clock_service_roundtrip(2);
+    clock_service_roundtrip(3);
     // SAFETY: this child borrows no constant Linux names, which classifying
     // no address as immutable data requires.
     assert!(unsafe { crate::image::register(alloc::sync::Arc::new(NoImage)) }.is_ok());

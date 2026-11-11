@@ -451,6 +451,55 @@ fn drain_cycles_do_not_deadlock() {
     // Completed jobs/bindings permit retirement; pending continuations keep their owners.
     unsafe { r.retire() }.unwrap();
 }
+unsafe extern "C" fn bounded_work(p: *mut c_void) {
+    // SAFETY: p is the matching fixture Arc pointer submitted to this callback.
+    // The queue keeps that owner across every suspension and callback return.
+    let f = unsafe { fixture(p) };
+    // SAFETY: setup published this pinned Runtime pointer before callback admission.
+    // The fixture is used while its Executor is live, including all suspended callbacks.
+    let r = unsafe { f.runtime() };
+    f.event(70);
+    if r.reschedule_requested().unwrap() {
+        r.reschedule().unwrap();
+    }
+    f.event(71);
+    assert!(!r.reschedule_requested().unwrap());
+    f.event(72);
+}
+#[test]
+fn a_step_bound_ends_the_step_at_a_reschedule_point() {
+    let (executor, f, _, _) = setup();
+    let r = executor.runtime();
+    let context = Arc::as_ptr(&f) as *mut c_void;
+    let seen = |f: &Fixture| {
+        f.events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.0)
+            .collect::<Vec<_>>()
+    };
+    // SAFETY: The callback and context identify this queue's fixture Arc.
+    // The owning Executor keeps its pinned runtime/stacks alive while the job is suspended.
+    unsafe { r.queue.execute(Kind::General, bounded_work, context) }.unwrap();
+    r.bound_steps(Some(|| true));
+    assert!(r.step().unwrap());
+    assert_eq!(
+        seen(&f),
+        [70],
+        "the bound ends the step at its reschedule point"
+    );
+    r.bound_steps(None);
+    while r.step().unwrap() {}
+    assert_eq!(
+        seen(&f),
+        [70, 71, 72],
+        "unbounded, the continuation runs to its end"
+    );
+    // SAFETY: This test has no asynchronous producers and calls on the dispatcher.
+    // Completed jobs/bindings permit retirement; pending continuations keep their owners.
+    unsafe { r.retire() }.unwrap();
+}
 unsafe extern "C" fn suspended(p: *mut c_void) {
     // SAFETY: p is the matching fixture Arc pointer submitted to this callback.
     // The queue keeps that owner across every suspension and callback return.

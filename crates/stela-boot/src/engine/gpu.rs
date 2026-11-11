@@ -1951,6 +1951,18 @@ impl Installed {
 /// age the boot PE's run loop bounds ([`pump_due`]).
 static PENDING_SINCE: AtomicU64 = AtomicU64::new(0);
 
+/// When the running pump's budget ends, in TSC ticks ([`pump_should_leave`]).
+static PUMP_LEAVE_AT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Whether the running pump should end its step at the next reschedule
+/// point inside it (a delay in preemptible Linux task context): the same
+/// reasons that end it between steps.
+fn pump_should_leave() -> bool {
+    super::service::shutdown_pending()
+        || host::rdtsc() >= PUMP_LEAVE_AT.load(Ordering::Relaxed)
+        || super::storage::host_drivers_wanted()
+}
+
 /// How long the environment's work may wait while the boot PE runs guest
 /// code at EL1 or EL2 with interrupts unmasked: it may hold a lock that
 /// disables only preemption, which other PEs spin on while it pumps.
@@ -2208,6 +2220,18 @@ pub(super) fn pump() {
     };
     let ran = gpu.work.dispatch_linux(|runtime| {
         lap(PumpPart::Enter);
+        // A long step ends at its next reschedule point once the budget is
+        // spent or a core waits for the lock; the task resumes on a later
+        // pump. Removed on every way out of this dispatch.
+        struct Unbound(Pin<&'static stela_drivers::platform::work::Runtime<SLOTS>>);
+        impl Drop for Unbound {
+            fn drop(&mut self) {
+                self.0.bound_steps(None);
+            }
+        }
+        PUMP_LEAVE_AT.store(started.saturating_add(budget), Ordering::Relaxed);
+        runtime.bound_steps(Some(pump_should_leave));
+        let _unbound = Unbound(runtime);
         let mut first = true;
         loop {
             // What is raised from here on this pass takes: the step runs
