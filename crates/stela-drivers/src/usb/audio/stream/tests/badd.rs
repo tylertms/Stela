@@ -477,11 +477,11 @@ fn badd_standard_mono_alternate_and_explicit_feedback_stream_real_pcm() {
         a.binding = parse(&c, 3).unwrap();
         assert!(matches!(a.binding.formats[0].sync, Sync::Explicit(_)));
         a.transport.inner.output.clear();
-        a.start_playback(0, 48000, &[0x72; 12288], true).unwrap();
+        a.start_playback(0, 48000, &[0x72; 24576], true).unwrap();
         a.start_capture(1, 48000).unwrap();
         a.poll().unwrap();
         assert!(a.progress.feedback_updates > 0);
-        assert_eq!(a.transport.inner.output, vec![0x72; 6144]);
+        assert_eq!(a.transport.inner.output, vec![0x72; 12288]);
         a.stop_capture().unwrap(); // keep the duplex power session awake while playback remains live
         assert_eq!(a.transport.states, [0, 0]);
         a.stop_playback().unwrap();

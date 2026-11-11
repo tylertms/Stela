@@ -198,7 +198,7 @@ impl Transport for Model {
     fn submit(&mut self, e: &Endpoint, p: u64, n: usize) -> Result<u64, BlockError> {
         assert!(self.active.contains(&e.address));
         assert!(n <= 3072);
-        assert_eq!(p & 4095, 0);
+        assert_eq!(p % 64, 0);
         self.submitted.push((e.address, n));
         self.next += 1;
         self.pending.insert(self.next, (*e, p, n));
@@ -411,7 +411,7 @@ fn duplex_capture_uses_packet_bytes_and_shared_clock_is_not_retuned() {
         a.start_capture(1, 48000).unwrap();
         a.start_playback(0, 48000, &vec![7; 24000], true).unwrap();
         a.poll().unwrap();
-        assert_eq!(a.progress().capture_frames, 1536);
+        assert_eq!(a.progress().capture_frames, 3072);
         let mut pcm = vec![0; 6144];
         assert_eq!(a.read_capture(&mut pcm).unwrap(), 6144);
         assert_eq!(&pcm[..192], &[1; 192]);
@@ -474,7 +474,7 @@ fn explicit_feedback_updates_packetizer_and_stale_feedback_stops() {
         };
         a.binding.formats[0].sync = Sync::Explicit(fb);
         a.start_playback(0, 48000, &vec![9; 24000], false).unwrap();
-        assert_eq!(a.poll().unwrap().feedback_updates, 32);
+        assert_eq!(a.poll().unwrap().feedback_updates, 64);
         a.transport.hold = true;
         a.transport.time = 100001;
         assert_eq!(a.poll(), Err(Error::Feedback));
@@ -800,5 +800,44 @@ fn fractional_low_rate_preserves_zero_length_service_intervals() {
         assert!(a.progress().playback_drained);
         assert_eq!(a.progress().playback_frames, 2);
         assert_eq!(a.transport.output, pcm);
+    });
+}
+
+/// A lane's queue covers a 64 ms service gap where the transfer and event
+/// rings allow it: 64 packets at 1 ms, the 192-packet cap at 125 us, the
+/// pool's size for large packets; no slot crosses a 64 KiB boundary.
+#[test]
+fn lanes_queue_enough_service_intervals_for_a_late_poll() {
+    let mut dma = TestRegion::new(512 * 1024);
+    let mut lane: Lane<u64> = Lane::new(&mut dma, POOL_BYTES).unwrap();
+    for (bytes, microframes, packets) in [(196, 8, 64), (168, 1, 192), (4096, 8, 32), (3072, 1, 42)]
+    {
+        lane.arm(bytes, microframes).unwrap();
+        assert_eq!(lane.packets.len(), packets, "{bytes} every {microframes}");
+        for packet in &lane.packets {
+            let start = lane.pool.physical() + packet.offset as u64;
+            assert_eq!(start % 64, 0);
+            assert_eq!(
+                start / TD_BOUNDARY,
+                (start + lane.slot as u64 - 1) / TD_BOUNDARY
+            );
+            assert!(packet.offset + lane.slot <= lane.pool.len());
+        }
+    }
+    assert_eq!(lane.arm(POOL_BYTES + 1, 8), Err(Error::Format));
+}
+
+/// A continuous stream at 1 ms intervals has 64 ms queued, so a 50 ms
+/// pause in polling does not starve it.
+#[test]
+fn a_continuous_stream_survives_a_fifty_millisecond_poll_gap() {
+    run(|a| {
+        // 200 ms of 2-channel 16-bit PCM.
+        a.start_playback(0, 48000, &vec![5; 38400], false).unwrap();
+        assert_eq!(a.progress().queued_playback, 64);
+        a.transport.time += 50_000;
+        let progress = a.poll().unwrap();
+        assert_eq!(progress.playback_frames, 64 * 48);
+        assert_eq!(progress.queued_playback, 64);
     });
 }

@@ -14,36 +14,84 @@ use alloc::{
     vec::Vec,
 };
 
-const PACKETS: usize = 32;
-const BUFFER_BYTES: usize = 4096;
+/// Packets a lane keeps in flight at most. The controller's transfer ring
+/// holds 254 TDs and its event ring 256 events shared by every device, so
+/// a stream leaves room for both.
+const MAX_PACKETS: usize = 192;
+/// Packets a lane keeps in flight at least, as far as its pool allows.
+const MIN_PACKETS: usize = 32;
+/// The service a lane's queue covers: a polled owner may be served this
+/// late without starving the device.
+const DEPTH_US: u64 = 64_000;
+/// One lane's packet buffers, carved into slots of the stream's packet size.
+const POOL_BYTES: usize = 128 * 1024;
+/// A feedback lane's pool: packets of at most 4 bytes.
+const FEEDBACK_POOL_BYTES: usize = 4096;
+const SLOT_ALIGN: usize = 64;
+/// A TD buffer must not cross a 64 KiB boundary.
+const TD_BOUNDARY: u64 = 64 * 1024;
 const PCM_LIMIT: usize = 1024 * 1024;
 const FEEDBACK_TIMEOUT_US: u64 = 100_000;
 
 struct Packet<K> {
-    buffer: DmaBuffer,
+    /// The slot's offset in the lane's pool.
+    offset: usize,
     ticket: Option<K>,
     bytes: usize,
 }
 struct Lane<K> {
     endpoint: Option<Endpoint>,
+    pool: DmaBuffer,
+    /// The pool's slot size while armed.
+    slot: usize,
     packets: Vec<Packet<K>>,
     order: VecDeque<usize>,
 }
 impl<K> Lane<K> {
-    fn new(dma: &mut dyn DmaAllocator) -> Result<Self, Error> {
+    fn new(dma: &mut dyn DmaAllocator, bytes: usize) -> Result<Self, Error> {
+        Ok(Self {
+            endpoint: None,
+            pool: dma.allocate(bytes, 4096)?,
+            slot: 0,
+            packets: Vec::new(),
+            order: VecDeque::new(),
+        })
+    }
+    /// Carve the idle pool into slots of `bytes` for a stream served every
+    /// `microframes`: enough packets to cover [`DEPTH_US`], within
+    /// [`MAX_PACKETS`] and the pool, no slot crossing a 64 KiB boundary.
+    fn arm(&mut self, bytes: usize, microframes: u32) -> Result<(), Error> {
+        debug_assert!(self.packets.iter().all(|p| p.ticket.is_none()));
+        let slot = bytes.max(4).next_multiple_of(SLOT_ALIGN);
+        let service_us = u64::from(microframes.max(1)) * 125;
+        let wanted = (DEPTH_US.div_ceil(service_us) as usize).clamp(MIN_PACKETS, MAX_PACKETS);
+        let base = self.pool.physical();
         let mut packets = Vec::new();
-        for _ in 0..PACKETS {
+        let mut offset = 0usize;
+        while packets.len() < wanted && offset + slot <= self.pool.len() {
+            let start = base + offset as u64;
+            if start / TD_BOUNDARY != (start + slot as u64 - 1) / TD_BOUNDARY {
+                offset = ((start / TD_BOUNDARY + 1) * TD_BOUNDARY - base) as usize;
+                continue;
+            }
             packets.push(Packet {
-                buffer: dma.allocate(BUFFER_BYTES, BUFFER_BYTES)?,
+                offset,
                 ticket: None,
                 bytes: 0,
             });
+            offset += slot;
         }
-        Ok(Self {
-            endpoint: None,
-            packets,
-            order: VecDeque::new(),
-        })
+        if packets.is_empty() {
+            return Err(Error::Format);
+        }
+        self.slot = slot;
+        self.packets = packets;
+        self.order.clear();
+        Ok(())
+    }
+    fn data(&self, index: usize, bytes: usize) -> &[u8] {
+        let offset = self.packets[index].offset;
+        &self.pool.bytes()[offset..offset + bytes]
     }
     fn queued(&self) -> usize {
         self.packets.iter().filter(|p| p.ticket.is_some()).count()
@@ -164,9 +212,9 @@ impl<T: Transport> AudioDevice<T> {
         Ok(Self {
             transport,
             binding,
-            output: Lane::new(dma)?,
-            input: Lane::new(dma)?,
-            feedback: Lane::new(dma)?,
+            output: Lane::new(dma, POOL_BYTES)?,
+            input: Lane::new(dma, POOL_BYTES)?,
+            feedback: Lane::new(dma, FEEDBACK_POOL_BYTES)?,
             playback: None,
             capture: None,
             output_pcm: VecDeque::new(),
@@ -207,8 +255,8 @@ impl<T: Transport> AudioDevice<T> {
         for lane in [&self.output, &self.input, &self.feedback] {
             bytes.extend_from_slice(&lane.order.len().to_le_bytes());
             bytes.push(u8::from(lane.endpoint.is_some()));
+            bytes.extend_from_slice(lane.pool.bytes());
             for packet in &lane.packets {
-                bytes.extend_from_slice(packet.buffer.bytes());
                 bytes.extend_from_slice(&packet.bytes.to_le_bytes());
                 bytes.push(u8::from(packet.ticket.is_some()));
             }
@@ -444,8 +492,13 @@ impl<T: Transport> AudioDevice<T> {
                 self.start_capture_inner(capture_index, rate, false, true, &mut false)?;
             }
             self.prepare_power()?;
+            self.output
+                .arm(format.max_bytes, format.service_microframes)?;
             self.output.endpoint = Some(format.data);
             if let Sync::Explicit(endpoint) = format.sync {
+                let interval = super::descriptors::service_interval(endpoint, self.binding.speed)
+                    .unwrap_or(format.service_microframes);
+                self.feedback.arm(4, interval)?;
                 self.feedback.endpoint = Some(endpoint);
             }
             self.output_pcm.extend(pcm.iter().copied());
@@ -565,6 +618,8 @@ impl<T: Transport> AudioDevice<T> {
         // the session's permission even if it does not acquire a new domain.
         *effects_attempted = true;
         self.prepare_power()?;
+        self.input
+            .arm(format.max_bytes, format.service_microframes)?;
         self.input.endpoint = Some(format.data);
         self.capture = Some(Capture {
             format,
@@ -861,16 +916,25 @@ impl<T: Transport> AudioDevice<T> {
                     .format
                     .max_bytes
             };
-            for (index, packet) in lane.packets.iter_mut().enumerate() {
+            if bytes > lane.slot {
+                return Err(Error::Format);
+            }
+            let Lane {
+                pool,
+                packets,
+                order,
+                ..
+            } = lane;
+            for (index, packet) in packets.iter_mut().enumerate() {
                 if packet.ticket.is_none() {
-                    packet.buffer.bytes_mut()[..bytes].fill(0xa5);
+                    pool.bytes_mut()[packet.offset..packet.offset + bytes].fill(0xa5);
                     packet.bytes = bytes;
                     packet.ticket = Some(self.transport.submit(
                         &endpoint,
-                        packet.buffer.physical(),
+                        pool.physical() + packet.offset as u64,
                         bytes,
                     )?);
-                    lane.order.push_back(index);
+                    order.push_back(index);
                 }
             }
         }
@@ -882,7 +946,14 @@ impl<T: Transport> AudioDevice<T> {
             return Ok(());
         };
         let endpoint = self.output.endpoint.ok_or(Error::NotRunning)?;
-        for (index, packet) in self.output.packets.iter_mut().enumerate() {
+        let Lane {
+            pool,
+            slot,
+            packets,
+            order,
+            ..
+        } = &mut self.output;
+        for (index, packet) in packets.iter_mut().enumerate() {
             if packet.ticket.is_some() {
                 continue;
             }
@@ -901,7 +972,7 @@ impl<T: Transport> AudioDevice<T> {
                     }
                 }
             };
-            if bytes > p.format.max_bytes {
+            if bytes > p.format.max_bytes || bytes > *slot {
                 return Err(Error::Feedback);
             }
             let bytes = if self.output_pcm.len() < bytes {
@@ -919,16 +990,16 @@ impl<T: Transport> AudioDevice<T> {
             }
             // A fractional zero-frame interval still consumes USB service time.
             // Submit its ZLP TD rather than compressing sample cadence.
-            for b in &mut packet.buffer.bytes_mut()[..bytes] {
+            for b in &mut pool.bytes_mut()[packet.offset..packet.offset + bytes] {
                 *b = self.output_pcm.pop_front().unwrap();
             }
             packet.bytes = bytes;
             packet.ticket = Some(self.transport.submit(
                 &endpoint,
-                packet.buffer.physical(),
+                pool.physical() + packet.offset as u64,
                 bytes,
             )?);
-            self.output.order.push_back(index);
+            order.push_back(index);
         }
         Ok(())
     }
@@ -962,12 +1033,12 @@ impl<T: Transport> AudioDevice<T> {
             let bytes = Self::packet(&mut self.progress, result?, packet.bytes, true)?;
             packet.ticket = None;
             self.feedback.order.pop_front();
-            if bytes == 0 || packet.buffer.bytes()[..bytes].iter().all(|byte| *byte == 0) {
+            let data = self.feedback.data(index, bytes);
+            if bytes == 0 || data.iter().all(|byte| *byte == 0) {
                 continue;
             }
             let p = self.playback.as_mut().ok_or(Error::NotRunning)?;
-            p.packetizer
-                .feedback(&packet.buffer.bytes()[..bytes], self.binding.speed);
+            p.packetizer.feedback(data, self.binding.speed);
             p.last_feedback = self.transport.now_us();
             self.progress.feedback_updates += 1;
         }
@@ -993,11 +1064,11 @@ impl<T: Transport> AudioDevice<T> {
                         return Err(Error::Overrun);
                     }
                     self.input_pcm
-                        .extend(packet.buffer.bytes()[..bytes].iter().copied());
+                        .extend(self.input.data(index, bytes).iter().copied());
                     self.progress.capture_frames += frames as u64;
                 }
                 if c.implicit && frames > 0 {
-                    if self.implicit_frames.len() >= PACKETS * 2 {
+                    if self.implicit_frames.len() >= MAX_PACKETS * 2 {
                         return Err(Error::Overrun);
                     }
                     self.implicit_frames.push_back(frames);
