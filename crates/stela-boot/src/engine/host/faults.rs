@@ -347,8 +347,78 @@ pub(crate) fn page_fault(
             page += PAGE;
         }
     }
+    // The window's other leaves, when the guest's are smaller than it. A
+    // protection fault replaced a present page, whose neighbours were
+    // mapped with it.
+    if frame.error & 1 == 0 {
+        let table = slot.wrapping_sub(tables::index(virtual_page, 0));
+        for beside in shadow::around(address, translation.size, FILL_WINDOW) {
+            map_beside(state, table, half, tag_checks[half], beside);
+        }
+    }
     state.fills += 1;
     state.fill_ticks += rdtsc().wrapping_sub(entered);
+}
+
+/// Map the leaf at `address`, in the window of a fault just filled through
+/// `table` (the host table that holds the whole window), from its own walk
+/// for a read: a TLB may cache any valid translation, as Arm lets a walk
+/// fetch and cache entries before any access needs them, and Access flag,
+/// permission, watchpoint, Tag Check and device outcomes leave the leaf to
+/// its own fault. Lower-half global leaves are left to their fault too
+/// (the shared span widens there), as are pages already present, so every
+/// entry written was absent and needs no flush.
+fn map_beside(state: &mut State, table: *mut u64, half: usize, tag_check: bool, address: u64) {
+    if !state.placement.native(address) {
+        return;
+    }
+    let Ok((translation, _)) = resolve(state, address, false, false) else {
+        return;
+    };
+    if (half == LOWER && translation.global)
+        || (tag_check && translation.attributes == mmu::attributes::TAGGED)
+    {
+        return;
+    }
+    let guarded = state.contexts.pan_flag
+        && state.current % VIEWS == EL1_VIEW
+        && (!translation.readable || translation.pan_sensitive);
+    let rights = PRESENT
+        | NX
+        | if translation.writable { WRITABLE } else { 0 }
+        | if guarded { tables::USER } else { 0 };
+    let (first, last) = shadow::window(address, translation.size, FILL_WINDOW);
+    let physical = translation
+        .physical
+        .wrapping_sub(address)
+        .wrapping_add(first);
+    let watch = &state.regime.as_ref().expect("a fault was filled").watch;
+    let mut page = first;
+    let mut mapped = false;
+    loop {
+        // SAFETY: the window lies in the one leaf table `table` names,
+        // the live table the fault's slot belongs to, which only this
+        // host manages.
+        let entry = unsafe { table.add(tables::index(page, 0)) };
+        // SAFETY: as above.
+        let absent = unsafe { entry.read_volatile() } & PRESENT == 0;
+        if absent
+            && !watch.blocks(page)
+            && let Some(host) = state.host_physical(physical.wrapping_add(page - first))
+        {
+            // SAFETY: as above.
+            unsafe { entry.write_volatile((host & tables::ADDRESS) | rights) };
+            state.prefills += 1;
+            mapped = true;
+        }
+        if page >= last & !(PAGE - 1) {
+            break;
+        }
+        page += PAGE;
+    }
+    if mapped {
+        state.extents[half].record(address, translation.size, translation.global);
+    }
 }
 
 /// #GP or #UD inside native code ends the block; elsewhere it is fatal.

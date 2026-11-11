@@ -40,6 +40,26 @@ pub fn window(address: u64, size: u64, window: u64) -> (u64, u64) {
     (first.max(start), last.min(end))
 }
 
+/// The first byte of each other `size`-byte leaf in the aligned `window`
+/// around `address`, nearest first and the following one before the
+/// preceding at each distance: the leaves a fill may map beside its own,
+/// each after its own walk. None when the leaf fills the window.
+pub fn around(address: u64, size: u64, window: u64) -> impl Iterator<Item = u64> {
+    let size = size.max(PAGE).next_power_of_two();
+    let (start, end) = leaf(address, window);
+    let own = address & !(size - 1);
+    let leaves = if size > end - start {
+        0
+    } else {
+        (end - start + 1) / size
+    };
+    (1..leaves).flat_map(move |distance| {
+        let after = own.checked_add(distance * size).filter(|&a| a <= end);
+        let before = own.checked_sub(distance * size).filter(|&b| b >= start);
+        after.into_iter().chain(before)
+    })
+}
+
 /// The leaves one half of a shadow was filled from since it was last
 /// emptied, and the global ones apart, each by its own extent: a TLBI by VA
 /// of another ASID reaches only those of a kept half ([`Kept::invalidate`]),
@@ -754,6 +774,32 @@ mod tests {
         kept.switch(key(1), alloc::vec![(0x1000, 0, 2)], Extents::new(), key(2));
         assert_eq!(kept.clear(), 1);
         assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn a_fill_maps_the_other_leaves_of_its_window_nearest_first() {
+        let leaves = |address, size| around(address, size, 1 << 16).collect::<Vec<_>>();
+        // A 16 KiB leaf in a 64 KiB window: the three others.
+        assert_eq!(leaves(0x1_4123, 1 << 14), [0x1_8000, 0x1_0000, 0x1_c000]);
+        assert_eq!(leaves(0x1_0000, 1 << 14), [0x1_4000, 0x1_8000, 0x1_c000]);
+        assert_eq!(leaves(0x1_fff8, 1 << 14), [0x1_8000, 0x1_4000, 0x1_0000]);
+        // 4 KiB leaves: fifteen, all within the window and distinct.
+        let small = leaves(0x2_3456, 1 << 12);
+        assert_eq!(small.len(), 15);
+        assert!(small.iter().all(|&a| (0x2_0000..0x3_0000).contains(&a)));
+        assert!(!small.contains(&0x2_3000));
+        // A leaf as large as the window or larger has no neighbours in it.
+        assert!(leaves(0x5_0000, 1 << 16).is_empty());
+        assert!(leaves(0x20_0000, 1 << 21).is_empty());
+        // The top of the address space does not wrap.
+        assert_eq!(
+            leaves(u64::MAX, 1 << 14),
+            [
+                0xffff_ffff_ffff_8000,
+                0xffff_ffff_ffff_4000,
+                0xffff_ffff_ffff_0000
+            ]
+        );
     }
 
     #[test]
