@@ -223,6 +223,10 @@ pub struct Policy {
     bound: u64,
     unsaved: u32,
     grows: bool,
+    /// Pipelines created through the cache this boot that it held, and
+    /// that it did not.
+    hits: u64,
+    misses: u64,
 }
 
 impl Policy {
@@ -231,7 +235,14 @@ impl Policy {
             bound: bound.min(MAX_BYTES),
             unsaved: 0,
             grows: true,
+            hits: 0,
+            misses: 0,
         }
+    }
+
+    /// Pipelines created through the cache this boot: found there, and not.
+    pub fn counts(&self) -> (u64, u64) {
+        (self.hits, self.misses)
     }
 
     /// Whether compiled pipelines are added to the cache. Once a snapshot
@@ -243,6 +254,11 @@ impl Policy {
     /// A pipeline was created through the cache, `hit` when it was found
     /// there: whether to snapshot now.
     pub fn created(&mut self, hit: bool) -> bool {
+        if hit {
+            self.hits += 1;
+        } else {
+            self.misses += 1;
+        }
         if self.grows && !hit {
             self.unsaved += 1;
         }
@@ -658,6 +674,8 @@ pub fn recall_nir(key: &[u8; 32]) -> Option<Vec<u8>> {
 /// store, and when it is snapshotted.
 pub(super) struct Persisted {
     claim: Option<Claim>,
+    /// The bytes the cache was seeded with that the driver took.
+    seeded: usize,
     cache: vk::PipelineCache,
     policy: Policy,
     log: fn(&str),
@@ -668,6 +686,7 @@ impl Persisted {
     pub(super) fn none(log: fn(&str)) -> Self {
         Self {
             claim: None,
+            seeded: 0,
             cache: vk::PipelineCache::null(),
             policy: Policy::new(0),
             log,
@@ -698,6 +717,7 @@ impl Persisted {
             // driver ignores data whose header is not its own.
             unsafe { device.create_pipeline_cache(&info, None) }
         };
+        let mut seeded = seed.bytes().len();
         let cache = create(seed.bytes()).or_else(|error| {
             if seed.bytes().is_empty() {
                 return Err(error);
@@ -705,10 +725,12 @@ impl Persisted {
             log(&alloc::format!(
                 "pipeline store refused by the driver ({error:?}); its pipelines compile again"
             ));
+            seeded = 0;
             create(&[])
         });
         match cache {
             Ok(cache) => Self {
+                seeded,
                 policy: Policy::new(claim.bound),
                 claim: Some(claim),
                 cache,
@@ -761,6 +783,14 @@ impl Persisted {
         match unsafe { device.get_pipeline_cache_data(self.cache) } {
             Ok(payload) => {
                 let bytes = payload.len();
+                // A warm boot whose cache holds nothing it was seeded with
+                // shows as misses with no hits; one with keys that change
+                // between boots, as misses of the same pipelines each boot.
+                let (hits, misses) = self.policy.counts();
+                (self.log)(&alloc::format!(
+                    "pipeline store snapshot bytes={bytes} seeded={} hits={hits} misses={misses}",
+                    self.seeded
+                ));
                 if self.policy.snapshotted(bytes) {
                     with_store(|slot| {
                         if let Some(store) = slot {

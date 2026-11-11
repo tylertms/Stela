@@ -103,11 +103,13 @@ fn snapshots_follow_new_compiles_and_stop_at_the_bound() {
         assert!(!policy.created(true));
     }
     assert!(!policy.unsaved());
+    assert_eq!(policy.counts(), (100, 0));
     for _ in 1..SNAPSHOT_COMPILES {
         assert!(!policy.created(false));
     }
     assert!(policy.unsaved());
     assert!(policy.created(false));
+    assert_eq!(policy.counts(), (100, u64::from(SNAPSHOT_COMPILES)));
     assert!(policy.snapshotted(1000));
     assert!(policy.grows() && !policy.unsaved());
 
