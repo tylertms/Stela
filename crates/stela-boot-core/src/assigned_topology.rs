@@ -350,6 +350,7 @@ impl<'a> Source<'a> {
             roster,
             profile,
             &alloc::vec![native::CoreClass::Unknown; roster.cores().len()],
+            &[],
         )
     }
 
@@ -360,7 +361,30 @@ impl<'a> Source<'a> {
         capture: &Capture,
     ) -> Result<Prepared<'s>> {
         let classes = Self::host_classes(roster, capture)?;
-        self.prepare_with_classes(roster, profile, &classes)
+        let cores = Self::host_cores(roster, capture)?;
+        self.prepare_with_classes(roster, profile, &classes, &cores)
+    }
+
+    /// Each assigned worker's physical core, as `host_classes` finds its
+    /// processor.
+    fn host_cores(roster: &dyn RetainedRoster, capture: &Capture) -> Result<Vec<native::Location>> {
+        roster
+            .cores()
+            .iter()
+            .map(|core| {
+                let index = *capture
+                    .selected
+                    .get(core.worker)
+                    .filter(|_| core.worker < capture.core_count as usize)
+                    .ok_or(refuse!("assigned worker has no captured processor"))?
+                    as usize;
+                capture
+                    .processors
+                    .get(index)
+                    .map(|processor| processor.location)
+                    .ok_or(refuse!("assigned worker has no captured processor"))
+            })
+            .collect()
     }
 
     fn host_classes(
@@ -418,6 +442,7 @@ impl<'a> Source<'a> {
         roster: &'s dyn RetainedRoster,
         profile: CpuProfile,
         host: &[native::CoreClass],
+        cores: &[native::Location],
     ) -> Result<Prepared<'s>> {
         use stela_crypto::Sha256;
         use stela_crypto::digest::Digest;
@@ -437,6 +462,13 @@ impl<'a> Source<'a> {
         let guest = self.guest_classes()?;
         let placement = native::placement(&guest, host, boot)
             .map_err(|error| refuse!("assigned host core placement: {error}", ?error))?;
+        // On a host of one core class whose workers share physical cores,
+        // pair the guest's slots on them by cluster (`native::paired`).
+        let placement = if host.windows(2).all(|pair| pair[0] == pair[1]) {
+            native::paired(&guest, cores, boot).unwrap_or(placement)
+        } else {
+            placement
+        };
         for (ordinal, slot) in resources.slots.iter().enumerate() {
             // Source PE order keeps PMGR's cluster ordinal coupling; only
             // the host worker assigned to each source slot changes.

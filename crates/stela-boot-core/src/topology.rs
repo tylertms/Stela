@@ -193,6 +193,93 @@ pub fn placement(
     Ok(assigned)
 }
 
+/// Guest slots to host workers on a host of one core class whose workers
+/// share physical cores (`cores[worker]` is each worker's core), or none
+/// when every worker has a core of its own or the counts differ, which keeps
+/// `placement`'s order. Host worker 0 runs the boot slot.
+///
+/// The SMT threads of one core divide its throughput. The guest keeps its
+/// background work on its efficiency cluster and its foreground work on the
+/// performance cluster, so efficiency and low-power slots fill whole cores
+/// first, two to a core, beginning with the boot worker's core when the boot
+/// slot is one of them; performance and unknown slots then take the cores
+/// left alone, and on shared cores each core's first thread before any
+/// second one, so a cluster's first slots, which its scheduler fills first
+/// when it is lightly loaded, get cores of their own.
+pub fn paired(guest: &[CoreClass], cores: &[Location], boot: usize) -> Option<Vec<usize>> {
+    if guest.len() != cores.len() || boot >= guest.len() || cores.len() > MAX_CORES {
+        return None;
+    }
+    // Each core's workers in host order, cores in order of first worker.
+    let mut groups: Vec<(Location, Vec<usize>)> = Vec::new();
+    for (worker, core) in cores.iter().enumerate() {
+        match groups.iter_mut().find(|(location, _)| location == core) {
+            Some((_, workers)) => workers.push(worker),
+            None => groups.push((*core, alloc::vec![worker])),
+        }
+    }
+    if groups.len() == cores.len() || groups[0].1[0] != 0 {
+        return None;
+    }
+    let pairs = |class: CoreClass| matches!(class, CoreClass::Efficiency | CoreClass::LowPower);
+    let mut assigned = alloc::vec![usize::MAX; guest.len()];
+    let mut used = alloc::vec![false; cores.len()];
+    assigned[boot] = 0;
+    used[0] = true;
+    let free = |used: &[bool], workers: &[usize]| workers.iter().filter(|&&w| !used[w]).count();
+    // Pairing slots: the core in progress, then whole free shared cores,
+    // then single cores, then any free worker.
+    let mut current = pairs(guest[boot]).then_some(0usize);
+    for (slot, &class) in guest.iter().enumerate() {
+        if assigned[slot] != usize::MAX || !pairs(class) {
+            continue;
+        }
+        let in_progress = current.filter(|&group| free(&used, &groups[group].1) != 0);
+        let group = in_progress
+            .or_else(|| {
+                groups
+                    .iter()
+                    .position(|(_, w)| w.len() > 1 && free(&used, w) == w.len())
+            })
+            .or_else(|| groups.iter().position(|(_, w)| free(&used, w) != 0))?;
+        let worker = *groups[group].1.iter().find(|&&w| !used[w])?;
+        assigned[slot] = worker;
+        used[worker] = true;
+        current = Some(group);
+    }
+    // Spreading slots: cores still wholly free, fewest threads first, and
+    // on them one thread per core per round; then any free worker.
+    let mut order: Vec<usize> = (0..groups.len())
+        .filter(|&group| free(&used, &groups[group].1) == groups[group].1.len())
+        .collect();
+    order.sort_by_key(|&group| groups[group].1.len());
+    let mut seats = Vec::new();
+    for round in 0.. {
+        let before = seats.len();
+        for &group in &order {
+            if let Some(&worker) = groups[group].1.get(round) {
+                seats.push(worker);
+            }
+        }
+        if seats.len() == before {
+            break;
+        }
+    }
+    let rest: Vec<usize> = (0..cores.len())
+        .filter(|&w| !used[w] && !seats.contains(&w))
+        .collect();
+    seats.extend(rest);
+    let mut seats = seats.into_iter();
+    for worker in &mut assigned {
+        if *worker == usize::MAX {
+            let seat = seats.find(|&w| !used[w])?;
+            *worker = seat;
+            used[seat] = true;
+        }
+    }
+    Some(assigned)
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Snapshot {

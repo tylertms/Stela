@@ -1041,3 +1041,55 @@ fn a_missing_floor_names_each_feature() {
          Bulldozer or newer)"
     );
 }
+
+fn cores(keys: &[u32]) -> Vec<Location> {
+    keys.iter()
+        .map(|&core| Location {
+            core,
+            ..Location::default()
+        })
+        .collect()
+}
+
+#[test]
+fn paired_keeps_placement_when_every_worker_has_its_own_core() {
+    use CoreClass::{Efficiency as E, Performance as P};
+    let guest = [E, E, E, E, P, P, P, P];
+    assert_eq!(paired(&guest, &cores(&[0, 1, 2, 3, 4, 5, 6, 7]), 0), None);
+    // Counts that differ keep it too.
+    assert_eq!(paired(&guest, &cores(&[0, 1, 2, 3, 0, 1, 2]), 0), None);
+}
+
+#[test]
+fn paired_puts_efficiency_slots_two_to_a_core_and_spreads_performance_slots() {
+    use CoreClass::{Efficiency as E, Performance as P};
+    // `select` on four cores with two threads: thread 0 of each, then thread 1.
+    let host = cores(&[0, 1, 2, 3, 0, 1, 2, 3]);
+    assert_eq!(
+        paired(&[E, E, E, E, P, P, P, P], &host, 0),
+        Some(vec![0, 4, 1, 5, 2, 3, 6, 7])
+    );
+    // Ten PEs on eight cores: the efficiency cluster takes both shared cores
+    // and every performance slot keeps a core of its own.
+    let host = cores(&[0, 1, 2, 3, 4, 5, 6, 7, 0, 1]);
+    assert_eq!(
+        paired(&[E, E, E, E, P, P, P, P, P, P], &host, 0),
+        Some(vec![0, 8, 1, 9, 2, 3, 4, 5, 6, 7])
+    );
+}
+
+#[test]
+fn paired_is_a_permutation_with_the_boot_worker_fixed() {
+    use CoreClass::{Efficiency, LowPower, Performance, Unknown};
+    let classes = [Unknown, Performance, Efficiency, LowPower];
+    let host = cores(&[0, 1, 2, 0, 1, 2]);
+    for guest_bits in 0..4096usize {
+        let guest = core::array::from_fn::<_, 6, _>(|i| classes[guest_bits >> (i * 2) & 3]);
+        for boot in 0..6 {
+            let mut result = paired(&guest, &host, boot).unwrap();
+            assert_eq!(result[boot], 0);
+            result.sort_unstable();
+            assert_eq!(result, vec![0, 1, 2, 3, 4, 5]);
+        }
+    }
+}
