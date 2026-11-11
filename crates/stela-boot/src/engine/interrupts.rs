@@ -514,6 +514,11 @@ pub(crate) unsafe fn install_on(tables: &'static mut Tables, handler: Handler) {
             base: idt as u64,
         };
         asm!("lidt [{}]", in(reg) &pointer, options(readonly, nostack, preserves_flags));
+        // Once for this processor, with interrupts disabled, its own IDT
+        // active (a fault is reported, not a triple fault) and before any
+        // guest code runs on it; nothing else writes its P-state registers.
+        let performance = stela_boot_core::host_performance::request_full_performance();
+        stela_boot_core::host_performance::record(performance);
     }
 }
 

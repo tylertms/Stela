@@ -42,6 +42,7 @@ pub mod handoff_records;
 pub mod heap;
 pub mod host_identity;
 pub mod host_memory;
+pub mod host_performance;
 pub mod host_resources;
 pub mod hpet;
 pub mod interrupt_image;

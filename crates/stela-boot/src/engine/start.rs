@@ -821,6 +821,10 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         "NATIVE ACTIVE workers={active_workers} parked=0 source_PEs={}\n",
         full_profile.processors.len().max(1),
     ));
+    output::arguments(format_args!(
+        "{}",
+        stela_boot_core::host_performance::summary()
+    ));
     if loaded_tree.is_some() {
         crate::status::begin("Setting up the Mac's hardware");
     }
