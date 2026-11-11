@@ -5,6 +5,9 @@
 //! hot loops of the macOS kernel and libsystem_platform (memcmp, strcmp,
 //! strlen, word and 32-byte copies, a vector OR fold, a vector compare,
 //! an array scan), with random lengths, contents and pages that fault.
+//! Both forms also end where blocks that store NZCV at each flag-setting
+//! instruction do (`NativeSystem::capture_every_nzcv`): the flags a B.cond's
+//! exit leaves, and those a fault after a compare finds, stay exact.
 #![cfg(all(
     feature = "test-support",
     feature = "std",
@@ -37,7 +40,10 @@ fn tbnz(rt: u32, bit: u32, words: i32) -> u32 {
 const EQ: u32 = 0;
 const NE: u32 = 1;
 const HS: u32 = 2;
+const LO: u32 = 3;
+const VS: u32 = 6;
 const HI: u32 = 8;
+const LT: u32 = 11;
 
 struct Rng(u64);
 impl Rng {
@@ -62,6 +68,45 @@ struct Program {
 
 fn programs() -> Vec<Program> {
     vec![
+        Program {
+            name: "byte checks whose side exits keep the flags",
+            words: vec![
+                0x3840_1408,     // ldrb w8,[x0],#1
+                0x6b09_011f,     // cmp w8,w9
+                b_cond(EQ, 9),   // b.eq past the loop
+                0xab08_014a,     // adds x10,x10,x8
+                b_cond(VS, 7),   // b.vs past the loop
+                0x6b0b_011f,     // cmp w8,w11
+                b_cond(HI, 5),   // b.hi past the loop
+                0xeb08_018c,     // subs x12,x12,x8
+                b_cond(LT, 3),   // b.lt past the loop
+                0xf100_0442,     // subs x2,x2,#1
+                b_cond(NE, -10), // b.ne to the ldrb
+            ],
+            setup: |rng, base, state, _| {
+                state.x[0] = base + rng.below(2 * PAGE);
+                state.x[2] = 1 + rng.below(3 * PAGE);
+                state.x[9] = rng.below(256);
+                state.x[10] = i64::MAX as u64 - rng.below(1 << 17);
+                state.x[11] = 250 + rng.below(6);
+                state.x[12] = rng.below(1 << 17);
+            },
+        },
+        Program {
+            name: "a count check before a load that faults",
+            words: vec![
+                0xf100_0442,    // subs x2,x2,#1
+                b_cond(LO, 4),  // b.lo past the loop
+                0x3840_1408,    // ldrb w8,[x0],#1
+                0x6b09_011f,    // cmp w8,w9
+                b_cond(NE, -4), // b.ne to the subs
+            ],
+            setup: |rng, base, state, _| {
+                state.x[0] = base + rng.below(2 * PAGE);
+                state.x[2] = rng.below(2 * PAGE);
+                state.x[9] = rng.below(256);
+            },
+        },
         Program {
             name: "kernel bzero by DC ZVA",
             words: vec![
@@ -335,6 +380,7 @@ fn run(
     code: &Mapping,
     data: &Mapping,
     loops: bool,
+    every_nzcv: bool,
     case: &Case,
 ) -> Result<(Outcome, u64)> {
     let Case {
@@ -345,6 +391,7 @@ fn run(
     } = *case;
     let mut machine = machine(code, data, words, TargetCpu::detect())?;
     machine.set_self_loops(loops);
+    machine.set_capture_every_nzcv(every_nzcv);
     // FEAT_CSV3 disclosed: every access masks its address, and the loop
     // carries its masked bases across the back edge.
     let pfr0 = machine.cpu.registers.get(Register::ID_AA64PFR0_EL1, 0);
@@ -424,14 +471,16 @@ fn self_loops_end_where_their_linked_blocks_do() -> Result<()> {
                     protected,
                     masked,
                 };
-                let run = |loops| run(&words, &code, &data, loops, &start);
-                let (linked, linked_blocks) = run(false)?;
-                let (looped, looped_blocks) = run(true)?;
-                assert_eq!(
-                    looped, linked,
+                let run = |loops, every| run(&words, &code, &data, loops, every, &start);
+                let (captured, _) = run(false, true)?;
+                let (linked, linked_blocks) = run(false, false)?;
+                let (looped, looped_blocks) = run(true, false)?;
+                let what = format!(
                     "{} prefix {prefix} case {case} masked {masked} protected {protected:?}",
                     program.name
                 );
+                assert_eq!(linked, captured, "linked: {what}");
+                assert_eq!(looped, captured, "looped: {what}");
                 cases += 1;
                 aborts += usize::from(linked.abort.is_some());
                 fewer += usize::from(looped_blocks < linked_blocks);

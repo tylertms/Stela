@@ -342,6 +342,7 @@ struct LoopExits {
         GuestAddress,
         usize,
         super::pinned::Dirty,
+        bool,
     )>,
     /// Each join's jump ([`loop_joins`]): the copy, its landing and the
     /// instructions it skips.
@@ -418,6 +419,31 @@ fn loop_joins(instructions: &[Instruction]) -> Vec<(usize, usize)> {
             Some((at, landing))
         })
         .collect()
+}
+
+/// Whether the flag-setting ADD/SUB at `index` of a pinned body leaves its
+/// NZCV capture (`flag_word::capture`) to the exit of the B.cond right after
+/// it, which reads the host flags as they are. On the branch's fall path the
+/// capture is dead: the next instruction that touches NZCV defines all four
+/// flags, and none before it reads them, faults, exits or leaves the frame
+/// ([`super::flag_word::dead_after`]), so the frame need not hold them. The
+/// branch is a side exit, not a join's landing (another path's flags reach
+/// it), and not HI or LS, whose test inverts the host carry.
+fn defers_capture(instructions: &[Instruction], index: usize, landing: &[bool]) -> bool {
+    matches!(
+        instructions[index].operation,
+        Operation::AddSub { flags: true, .. } | Operation::AddSubRegister { flags: true, .. }
+    ) && matches!(
+        instructions.get(index + 1),
+        Some(Instruction {
+            pc,
+            operation: Operation::BranchCondition { condition, target },
+        }) if *condition < 14
+            && condition / 2 != 4
+            && target.0 > pc.0
+            && instructions[index].pc.0.checked_add(4) == Some(pc.0)
+    ) && !landing[index + 1]
+        && super::flag_word::dead_after(instructions, index + 1)
 }
 
 /// Run `analysis` (`guest_range::checks`, `stack_alignment::checks`) on
@@ -649,6 +675,12 @@ fn emit_selected(
     // Each branch the block runs past: its jump to a side exit, its target
     // and the instructions up to it.
     let mut side_exits = vec![];
+    // Jumps of branches whose flag setter deferred its capture to them
+    // ([`defers_capture`]), with their side exit's index.
+    let mut capture_stubs: Vec<(super::asm::Patch, usize)> = vec![];
+    // The instruction just emitted deferred its NZCV capture to the branch
+    // after it.
+    let mut deferred_capture = false;
     // Accesses that address memory from an earlier access's masked address
     // (`masked_base`), which the instructions emitted alone keep track of.
     let reuse_bases = pinned
@@ -1142,8 +1174,15 @@ fn emit_selected(
             block.source_map.push((instruction.pc, code.len()));
             code.set_instruction(block.source_map.len() - 1);
             if let Some(target) = instruction.operation.conditional_target() {
-                let taken = branch_condition(code, &instruction.operation, held.rax)
-                    .expect("a conditional branch's condition");
+                // The flag setter before left its capture to this branch's
+                // exit ([`defers_capture`]): the host flags hold NZCV.
+                let deferred = core::mem::take(&mut deferred_capture);
+                let taken = if deferred {
+                    branch_condition_with(code, &instruction.operation, super::Rax::Nzcv, true)
+                } else {
+                    branch_condition(code, &instruction.operation, held.rax)
+                }
+                .expect("a conditional branch's condition");
                 // A side exit's stub is its link slot and exit alone, which is
                 // where `successor_exits` finds it: what the run has written is
                 // stored before the branch, flags untouched.
@@ -1163,12 +1202,20 @@ fn emit_selected(
                     if let Some(&(at, to)) = joins.iter().find(|&&(at, _)| at == cursor) {
                         let skipped = u8::try_from(to - at - 1).expect("bounded body");
                         loop_exits.joins.push((jump, copy, to, skipped));
-                        loop_exits.side.push((None, target, rows, dirty));
+                        loop_exits.side.push((None, target, rows, dirty, false));
                     } else {
-                        loop_exits.side.push((Some(jump), target, rows, dirty));
+                        loop_exits
+                            .side
+                            .push((Some(jump), target, rows, dirty, deferred));
                     }
                 } else {
-                    side_exits.push((jump, target, block.source_map.len()));
+                    if deferred {
+                        // The capture the flag setter left out, on the way out.
+                        capture_stubs.push((jump, side_exits.len()));
+                        side_exits.push((None, target, block.source_map.len()));
+                    } else {
+                        side_exits.push((Some(jump), target, block.source_map.len()));
+                    }
                 }
                 bases.after(instruction, None);
                 emitted_alone = true;
@@ -1236,6 +1283,31 @@ fn emit_selected(
             if frame_bound {
                 code.set_pinned(false);
                 super::pinned::write_back(code);
+            }
+            if !frame_bound
+                && code.is_pinned()
+                && !code.constant_time()
+                && !native.capture_every_nzcv
+                && defers_capture(instructions, cursor, landing)
+                && super::pinned::emit_direct_with_add_sub_capture(
+                    code,
+                    &instruction.operation,
+                    target,
+                    // The host flags keep the result, with C as Arm has it.
+                    |code: &mut Code, borrow| {
+                        if borrow {
+                            code.asm().cmc();
+                        }
+                    },
+                )
+            {
+                deferred_capture = true;
+                after = Held::NOTHING;
+                let applied = code.finish_base_request();
+                bases.after(instruction, applied);
+                emitted_alone = true;
+                cursor += 1;
+                continue;
             }
             after = emit_single(
                 code,
@@ -1428,8 +1500,18 @@ fn emit_selected(
     // terminal's branch: only the jump over the paths below comes between.
     let flags_live = after.rax == super::Rax::Nzcv && code.ends_with(&nzcv_store(code.is_pinned()));
     // Before the terminal, whose direct exits end the code.
-    if !pointer_paths.is_empty() || !mirrored_paths.is_empty() || !amx_paths.is_empty() {
+    if !pointer_paths.is_empty()
+        || !mirrored_paths.is_empty()
+        || !amx_paths.is_empty()
+        || !capture_stubs.is_empty()
+    {
         let over = code.asm().jmp();
+        for (jump, exit) in core::mem::take(&mut capture_stubs) {
+            // The deferred capture, from the flags the branch kept.
+            code.asm().bind(jump);
+            super::flag_word::capture(code, false);
+            side_exits[exit].0 = Some(code.asm().jmp());
+        }
         if let Some(cells) = native.pointer {
             for path in pointer_paths {
                 super::pointer::inline::place(code, path, cells);
@@ -1480,7 +1562,7 @@ fn emit_selected(
         let mut rows: Vec<usize> = loop_exits
             .side
             .iter()
-            .map(|&(_, _, rows, _)| rows)
+            .map(|&(_, _, rows, _, _)| rows)
             .collect();
         rows.dedup();
         let mut seen = vec![];
@@ -1491,12 +1573,16 @@ fn emit_selected(
             seen.push(row);
             let mut target = None;
             let mut stored = vec![];
-            for &(jump, to, at, dirty) in &loop_exits.side {
+            for &(jump, to, at, dirty, capture) in &loop_exits.side {
                 if at == row {
                     target = Some(to);
                     // A join's exit stays, with no jump to it.
                     let Some(jump) = jump else { continue };
                     code.asm().bind(jump);
+                    if capture {
+                        // The deferred capture, from the flags the branch kept.
+                        super::flag_word::capture(code, false);
+                    }
                     super::pinned::write_back_locals(code, dirty);
                     stored.push(code.asm().jmp());
                 }
@@ -1506,7 +1592,7 @@ fn emit_selected(
                 asm.bind(jump);
             }
             settle_loop(&mut asm, 0, native.loop_counts);
-            side_exits.push((asm.jmp(), target.expect("a branch's jumps"), row));
+            side_exits.push((Some(asm.jmp()), target.expect("a branch's jumps"), row));
         }
         let mut asm = code.asm();
         if let Some(to_fallthrough) = to_fallthrough {
@@ -1550,6 +1636,7 @@ fn emit_selected(
     let instructions_run = block.source_map.len();
     debug_assert_eq!(instructions_run, source_rows);
     for (jump, target, run) in side_exits {
+        let jump = jump.expect("a side exit's jump");
         let mut asm = code.asm();
         asm.bind(jump);
         direct_exit_with(&mut asm, target, side_exit(instructions_run - run));

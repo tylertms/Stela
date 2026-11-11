@@ -208,6 +208,11 @@ pub struct NativeSystem {
     /// profiles.
     #[serde(default)]
     pub loop_counts: bool,
+    /// Every flag-setting instruction stores NZCV as it runs, none leaving
+    /// it to the exit of the B.cond after it (`x86_64::block`'s deferred
+    /// captures): for tests that compare both forms.
+    #[serde(default)]
+    pub capture_every_nzcv: bool,
 }
 
 impl NativeSystem {
@@ -221,6 +226,7 @@ impl NativeSystem {
         amx: false,
         self_loops: false,
         loop_counts: false,
+        capture_every_nzcv: false,
     };
 }
 

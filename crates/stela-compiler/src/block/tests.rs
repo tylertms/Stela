@@ -2340,3 +2340,67 @@ fn self_loops_take_dc_zva_unconditional_back_branches_and_joins() {
         assert_eq!(linked.source_bytes, first);
     }
 }
+
+#[test]
+fn flag_setters_leave_their_capture_to_the_exit_of_the_branch_after_them() {
+    let compile = |words: &[u32], self_loops: bool, capture_every_nzcv: bool| {
+        let source: Vec<u8> = words.iter().copied().flat_map(u32::to_le_bytes).collect();
+        let options = crate::Options::new(
+            BlockProfile::new(Features::SYSTEM_MODE),
+            crate::TargetCpu::detect(),
+        )
+        .with_memory_checks(crate::x86_64::MemoryChecks::system(true, false, true, true))
+        .with_native_system(crate::x86_64::NativeSystem {
+            self_loops,
+            capture_every_nzcv,
+            ..crate::x86_64::NativeSystem::NONE
+        });
+        crate::compile(&source, GuestAddress(0x1000), &options).unwrap()
+    };
+    // The bytes of row `row`, up to the next row.
+    let row = |block: &crate::block::CompiledBlock, row: usize| {
+        block.native.source_map[row + 1].1 - block.native.source_map[row].1
+    };
+    // ldrb w8,[x0],#1; ldrb w9,[x1],#1; subs w8,w8,w9; b.ne +3;
+    // subs x2,x2,#1; b.ne -5: the next SUBS defines the flags again
+    // before anything needs them.
+    let memcmp = [
+        0x3840_1408,
+        0x3840_1429,
+        0x6b09_0108,
+        0x5400_0061,
+        0xf100_0442,
+        0x54ff_ff61,
+    ];
+    // subs x2,x2,#1; b.lo +4; ldrb w8,[x0],#1; cmp w8,w9; b.ne -4: the
+    // load's fault needs the SUBS's flags.
+    let checked = [
+        0xf100_0442,
+        0x5400_0083,
+        0x3840_1408,
+        0x6b09_011f,
+        0x54ff_ff81,
+    ];
+    for self_loops in [false, true] {
+        let (deferred, every) = (
+            compile(&memcmp, self_loops, false),
+            compile(&memcmp, self_loops, true),
+        );
+        assert_eq!(deferred.self_loop, self_loops);
+        // LAHF, SETO and the word's store move to the branch's exit.
+        assert!(
+            row(&deferred, 2) + 8 <= row(&every, 2),
+            "loops {self_loops}: {} and {}",
+            row(&deferred, 2),
+            row(&every, 2)
+        );
+        let (deferred, every) = (
+            compile(&checked, self_loops, false),
+            compile(&checked, self_loops, true),
+        );
+        assert_eq!(
+            deferred.native.x86_64_code, every.native.x86_64_code,
+            "loops {self_loops}"
+        );
+    }
+}

@@ -229,6 +229,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             amx: self.cpu.amx.generation().is_some(),
             self_loops: self.self_loops,
             loop_counts: self.step_timing.is_some(),
+            capture_every_nzcv: self.capture_every_nzcv,
         })
     }
 
@@ -238,6 +239,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_self_loops(&mut self, on: bool) {
         self.self_loops = on;
+        self.native_system = None;
+    }
+
+    /// Have every flag-setting instruction store NZCV as it runs
+    /// ([`NativeSystem::capture_every_nzcv`]), or leave the default, from
+    /// the next compilation on. For tests that compare the two.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_capture_every_nzcv(&mut self, on: bool) {
+        self.capture_every_nzcv = on;
         self.native_system = None;
     }
 

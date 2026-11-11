@@ -963,6 +963,10 @@ pub struct Machine<H: Host, D: Devices> {
     /// iterations inside themselves (`NativeSystem::self_loops`): on, but
     /// for tests that compare both forms.
     self_loops: bool,
+    /// Whether every flag-setting instruction stores NZCV as it runs
+    /// (`NativeSystem::capture_every_nzcv`): off, but for tests that
+    /// compare both forms.
+    capture_every_nzcv: bool,
     /// The physical count up to which the event streams have set the event
     /// register; `None` before the first sample.
     event_sample: Option<u64>,
@@ -1407,6 +1411,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             memory_checks: None,
             native_system: None,
             self_loops: true,
+            capture_every_nzcv: false,
             event_sample: None,
             debug: None,
             device_lines: None,
