@@ -1265,9 +1265,18 @@ pub(super) fn register_store(
     Some(scratch)
 }
 
-/// `movabs rax,value`.
+/// RAX = `value` in its shortest form, none of which changes RFLAGS:
+/// `mov eax,imm32` (5 bytes, zero-extended), `mov rax,simm32` (7 bytes,
+/// sign-extended) or `movabs rax,imm64` (10 bytes).
 fn immediate(code: &mut Code, value: u64) {
-    code.asm().mov_imm64(asm::Gpr::Rax, value);
+    let mut asm = code.asm();
+    if let Ok(low) = u32::try_from(value) {
+        asm.mov_imm32(asm::Gpr::Rax, low);
+    } else if let Ok(signed) = i32::try_from(value as i64) {
+        asm.mov_rm_imm32(asm::Size::Qword, asm::Gpr::Rax, signed);
+    } else {
+        asm.mov_imm64(asm::Gpr::Rax, value);
+    }
 }
 
 /// `movabs rax,address`, its field a relocation of the block.

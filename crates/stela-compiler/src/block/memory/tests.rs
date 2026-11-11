@@ -152,8 +152,7 @@ fn shared_literal_forms_use_the_checked_scalar_service_and_exact_source_map() {
                         [0x1000, 0x1004]
                     );
                     // Exact guest address is materialized, never host RIP.
-                    let mut constant = alloc::vec![0x48, 0xb8];
-                    constant.extend(0x1020u64.to_le_bytes());
+                    let constant = shortest_mov_rax(0x1020);
                     assert!(
                         emitted
                             .native
@@ -224,8 +223,7 @@ fn shared_simd_literal_forms_keep_checked_asimd_requirements_and_source_maps() {
                                 .collect::<Vec<_>>(),
                             [pc, pc + 4]
                         );
-                        let mut constant = alloc::vec![0x48, 0xb8];
-                        constant.extend(address.to_le_bytes());
+                        let constant = shortest_mov_rax(address);
                         assert!(
                             emitted
                                 .native
@@ -316,4 +314,16 @@ fn memory_context_v2_has_distinct_profile_identity_and_fixed_layout() {
         CheckedMemoryProfile::SpAlignmentDisabled.id(),
         "checked-gpr-memory-sa0-off-normal-wb-v4"
     );
+}
+
+/// The shortest move of `value` into RAX, as the compiler materializes a
+/// guest address.
+fn shortest_mov_rax(value: u64) -> Vec<u8> {
+    if let Ok(low) = u32::try_from(value) {
+        [&[0xb8][..], &low.to_le_bytes()].concat()
+    } else if let Ok(signed) = i32::try_from(value as i64) {
+        [&[0x48, 0xc7, 0xc0][..], &signed.to_le_bytes()].concat()
+    } else {
+        [&[0x48, 0xb8][..], &value.to_le_bytes()].concat()
+    }
 }

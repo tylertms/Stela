@@ -58,4 +58,28 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn addresses_take_their_shortest_move() {
+        let store = [0x48, 0x89, 0x87, 8, 0, 0, 0];
+        for (address, mov) in [
+            (0x1234_5678_u64, &[0xb8, 0x78, 0x56, 0x34, 0x12][..]),
+            (
+                0xffff_ffff_8000_0000,
+                &[0x48, 0xc7, 0xc0, 0, 0, 0, 0x80][..],
+            ),
+            (0x1_8000_0000, &[0x48, 0xb8, 0, 0, 0, 0x80, 1, 0, 0, 0][..]),
+        ] {
+            let mut code = Code::new();
+            emit(
+                &mut code,
+                &Operand {
+                    destination: Register::X(1),
+                    address,
+                },
+            );
+            assert_eq!(&code[..mov.len()], mov, "{address:x}");
+            assert_eq!(&code[mov.len()..], store, "{address:x}");
+        }
+    }
 }
