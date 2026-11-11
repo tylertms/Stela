@@ -5,7 +5,7 @@
 //! Apple's GPUs and NVIDIA's warps both have; the builtins case records the
 //! width. The order in which atomics return their values is the device's
 //! choice, so those outputs are compared sorted.
-use super::plan::{Buffer, Case, Output, Plan, Texture, Tolerance};
+use super::plan::{Buffer, Case, Output, Plan, Step, Texture, Tolerance};
 use super::values::{Dtype, Random, bits32, f16_bits, f16r, f32r, f32s, floats, ints, sum, u32s};
 use serde_json::json;
 
@@ -275,6 +275,81 @@ fn atomics(plan: &mut Plan, library: &str) {
                 .buffer(Buffer::data("sums", 1, floats(Dtype::F32, &[0.0; 4])))
                 .output(Output::exact("sums", Dtype::F32, floats(Dtype::F32, &sums))),
         );
+    }
+}
+
+/// The word `store_linear` stores at an index.
+fn linear_word(i: u32) -> u32 {
+    i.wrapping_mul(2_654_435_761).wrapping_add(0x9e37_79b9)
+}
+
+/// Plain device stores: their bandwidth into Shared and Private buffers
+/// (gpu_ms of the two cases), and their visibility to the next dispatch
+/// and, through a fence or a barrier, to the last threadgroup.
+fn store_order(plan: &mut Plan, library: &str) {
+    // 4 MiB stored, then read back by 4096 threads in a strided sum.
+    let (words_n, threads) = (1u32 << 20, 4096u32);
+    let sums: Vec<u32> = (0..threads)
+        .map(|t| {
+            (t..words_n)
+                .step_by(threads as usize)
+                .fold(0u32, |s, i| s.wrapping_add(linear_word(i)))
+        })
+        .collect();
+    for mode in ["shared", "private"] {
+        plan.add(
+            Case::sequence(
+                &format!("compute.store_bandwidth.{mode}"),
+                library,
+                vec![
+                    Step::compute("store_linear", [words_n, 1, 1], [256, 1, 1])
+                        .bind(&[("data", 0)]),
+                    Step::compute("sum_strided", [threads, 1, 1], [256, 1, 1]).bind(&[
+                        ("data", 0),
+                        ("sums", 1),
+                        ("words", 2),
+                    ]),
+                ],
+            )
+            .buffer(
+                Buffer::zeroed("data", 0, words_n as usize * 4)
+                    .unbound()
+                    .set("storage", mode),
+            )
+            .buffer(Buffer::zeroed("sums", 0, threads as usize * 4).unbound())
+            .buffer(Buffer::data("words", 0, u32s(&[words_n])).unbound())
+            .output(Output::exact("sums", Dtype::U32, u32s(&sums)))
+            .note("the store kernel's gpu_ms is the store cost into this storage mode"),
+        );
+    }
+    let (groups, size) = (64usize, 256usize);
+    let data = values(24, groups * size, 1 << 16);
+    let total = data.iter().fold(0u64, |s, &v| (s + v) & 0xFFFF_FFFF);
+    for (name, function) in [
+        ("compute.last_group_reduction", "last_group_sum"),
+        ("compute.last_group_reduction.plain", "last_group_sum_plain"),
+    ] {
+        let mut case = Case::compute(
+            name,
+            library,
+            function,
+            [(groups * size) as u32, 1, 1],
+            [size as u32, 1, 1],
+        )
+        .buffer(Buffer::data("in", 0, words(&data)))
+        .buffer(Buffer::zeroed("partials", 1, groups * 4))
+        .buffer(Buffer::data("cells", 2, u32s(&[0, 0])))
+        .output(Output::exact("cells", Dtype::U32, words(&[groups as u64, total])).set("length", 8))
+        .set(
+            "threadgroup_memory",
+            json!([{"index": 0, "length": size * 4}]),
+        );
+        if function.ends_with("plain") {
+            case = case
+                .informational()
+                .note("plain stores and a device barrier: Metal does not promise the last group sees them");
+        }
+        plan.add(case);
     }
 }
 
@@ -997,6 +1072,7 @@ pub fn build(plan: &mut Plan) {
     builtins(plan, &library);
     reduction(plan, &library);
     atomics(plan, &library);
+    store_order(plan, &library);
     simd(plan, &library);
     memory(plan, &library);
     control(plan, &library);

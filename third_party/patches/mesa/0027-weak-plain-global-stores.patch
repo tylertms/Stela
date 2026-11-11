@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 15:35:32 +0000
+Subject: [PATCH] nak: emit weak global stores unless the store is coherent or
+ volatile
+
+A plain store has to reach other threads only through a barrier or
+fence that releases global memory, and that lowering (CCTL.WBALL, then
+MEMBAR) drains weak stores too. Strong GPU-scope order on every plain
+store makes each one wait on memory, which is slow for buffers in
+system memory. Coherent and volatile stores keep strong GPU scope;
+atomics are not changed.
+---
+ src/nouveau/compiler/nak/from_nir.rs | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/compiler/nak/from_nir.rs b/src/nouveau/compiler/nak/from_nir.rs
+index 77c08534f6ad198955fdc68f9e06783f8467c059..b34a2bdb986abdbd7bfda30ba2c82dcc93a701fc 100644
+--- a/src/nouveau/compiler/nak/from_nir.rs
++++ b/src/nouveau/compiler/nak/from_nir.rs
+@@ -3870,10 +3870,24 @@ impl<'a> ShaderFromNir<'a> {
+                 let size_B =
+                     (srcs[0].bit_size() / 8) * srcs[0].num_components();
+                 assert!(u32::from(size_B) <= intrin.align());
++                // A plain store only has to be visible to other threads
++                // after a barrier or fence that releases global memory, and
++                // that lowering (CCTL.WBALL, then MEMBAR, in the
++                // nir_intrinsic_barrier arm) drains weak
++                // stores as well. Coherent and volatile stores must be seen
++                // without one, so they stay strong at GPU scope.
++                let order = if intrin.access()
++                    & (ACCESS_COHERENT | ACCESS_VOLATILE)
++                    != 0
++                {
++                    MemOrder::Strong(MemScope::GPU)
++                } else {
++                    MemOrder::Weak
++                };
+                 let access = MemAccess {
+                     mem_type: MemType::from_size(size_B, false),
+                     space: MemSpace::Global(MemAddrType::A64),
+-                    order: MemOrder::Strong(MemScope::GPU),
++                    order: order,
+                     eviction_priority: self
+                         .get_eviction_priority(intrin.access()),
+                 };

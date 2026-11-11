@@ -135,6 +135,85 @@ kernel void atomics_fenced(device atomic_uint *cells [[buffer(0)]], coherent(dev
     atomic_store_explicit(&cells[1], sum, memory_order_relaxed);
 }
 
+// Store bandwidth: every word stored once in order, a function of its
+// index; then a strided sum of what was stored, one sum per thread.
+kernel void store_linear(device uint *out [[buffer(0)]], uint id [[thread_position_in_grid]])
+{
+    out[id] = id * 2654435761u + 0x9e3779b9u;
+}
+
+kernel void sum_strided(device const uint *in [[buffer(0)]], device uint *sums [[buffer(1)]],
+                        constant uint &words [[buffer(2)]], uint id [[thread_position_in_grid]],
+                        uint threads [[threads_per_grid]])
+{
+    uint sum = 0;
+    for (uint i = id; i < words; i += threads)
+        sum += in[i];
+    sums[id] = sum;
+}
+
+// A threadgroup's sum through threadgroup memory, in every thread.
+static uint group_sum(threadgroup uint *scratch, uint value, uint local, uint size)
+{
+    scratch[local] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = size / 2; stride > 0; stride /= 2) {
+        if (local < stride)
+            scratch[local] += scratch[local + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return scratch[0];
+}
+
+// Each threadgroup publishes its sum, then takes a ticket; the group with
+// the last ticket adds every published sum. The sums are coherent(device)
+// and a device fence sits on each side of the relaxed ticket, which is
+// what Metal requires for the last group to see them.
+kernel void last_group_sum(device const uint *in [[buffer(0)]], coherent(device) device uint *partials [[buffer(1)]],
+                           device atomic_uint *cells [[buffer(2)]], threadgroup uint *scratch [[threadgroup(0)]],
+                           uint id [[thread_position_in_grid]], uint local [[thread_index_in_threadgroup]],
+                           uint group [[threadgroup_position_in_grid]], uint size [[threads_per_threadgroup]],
+                           uint groups [[threadgroups_per_grid]])
+{
+    uint sum = group_sum(scratch, in[id], local, size);
+    if (local != 0)
+        return;
+    partials[group] = sum;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    uint ticket = atomic_fetch_add_explicit(&cells[0], 1u, memory_order_relaxed);
+    if (ticket != groups - 1u)
+        return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    uint total = 0;
+    for (uint g = 0; g < groups; g++)
+        total += partials[g];
+    atomic_store_explicit(&cells[1], total, memory_order_relaxed);
+}
+
+// The same with plain stores ordered only by a device threadgroup barrier
+// before the relaxed ticket. Metal does not promise that the last group
+// sees every sum this way.
+kernel void last_group_sum_plain(device const uint *in [[buffer(0)]], device uint *partials [[buffer(1)]],
+                                 device atomic_uint *cells [[buffer(2)]], threadgroup uint *scratch [[threadgroup(0)]],
+                                 uint id [[thread_position_in_grid]], uint local [[thread_index_in_threadgroup]],
+                                 uint group [[threadgroup_position_in_grid]], uint size [[threads_per_threadgroup]],
+                                 uint groups [[threadgroups_per_grid]])
+{
+    uint sum = group_sum(scratch, in[id], local, size);
+    if (local == 0)
+        partials[group] = sum;
+    threadgroup_barrier(mem_flags::mem_device);
+    if (local != 0)
+        return;
+    uint ticket = atomic_fetch_add_explicit(&cells[0], 1u, memory_order_relaxed);
+    if (ticket != groups - 1u)
+        return;
+    uint total = 0;
+    for (uint g = 0; g < groups; g++)
+        total += partials[g];
+    atomic_store_explicit(&cells[1], total, memory_order_relaxed);
+}
+
 // Exchange returns every value once: the old values and the final value
 // together are the inputs and the initial value.
 kernel void atomics_exchange(device atomic_uint *cell [[buffer(0)]], device uint *seen [[buffer(1)]],
