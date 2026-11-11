@@ -37,6 +37,7 @@ mod status;
 pub use status::{
     StatusAttribute, StatusEvent, StatusNotice, StatusNotifications, Uac1StatusNotice,
 };
+pub mod sink;
 mod stream;
 pub use control::{Control, MixerRange, RateRange, Rates, ResolvedClock};
 pub use descriptors::{Binding, Entity, Format, Graph, Sync};

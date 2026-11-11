@@ -3,6 +3,7 @@
 use super::*;
 mod badd;
 mod mixer;
+mod sink;
 mod uac1;
 mod uac3;
 use crate::usb::audio::*;
