@@ -1917,6 +1917,9 @@ impl AppleDevices {
                 })();
                 advanced.map_err(|why| match controller.dma_fault() {
                     Some(fault) => fail(refuse!("USB DMA fault", ?fault).because(why)),
+                    None if why.what() == crate::usb::host::CONTROL_TIMEOUT => {
+                        fail(controller.control_timeout(master.number, why))
+                    }
                     None => fail(why),
                 })?;
             }
