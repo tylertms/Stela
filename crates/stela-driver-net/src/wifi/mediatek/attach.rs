@@ -212,7 +212,11 @@ pub unsafe fn attach<C: 'static>(
     // SAFETY: the controller and interface are this requester's, after its
     // completed bootstrap and policy; `resource` keeps their permission.
     let client = unsafe { Client::new(controller, interface) }.map_err(AttachError::Client)?;
-    let managed = ManagedClient::new(client, country.clone(), Environment::Any)
+    // cfg80211 applies INDOOR_ONLY only to GO/AP initiation, never to a
+    // managed station following its AP (chan.c cfg80211_ir_permissive_chan),
+    // so a station on an indoor-only channel joins as on Linux. The model
+    // tests of the managed link run under the same environment.
+    let managed = ManagedClient::new(client, country.clone(), Environment::Indoor)
         .map_err(|error| AttachError::Policy(error.error))?;
     let link =
         ManagedLink::new(managed, inputs.pages).map_err(|error| AttachError::Link(error.error))?;
