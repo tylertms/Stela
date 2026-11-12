@@ -388,6 +388,16 @@ fn rescan(
     beacon: &[u8],
     wait_us: u64,
 ) -> Option<Vec<u8>> {
+    rescan_after(station, model, Some(beacon), wait_us)
+}
+
+/// As [`rescan`], the scan finding `beacon` when there is one.
+fn rescan_after(
+    station: &mut TestStation,
+    model: &Model,
+    beacon: Option<&[u8]>,
+    wait_us: u64,
+) -> Option<Vec<u8>> {
     // The departure ends well before the wait does.
     for _ in 0..4 {
         assert!(!station.carrier());
@@ -401,7 +411,9 @@ fn rescan(
     );
     // The poll past the wait scans; the beacon answers the scan.
     assert!(!station.carrier());
-    incoming(model, beacon, None, false);
+    if let Some(beacon) = beacon {
+        incoming(model, beacon, None, false);
+    }
     assert!(!station.carrier());
     done(model);
     assert!(!station.carrier());
@@ -581,10 +593,12 @@ fn a_lost_sae_association_resumes_its_pmksa_and_runs_sae_again_once_refused() {
 }
 
 #[test]
-fn a_protected_psk_association_opens_its_port_once_the_igtk_installs() {
+fn a_protected_psk_association_opens_its_port_once_the_igtk_installs_and_again_from_the_scan_cache()
+{
     if crate::test_process::isolate_model() {
         return;
     }
+    let _clock = crate::test_clock::virtualize();
     let (client, model) = setup_modern();
     let (_, bss) = inputs_akm(&client, 2);
     let client = ManagedClient::new(client, country(), Environment::Indoor).unwrap();
@@ -604,7 +618,13 @@ fn a_protected_psk_association_opens_its_port_once_the_igtk_installs() {
     let pmk = network.secret.pmk(&network.ssid);
     let security = Security::select(&bss.elements, true).unwrap();
     assert!(security.management.is_some());
-    let mut ap = Authenticator::between(security.suites(), pmk, AP, LOCAL, security.element());
+    let mut ap = Authenticator::between(
+        security.suites(),
+        pmk.clone(),
+        AP,
+        LOCAL,
+        security.element(),
+    );
     let mut station = Station::new(
         link,
         profile().interface,
@@ -657,6 +677,31 @@ fn a_protected_psk_association_opens_its_port_once_the_igtk_installs() {
     eapol(&model, &ap.message_3_with(&whole, &igtk));
     // Message 4 is queued ahead of the IGTK, which installs once it drained;
     // only then does the port open.
+    assert!(!station.carrier());
+    ap.signed_reply(&sent_eapol(&model), 0x308);
+    assert!(station.carrier());
+
+    // The firmware loses the BSS. The AP's beacon arrives while the station
+    // leaves, and the scan after the reconnect delay misses it: the station
+    // joins the AP from the scan cache, as cfg80211's BSS table keeps it.
+    bss_lost(&model);
+    incoming(&model, &beacon, None, false);
+    let auth = rescan_after(&mut station, &model, None, 200_000).expect("a rejoin");
+    assert_eq!(auth[..2], [0xb0, 0]);
+    assert_eq!(auth[24..28], [0, 0, 1, 0]);
+    station.carrier();
+    incoming(&model, &response(0xb0, &[0, 0, 2, 0, 0, 0]), None, false);
+    station.carrier();
+    assert_eq!(finish_tx(&model)[0][..2], [0, 0]);
+    station.carrier();
+    incoming(&model, &response(0x10, &association), None, false);
+    assert!(!station.carrier());
+    // The AP kept its IGTK; the new handshake installs it again.
+    let mut ap = Authenticator::between(security.suites(), pmk, AP, LOCAL, security.element());
+    eapol(&model, &ap.message_1());
+    assert!(!station.carrier());
+    ap.message_2(&sent_eapol(&model));
+    eapol(&model, &ap.message_3_with(&whole, &igtk));
     assert!(!station.carrier());
     ap.signed_reply(&sent_eapol(&model), 0x308);
     assert!(station.carrier());

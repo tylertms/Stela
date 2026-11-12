@@ -6,10 +6,13 @@ pub(super) const MAX_OBSERVATIONS: usize = 256;
 use wifi::regulatory::{HardwarePolicy, OsPolicy, Owner, PmfAuthenticationGuard};
 
 impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
-    /// At most256 current native observations; beginning another scan revokes
-    /// membership of all old handles, even if their historical bytes remain.
+    /// At most 256 native observations, each kept until it expires; a
+    /// newer one of the same BSS replaces it.
     pub fn pmf_bss_observations(&self) -> impl Iterator<Item = &Arc<PmfBssObservation>> {
-        self.state().pmf_observations.iter()
+        self.state()
+            .pmf_observations
+            .iter()
+            .map(|(_, observed)| observed)
     }
     /// Explicit PMF association using an observation and real OS-selected
     /// pre-association policy, before any peer/ROC/auth/assoc native publication.
@@ -39,7 +42,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 .state()
                 .pmf_observations
                 .iter()
-                .any(|old| Arc::ptr_eq(old, observed))
+                .any(|(_, old)| Arc::ptr_eq(old, observed))
         {
             return Err(Error::WrongProfile);
         }
@@ -137,7 +140,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             || !s
                 .pmf_observations
                 .iter()
-                .any(|old| Arc::ptr_eq(old, observed))
+                .any(|(_, old)| Arc::ptr_eq(old, observed))
         {
             return Err(Error::WrongProfile);
         }

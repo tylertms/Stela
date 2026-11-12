@@ -79,7 +79,10 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             .begin(request, now, budget, policy)
             .map_err(Error::Scan)?;
         s.scan_ticket = Some(ticket);
-        s.pmf_observations.clear();
+        // A new scan keeps what earlier ones saw until it expires, so a
+        // join may take the BSS from the cache as cfg80211's does.
+        s.pmf_observations
+            .retain(|(seen, _)| now.saturating_sub(*seen) <= super::policy::BSS_EXPIRE_US);
         // From request ownership through transport, any unexpected failure
         // keeps an explicit non-Idle owner. A policy refusal before handoff
         // can withdraw only the never-submitted Starting generation.

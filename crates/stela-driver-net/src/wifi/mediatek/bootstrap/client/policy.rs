@@ -24,7 +24,7 @@ pub use link::{
 static NEXT_OWNER: wifi::Identities = wifi::Identities::new();
 static NEXT_BSS: wifi::Identities = wifi::Identities::new();
 /// IEEE80211_SCAN_RESULT_EXPIRE: how long a scan's BSS stays known.
-const BSS_EXPIRE_US: u64 = 30_000_000;
+pub(super) const BSS_EXPIRE_US: u64 = 30_000_000;
 
 /// Where the station operates, as cfg80211's `reg_is_indoor` knows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

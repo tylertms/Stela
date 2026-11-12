@@ -218,7 +218,9 @@ struct Owned<I: BarIo, Q: QueueIo, C: 'static> {
     controller: Controller<I, Q, C>,
     interface: Interface<Arc<C>>,
     station: Station,
-    pmf_observations: Vec<Arc<PmfBssObservation>>,
+    /// Each scan observation with the time it was seen, kept for
+    /// [`policy::BSS_EXPIRE_US`] as cfg80211 keeps its BSS table.
+    pmf_observations: Vec<(u64, Arc<PmfBssObservation>)>,
     fragments: station::fragments::Fragments,
     txs: txs::State,
     pmf_selected: Option<Arc<PmfBssObservation>>,

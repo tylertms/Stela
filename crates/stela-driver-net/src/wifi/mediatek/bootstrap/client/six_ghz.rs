@@ -65,7 +65,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         if !s
             .pmf_observations
             .iter()
-            .any(|old| Arc::ptr_eq(old, observed))
+            .any(|(_, old)| Arc::ptr_eq(old, observed))
             || Some(profile.interface) != s.interface.registered_context()
             || s.reserved_wcid.is_some_and(|wcid| wcid != profile.wcid)
         {
@@ -228,7 +228,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             || !s
                 .pmf_observations
                 .iter()
-                .any(|old| Arc::ptr_eq(old, observed))
+                .any(|(_, old)| Arc::ptr_eq(old, observed))
         {
             return Err(Error::Station(station::Error::Stale));
         }

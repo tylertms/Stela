@@ -234,6 +234,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                     .map_err(Error::Scan)?;
                 let nontransmitted = scan::multiple_bssid::nontransmitted(&bss);
                 for bss in core::iter::once(bss).chain(nontransmitted) {
+                    s.pmf_observations.retain(|(_, old)| {
+                        old.bss.bssid != bss.bssid || old.bss.channel != bss.channel
+                    });
                     s.pmf_observations
                         .try_reserve(1)
                         .map_err(|_| Error::NoMemory)?;
@@ -241,7 +244,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                         s.pmf_observations.remove(0);
                     }
                     s.pmf_observations
-                        .push(Arc::new(PmfBssObservation { bss: bss.clone() }));
+                        .push((now, Arc::new(PmfBssObservation { bss: bss.clone() })));
                     events.push(Event::Bss(bss));
                 }
                 continue;
