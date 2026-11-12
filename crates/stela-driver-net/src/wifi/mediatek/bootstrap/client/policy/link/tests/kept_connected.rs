@@ -565,3 +565,189 @@ fn a_reported_six_ghz_ap_is_scanned_and_joined_by_sae_hash_to_element() {
     ap.signed_reply(&sent_eapol_on(&model, 1), 0x308);
     assert!(station.carrier());
 }
+
+/// A UDP datagram in IPv4 between the DHCP ports, with its header checksum:
+/// a BOOTP request (`op` 1, DHCPDISCOVER) or reply (`op` 2, DHCPOFFER).
+fn dhcp_datagram(source: [u8; 4], destination: [u8; 4], op: u8) -> Vec<u8> {
+    // op, htype, hlen, hops, xid, secs, flags (broadcast), four addresses,
+    // chaddr, sname, file, magic cookie, message type, end.
+    let mut bootp = vec![op, 1, 6, 0, 0x5a, 0x5a, 0x5a, 0x5a, 0, 0, 0x80, 0];
+    bootp.extend_from_slice(&[0; 16]);
+    bootp.extend_from_slice(&LOCAL.0);
+    bootp.extend_from_slice(&[0; 10 + 64 + 128]);
+    bootp.extend_from_slice(&[99, 130, 83, 99, 53, 1, op, 255]);
+    let (sport, dport) = if op == 1 { (68u16, 67u16) } else { (67, 68) };
+    let mut udp = Vec::new();
+    udp.extend_from_slice(&sport.to_be_bytes());
+    udp.extend_from_slice(&dport.to_be_bytes());
+    udp.extend_from_slice(&((8 + bootp.len()) as u16).to_be_bytes());
+    udp.extend_from_slice(&[0, 0]);
+    udp.extend_from_slice(&bootp);
+    let mut ip = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, 17, 0, 0];
+    ip[2..4].copy_from_slice(&((20 + udp.len()) as u16).to_be_bytes());
+    ip.extend_from_slice(&source);
+    ip.extend_from_slice(&destination);
+    let sum = ip
+        .chunks(2)
+        .map(|w| u32::from(u16::from_be_bytes([w[0], w[1]])))
+        .sum::<u32>();
+    let sum = (sum & 0xffff) + (sum >> 16);
+    ip[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    ip.extend_from_slice(&udp);
+    ip
+}
+
+/// A data frame from the AP that the device decrypted: `datagram` to
+/// `destination`, under key `index` at packet number `pn`.
+fn decrypted_from_ap(model: &Model, destination: Mac, datagram: &[u8], index: u8, pn: u64) {
+    let mut frame = data(destination == Mac::BROADCAST);
+    frame.truncate(24);
+    frame.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 8, 0]);
+    frame.extend_from_slice(datagram);
+    incoming(model, &frame, Some((1, index, pn)), false);
+}
+
+#[test]
+fn an_attached_mt7925_carries_dhcp_under_the_handshake_keys_through_the_link() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    // The booted model's controller, then the keeper's scan, join and
+    // 4-way handshake, as the boot path runs them.
+    let (client, model) = setup_modern();
+    let (_, bss) = modern_inputs(&client);
+    let client = ManagedClient::new(client, country(), Environment::Indoor).unwrap();
+    let link = ManagedLink::new(
+        client,
+        Provider(Arc::new(AtomicUsize::new(0)), Default::default()),
+    )
+    .unwrap();
+    let network = Network {
+        ssid: b"x".to_vec(),
+        secret: Secret::parse(b"correct horse battery").unwrap(),
+        country: None,
+    };
+    let pmk = network.secret.pmk(&network.ssid);
+    let security = Security::select(&bss.elements, true).unwrap();
+    let mut ap = Authenticator::between(security.suites(), pmk, AP, LOCAL, security.element());
+    let mut station = Station::new(
+        link,
+        profile().interface,
+        country(),
+        network,
+        Arc::new(Fixed),
+        crate::Clock {
+            ticks_per_microsecond: 1,
+        },
+    );
+    assert!(!station.carrier());
+    let mut body = vec![0; 8];
+    body.extend_from_slice(&100u16.to_le_bytes());
+    body.extend_from_slice(&bss.capabilities.to_le_bytes());
+    body.extend_from_slice(&bss.elements);
+    let mut beacon = response(0x80, &body);
+    beacon[4..10].copy_from_slice(&Mac::BROADCAST.0);
+    incoming(&model, &beacon, None, false);
+    assert!(!station.carrier());
+    done(&model);
+    assert!(!station.carrier());
+    assert_eq!(finish_tx(&model)[0][..2], [0xb0, 0]);
+    station.carrier();
+    incoming(&model, &response(0xb0, &[0, 0, 2, 0, 0, 0]), None, false);
+    station.carrier();
+    assert_eq!(finish_tx(&model)[0][..2], [0, 0]);
+    station.carrier();
+    let mut association = vec![0x11, 0, 0, 0, 1, 0xc0];
+    association.extend_from_slice(&bss.elements);
+    incoming(&model, &response(0x10, &association), None, false);
+    assert!(!station.carrier());
+    // Before the handshake the port is closed to data.
+    let discover = dhcp_datagram([0; 4], [255; 4], 1);
+    let mut ethernet = Vec::new();
+    ethernet.extend_from_slice(&Mac::BROADCAST.0);
+    ethernet.extend_from_slice(&LOCAL.0);
+    ethernet.extend_from_slice(&[8, 0]);
+    ethernet.extend_from_slice(&discover);
+    assert!(station.transmit(&ethernet).is_err());
+    eapol(&model, &ap.message_1());
+    assert!(!station.carrier());
+    ap.message_2(&sent_eapol(&model));
+    let rsn = crate::wifi::connection::find(&bss.elements, 48).unwrap();
+    let mut whole = vec![48, rsn.len() as u8];
+    whole.extend_from_slice(rsn);
+    eapol(&model, &ap.message_3(&whole));
+    assert!(station.carrier());
+    ap.signed_reply(&sent_eapol(&model), 0x308);
+    // DHCPDISCOVER leaves as a protected data frame to the AP, which the
+    // device encrypts under the installed pairwise key.
+    station.transmit(&ethernet).unwrap();
+    let sent = finish_tx(&model).pop().unwrap();
+    // QoS data to the WMM AP, to DS, protected: BSSID, own address,
+    // broadcast destination, then best effort.
+    assert_eq!(sent[..2], [0x88, 0x41]);
+    assert_eq!(sent[4..10], AP.0);
+    assert_eq!(sent[10..16], LOCAL.0);
+    assert_eq!(sent[16..22], Mac::BROADCAST.0);
+    assert_eq!(sent[24] & 0x0f, 0);
+    assert_eq!(sent[26..34], [0xaa, 0xaa, 3, 0, 0, 0, 8, 0]);
+    assert_eq!(sent[34..], discover[..]);
+    // DHCPOFFER to the station under the pairwise key and a broadcast one
+    // under the group key, each out of the link as Ethernet.
+    const SERVER: [u8; 6] = [4, 1, 2, 3, 4, 5];
+    let offer = dhcp_datagram([192, 0, 2, 1], [192, 0, 2, 10], 2);
+    decrypted_from_ap(&model, LOCAL, &offer, 0, 1);
+    let broadcast = dhcp_datagram([192, 0, 2, 1], [255; 4], 2);
+    // Message 3 gave GTK 1 at receive counter 7.
+    decrypted_from_ap(&model, Mac::BROADCAST, &broadcast, 1, 8);
+    let mut received = Vec::new();
+    for _ in 0..8 {
+        if let Some(frame) = station.receive().unwrap() {
+            received.push(frame);
+        }
+    }
+    assert_eq!(received.len(), 2);
+    for (frame, (destination, datagram)) in received
+        .iter()
+        .zip([(LOCAL, &offer), (Mac::BROADCAST, &broadcast)])
+    {
+        assert_eq!(frame[..6], destination.0);
+        assert_eq!(frame[6..12], SERVER);
+        assert_eq!(frame[12..14], [8, 0]);
+        assert_eq!(frame[14..], datagram[..]);
+    }
+    // A replayed DHCPOFFER is dropped, as ieee80211_crypto_ccmp_decrypt
+    // drops it, and the link stays up for the next one.
+    decrypted_from_ap(&model, LOCAL, &offer, 0, 1);
+    decrypted_from_ap(&model, LOCAL, &offer, 0, 2);
+    let mut received = Vec::new();
+    for _ in 0..6 {
+        if let Some(frame) = station.receive().unwrap() {
+            received.push(frame);
+        }
+    }
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0][14..], offer[..]);
+    assert_eq!(station.radio_mut().link_mut().rejected_frames(), 1);
+    assert!(station.carrier());
+    // No diagnostic so far became an error.
+    while station.take_notice().is_some() {}
+    // A receive buffer the device cannot get back quarantines the adapter
+    // for good: the keeper reports why once and stops retrying.
+    model.queues[&0xd4520].lock().unwrap().fail_publish = true;
+    decrypted_from_ap(&model, LOCAL, &offer, 0, 3);
+    let error = station.receive().unwrap_err();
+    let reason = alloc::string::String::from(station.lost().expect("the radio is lost"));
+    assert_eq!(error, LinkError::Adapter(reason.clone()));
+    assert_eq!(station.take_notice(), Some(reason.clone()));
+    let tx = model.queues[&0xd4300].lock().unwrap().head;
+    for _ in 0..4 {
+        assert!(!station.carrier());
+        assert_eq!(
+            station.receive().unwrap_err(),
+            LinkError::Adapter(reason.clone())
+        );
+        assert!(station.transmit(&ethernet).is_err());
+    }
+    assert_eq!(station.take_notice(), None);
+    assert_eq!(model.queues[&0xd4300].lock().unwrap().head, tx);
+}
