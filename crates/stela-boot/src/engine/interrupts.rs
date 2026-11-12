@@ -394,22 +394,35 @@ pub(crate) unsafe fn install(handler: Handler) {
 
 /// Turn AVX on where this CPU has it, which firmware leaves off, so host
 /// code that detects AVX or F16C through XCR0 finds it usable, and so that
-/// translated blocks may use FMA3, F16C and AVX2. The entry stubs save the
-/// enabled state whatever it is.
+/// translated blocks may use FMA3, F16C and AVX2; and the AVX-512 state
+/// (opmask, ZMM_Hi256, Hi16_ZMM) where the CPU has AVX-512F and XSAVE
+/// manages that state, so that they may use the EVEX forms and XMM16-31.
+/// The entry stubs save the enabled state whatever it is.
 ///
 /// # Safety
 /// Ring 0 with interrupts masked, on a CPU whose extended state nothing has
 /// captured yet.
 pub(crate) unsafe fn enable_avx() {
-    use core::arch::x86_64::{__cpuid, _xgetbv, _xsetbv};
+    use core::arch::x86_64::{__cpuid, __cpuid_count, _xgetbv, _xsetbv};
     const XSAVE_AND_AVX: u32 = 1 << 26 | 1 << 28;
     const CR4_OSXSAVE: u64 = 1 << 18;
-    const XCR0_AVX: u64 = 0x7;
+    const XCR0_AVX512: u64 = super::xstate::AVX512;
+    /// CPUID.(EAX=07H,ECX=0):EBX bit 16: AVX-512F.
+    const AVX512F: u32 = 1 << 16;
+    let basic = __cpuid(0).eax;
     if __cpuid(1).ecx & XSAVE_AND_AVX != XSAVE_AND_AVX {
         return;
     }
-    // SAFETY: CPUID enumerates XSAVE and AVX, so CR4.OSXSAVE and these XCR0
-    // bits are defined; the caller holds this CPU in ring 0.
+    // CPUID.(EAX=0DH,ECX=0):EAX: the XCR0 bits XSAVE manages; setting
+    // another faults.
+    let managed = u64::from(__cpuid_count(0xd, 0).eax);
+    let avx512 = basic >= 7
+        && __cpuid_count(7, 0).ebx & AVX512F != 0
+        && managed & XCR0_AVX512 == XCR0_AVX512;
+    let wanted: u64 = 0x7 | if avx512 { XCR0_AVX512 } else { 0 };
+    // SAFETY: CPUID enumerates XSAVE and AVX, and XSAVE manages the AVX-512
+    // bits where they are set, so CR4.OSXSAVE and these XCR0 bits are
+    // defined; the caller holds this CPU in ring 0.
     unsafe {
         let cr4: u64;
         core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
@@ -421,8 +434,8 @@ pub(crate) unsafe fn enable_avx() {
             );
         }
         let xcr0 = _xgetbv(0);
-        if xcr0 & XCR0_AVX != XCR0_AVX {
-            _xsetbv(0, xcr0 | XCR0_AVX);
+        if xcr0 & wanted != wanted {
+            _xsetbv(0, xcr0 | wanted);
         }
     }
 }
