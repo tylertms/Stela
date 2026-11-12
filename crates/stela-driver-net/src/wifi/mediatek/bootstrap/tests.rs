@@ -1076,27 +1076,29 @@ fn every_bring_up_step_fits_a_recovery_step() {
     if crate::test_process::isolate_model() {
         return;
     }
-    let mut f = NativeFixture::new(Chip::Mt7925);
-    longest_step();
-    f.install().unwrap();
-    f.boot(Chip::Mt7925);
-    f.policy(Chip::Mt7925);
-    // SAFETY: the model device, its pages and its domain belong to this test alone; no other
-    // driver, worker or DMA touches them.
-    unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
-    // SAFETY: as above.
-    unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
-    let context = crate::wifi::mediatek::bootstrap::client::tests::profile().interface;
-    // SAFETY: as above.
-    let interface = unsafe { block_on(f.controller.register_interface(context)) }.unwrap();
-    let longest = longest_step();
-    assert!(longest > 0);
-    assert!(
-        longest <= crate::wifi::connection::keeper::RECOVERY_STEP_US,
-        "{longest} us"
-    );
-    drop(interface);
-    f.retire();
+    for chip in [Chip::Mt7921, Chip::Mt7922, Chip::Mt7925] {
+        let mut f = NativeFixture::new(chip);
+        longest_step();
+        f.install().unwrap();
+        f.boot(chip);
+        f.policy(chip);
+        // SAFETY: the model device, its pages and its domain belong to this test alone; no
+        // other driver, worker or DMA touches them.
+        unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
+        // SAFETY: as above.
+        unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
+        let context = crate::wifi::mediatek::bootstrap::client::tests::profile().interface;
+        // SAFETY: as above.
+        let interface = unsafe { block_on(f.controller.register_interface(context)) }.unwrap();
+        let longest = longest_step();
+        assert!(longest > 0);
+        assert!(
+            longest <= crate::wifi::connection::keeper::RECOVERY_STEP_US,
+            "{chip:?}: {longest} us"
+        );
+        drop(interface);
+        f.retire();
+    }
 }
 
 /// A bring-up abandoned in the middle of its firmware download, as a lost
