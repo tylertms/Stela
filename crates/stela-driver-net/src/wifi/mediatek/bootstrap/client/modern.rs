@@ -9,6 +9,9 @@ pub(super) struct Configuration {
     context: Arc<AssociationContext>,
     pub(super) wire: wire::modern::Configuration,
     commands: Vec<wire::Outgoing>,
+    /// How many of `commands` lead them as the BSS's: one MT7925 request,
+    /// or connac2's sequence.
+    bss_commands: usize,
     filter: crate::wifi::mediatek::mcu::init::Request,
     completed: usize,
     pub(super) prepared_edca: [station::phy::AccessCategory; 4],
@@ -330,6 +333,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             let format = &mut s.format_generation;
             let links = &mut s.links;
             let m = s.modern.as_mut().unwrap();
+            let connac2 = roc.controller.state().identity.chip != Chip::Mt7925;
             // SAFETY: covered by this function's own safety contract.
             unsafe {
                 authority.publish_association(
@@ -340,7 +344,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                         started = true;
                         *format = None;
                         for (index, outgoing) in m.commands.iter().enumerate() {
-                            if index == 1 {
+                            // The admission counters clear after the BSS's
+                            // requests (mt7921_mac_sta_assoc).
+                            if index == m.bss_commands {
                                 roc.controller
                                     .state_mut()
                                     .control
@@ -348,6 +354,11 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                                     .map_err(|e| {
                                         Error::Bootstrap(super::super::Error::Control(e))
                                     })?;
+                            }
+                            // BSS_CHANGED_ERP_SLOT after the peer's record:
+                            // connac2's MAC timing (mt7921_bss_info_changed).
+                            if connac2 && index == m.bss_commands + 1 {
+                                Self::set_timing(roc.controller, p)?;
                             }
                             // Source filter transport precedes the final awake update;
                             // preserve its one-way/raw fact rather than inventing ACK.
@@ -478,6 +489,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         }
         let codec = Self::codec(s);
         let bss = codec.bss(p, Some(&wire), true).map_err(Error::Codec)?;
+        let bss_commands = bss.len();
         let mut commands = Vec::new();
         commands
             .try_reserve_exact(6 + bss.len())
@@ -523,6 +535,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             context,
             wire,
             commands,
+            bss_commands,
             filter,
             completed: 0,
             prepared_edca,

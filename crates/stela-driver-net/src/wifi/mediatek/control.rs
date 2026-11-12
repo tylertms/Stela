@@ -77,6 +77,9 @@ pub enum Error {
         last: u32,
     },
     Poisoned,
+    /// A timing the MAC's registers cannot hold, or a chip whose firmware
+    /// keeps it.
+    UnsupportedTiming,
 }
 impl From<registers::Error> for Error {
     fn from(e: registers::Error) -> Self {

@@ -583,6 +583,11 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                     .clear_peer_admission(p.wcid)
                     .map_err(|e| Error::Bootstrap(super::Error::Control(e)))?;
                 Self::command(s, Command::StationRecord, &peer)?;
+                // BSS_CHANGED_ERP_SLOT: connac2's MAC timing
+                // (mt7921_bss_info_changed); the MT7925 keeps its own.
+                if s.controller.state().identity.chip != Chip::Mt7925 {
+                    Self::set_timing(&mut s.controller, p)?;
+                }
                 Self::command(s, Command::StationRecord, &broadcast)?;
                 let beacon_filter = codec.beacon_filter(p).map_err(Error::Codec)?;
                 Self::send(s, &beacon_filter)?;

@@ -1,5 +1,5 @@
 extern crate std;
-use super::super::tests::{CHIPS, done, setup_modern, setup_modern_radio, setup_on};
+use super::super::tests::{CHIPS, done, setup_modern, setup_on, setup_radio_on};
 use super::*;
 use crate::bus::dma::memory::{CacheAttribute, MemoryError, PageGeometry, PinnedPages};
 use crate::wifi::mediatek::{
@@ -821,160 +821,174 @@ fn actual_2ghz_he20_profile_scans_associates_and_carries_ethernet_on_its_real_ch
         number: 1,
         frequency_mhz: 2412,
     };
-    let (client, model) = setup_modern_radio(false, channel);
-    let actual = client.local_advertisement(Band::Ghz2).unwrap();
-    let mut local = vec![0, 1, b'x'];
-    let mut at = 0;
-    while at < actual.elements().len() {
-        let n = usize::from(actual.elements()[at + 1]);
-        let ie = &actual.elements()[at..at + 2 + n];
-        // A real frontend can select the HE subset. Preserve its
-        // original source maps after parsing exactly the advertised bytes.
-        if ie[0] != 255 || ie[2] != 108 {
-            local.extend_from_slice(ie);
+    for chip in CHIPS {
+        let (client, model) = setup_radio_on(chip, channel);
+        let actual = client.local_advertisement(Band::Ghz2).unwrap();
+        let mut local = vec![0, 1, b'x'];
+        let mut at = 0;
+        while at < actual.elements().len() {
+            let n = usize::from(actual.elements()[at + 1]);
+            let ie = &actual.elements()[at..at + 2 + n];
+            // A real frontend can select the HE subset. Preserve its
+            // original source maps after parsing exactly the advertised bytes.
+            if ie[0] != 255 || ie[2] != 108 {
+                local.extend_from_slice(ie);
+            }
+            at += 2 + n;
         }
-        at += 2 + n;
-    }
-    local.extend_from_slice(&[
-        48, 18, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2,
-    ]);
-    let caps = Capabilities::parse(Band::Ghz2, Role::Station, &local)
-        .unwrap()
-        .with_local_he_source_maps(*actual.he_source_maps())
+        local.extend_from_slice(&[
+            48, 18, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2,
+        ]);
+        let caps = Capabilities::parse(Band::Ghz2, Role::Station, &local)
+            .unwrap()
+            .with_local_he_source_maps(*actual.he_source_maps())
+            .unwrap();
+        let request = AssociationRequest::new_modern_with_local(
+            0x11,
+            10,
+            local.clone(),
+            caps,
+            Mode::He,
+            Width::Mhz20,
+        )
         .unwrap();
-    let request = AssociationRequest::new_modern_with_local(
-        0x11,
-        10,
-        local.clone(),
-        caps,
-        Mode::He,
-        Width::Mhz20,
-    )
-    .unwrap();
-    let mut ap = Vec::new();
-    at = 0;
-    while at < local.len() {
-        let n = usize::from(local[at + 1]);
-        let ie = &local[at..at + 2 + n];
-        if ie[0] == 221 {
-            ap.extend_from_slice(&[
-                221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0x80, 0, 3, 0xa4, 0, 0, 0x27, 0xa4, 0, 0, 0x42,
-                0x43, 94, 0, 0x62, 0x32, 47, 0,
-            ]);
-        } else {
-            let offset = ap.len();
-            ap.extend_from_slice(ie);
-            if ie[0] == 1 {
-                for q in 0..4 {
-                    ap[offset + 2 + q] |= 0x80;
+        let mut ap = Vec::new();
+        at = 0;
+        while at < local.len() {
+            let n = usize::from(local[at + 1]);
+            let ie = &local[at..at + 2 + n];
+            if ie[0] == 221 {
+                ap.extend_from_slice(&[
+                    221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0x80, 0, 3, 0xa4, 0, 0, 0x27, 0xa4, 0, 0,
+                    0x42, 0x43, 94, 0, 0x62, 0x32, 47, 0,
+                ]);
+            } else {
+                let offset = ap.len();
+                ap.extend_from_slice(ie);
+                if ie[0] == 1 {
+                    for q in 0..4 {
+                        ap[offset + 2 + q] |= 0x80;
+                    }
                 }
             }
+            at += 2 + n;
         }
-        at += 2 + n;
+        let mut ht = [0; 22];
+        ht[0] = 1;
+        ap.extend_from_slice(&[61, 22]);
+        ap.extend_from_slice(&ht);
+        ap.extend_from_slice(&[255, 7, 36, 3, 0, 0, 0, 0xff, 0xff, 5, 4, 0, 2, 0, 0]);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let client = ManagedClient::new(client, country(), Environment::Indoor).unwrap();
+        let mut link = ManagedLink::new(
+            client,
+            Provider(drops.clone(), core::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+        let receive = |bytes: &[u8], pn: Option<u64>| {
+            let mut raw = incoming_bytes_on(chip, bytes, pn.map(|n| (1, 0, n)), false);
+            raw[13] = 1;
+            device_receive(&model.queues[&0xd4520], &raw, true, 0);
+        };
+        link.begin_scan(
+            scan::Request::new(vec![channel], vec![], vec![]).unwrap(),
+            1_000_000,
+        )
+        .unwrap();
+        let mut body = vec![0; 8];
+        body.extend_from_slice(&100u16.to_le_bytes());
+        body.extend_from_slice(&0x11u16.to_le_bytes());
+        body.extend_from_slice(&ap);
+        let mut beacon = response(0x80, &body);
+        beacon[4..10].fill(255);
+        receive(&beacon, None);
+        link.service().unwrap();
+        let handle = link.bss().next().unwrap().0;
+        done(&model);
+        link.service().unwrap();
+        // SAFETY: completed model scan/radio/RX work independently drained.
+        unsafe { link.retire_scan_after_drain() }.unwrap();
+        let mut profile = profile();
+        profile.channel = channel;
+        profile.basic_rates = 15;
+        profile.supported_rates = 0xfff;
+        profile.slot_time = 20;
+        let join = Join {
+            bssid: AP,
+            channel,
+            policy: station::PortPolicy::Controlled,
+            request,
+        };
+        link.join(handle, join, profile).unwrap();
+        assert_eq!(finish_tx_on(&model, 1)[0][..2], [0xb0, 0]);
+        link.service().unwrap();
+        receive(&response(0xb0, &[0, 0, 2, 0, 0, 0]), None);
+        link.service().unwrap();
+        assert_eq!(finish_tx_on(&model, 1)[0][..2], [0, 0]);
+        link.service().unwrap();
+        let mut assoc = vec![0x11, 0, 0, 0, 1, 0xc0];
+        assoc.extend_from_slice(&ap);
+        receive(&response(0x10, &assoc), None);
+        link.service().unwrap();
+        link.configure().unwrap();
+        secure(&mut link);
+        // The authorized port enters power save first.
+        link.service().unwrap();
+        // The association's long slot, in connac2's MAC timing registers
+        // (mt792x_mac_set_timeing): the 2.4 GHz SIFS and 20 us.
+        let icr0 = |slot: u32| (1, 0x210a4, 360 | (2 << 10) | (10 << 16) | (slot << 24));
+        if chip != Chip::Mt7925 {
+            let log = model.bar.0.lock().unwrap().log.clone();
+            assert!(log.contains(&icr0(20)));
+            assert!(!log.contains(&icr0(9)));
+        }
+        // A beacon turning on Short Slot Time moves the BSS to 9 us, as
+        // mt7925_mcu_set_timing sends it and mt792x_mac_set_timeing programs it.
+        let mut short = beacon.clone();
+        short[35] |= 0x04;
+        receive(&short, None);
+        link.service().unwrap();
+        if chip == Chip::Mt7925 {
+            let command = model
+                .response
+                .lock()
+                .unwrap()
+                .client_commands
+                .last()
+                .unwrap()
+                .clone();
+            assert_eq!(command[48 + 4..48 + 14], [23, 0, 20, 0, 1, 0, 0, 0, 9, 0]);
+        } else {
+            assert!(model.bar.0.lock().unwrap().log.contains(&icr0(9)));
+        }
+        assert_eq!(
+            link.state()
+                .client
+                .client
+                .state()
+                .profile
+                .unwrap()
+                .slot_time,
+            9
+        );
+        link.transmit(&eth(0x800)).unwrap();
+        assert_eq!(finish_tx_on(&model, 1).len(), 1);
+        link.service().unwrap();
+        // Its TX-free starts TID 0's block-ack session, as
+        // mt7925_tx_check_aggr does, and the next frame waits for it.
+        drain_notices(&mut link);
+        assert!(link.state().client.client.state().transmit_ba[0].is_some());
+        link.transmit(&eth(0x800)).unwrap();
+        assert_eq!(link.state().held.len(), 1);
+        receive(&data(false), Some(1));
+        let frame = link.receive().unwrap().unwrap();
+        assert_eq!(&frame[12..14], &0x800u16.to_be_bytes());
+        assert_eq!(model.response.lock().unwrap().home_channel, Some(1));
+        stop(&mut link, &model);
+        drop(link);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(model.drops.load(Ordering::Relaxed), 1);
     }
-    let mut ht = [0; 22];
-    ht[0] = 1;
-    ap.extend_from_slice(&[61, 22]);
-    ap.extend_from_slice(&ht);
-    ap.extend_from_slice(&[255, 7, 36, 3, 0, 0, 0, 0xff, 0xff, 5, 4, 0, 2, 0, 0]);
-    let drops = Arc::new(AtomicUsize::new(0));
-    let client = ManagedClient::new(client, country(), Environment::Indoor).unwrap();
-    let mut link = ManagedLink::new(
-        client,
-        Provider(drops.clone(), core::sync::atomic::AtomicBool::new(false)),
-    )
-    .unwrap();
-    let receive = |bytes: &[u8], pn: Option<u64>| {
-        let mut raw = incoming_bytes(bytes, pn.map(|n| (1, 0, n)), false);
-        raw[13] = 1;
-        device_receive(&model.queues[&0xd4520], &raw, true, 0);
-    };
-    link.begin_scan(
-        scan::Request::new(vec![channel], vec![], vec![]).unwrap(),
-        1_000_000,
-    )
-    .unwrap();
-    let mut body = vec![0; 8];
-    body.extend_from_slice(&100u16.to_le_bytes());
-    body.extend_from_slice(&0x11u16.to_le_bytes());
-    body.extend_from_slice(&ap);
-    let mut beacon = response(0x80, &body);
-    beacon[4..10].fill(255);
-    receive(&beacon, None);
-    link.service().unwrap();
-    let handle = link.bss().next().unwrap().0;
-    done(&model);
-    link.service().unwrap();
-    // SAFETY: completed model scan/radio/RX work independently drained.
-    unsafe { link.retire_scan_after_drain() }.unwrap();
-    let mut profile = profile();
-    profile.channel = channel;
-    profile.basic_rates = 15;
-    profile.supported_rates = 0xfff;
-    profile.slot_time = 20;
-    let join = Join {
-        bssid: AP,
-        channel,
-        policy: station::PortPolicy::Controlled,
-        request,
-    };
-    link.join(handle, join, profile).unwrap();
-    assert_eq!(finish_tx_on(&model, 1)[0][..2], [0xb0, 0]);
-    link.service().unwrap();
-    receive(&response(0xb0, &[0, 0, 2, 0, 0, 0]), None);
-    link.service().unwrap();
-    assert_eq!(finish_tx_on(&model, 1)[0][..2], [0, 0]);
-    link.service().unwrap();
-    let mut assoc = vec![0x11, 0, 0, 0, 1, 0xc0];
-    assoc.extend_from_slice(&ap);
-    receive(&response(0x10, &assoc), None);
-    link.service().unwrap();
-    link.configure().unwrap();
-    secure(&mut link);
-    // The authorized port enters power save first.
-    link.service().unwrap();
-    // A beacon turning on Short Slot Time moves the BSS to 9 us, as
-    // mt7925_mcu_set_timing sends it.
-    let mut short = beacon.clone();
-    short[35] |= 0x04;
-    receive(&short, None);
-    link.service().unwrap();
-    let command = model
-        .response
-        .lock()
-        .unwrap()
-        .client_commands
-        .last()
-        .unwrap()
-        .clone();
-    assert_eq!(command[48 + 4..48 + 14], [23, 0, 20, 0, 1, 0, 0, 0, 9, 0]);
-    assert_eq!(
-        link.state()
-            .client
-            .client
-            .state()
-            .profile
-            .unwrap()
-            .slot_time,
-        9
-    );
-    link.transmit(&eth(0x800)).unwrap();
-    assert_eq!(finish_tx_on(&model, 1).len(), 1);
-    link.service().unwrap();
-    // Its TX-free starts TID 0's block-ack session, as
-    // mt7925_tx_check_aggr does, and the next frame waits for it.
-    drain_notices(&mut link);
-    assert!(link.state().client.client.state().transmit_ba[0].is_some());
-    link.transmit(&eth(0x800)).unwrap();
-    assert_eq!(link.state().held.len(), 1);
-    receive(&data(false), Some(1));
-    let frame = link.receive().unwrap().unwrap();
-    assert_eq!(&frame[12..14], &0x800u16.to_be_bytes());
-    assert_eq!(model.response.lock().unwrap().home_channel, Some(1));
-    stop(&mut link, &model);
-    drop(link);
-    assert_eq!(drops.load(Ordering::Relaxed), 1);
-    assert_eq!(model.drops.load(Ordering::Relaxed), 1);
 }
 #[test]
 fn native_rx_ring_failure_cannot_leave_cached_association_carrier_up() {

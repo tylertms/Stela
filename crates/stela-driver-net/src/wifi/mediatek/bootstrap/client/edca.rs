@@ -447,17 +447,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         Self::command_ready(s)?;
         let mut profile = s.profile.ok_or(Error::WrongPhase)?;
         profile.slot_time = slot;
-        let Some(body) = Self::codec(s).timing(profile).map_err(Error::Codec)? else {
-            // connac2 keeps the slot time in the MAC's timing registers
-            // (`mt792x_mac_set_timeing`), which this driver does not
-            // program: report the change and keep the current timing.
-            s.slot_time = None;
-            s.csa.ready.try_reserve(1).map_err(|_| Error::NoMemory)?;
-            s.csa.ready.push(Event::Unsupported(
-                "a 2.4 GHz slot time change on MT7921 or MT7922: the MAC keeps its timing",
-            ));
-            return Ok(());
-        };
+        // connac2 keeps the slot time in the MAC's timing registers
+        // (`mt792x_mac_set_timeing`); the MT7925 takes a BSS_INFO_UPDATE.
+        let body = Self::codec(s).timing(profile).map_err(Error::Codec)?;
         s.replies.try_reserve(1).map_err(|_| Error::NoMemory)?;
         let phase = &mut s.phase;
         let current = &mut s.profile;
@@ -471,7 +463,12 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 wifi::regulatory::AssociationUse::Management,
                 |_, _| {
                     *phase = Phase::Quarantined;
-                    Self::command_parts(controller, replies, Command::BssInfo, &body)?;
+                    match &body {
+                        Some(body) => {
+                            Self::command_parts(controller, replies, Command::BssInfo, body)?
+                        }
+                        None => Self::set_timing(controller, profile)?,
+                    }
                     *current = Some(profile);
                     *phase = Phase::Associated;
                     Ok(())
@@ -481,6 +478,19 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         .map_err(Error::Regulatory)??;
         s.slot_time = None;
         Ok(())
+    }
+
+    /// `mt792x_mac_set_timeing` on a connac2 chip: the profile's band's
+    /// SIFS and its slot time in the MAC's timing registers.
+    pub(super) fn set_timing(
+        controller: &mut Controller<I, Q, C>,
+        profile: Profile,
+    ) -> Result<(), Error> {
+        controller
+            .state_mut()
+            .control
+            .set_timing(profile.channel.band == wifi::Band::Ghz2, profile.slot_time)
+            .map_err(|e| Error::Bootstrap(super::super::Error::Control(e)))
     }
 
     /// No received event waits ahead of a command's reply.

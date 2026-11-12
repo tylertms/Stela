@@ -20,10 +20,7 @@ pub(super) fn setup_modern() -> (Client<Bar, Q, NativeGuard>, Model) {
 fn setup_modern_power(split: bool) -> (Client<Bar, Q, NativeGuard>, Model) {
     setup_modern_radio(split, CHANNEL)
 }
-pub(super) fn setup_modern_radio(
-    split: bool,
-    channel: Channel,
-) -> (Client<Bar, Q, NativeGuard>, Model) {
+fn setup_modern_radio(split: bool, channel: Channel) -> (Client<Bar, Q, NativeGuard>, Model) {
     setup_modern_bands(Chip::Mt7925, split, channel, 0, None)
 }
 /// A modern client whose board also programs 6 GHz channel 1 with `flags`.
@@ -149,6 +146,10 @@ pub(super) fn done(model: &Model) {
 /// A client of `chip` on the modern client's board.
 pub(crate) fn setup_on(chip: Chip) -> (Client<Bar, Q, NativeGuard>, Model) {
     setup_modern_bands(chip, false, CHANNEL, 0, None)
+}
+/// [`setup_on`] started on `channel`.
+pub(crate) fn setup_radio_on(chip: Chip, channel: Channel) -> (Client<Bar, Q, NativeGuard>, Model) {
+    setup_modern_bands(chip, false, channel, 0, None)
 }
 /// The chips whose station journeys run in the model.
 pub(crate) const CHIPS: [Chip; 3] = [Chip::Mt7925, Chip::Mt7921, Chip::Mt7922];

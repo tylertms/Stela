@@ -262,6 +262,48 @@ impl<I: BarIo> Control<I> {
         })();
         self.finish(result)
     }
+    /// `mt792x_mac_set_timeing` for band 0 at coverage class 0: with the
+    /// arbiter's TX and RX held, the CCK and OFDM PLCP and CCA timeouts,
+    /// the band's SIFS (10 us on 2.4 GHz, else 16) and `slot_time`, and the
+    /// CF-End rate (11 Mbps CCK only for a 2.4 GHz long slot). Connac2 only;
+    /// the MT7925's firmware takes the slot time.
+    pub(in crate::wifi::mediatek) fn set_timing(
+        &mut self,
+        two_ghz: bool,
+        slot_time: u16,
+    ) -> Result<(), Error> {
+        const ARB_SCR: u32 = 0x820e3080;
+        const TX_RX_DISABLE: u32 = (1 << 8) | (1 << 9);
+        const TMAC_CDTR: u32 = 0x820e4090;
+        const TMAC_ODTR: u32 = 0x820e4094;
+        const TMAC_ICR0: u32 = 0x820e40a4;
+        const AGG_ACR0: u32 = 0x820e2084;
+        if self.chip() == Chip::Mt7925 || slot_time > 0x7f {
+            return Err(Error::UnsupportedTiming);
+        }
+        self.guard(true)?;
+        let result = (|| {
+            self.mac_modify(ARB_SCR, 0, TX_RX_DISABLE)?;
+            block_on(until(self.clock.deadline(1)));
+            self.registers.write32(TMAC_CDTR, 231 | (48 << 16))?;
+            self.registers.write32(TMAC_ODTR, 60 | (28 << 16))?;
+            let sifs = if two_ghz { 10 } else { 16 };
+            self.registers.write32(
+                TMAC_ICR0,
+                360 | (2 << 10) | (sifs << 16) | (u32::from(slot_time) << 24),
+            )?;
+            // MT792x_CFEND_RATE_11B or MT792x_CFEND_RATE_DEFAULT (OFDM 24M).
+            let cf_end = if slot_time < 20 || !two_ghz {
+                0x49
+            } else {
+                0x03
+            };
+            self.mac_modify(AGG_ACR0, 0x3fff, cf_end)?;
+            self.mac_modify(ARB_SCR, TX_RX_DISABLE, 0)?;
+            Ok(())
+        })();
+        self.finish(result)
+    }
     /// Read-to-clear and airtime reset effects. Host accounting/time
     /// is held by the lifecycle; no air/duration result is invented.
     pub(in crate::wifi::mediatek) fn reset_mac_counters(&mut self) -> Result<[u32; 11], Error> {
