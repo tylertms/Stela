@@ -207,6 +207,39 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         Ok(())
     }
 
+    /// Release everything the client holds once its hardware was reset, as
+    /// `mt7925e_mac_reset` frees its tokens and queues: the controller's rings
+    /// and mappings, and the interfaces and keys the reset firmware forgot,
+    /// in whatever phase the failure left them.
+    ///
+    /// # Safety
+    /// The WLAN subsystem was reset (WFSYS) with its WFDMA stopped and every
+    /// ring base reprogrammed by a later owner, so neither the old firmware
+    /// nor its DMA reaches this client's memory; no interrupt or deferred user
+    /// of this client remains.
+    pub unsafe fn release_after_reset(&mut self) -> Result<(), Error> {
+        let s = self.state_mut();
+        s.phase = Phase::Quarantined;
+        // SAFETY: the reset is this function's contract.
+        unsafe { s.controller.retire_after_quiesce() }.map_err(Error::Bootstrap)?;
+        for link in &mut s.links {
+            // SAFETY: as above: the reset firmware holds none of them.
+            unsafe {
+                link.ptk.retire_after_reset();
+                link.gtk.retire_after_reset();
+                link.interface.retire_after_reset();
+            }
+        }
+        for key in [&mut s.ptk, &mut s.gtk].into_iter().flatten() {
+            // SAFETY: as above.
+            unsafe { key.retire_after_reset() };
+        }
+        // SAFETY: as above.
+        unsafe { s.interface.retire_after_reset() };
+        s.phase = Phase::Stopped;
+        Ok(())
+    }
+
     /// # Safety
     /// Whole-controller radio/firmware/DMA/IOTLB/IRQ/work quiescence
     /// meets Controller::retire_after_quiesce. This is an independent platform

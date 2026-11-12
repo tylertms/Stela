@@ -324,6 +324,16 @@ impl<C: 'static> Interface<C> {
         Ok(())
     }
 }
+impl<C: 'static> Interface<C> {
+    /// Forget the registration after the firmware that held it was reset.
+    ///
+    /// # Safety
+    /// The whole WLAN subsystem holding this interface was reset; no command
+    /// may still name it.
+    pub(in crate::wifi::mediatek) unsafe fn retire_after_reset(&mut self) {
+        self.owned_mut().phase = Phase::Retired;
+    }
+}
 impl<C: 'static> Drop for Interface<C> {
     fn drop(&mut self) {
         if let Some(owned) = self.owned.take()

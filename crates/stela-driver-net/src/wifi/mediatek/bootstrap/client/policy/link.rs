@@ -841,6 +841,22 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
         Self::reconcile(s);
         Ok(result?)
     }
+    /// Release the link once its hardware was reset under a new owner; its
+    /// queued frames and notices go with it.
+    ///
+    /// # Safety
+    /// As for [`Client::release_after_reset`].
+    pub unsafe fn release_after_reset(&mut self) -> Result<(), LinkControlError> {
+        let s = self.state_mut();
+        s.data.clear();
+        s.held.clear();
+        s.notices.clear();
+        s.pending = None;
+        s.released = None;
+        s.armed = false;
+        // SAFETY: forwarded from the caller.
+        Ok(unsafe { s.client.release_after_reset() }?)
+    }
     /// # Safety
     /// Exact whole-controller/radio/DMA/IOTLB/IRQ/work quiescence meets the
     /// original native platform fence, independently of stop/idle observations.

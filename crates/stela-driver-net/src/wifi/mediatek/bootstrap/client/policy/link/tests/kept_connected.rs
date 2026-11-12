@@ -12,6 +12,7 @@ use crate::wifi::{
     sae::{Derivation, Exchange},
     supplicant::tests::Authenticator,
 };
+use alloc::rc::Rc;
 use stela_driver_base::entropy::{Entropy, EntropyError};
 
 struct Fixed;
@@ -614,6 +615,116 @@ fn decrypted_from_ap(model: &Model, destination: Mac, datagram: &[u8], index: u8
     frame.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 8, 0]);
     frame.extend_from_slice(datagram);
     incoming(model, &frame, Some((1, index, pn)), false);
+}
+
+/// A booted model's managed link and its device, as an attach gives them.
+fn managed_link() -> (TestLink, Model) {
+    let (client, model) = setup_modern();
+    let client = ManagedClient::new(client, country(), Environment::Indoor).unwrap();
+    let link = ManagedLink::new(
+        client,
+        Provider(Arc::new(AtomicUsize::new(0)), Default::default()),
+    )
+    .unwrap();
+    (link, model)
+}
+
+/// A chip reset that takes `steps` pending steps, then hands over a newly
+/// booted model's link.
+struct Reset {
+    steps: u32,
+    addresses: Rc<core::cell::RefCell<Vec<Mac>>>,
+    models: Rc<core::cell::RefCell<Vec<Model>>>,
+    /// The lost link's device, which the reset stops.
+    old: (
+        Arc<std::sync::Mutex<crate::wifi::mediatek::mailbox::tests::Response>>,
+        Bar,
+    ),
+}
+impl crate::wifi::mediatek::station::Recover<Bar, Q, NativeGuard, Provider> for Reset {
+    fn step(
+        &mut self,
+        address: Mac,
+    ) -> core::task::Poll<Result<(TestLink, Context), alloc::string::String>> {
+        self.addresses.borrow_mut().push(address);
+        if self.steps > 0 {
+            self.steps -= 1;
+            return core::task::Poll::Pending;
+        }
+        // The WLAN subsystem reset stops the old device's DMA.
+        self.old.0.lock().unwrap().clc_processing = false;
+        self.old.1.0.lock().unwrap().values.insert(0xd4208, 0);
+        let (link, model) = managed_link();
+        self.models.borrow_mut().push(model);
+        core::task::Poll::Ready(Ok((link, profile().interface)))
+    }
+}
+
+/// mt7925_mac_reset_work: a hung firmware loses the link, the chip reset
+/// runs a step per poll and the station scans again on the new link.
+#[test]
+fn a_lost_link_is_reset_and_the_station_scans_again_on_the_new_one() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let (link, model) = managed_link();
+    let network = Network {
+        ssid: b"x".to_vec(),
+        secret: Secret::parse(b"correct horse battery").unwrap(),
+        country: None,
+    };
+    let models = Rc::new(core::cell::RefCell::new(Vec::new()));
+    let addresses = Rc::new(core::cell::RefCell::new(Vec::new()));
+    let reset = Reset {
+        steps: 2,
+        addresses: addresses.clone(),
+        models: models.clone(),
+        old: (model.response.clone(), model.bar.clone()),
+    };
+    let mut station = Station::new(
+        link,
+        profile().interface,
+        country(),
+        network,
+        Arc::new(Fixed),
+        crate::Clock {
+            ticks_per_microsecond: 1,
+        },
+    )
+    .with_recovery(Box::new(reset));
+    model.response.lock().unwrap().pause_next_index_us =
+        crate::wifi::connection::keeper::RUNTIME_COMMAND_TIMEOUT_US + 10_000;
+    assert!(!station.carrier());
+    // Lost, then two pending steps and the step that hands over the link,
+    // one a poll: the station neither errs nor carries meanwhile.
+    let mut polls = 0;
+    while models.borrow().is_empty() {
+        assert!(!station.carrier());
+        assert_eq!(station.transmit(&[0; 60]), Err(LinkError::NoCarrier));
+        assert!(station.lost().is_none());
+        polls += 1;
+        assert!(polls <= 3);
+    }
+    assert_eq!(polls, 3);
+    assert_eq!(models.borrow().len(), 1);
+    let reported: Vec<_> = core::iter::from_fn(|| station.take_diagnostic()).collect();
+    assert!(
+        reported
+            .iter()
+            .any(|r| r.contains("recovered by a chip reset")),
+        "{reported:?}"
+    );
+    // The new link scans: its device takes the scan request on its MCU
+    // queue.
+    let commands = |models: &Rc<core::cell::RefCell<Vec<Model>>>| {
+        models.borrow()[0].queues[&0xd43f0].lock().unwrap().head
+    };
+    let before = commands(&models);
+    assert!(!station.carrier());
+    assert_ne!(commands(&models), before);
+    // The reset keeps the station's address.
+    assert_eq!(addresses.borrow().len(), 3);
+    assert!(addresses.borrow().iter().all(|address| *address == LOCAL));
 }
 
 #[test]

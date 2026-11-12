@@ -27,7 +27,8 @@ use crate::{
         },
     },
 };
-use alloc::{boxed::Box, format, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
+use core::task::Poll;
 use stela_driver_base::entropy::Entropy;
 
 /// The AP's WCID, the first `mt76_wcid_alloc` gives the sole station.
@@ -39,11 +40,29 @@ pub type Wifi<C> = Station<MmioBar, MmioQueue, C, &'static dyn PageSource>;
 /// A managed MT7925 link kept connected to one network.
 pub type Station<I, Q, C, S> = Keeper<Mt7925<I, Q, C, S>>;
 
+/// Brings a lost MT7925 up again on its own hardware, as
+/// `mt7925e_mac_reset` does: a WLAN subsystem reset, then the whole
+/// bring-up, a bounded step per call.
+pub trait Recover<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> {
+    /// One step of the attempt for station address `address`: once the
+    /// attempt completes, a fresh managed link and its interface, or why it
+    /// failed. A completed attempt reset the WLAN subsystem and reprogrammed
+    /// every ring base, so no firmware or DMA of an earlier link reaches
+    /// that link's memory. One call stays within
+    /// [`keeper::RECOVERY_STEP_US`].
+    #[allow(
+        clippy::type_complexity,
+        reason = "the link and its interface come back together"
+    )]
+    fn step(&mut self, address: Mac) -> Poll<Result<(ManagedLink<I, Q, C, S>, Context), String>>;
+}
+
 /// A managed MT7925 link and its station interface.
 pub struct Mt7925<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> {
     link: ManagedLink<I, Q, C, S>,
     interface: Context,
     country: Country,
+    recovery: Option<Box<dyn Recover<I, Q, C, S>>>,
 }
 
 impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> Station<I, Q, C, S> {
@@ -62,11 +81,18 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> Station<I, Q, C,
                 link,
                 interface,
                 country,
+                recovery: None,
             },
             network,
             entropy,
             clock,
         )
+    }
+
+    /// Recover the radio through `recovery` once it is lost.
+    pub fn with_recovery(mut self, recovery: Box<dyn Recover<I, Q, C, S>>) -> Self {
+        self.radio_mut().recovery = Some(recovery);
+        self
     }
 }
 
@@ -118,13 +144,40 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> Radio for Mt7925
     }
 
     fn service(&mut self) -> Result<(), LinkControlError> {
+        // A lost link that recovers is left alone: the recovery owns the
+        // hardware now.
+        if self.recovery.is_some() && self.link.lost() {
+            return Ok(());
+        }
         self.link.service().map(|_| ())
     }
 
-    // No `recoverable`/`recover` yet: the chip reset that
-    // `mt7925_mac_reset_work` runs arrives with the stepped bring-up, whose
-    // steps fit `keeper::RECOVERY_STEP_US`. Until then a lost MT7925 stays
-    // lost.
+    fn recoverable(&self) -> bool {
+        self.recovery.is_some()
+    }
+
+    /// `mt7925_mac_reset_work`: a step of the chip reset and bring-up; once
+    /// it completes, the new link replaces the lost one, whose memory the
+    /// reset freed.
+    fn recover(&mut self) -> Result<keeper::Recovery, String> {
+        let address = self.link.mac();
+        let recovery = self
+            .recovery
+            .as_mut()
+            .ok_or_else(|| String::from("MT7925: no recovery"))?;
+        let (link, interface) = match recovery.step(address) {
+            Poll::Pending => return Ok(keeper::Recovery::Pending),
+            Poll::Ready(result) => result?,
+        };
+        let mut old = core::mem::replace(&mut self.link, link);
+        self.interface = interface;
+        // SAFETY: the completed attempt reset the WLAN subsystem and
+        // reprogrammed every ring base, so the old link's firmware and DMA
+        // are gone, and nothing else uses the old link. One that does not
+        // release keeps its memory, as its Drop does.
+        let _ = unsafe { old.release_after_reset() };
+        Ok(keeper::Recovery::Done)
+    }
 
     fn take_event(&mut self) -> Option<keeper::Event> {
         while let Some(notice) = self.link.take_notice() {

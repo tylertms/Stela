@@ -358,6 +358,27 @@ impl<C: 'static> HardwareKey<C> {
         Ok(())
     }
 }
+impl<C: 'static> HardwareKey<C> {
+    /// Forget the key after the firmware that held it was reset, as
+    /// `mt7925_mac_reset_work` drops every key with its interfaces.
+    ///
+    /// # Safety
+    /// The whole WLAN subsystem holding this key was reset, its DMA stopped
+    /// and its receive users drained; no command may still name the key.
+    pub(in crate::wifi::mediatek) unsafe fn retire_after_reset(&mut self) {
+        let state = self.owned_mut();
+        // SAFETY: the reset above removed the key from the hardware and the
+        // caller drained every user.
+        unsafe { state.slot.retire_after_drain() };
+        state.phase = Phase::Empty;
+        state.candidate = None;
+        state.reply = None;
+        state.gtk = None;
+        state.igtk = None;
+        state.other_igtk = None;
+        state.pending_igtk = None;
+    }
+}
 impl<C: 'static> Drop for HardwareKey<C> {
     fn drop(&mut self) {
         if let Some(owned) = self.owned.take()

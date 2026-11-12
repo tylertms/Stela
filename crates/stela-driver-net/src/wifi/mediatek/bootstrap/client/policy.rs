@@ -1542,6 +1542,13 @@ impl<I: BarIo, Q: QueueIo, C: 'static> ManagedClient<I, Q, C> {
         self.client.stop().map_err(PolicyError::Client)
     }
     /// # Safety
+    /// As for [`Client::release_after_reset`].
+    pub unsafe fn release_after_reset(&mut self) -> Result<(), PolicyError> {
+        self.revoked = true;
+        // SAFETY: forwarded from the caller.
+        unsafe { self.client.release_after_reset() }.map_err(PolicyError::Client)
+    }
+    /// # Safety
     /// The independent whole-controller platform fence meets
     /// Client::stop_after_quiesce; local idle alone is insufficient.
     pub unsafe fn stop_after_quiesce(&mut self) -> Result<(), PolicyError> {

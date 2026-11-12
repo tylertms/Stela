@@ -573,8 +573,7 @@ impl<R: Radio> Keeper<R> {
         &self.link
     }
 
-    /// The radio, for device models.
-    #[cfg(test)]
+    /// The radio, for its vendor's setup and for device models.
     pub(crate) fn radio_mut(&mut self) -> &mut R {
         &mut self.link
     }

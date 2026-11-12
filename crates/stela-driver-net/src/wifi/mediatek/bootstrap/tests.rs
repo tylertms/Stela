@@ -242,6 +242,28 @@ impl NativeFixture {
         }
     }
     pub(crate) fn install(&mut self) -> Result<(), BootError> {
+        block_on(self.install_stepped())
+    }
+    /// A new owner of the same device, as the next bring-up attempt takes
+    /// it; the abandoned controller keeps its memory, as its Drop does.
+    pub(crate) fn reclaim(&mut self) {
+        let chip = self.chip;
+        // SAFETY: the model device belongs to this test alone.
+        let control =
+            unsafe { Control::new(Registers::new(chip, self.bar.clone()), model_clock()) }.unwrap();
+        #[expect(
+            clippy::arc_with_non_send_sync,
+            reason = "private local-custody model exercises the real owner retention paths"
+        )]
+        let guard = Arc::new(NativeGuard {
+            _local: core::marker::PhantomData,
+            model: self.model.clone(),
+            bar: self.bar.clone(),
+            drops: self.drops.clone(),
+        });
+        self.controller = Controller::claim(identity(chip), control, guard, None).unwrap();
+    }
+    pub(crate) async fn install_stepped(&mut self) -> Result<(), BootError> {
         let domain: Arc<dyn crate::bus::dma::mapping::DmaDomain> =
             Arc::new(Domain(self.memory.clone()));
         let bar = self.bar.clone();
@@ -252,13 +274,11 @@ impl NativeFixture {
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
         unsafe {
-            block_on(
-                self.controller
-                    .install_with(&Source, domain, false, move |offset| {
-                        let state = states.get(&offset).unwrap().clone();
-                        let inner = if offset == 0xd4400
-                            || offset == if is_c3 { 0xd43f0 } else { 0xd4410 }
-                        {
+            self.controller
+                .install_with(&Source, domain, false, move |offset| {
+                    let state = states.get(&offset).unwrap().clone();
+                    let inner =
+                        if offset == 0xd4400 || offset == if is_c3 { 0xd43f0 } else { 0xd4410 } {
                             Inner::Tx(DeviceIo {
                                 io: Io(state),
                                 rx: states[&0xd4500].clone(),
@@ -274,22 +294,25 @@ impl NativeFixture {
                         } else {
                             Inner::Rx(Io(state))
                         };
-                        Ok(Q {
-                            inner,
-                            bar: bar.clone(),
-                            offset,
-                            runtime: states[&0xd4540].clone(),
-                            response: response.clone(),
-                        })
-                    }),
-            )
+                    Ok(Q {
+                        inner,
+                        bar: bar.clone(),
+                        offset,
+                        runtime: states[&0xd4540].clone(),
+                        response: response.clone(),
+                    })
+                })
+                .await
         }
     }
     pub(crate) fn boot(&mut self, chip: Chip) {
+        block_on(self.boot_stepped(chip));
+    }
+    pub(crate) async fn boot_stepped(&mut self, chip: Chip) {
         let requests = Requests::new(&identity(chip));
         let provider = catalog(&requests, patch_bytes(), ram(&clc_bytes(chip)));
         let prepared = requests.load(&provider).unwrap();
-        block_on(self.controller.boot(&prepared)).unwrap();
+        self.controller.boot(&prepared).await.unwrap();
     }
     pub(crate) fn policy(&mut self, chip: Chip) {
         self.policy_bands(chip, [true, true, false]);
@@ -1049,5 +1072,34 @@ fn every_bring_up_step_fits_a_recovery_step() {
         "{longest} us"
     );
     drop(interface);
+    f.retire();
+}
+
+/// A bring-up abandoned in the middle of its firmware download, as a lost
+/// station's recovery is when the radio is lost for good, leaves the device
+/// to the next owner: its WLAN subsystem reset, download and start succeed.
+#[test]
+fn a_bring_up_dropped_mid_download_leaves_the_device_to_the_next_reset() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let mut f = NativeFixture::new(Chip::Mt7925);
+    let firmware_queue = f.queues[&0xd4400].clone();
+    {
+        let mut stepped = crate::wifi::stepped::Stepped::new(async {
+            f.install_stepped().await.unwrap();
+            f.boot_stepped(Chip::Mt7925).await;
+        });
+        while firmware_queue.lock().unwrap().head < 2 {
+            assert!(stepped.step().is_pending());
+        }
+        // Dropped mid-download: its state goes at the await it stopped at.
+    }
+    assert_eq!(f.controller.phase(), Phase::Quarantined);
+    f.reclaim();
+    f.install().unwrap();
+    f.boot(Chip::Mt7925);
+    f.policy(Chip::Mt7925);
+    assert_eq!(f.controller.phase(), Phase::Policy);
     f.retire();
 }

@@ -149,6 +149,9 @@ struct Owned<I: BarIo, Q: QueueIo, C: 'static> {
     /// The MCU did not report power-on for download in time; Linux warns
     /// and downloads anyway, and so does this controller.
     firmware_power_late: bool,
+    /// Every command waits at most the runtime bound, from the first: the
+    /// bring-up runs from station polls, as a recovery does.
+    runtime_commands: bool,
 }
 /// Drop after the first mutation keeps the entire real context,
 /// including fully completed facts. Independent quiescence is required
@@ -295,6 +298,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
                 counter_reset_ticks: None,
                 cleared_rings: 0,
                 firmware_power_late: false,
+                runtime_commands: false,
             });
             Ok(Self {
                 owned: Some(Box::from_raw(p)),
@@ -331,6 +335,11 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
     /// timed out, as Linux does after its warning.
     pub fn firmware_power_late(&self) -> bool {
         self.state().firmware_power_late
+    }
+    /// Bound every command of this controller by the runtime bound, as a
+    /// bring-up that runs from station polls needs; set before the install.
+    pub(in crate::wifi::mediatek) fn bound_commands(&mut self) {
+        self.state_mut().runtime_commands = true;
     }
     fn require(&self, phase: Phase) -> Result<(), Error> {
         if self.phase() == phase {
@@ -454,6 +463,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
             }
             .map_err(Error::Mailbox)?,
         );
+        if s.runtime_commands {
+            s.mailbox.as_mut().unwrap().enter_runtime();
+        }
         s.phase = Phase::Queues;
         Ok(())
     }

@@ -64,7 +64,7 @@ pub(super) struct Link<C: 'static> {
     pub(super) channel_change: Option<Option<ChannelDefinition>>,
     pub(super) applied_edca: Option<edca::AppliedEdca>,
     prepared_edca: [station::phy::AccessCategory; 4],
-    interface: Interface<Arc<C>>,
+    pub(super) interface: Interface<Arc<C>>,
     /// The MLDs' PTK, kept on this link's AP WCID as on every link's.
     pub(super) ptk: HardwareKey<Arc<C>>,
     /// The GTK of this link's AP.

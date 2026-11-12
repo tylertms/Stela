@@ -22,7 +22,7 @@ use super::{
     mcu::device::Context,
     registers::MmioBar,
     ring::MmioQueue,
-    station::{Station, Wifi},
+    station::{Recover, Station, Wifi},
 };
 use crate::{
     Clock, Mac,
@@ -31,11 +31,11 @@ use crate::{
     wifi::{
         network::Network,
         regulatory::database::{self, Country, Database},
-        stepped::block_on,
+        stepped::{Stepped, block_on},
     },
 };
-use alloc::{sync::Arc, vec::Vec};
-use core::{any::Any, fmt, ptr::NonNull};
+use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
+use core::{any::Any, fmt, ptr::NonNull, task::Poll};
 use stela_driver_base::entropy::Entropy;
 
 /// The services and platform facts the attach borrows.
@@ -194,6 +194,9 @@ pub struct Hardware<C: 'static> {
     /// Controllers of failed attempts, released once a later attempt's WLAN
     /// subsystem reset has stopped their DMA.
     failed: Vec<Native<C>>,
+    /// The bring-up runs from station polls: every command waits at most the
+    /// runtime bound.
+    polled: bool,
 }
 
 impl<C: 'static> Hardware<C> {
@@ -247,6 +250,9 @@ impl<C: 'static> Hardware<C> {
                 self.clock,
             )
         }?;
+        if self.polled {
+            controller.bound_commands();
+        }
         // SAFETY: as above, with the kept domain and page source.
         let installed =
             unsafe { controller.install(self.pages, self.domain.clone(), self.aspm) }.await;
@@ -369,6 +375,58 @@ impl<C: 'static> Hardware<C> {
     }
 }
 
+/// One recovery attempt: the bring-up of the reset function with the
+/// station's address, the hardware handed back for the next attempt.
+async fn recovery<C: 'static>(
+    mut hardware: Hardware<C>,
+    address: Mac,
+) -> (Hardware<C>, Result<BroughtUp<C>, AttachError>) {
+    let result = hardware.attempt(Some(address)).await;
+    (hardware, result)
+}
+
+/// A running recovery attempt, allocated once when it starts.
+type Attempt<C> = Stepped<'static, (Hardware<C>, Result<BroughtUp<C>, AttachError>)>;
+
+/// `mt7925_mac_reset_work`'s chip reset for a lost station, run a bounded
+/// step per keeper poll: each attempt resets the WLAN subsystem and brings
+/// the function up again with the station's address.
+pub struct Recoverer<C: 'static> {
+    hardware: Option<Hardware<C>>,
+    attempt: Option<Attempt<C>>,
+}
+
+impl<C: 'static> Recoverer<C> {
+    fn new(mut hardware: Hardware<C>) -> Self {
+        hardware.polled = true;
+        Self {
+            hardware: Some(hardware),
+            attempt: None,
+        }
+    }
+}
+
+impl<C: 'static> Recover<MmioBar, MmioQueue, C, &'static dyn PageSource> for Recoverer<C> {
+    fn step(&mut self, address: Mac) -> Poll<Result<(Link<C>, Context), String>> {
+        if self.attempt.is_none() {
+            let Some(hardware) = self.hardware.take() else {
+                return Poll::Ready(Err(String::from("MT7925: the recovery lost its hardware")));
+            };
+            self.attempt = Some(Stepped::new(recovery(hardware, address)));
+        }
+        let Poll::Ready((hardware, result)) = self.attempt.as_mut().unwrap().step() else {
+            return Poll::Pending;
+        };
+        self.attempt = None;
+        self.hardware = Some(hardware);
+        Poll::Ready(
+            result
+                .map(|up| (up.link, up.interface))
+                .map_err(|error| format!("{error}")),
+        )
+    }
+}
+
 /// Identify, boot and program the function `pci` names, then register its
 /// station interface and keep it connected to `inputs.network`.
 ///
@@ -410,6 +468,7 @@ pub unsafe fn attach<C: 'static>(
         sar: inputs.sar,
         entropy: inputs.entropy.clone(),
         failed: Vec::new(),
+        polled: false,
     };
     // The attach runs the same stepped bring-up a recovery steps through,
     // to completion.
@@ -422,7 +481,8 @@ pub unsafe fn attach<C: 'static>(
             inputs.network,
             inputs.entropy,
             inputs.clock,
-        ),
+        )
+        .with_recovery(Box::new(Recoverer::new(hardware))),
         firmware_domain_unused: up.firmware_domain_unused,
         random_address: up.random_address,
     })
@@ -431,6 +491,7 @@ pub unsafe fn attach<C: 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate std;
     use stela_driver_base::entropy::EntropyError;
 
     struct Fixed(u8);
@@ -445,6 +506,55 @@ mod tests {
         fn fill(&self, _: &mut [u8]) -> Result<(), EntropyError> {
             Err(EntropyError::Unavailable)
         }
+    }
+
+    /// The largest a recovery attempt's state may grow, allocated once per
+    /// attempt: a bring-up's awaits keep their locals across steps, and a
+    /// change that makes this larger should be seen.
+    /// 2584 bytes when this bound was set.
+    const RECOVERY_ATTEMPT_BYTES: usize = 4 * 1024;
+
+    #[test]
+    fn a_recovery_attempt_is_one_bounded_allocation() {
+        let memory = Arc::new(std::sync::Mutex::new(
+            super::super::ring::tests::Memory::default(),
+        ));
+        let firmware: &'static dyn Provider =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(firmware::tests::catalog(
+                &firmware::tests::requests(Chip::Mt7925),
+                Vec::new(),
+                Vec::new(),
+            )));
+        let hardware = Hardware {
+            pci: PciIdentity {
+                vendor: 0x14c3,
+                device: 0x7925,
+                subsystem_vendor: 0,
+                subsystem_device: 0,
+                revision: 0,
+            },
+            base: NonNull::dangling(),
+            bytes: 0x200000,
+            resource: Arc::new(()),
+            domain: Arc::new(super::super::ring::tests::Domain(memory)),
+            firmware,
+            pages: &super::super::ring::tests::Source,
+            clock: Clock {
+                ticks_per_microsecond: 1,
+            },
+            vector: false,
+            aspm: false,
+            alpha2: *b"US",
+            country: crate::wifi::regulatory::database::tests::country(),
+            sar: Sar::default(),
+            entropy: Arc::new(Fixed(1)),
+            failed: Vec::new(),
+            polled: true,
+        };
+        // Never polled: only its size is read.
+        let attempt = recovery(hardware, Mac([2, 0, 0, 0, 0, 1]));
+        let bytes = core::mem::size_of_val(&attempt);
+        assert!(bytes <= RECOVERY_ATTEMPT_BYTES, "{bytes} bytes");
     }
 
     #[test]
