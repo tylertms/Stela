@@ -2404,6 +2404,10 @@ fn branch_condition_with(
 }
 
 #[cfg(test)]
+mod flag_cost_tests;
+#[cfg(test)]
+mod host_cost;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod vector_cache_tests;
