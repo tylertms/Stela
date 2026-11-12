@@ -295,6 +295,46 @@ fn block_ack_action_body_selects_source_request_or_normal_management_tid() {
     }
 }
 #[test]
+fn connac2_addba_request_asks_for_the_session_on_its_requested_tid() {
+    for chip in [Chip::Mt7921, Chip::Mt7922] {
+        for action in 0..=2u8 {
+            let mut bytes = [0; 33];
+            bytes[..2].copy_from_slice(&0x00d0u16.to_le_bytes());
+            bytes[4] = 2;
+            bytes[24] = 3;
+            bytes[25] = action;
+            // Block Ack Parameter Set: TID 5.
+            bytes[27..29].copy_from_slice(&(5u16 << 2 | 2).to_le_bytes());
+            let mut c = base(chip);
+            c.frame = Frame {
+                bytes: bytes.len(),
+                header_bytes: 24,
+                kind: Kind::Management,
+                subtype: 13,
+                tid: 0,
+                multicast: false,
+                fragment: Fragment::None,
+                sequence: Sequence::Hardware,
+                minimum_rate: true,
+            };
+            c.protect = false;
+            c.hardware_amsdu = false;
+            c.fixed_rate = Some(FixedRate::Connac2(11 | 1 << 6));
+            assert_eq!(encode(c), Err(Error::UnsupportedFrame));
+            let w = words(encode_mpdu(c, &bytes).unwrap());
+            let request = action == 0;
+            assert_eq!((w[1] >> 20) & 7, if request { 5 } else { 0 });
+            assert_eq!(w[5] & (1 << 14) != 0, request);
+            assert_eq!((w[7] >> 16) & 15, 13);
+            assert_ne!(w[2] & (1 << 31), 0);
+            // Another category is ordinary management.
+            bytes[24] = 4;
+            let w = words(encode_mpdu(c, &bytes).unwrap());
+            assert_eq!(((w[1] >> 20) & 7, w[5] & (1 << 14)), (0, 0));
+        }
+    }
+}
+#[test]
 fn protected_sa_query_requires_full_protection() {
     for action in 0..=1u8 {
         let mut bytes = [0; 28];

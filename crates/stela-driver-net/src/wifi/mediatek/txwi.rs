@@ -106,7 +106,9 @@ pub struct Config {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum QualifiedAction {
-    BlockAck(u8),
+    /// A Block Ack action and its code; an ADDBA request also names the
+    /// TID its capability field requests.
+    BlockAck(u8, u8),
     SaQuery,
     /// Any other unprotected action, ordinary management to
     /// `mt7925_mac_write_txwi_80211`.
@@ -117,8 +119,8 @@ pub fn encode(c: Config) -> Result<[u8; 32], Error> {
     encode_inner(c, None)
 }
 
-/// Body-checked MT7925 Block Ack, protected unicast SA Query and other
-/// action path; only a robust category may be protected.
+/// Body-checked Block Ack, protected unicast SA Query and other action
+/// path; only a robust category may be protected.
 /// Metadata-only Action encoding remains refused: the real category/action bytes select the donor
 /// ADDBA-request TID independently of ordinary response/DELBA management.
 /// This constructs no agreement, radio permission, protection or air receipt.
@@ -127,8 +129,7 @@ pub(in crate::wifi::mediatek) fn encode_mpdu(c: Config, bytes: &[u8]) -> Result<
         return encode(c);
     }
     let h = crate::wifi::frame::Header::parse(bytes).map_err(|_| Error::InvalidHeader)?;
-    if c.chip != Chip::Mt7925
-        || h.fragmented()
+    if h.fragmented()
         || h.control & 0x00fc != 0x00d0
         || h.length != 24
         || usize::from(c.frame.header_bytes) != h.length
@@ -173,7 +174,13 @@ pub(in crate::wifi::mediatek) fn encode_mpdu(c: Config, bytes: &[u8]) -> Result<
     if body.len() < minimum {
         return Err(Error::InvalidHeader);
     }
-    encode_inner(c, Some(QualifiedAction::BlockAck(action)))
+    // The ADDBA request's TID, from its Block Ack Parameter Set.
+    let tid = if action == 0 {
+        ((u16::from_le_bytes([body[3], body[4]]) >> 2) & 15) as u8
+    } else {
+        0
+    };
+    encode_inner(c, Some(QualifiedAction::BlockAck(action, tid)))
 }
 
 fn encode_inner(c: Config, action: Option<QualifiedAction>) -> Result<[u8; 32], Error> {
@@ -255,7 +262,7 @@ fn encode_inner(c: Config, action: Option<QualifiedAction>) -> Result<[u8; 32], 
     let mut amsdu = c.hardware_amsdu && c.pid < 3;
     if connac3 {
         // pinned connac3 tx_mgnt_type::{MT_TX_NORMAL=0,MT_TX_ADDBA=2}.
-        let tid = if action == Some(QualifiedAction::BlockAck(0)) {
+        let tid = if matches!(action, Some(QualifiedAction::BlockAck(0, _))) {
             2
         } else if f.kind == Kind::Management {
             0
@@ -281,9 +288,21 @@ fn encode_inner(c: Config, action: Option<QualifiedAction>) -> Result<[u8; 32], 
             words[1] |= 1 << 31;
         }
     } else {
+        // mt76_connac2_mac_write_txwi_80211: an ADDBA request asks for the
+        // session (MT_TXD5_ADD_BA) and carries its TID.
+        let tid = match action {
+            Some(QualifiedAction::BlockAck(0, tid)) => {
+                words[5] |= 1 << 14;
+                tid
+            }
+            _ => f.tid,
+        };
+        if tid > 7 {
+            return Err(Error::InvalidTid);
+        }
         words[1] |= 1 << 31
             | u32::from(vif.omac) << 24
-            | u32::from(f.tid) << 20
+            | u32::from(tid) << 20
             | 2 << 16
             | u32::from(f.header_bytes / 2) << 11;
         if c.phy_band_one || vif.band != 0 {
