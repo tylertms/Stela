@@ -15,6 +15,7 @@ fn us() -> Country {
 
 fn planned(configuration: u8, eht_control: Option<&[u8]>, sar: &Sar) -> Plan {
     Plan::new(Inputs {
+        chip: Chip::Mt7925,
         country: &us(),
         bands: [true; 3],
         channel_configuration: configuration,
@@ -158,6 +159,7 @@ fn acpi_sar_caps_each_range() {
 #[test]
 fn a_missing_band_stops_the_channel_update_as_the_source_does() {
     let plan = Plan::new(Inputs {
+        chip: Chip::Mt7925,
         country: &us(),
         bands: [false, true, true],
         channel_configuration: 0,
@@ -178,4 +180,48 @@ fn a_missing_band_stops_the_channel_update_as_the_source_does() {
     assert_eq!(*values(inputs.domain.channels_5ghz).last().unwrap(), 177);
     assert_eq!(inputs.domain.channels_6ghz.len(), 59);
     assert!(inputs.power.ghz2.is_none());
+}
+
+#[test]
+fn connac2_follows_mt7921_regd_update() {
+    let mut rules = [0; 16];
+    rules[..4].copy_from_slice(&1u32.to_le_bytes());
+    rules[4..6].copy_from_slice(b"US");
+    for chip in [Chip::Mt7921, Chip::Mt7922] {
+        // No 2.4 GHz band: mt7921_regd_channel_update still drops UNII-4
+        // and UNII-5 to 8 without their CLC bits; a BE_CTRL rule never
+        // marks NO_EHT.
+        let plan = Plan::new(Inputs {
+            chip,
+            country: &us(),
+            bands: [false, true, true],
+            channel_configuration: 0,
+            eht_control: Some(&rules),
+            sar: &Sar::default(),
+        })
+        .unwrap();
+        let inputs = plan.inputs();
+        assert_eq!(*values(inputs.domain.channels_5ghz).last().unwrap(), 165);
+        assert!(inputs.domain.channels_6ghz.is_empty());
+        assert!(
+            inputs
+                .domain
+                .channels_5ghz
+                .iter()
+                .all(|c| c.flags & channel::NO_EHT == 0)
+        );
+        // Every band's rate power, 6 GHz without a CLC configuration too,
+        // over connac2's channel lists.
+        assert!(inputs.power.ghz2.is_none());
+        for (rows, band) in [
+            (inputs.power.ghz5, Band::Ghz5),
+            (inputs.power.ghz6, Band::Ghz6),
+        ] {
+            let values: Vec<u8> = rows.unwrap().iter().map(|r| r.hardware_value).collect();
+            assert_eq!(values, power::channels(chip, band));
+        }
+        assert_eq!(power(inputs.power.ghz5, 36), 46);
+        // Disabled 6 GHz channels keep the unregulated start.
+        assert_eq!(power(inputs.power.ghz6, 1), 127);
+    }
 }

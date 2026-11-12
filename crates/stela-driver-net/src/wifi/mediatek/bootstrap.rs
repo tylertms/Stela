@@ -54,12 +54,8 @@ pub enum Error {
     RequiredRfkill,
     ChannelNotInDomain,
     UnsupportedBand,
-    /// Only MT7925's regulatory programming is ported.
-    UnsupportedChip(Chip),
     FirmwareStatus(u32),
-    UnvalidatedHeaderFormat {
-        wcid: u16,
-    },
+    UnvalidatedHeaderFormat { wcid: u16 },
     Interface(mailbox::device::Error),
     WrongFirmware,
     Register(registers::Error),
@@ -554,14 +550,12 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
         s.phase = Phase::Clc;
         Ok(())
     }
-    /// The channel domain and rate power `mt7925_mcu_regd_update` programs
-    /// for `country` after the completed CLC, under the platform's `sar`.
+    /// The channel domain and rate power `mt7925_mcu_regd_update` or
+    /// `__mt7921_mcu_regd_update` programs for `country` after the completed
+    /// CLC, under the platform's `sar`.
     pub fn regulatory_plan(&self, country: &Country, sar: &Sar) -> Result<regd::Plan, Error> {
         self.require(Phase::Clc)?;
         let s = self.state();
-        if s.identity.chip != Chip::Mt7925 {
-            return Err(Error::UnsupportedChip(s.identity.chip));
-        }
         let policy = s.policy.as_ref().ok_or(Error::MissingPolicy)?;
         let observed = policy.capabilities().observed();
         let phy = observed.phy().ok_or(Error::MissingCapabilities)?;
@@ -570,6 +564,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
             .select_clc(policy.eeprom().observed().byte())
             .map_err(|error| Error::Clc(mailbox::clc::Error::Selection(error)))?;
         regd::Plan::new(regd::Inputs {
+            chip: s.identity.chip,
             country,
             bands: [
                 phy.has_2ghz(),

@@ -86,6 +86,10 @@ fn frequency(band: Band, channel: u8) -> u16 {
 
 /// What the plan reads from the completed CLC.
 pub struct Inputs<'a> {
+    /// MT7925 follows `mt7925_mcu_regd_update`; MT7921 and MT7922 follow
+    /// `__mt7921_mcu_regd_update`, which leaves EHT and the MTCL to the
+    /// firmware's CLC and sends every band's rate power.
+    pub chip: Chip,
     pub country: &'a Country,
     /// The bands the PHY registers: `cap.has_2ghz`, `has_5ghz`, `has_6ghz`.
     pub bands: [bool; 3],
@@ -126,8 +130,12 @@ impl Plan {
     /// `None` when the plan cannot be allocated.
     pub fn new(inputs: Inputs<'_>) -> Option<Self> {
         let country = inputs.country;
-        let mtcl = inputs.sar.mtcl_configuration(country.alpha2());
-        let eht = eht(&inputs, mtcl);
+        let connac3 = inputs.chip == Chip::Mt7925;
+        // mt7921 hands the MTCL to the firmware in SET_CLC and has no EHT.
+        let mtcl = connac3
+            .then(|| inputs.sar.mtcl_configuration(country.alpha2()))
+            .flatten();
+        let eht = !connac3 || eht(&inputs, mtcl);
         let mut configuration = inputs.channel_configuration;
         if let Some(mtcl) = mtcl {
             if mtcl & 3 == 0 {
@@ -163,8 +171,9 @@ impl Plan {
             }
             let mut regulated = country.band(centers)?;
             // mt7925_regd_channel_update stops at the first band the PHY
-            // lacks.
-            let updated = inputs.bands[..=i].iter().all(|&b| b);
+            // lacks; mt7921_regd_channel_update starts at 5 GHz.
+            let first = if connac3 { 0 } else { 1 };
+            let updated = inputs.bands[first.min(i)..=i].iter().all(|&b| b);
             let unii = match band {
                 Band::Ghz2 => &UNII[..0],
                 Band::Ghz5 => &UNII[..1],
@@ -195,11 +204,12 @@ impl Plan {
                     }),
             );
             // mt7925_mcu_set_rate_txpower skips 6 GHz without a CLC
-            // channel configuration.
-            if band == Band::Ghz6 && configuration == 0 {
+            // channel configuration; mt76_connac_mcu_set_rate_txpower
+            // sends every band the PHY has.
+            if connac3 && band == Band::Ghz6 && configuration == 0 {
                 continue;
             }
-            let rows = power::channels(Chip::Mt7925, band);
+            let rows = power::channels(inputs.chip, band);
             let mut power = Vec::new();
             power.try_reserve_exact(rows.len()).ok()?;
             for &value in rows {
