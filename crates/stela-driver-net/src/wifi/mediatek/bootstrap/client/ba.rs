@@ -222,8 +222,8 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                     1_000_000,
                 )
                 .map_err(Error::Reorder)?;
-                let bodies = Self::on_every_link(s, |p| {
-                    wire::modern::ba_request(
+                let bodies = Self::on_every_link(s, |codec, p| {
+                    codec.ba(
                         p,
                         session.tid(),
                         session.start_sequence(),
@@ -405,8 +405,8 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             return Err(Error::NeedsDrain);
         }
         native.stop(); // terminal software queue plus serialized timer/callback cancellation
-        let bodies = Self::on_every_link(s, |p| {
-            wire::modern::ba_request(
+        let bodies = Self::on_every_link(s, |codec, p| {
+            codec.ba(
                 p,
                 session.tid(),
                 session.start_sequence(),

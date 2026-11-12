@@ -112,7 +112,11 @@ fn pair(band: Band, width_bits: u8, width320: bool) -> (Capabilities, Capabiliti
     )
 }
 
-fn fixture(band: Band, mode: Mode, width: Width) -> (Profile, Configuration) {
+pub(in crate::wifi::mediatek::mcu::client) fn fixture(
+    band: Band,
+    mode: Mode,
+    width: Width,
+) -> (Profile, Configuration) {
     let bits = if band == Band::Ghz2 { 2 } else { 4 | 8 | 16 };
     let (local, peer) = pair(band, bits, band == Band::Ghz6);
     let n = Negotiated::between(&local, &peer, mode, width).unwrap();

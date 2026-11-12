@@ -75,6 +75,88 @@ pub struct MldLink {
     pub eml: Option<u16>,
 }
 
+/// The station command layouts of a chip's connac generation: the one
+/// place the client chooses between the MT7925's connac3 records and the
+/// MT7921 and MT7922's connac2 records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Codec {
+    Connac2,
+    Connac3,
+}
+impl Codec {
+    pub fn of(chip: crate::wifi::mediatek::identity::Chip) -> Self {
+        if chip == crate::wifi::mediatek::identity::Chip::Mt7925 {
+            Self::Connac3
+        } else {
+            Self::Connac2
+        }
+    }
+    /// The BSS_INFO_UPDATE bodies that configure the BSS: one connac3
+    /// request, or the connac2 sequence of `mt76_connac_mcu_uni_add_bss`.
+    pub fn bss(
+        self,
+        p: Profile,
+        modern: Option<&modern::Configuration>,
+        enable: bool,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        match self {
+            Self::Connac3 => Ok(vec![match modern {
+                Some(m) => m.bss_request(p, enable)?,
+                None => p.bss_request(enable)?,
+            }]),
+            Self::Connac2 => connac2::station::bss_requests(p, modern, enable),
+        }
+    }
+    /// The AP peer's STA_REC_UPDATE body; `associated` is the association's
+    /// state, and a disabled peer is its removal.
+    pub fn peer(
+        self,
+        p: Profile,
+        modern: Option<&modern::Configuration>,
+        enable: bool,
+        associated: bool,
+    ) -> Result<Vec<u8>, Error> {
+        match (self, modern) {
+            (Self::Connac3, Some(m)) if enable => m.peer_request(p, associated),
+            (Self::Connac3, _) => p.peer_request(enable, associated),
+            (Self::Connac2, _) => connac2::station::peer_request(p, modern, enable, associated),
+        }
+    }
+    /// The STA_REC_UPDATE body of the interface's broadcast entry.
+    pub fn broadcast(
+        self,
+        p: Profile,
+        modern: Option<&modern::Configuration>,
+    ) -> Result<Vec<u8>, Error> {
+        match self {
+            Self::Connac3 => p.broadcast_request(),
+            Self::Connac2 => connac2::station::broadcast_request(p, modern),
+        }
+    }
+    /// The STA_REC_UPDATE bodies of one block-ack agreement's change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ba(
+        self,
+        p: Profile,
+        tid: u8,
+        ssn: u16,
+        window: u16,
+        amsdu: bool,
+        enable: bool,
+        transmit: bool,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        match self {
+            Self::Connac3 => Ok(vec![modern::ba_request(
+                p, tid, ssn, window, amsdu, enable, transmit,
+            )?]),
+            Self::Connac2 => {
+                connac2::station::ba_requests(p, tid, ssn, window, amsdu, enable, transmit)
+                    .map(Vec::from)
+            }
+        }
+    }
+}
+
 fn put16(bytes: &mut [u8], at: usize, v: u16) {
     bytes[at..at + 2].copy_from_slice(&v.to_le_bytes());
 }

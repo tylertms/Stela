@@ -349,8 +349,8 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 }
                 // Generic TX_OPERATIONAL's source params.ssn is0; the request
                 // software snapshot is a separate management input, not this.
-                let bodies = Self::on_every_link(s, |p| {
-                    wire::modern::ba_request(
+                let bodies = Self::on_every_link(s, |codec, p| {
+                    codec.ba(
                         p,
                         session.tid(),
                         0,
@@ -425,8 +425,8 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         if Self::tx_ba_pending(s, &session) {
             return Err(Error::NeedsDrain);
         }
-        let bodies = Self::on_every_link(s, |p| {
-            wire::modern::ba_request(p, session.tid(), 0, 1, false, false, true)
+        let bodies = Self::on_every_link(s, |codec, p| {
+            codec.ba(p, session.tid(), 0, 1, false, false, true)
         })?;
         if let Err(error) = bodies
             .iter()

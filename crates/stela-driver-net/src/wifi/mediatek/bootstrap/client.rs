@@ -403,6 +403,10 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             })),
         })
     }
+    /// The station command layouts of the controller's chip.
+    fn codec(s: &Owned<I, Q, C>) -> wire::Codec {
+        wire::Codec::of(s.controller.state().identity.chip)
+    }
     fn state(&self) -> &Owned<I, Q, C> {
         self.owned.as_deref().unwrap()
     }
@@ -530,20 +534,20 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 if p.supported_rates & !supported != 0 {
                     return Err(Error::WrongProfile);
                 }
-                let bss = p.bss_request(true).map_err(Error::Codec)?;
-                let peer = p.peer_request(true, true).map_err(Error::Codec)?;
-                Self::command(s, Command::BssInfo, &bss)?;
+                let codec = Self::codec(s);
+                let bss = codec.bss(p, None, true).map_err(Error::Codec)?;
+                let peer = codec.peer(p, None, true, true).map_err(Error::Codec)?;
+                let broadcast = codec.broadcast(p, None).map_err(Error::Codec)?;
+                for body in &bss {
+                    Self::command(s, Command::BssInfo, body)?;
+                }
                 s.controller
                     .state_mut()
                     .control
                     .clear_peer_admission(p.wcid)
                     .map_err(|e| Error::Bootstrap(super::Error::Control(e)))?;
                 Self::command(s, Command::StationRecord, &peer)?;
-                Self::command(
-                    s,
-                    Command::StationRecord,
-                    &p.broadcast_request().map_err(Error::Codec)?,
-                )?;
+                Self::command(s, Command::StationRecord, &broadcast)?;
                 Self::command(
                     s,
                     Command::BssInfo,

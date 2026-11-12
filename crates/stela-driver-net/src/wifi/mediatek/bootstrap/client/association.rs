@@ -115,9 +115,12 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         }
         let generation = s.peer_generation.checked_add(1).ok_or(Error::Busy)?;
         // Prepare all source bodies before beginning physical mutation.
-        let bss = profile.bss_request(false).map_err(Error::Codec)?;
-        let peer = profile.peer_request(true, false).map_err(Error::Codec)?;
-        let broadcast = profile.broadcast_request().map_err(Error::Codec)?;
+        let codec = Self::codec(s);
+        let bss = codec.bss(profile, None, false).map_err(Error::Codec)?;
+        let peer = codec
+            .peer(profile, None, true, false)
+            .map_err(Error::Codec)?;
+        let broadcast = codec.broadcast(profile, None).map_err(Error::Codec)?;
         let ciphers = join.request.key_ciphers();
         let management_cipher = join.request.pmf().map(|pmf| pmf.management());
         let action = match beacon {
@@ -167,7 +170,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             .control
             .clear_peer_admission(profile.wcid)
             .map_err(|e| Error::Bootstrap(super::super::Error::Control(e)))?;
-        Self::command(s, Command::BssInfo, &bss)?;
+        for body in &bss {
+            Self::command(s, Command::BssInfo, body)?;
+        }
         Self::command(s, Command::StationRecord, &peer)?;
         s.format_generation = Some(generation);
         Self::command(s, Command::StationRecord, &broadcast)?;
@@ -265,8 +270,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         let mut p = s.profile.ok_or(Error::WrongProfile)?;
         if p.cipher == 0 {
             p.cipher = 4;
-            let b = Self::bss_request(s, p, true)?;
-            Self::command(s, Command::BssInfo, &b)?;
+            for body in Self::bss_request(s, p, true)? {
+                Self::command(s, Command::BssInfo, &body)?;
+            }
             s.profile = Some(p);
         }
         let key = if pairwise {

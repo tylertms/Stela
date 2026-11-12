@@ -128,5 +128,7 @@ pub(in crate::wifi::mediatek) fn scan_done(event_id: u8) -> bool {
     SCAN_DONE_EVENTS.contains(&event_id)
 }
 
+pub(in crate::wifi::mediatek) mod station;
+
 #[cfg(test)]
 mod tests;

@@ -75,7 +75,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             Command::StationRecord,
             &match &six {
                 Some(codec) => codec.peer_request(false),
-                None => p.peer_request(false, false),
+                None => Self::codec(s).peer(p, None, false, false),
             }
             .map_err(Error::Codec)?,
         )?;
@@ -85,10 +85,12 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             .clear_peer_admission(p.wcid)
             .map_err(|e| Error::Bootstrap(super::super::Error::Control(e)))?;
         let bss = match &six {
-            Some(codec) => codec.bss_request().map_err(Error::Codec)?,
+            Some(codec) => vec![codec.bss_request().map_err(Error::Codec)?],
             None => Self::bss_request(s, p, false)?,
         };
-        Self::command(s, Command::BssInfo, &bss)?;
+        for body in &bss {
+            Self::command(s, Command::BssInfo, body)?;
+        }
         Self::remove_links(s)?;
         s.phase = Phase::NeedsDrain;
         Ok(())

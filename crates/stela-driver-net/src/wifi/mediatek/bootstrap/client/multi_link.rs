@@ -527,13 +527,18 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
     /// block ack session on every link's AP WCID.
     pub(super) fn on_every_link(
         s: &Owned<I, Q, C>,
-        record: impl Fn(Profile) -> Result<Vec<u8>, wire::Error>,
+        record: impl Fn(wire::Codec, Profile) -> Result<Vec<Vec<u8>>, wire::Error>,
     ) -> Result<Vec<Vec<u8>>, Error> {
         let p = s.profile.ok_or(Error::WrongProfile)?;
-        [p].into_iter()
+        let codec = Self::codec(s);
+        let mut bodies = Vec::new();
+        for p in [p]
+            .into_iter()
             .chain(s.links.iter().map(|link| link.profile))
-            .map(|p| record(p).map_err(Error::Codec))
-            .collect()
+        {
+            bodies.extend(record(codec, p).map_err(Error::Codec)?);
+        }
+        Ok(bodies)
     }
 
     /// The AP's WCID on each link of the association whose setup link `p`

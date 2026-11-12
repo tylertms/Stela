@@ -177,7 +177,16 @@ impl Configuration {
         self.matches(profile)?;
         profile.bss_request_inner(enable, Some(self), self.link.as_ref())
     }
-    fn matches(&self, profile: Profile) -> Result<(), Error> {
+    /// The local HE MCS maps for 80, 160 and 80+80 MHz the BSS's HE record
+    /// carries.
+    pub(super) const fn local_he_maps(&self) -> &[McsMaps; 3] {
+        &self.local_he_maps
+    }
+    /// The BSS's operating width.
+    pub(super) const fn width(&self) -> Width {
+        self.width
+    }
+    pub(super) fn matches(&self, profile: Profile) -> Result<(), Error> {
         // Recheck supplied resources/rates/antenna against this kept
         // metadata on every request, before any caller can publish it.
         Self::checked(
@@ -520,4 +529,4 @@ pub fn ba_request(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

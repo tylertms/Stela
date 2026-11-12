@@ -67,9 +67,8 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         let bss = if profile.cipher == 0 {
             profile.cipher = cipher_code(cipher);
             Some(
-                modern
-                    .wire
-                    .bss_request(profile, true)
+                Self::codec(s)
+                    .bss(profile, Some(&modern.wire), true)
                     .map_err(Error::Codec)?,
             )
         } else {
@@ -95,8 +94,10 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 wifi::regulatory::AssociationUse::Management,
                 |_, _| {
                     *phase = Phase::Quarantined;
-                    if let Some(body) = &bss {
-                        Self::command_parts(controller, replies, Command::BssInfo, body)?;
+                    if let Some(bodies) = &bss {
+                        for body in bodies {
+                            Self::command_parts(controller, replies, Command::BssInfo, body)?;
+                        }
                         *current_profile = Some(profile);
                     }
                     let mailbox = controller.state_mut().mailbox.as_mut().unwrap();
@@ -426,12 +427,10 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         s: &Owned<I, Q, C>,
         p: Profile,
         enable: bool,
-    ) -> Result<Vec<u8>, Error> {
-        match s.modern.as_ref() {
-            Some(m) => m.wire.bss_request(p, enable),
-            None => p.bss_request(enable),
-        }
-        .map_err(Error::Codec)
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        Self::codec(s)
+            .bss(p, s.modern.as_ref().map(|m| &m.wire), enable)
+            .map_err(Error::Codec)
     }
 
     pub(super) fn prepare_modern(
@@ -473,19 +472,22 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             }
             wire = wire.with_link(Self::mld_link(affiliation, p));
         }
+        let codec = Self::codec(s);
+        let bss = codec.bss(p, Some(&wire), true).map_err(Error::Codec)?;
         let mut commands = Vec::new();
-        commands.try_reserve_exact(7).map_err(|_| Error::NoMemory)?;
+        commands
+            .try_reserve_exact(6 + bss.len())
+            .map_err(|_| Error::NoMemory)?;
+        commands.extend(bss.into_iter().map(|body| (Command::BssInfo, body)));
         commands.push((
-            Command::BssInfo,
-            wire.bss_request(p, true).map_err(Error::Codec)?,
+            Command::StationRecord,
+            codec
+                .peer(p, Some(&wire), true, true)
+                .map_err(Error::Codec)?,
         ));
         commands.push((
             Command::StationRecord,
-            wire.peer_request(p, true).map_err(Error::Codec)?,
-        ));
-        commands.push((
-            Command::StationRecord,
-            p.broadcast_request().map_err(Error::Codec)?,
+            codec.broadcast(p, Some(&wire)).map_err(Error::Codec)?,
         ));
         commands.push((Command::Edca, wire.edca_request(p).map_err(Error::Codec)?));
         if context.negotiated().eht.is_some() {

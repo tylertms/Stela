@@ -68,15 +68,19 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             profile.interface = context;
         }
         // Every fallible body is prepared before Station or hardware mutation.
+        let codec = Self::codec(s);
         let bss = match &multi_link {
-            Some(affiliation) => {
-                profile.link_bss_request(false, &Self::mld_link(affiliation, profile))
-            }
-            None => profile.bss_request(false),
+            // Only the MT7925 advertises multi-link operation.
+            Some(affiliation) => profile
+                .link_bss_request(false, &Self::mld_link(affiliation, profile))
+                .map(|body| vec![body]),
+            None => codec.bss(profile, None, false),
         }
         .map_err(Error::Codec)?;
-        let peer = profile.peer_request(true, false).map_err(Error::Codec)?;
-        let broadcast = profile.broadcast_request().map_err(Error::Codec)?;
+        let peer = codec
+            .peer(profile, None, true, false)
+            .map_err(Error::Codec)?;
+        let broadcast = codec.broadcast(profile, None).map_err(Error::Codec)?;
         let session = s
             .station
             .begin_external_authentication(
@@ -107,7 +111,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             .control
             .clear_peer_admission(profile.wcid)
             .map_err(|e| Error::Bootstrap(super::super::Error::Control(e)))?;
-        Self::command(s, Command::BssInfo, &bss)?;
+        for body in &bss {
+            Self::command(s, Command::BssInfo, body)?;
+        }
         Self::command(s, Command::StationRecord, &peer)?;
         s.format_generation = Some(generation);
         Self::command(s, Command::StationRecord, &broadcast)?;
