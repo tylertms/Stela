@@ -82,7 +82,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             .ok_or(Error::WrongProfile)?;
         if actual.capabilities().observed().six_ghz() != Some(true)
             || !actual.initial_channel_present(profile.channel.band, profile.channel.number as u8)
-            || actual.programmed_mt7925().is_none()
+            || actual.programmed().is_none()
         {
             return Err(Error::WrongProfile);
         }
@@ -90,11 +90,15 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         if profile.antenna_mask != local.antenna_mask() {
             return Err(Error::WrongProfile);
         }
-        let codec =
-            wire::six_ghz::Preauthentication::new(profile, local.capabilities(), observed.bss())
-                .map_err(Error::Codec)?;
+        let codec = wire::six_ghz::Preauthentication::new(
+            Self::codec(s),
+            profile,
+            local.capabilities(),
+            observed.bss(),
+        )
+        .map_err(Error::Codec)?;
         // All bodies and bounds are prepared before state or native effects.
-        let bss = codec.bss_request().map_err(Error::Codec)?;
+        let bss = codec.bss_requests().map_err(Error::Codec)?;
         let peer = codec.peer_request(true).map_err(Error::Codec)?;
         let broadcast = codec.broadcast_request().map_err(Error::Codec)?;
         let generation = s.peer_generation.checked_add(1).ok_or(Error::NeedsDrain)?;
@@ -163,11 +167,11 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                     .control
                     .clear_peer_admission(profile.wcid)
                     .map_err(|e| Error::Bootstrap(super::super::Error::Control(e)))?;
-                for (command, bytes) in [
-                    (Command::BssInfo, &bss),
+                // MT7925's order; each connac2 BSS body is its own command.
+                for (command, bytes) in bss.iter().map(|b| (Command::BssInfo, b)).chain([
                     (Command::StationRecord, &peer),
                     (Command::StationRecord, &broadcast),
-                ] {
+                ]) {
                     Self::qualify_six(s, guard, Use::PreparePeer, now)?;
                     Self::command(s, command, bytes)?;
                 }

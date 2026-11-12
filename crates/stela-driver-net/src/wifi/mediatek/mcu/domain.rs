@@ -102,6 +102,15 @@ impl Request {
     pub fn counts(&self) -> [u8; 3] {
         self.counts
     }
+    /// The rows `build` wrote for band index `band` (2.4, 5, 6 GHz), each a
+    /// hardware value, two pad bytes and the raw flags, after this chip's
+    /// header.
+    pub fn rows(&self, band: usize) -> &[[u8; 8]] {
+        let header = if self.chip == Chip::Mt7925 { 16 } else { 12 };
+        let first: usize = self.counts[..band].iter().map(|&n| usize::from(n)).sum();
+        let rows = self.body[header..].as_chunks::<8>().0;
+        &rows[first..first + usize::from(self.counts[band])]
+    }
     pub fn expects_response(&self) -> bool {
         self.chip == Chip::Mt7925
     }

@@ -646,7 +646,7 @@ fn active_six_ghz_rnr_requires_programmed_probe_policy_and_reuses_refused_owner(
                         .policy
                         .as_ref()
                         .unwrap()
-                        .programmed_mt7925()
+                        .programmed()
                         .unwrap()
                         .0,
                     band,
@@ -706,7 +706,17 @@ fn mismatched_country_returns_original_owner_and_sku_padding_is_not_power() {
     assert_eq!(
         sku_max(
             &wifi::mediatek::mcu::power::Limits::uniform(-3).sku(Chip::Mt7925, Band::Ghz5),
-            Band::Ghz5
+            Band::Ghz5,
+            Chip::Mt7925
+        ),
+        Some(-3)
+    );
+    // mt76_connac_mcu_build_sku's 161-byte connac2 SKU.
+    assert_eq!(
+        sku_max(
+            &wifi::mediatek::mcu::power::Limits::uniform(-3).sku(Chip::Mt7921, Band::Ghz5),
+            Band::Ghz5,
+            Chip::Mt7921
         ),
         Some(-3)
     );

@@ -177,17 +177,28 @@ fn channel(band: Band, n: u16) -> Option<Channel> {
         frequency_mhz: mhz,
     })
 }
-fn sku_max(sku: &[u8], band: Band) -> Option<i8> {
-    if sku.len() != 449 {
+/// The highest power a rate-power row's SKU allows on `band`. Its rates start
+/// after CCK and OFDM at byte 44 on MT7925 and 12 on MT7921 and MT7922: HT20,
+/// HT40 and MCS32, VHT or HE MCS in rows of 12 with 10 used, RU rows, then
+/// MT7925's EHT rows.
+fn sku_max(sku: &[u8], band: Band, chip: Chip) -> Option<i8> {
+    let (rates, len) = if chip == Chip::Mt7925 {
+        (44, 449)
+    } else {
+        (12, 161)
+    };
+    if sku.len() != len {
         return None;
     }
+    let mcs = rates + 17;
+    let ru = mcs + 48;
     let mut result = i8::MIN;
     for (i, &raw) in sku.iter().enumerate() {
         let used = (band == Band::Ghz2 && i < 4)
             || (4..12).contains(&i)
-            || (44..61).contains(&i)
-            || (61..109).contains(&i) && (i - 61) % 12 < 10
-            || (109..449).contains(&i);
+            || (rates..mcs).contains(&i)
+            || (mcs..ru).contains(&i) && (i - mcs) % 12 < 10
+            || i >= ru;
         if used {
             result = result.max(raw as i8);
         }
@@ -208,39 +219,50 @@ impl Snapshot {
         let (domain, power) = c
             .policy
             .as_ref()
-            .and_then(|p| p.programmed_mt7925())
+            .and_then(|p| p.programmed())
             .ok_or(PolicyError::IncompleteProgramming)?;
         if domain.alpha2() != country.alpha2() || power.alpha2() != country.alpha2() {
             return Err(PolicyError::CountryMismatch);
         }
+        // mt7925_mcu_rate_txpower_band's 52-byte header and 450-byte rows;
+        // mt76_connac_mcu_rate_txpower_band's 44 and 162, with a PSE flush
+        // after each request.
+        let chip = domain.chip();
+        let (header, row, band_at) = if chip == Chip::Mt7925 {
+            (52, 450, 13)
+        } else {
+            (44, 162, 5)
+        };
+        let rates = || {
+            power.requests().iter().filter(|r| {
+                r.kind() != wifi::mediatek::mcu::power::Kind::PseFlush || chip == Chip::Mt7925
+            })
+        };
         let mut powers = Vec::new();
-        let n = power
-            .requests()
-            .iter()
-            .map(|r| r.body().len().saturating_sub(52) / 450)
+        let n = rates()
+            .map(|r| r.body().len().saturating_sub(header) / row)
             .sum();
         powers
             .try_reserve_exact(n)
             .map_err(|_| PolicyError::NoMemory)?;
-        for request in power.requests() {
+        for request in rates() {
             let body = request.body();
             if request.kind() != wifi::mediatek::mcu::power::Kind::RatePower {
                 return Err(PolicyError::IncompleteProgramming);
             }
-            let band = match body.get(13) {
+            let band = match body.get(band_at) {
                 Some(1) => Band::Ghz2,
                 Some(2) => Band::Ghz5,
                 Some(3) => Band::Ghz6,
                 _ => return Err(PolicyError::IncompleteProgramming),
             };
             for raw in body
-                .get(52..)
+                .get(header..)
                 .ok_or(PolicyError::IncompleteProgramming)?
-                .as_chunks::<450>()
-                .0
+                .chunks(row)
             {
                 let c = channel(band, u16::from(raw[0])).ok_or(PolicyError::PowerMismatch)?;
-                let max = sku_max(&raw[1..], band).ok_or(PolicyError::PowerMismatch)?;
+                let max = sku_max(&raw[1..], band, chip).ok_or(PolicyError::PowerMismatch)?;
                 if powers.iter().any(|&(p, _)| p == c) {
                     return Err(PolicyError::PowerMismatch);
                 }
@@ -252,10 +274,8 @@ impl Snapshot {
         channels
             .try_reserve_exact(counts.iter().map(|&n| usize::from(n)).sum())
             .map_err(|_| PolicyError::NoMemory)?;
-        let mut entries = domain.body()[16..].as_chunks::<8>().0.iter();
-        for (band, count) in [Band::Ghz2, Band::Ghz5, Band::Ghz6].into_iter().zip(counts) {
-            for _ in 0..count {
-                let e = entries.next().ok_or(PolicyError::IncompleteProgramming)?;
+        for (index, band) in [Band::Ghz2, Band::Ghz5, Band::Ghz6].into_iter().enumerate() {
+            for e in domain.rows(index) {
                 let channel = channel(band, u16::from_le_bytes([e[0], e[1]]))
                     .ok_or(PolicyError::RestrictionMismatch)?;
                 let flags = u32::from_le_bytes(e[4..8].try_into().unwrap());

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 // Copyright (C) 2016 Felix Fietkau <nbd@nbd.name>
 // Copyright (C) 2020-2025 MediaTek Inc.
-//! Source-selected MT7925 station advertisements from this device's
+//! Source-selected MT7921, MT7922 and MT7925 station advertisements from this device's
 //! NIC, image/EEPROM/CLC and source-policy observations. Advertisement
 //! bytes are capabilities, never an association or transmission permission.
 use super::*;
@@ -137,7 +137,8 @@ pub(super) fn current<I: BarIo, Q: QueueIo, C: 'static>(
         .ok_or(LocalError::MissingPhy)?;
     let observations = policy.capabilities().observed();
     let phy = observations.phy().ok_or(LocalError::MissingPhy)?;
-    if observations.chip() != Chip::Mt7925 {
+    let chip = observations.chip();
+    if chip != s.controller.state().identity.chip {
         return Err(LocalError::WrongDevice);
     }
     let available = match band {
@@ -151,13 +152,17 @@ pub(super) fn current<I: BarIo, Q: QueueIo, C: 'static>(
     let antenna = phy.antenna_mask().map_err(|_| LocalError::UnsupportedNss)?;
     // The pinned PHY callback sets chainmask=antenna_mask; it does
     // not infer extra sounding chains from an unrelated EEPROM default.
-    let selection = policy
-        .auxiliary()
-        .select_clc(policy.eeprom().observed().byte())
-        .map_err(LocalError::Selection)?;
     let inputs = policy.source_inputs();
-    let eht = source_eht_enabled(&selection, inputs.alpha2, inputs.mtcl_configuration)?;
+    // MT7921 and MT7922 have no EHT, and their CLC no BE control.
+    let eht = chip == Chip::Mt7925 && {
+        let selection = policy
+            .auxiliary()
+            .select_clc(policy.eeprom().observed().byte())
+            .map_err(LocalError::Selection)?;
+        source_eht_enabled(&selection, inputs.alpha2, inputs.mtcl_configuration)?
+    };
     make(
+        chip,
         band,
         antenna,
         u16::from(antenna),
@@ -220,9 +225,22 @@ fn mcs(nss: u8) -> u16 {
 // A-MSDU; LDPC/STBC/MU/DCM/beamformee/feedback/PPE/long-SIG-B capabilities.
 const HE_STATION_MAC: [u8; 6] = [1, 8, 0, 0x1a, 0x40, 0];
 const HE_STATION_PHY: [u8; 11] = [0, 0x70, 0xce, 0x12, 0x6d, 0xc0, 0xb3, 6, 0x4e, 0x3f, 0];
+/// mt7921_init_he_caps sets the same station fields except these, which it
+/// adds only for MT7922: PHY 0 CHANNEL_WIDTH_SET_160MHZ_IN_5G, PHY 4
+/// BEAMFORMEE_MAX_STS_ABOVE_80MHZ_4, PHY 8 20MHZ_IN_160MHZ and
+/// 80MHZ_IN_160MHZ_HE_PPDU.
+const HE_160: [(usize, u8); 3] = [(0, 0x08), (4, 0x60), (8, 0x0c)];
 const HT_BASE: u16 = 0x0973;
 const VHT_BASE: u32 = 0x3390_7176;
+/// VHT SUPP_CHAN_WIDTH_160MHZ and SHORT_GI_160, which mt7921_register_device
+/// adds only for MT7922.
+const VHT_160: u32 = 0x44;
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each is one source input of the advertisement"
+)]
 fn make(
+    chip: Chip,
     band: Band,
     antenna: u8,
     chainmask: u16,
@@ -241,6 +259,8 @@ fn make(
     {
         return Err(LocalError::UnsupportedWidth);
     }
+    let wide = chip != Chip::Mt7921;
+    let eht = eht && chip == Chip::Mt7925;
     let mut elements = Vec::new();
     if band == Band::Ghz2 {
         ie(&mut elements, 1, &[2, 4, 11, 22, 12, 18, 24, 36]);
@@ -256,14 +276,21 @@ fn make(
         ht[..2].copy_from_slice(&cap.to_le_bytes());
         // Preserve the exact pinned init.c assignment:2G density is assigned
         // twice, ending at1us(enum3);5G remains its initialized zero value.
-        ht[2] = 3 | if band == Band::Ghz2 { 3 << 2 } else { 0 };
+        // mt7921 leaves both at mt76_init_sband's zero.
+        let density = if band == Band::Ghz2 && chip == Chip::Mt7925 {
+            3
+        } else {
+            0
+        };
+        ht[2] = 3 | density << 2;
         ht[3..3 + usize::from(nss)].fill(0xff);
         ht[15] = 1;
         ie(&mut elements, 45, &ht);
         ie(&mut elements, 127, &EXTENDED_CAPABILITIES);
         if band == Band::Ghz5 {
             let mut vht = [0; 12];
-            let cap = VHT_BASE | if nss > 1 { 0x80 } else { 0 };
+            let base = if wide { VHT_BASE } else { VHT_BASE & !VHT_160 };
+            let cap = base | if nss > 1 { 0x80 } else { 0 };
             vht[..4].copy_from_slice(&cap.to_le_bytes());
             vht[4..6].copy_from_slice(&mcs(nss).to_le_bytes());
             vht[8..10].copy_from_slice(&mcs(nss).to_le_bytes());
@@ -278,9 +305,14 @@ fn make(
     } else {
         4 | 8 | 0x40
     };
+    if !wide {
+        for (i, bits) in HE_160 {
+            phy[i] &= !bits;
+        }
+    }
     he.extend_from_slice(&phy);
     let map = mcs(nss).to_le_bytes();
-    for _ in 0..if band == Band::Ghz2 { 1 } else { 2 } {
+    for _ in 0..if band == Band::Ghz2 || !wide { 1 } else { 2 } {
         he.extend_from_slice(&map);
         he.extend_from_slice(&map);
     }
@@ -338,9 +370,14 @@ fn make(
             rx: mcs(nss),
             tx: mcs(nss),
         },
-        McsMaps {
-            rx: mcs(nss),
-            tx: mcs(nss),
+        // mt7921_init_he_caps fills the 160 MHz maps only for MT7922.
+        if wide {
+            McsMaps {
+                rx: mcs(nss),
+                tx: mcs(nss),
+            }
+        } else {
+            McsMaps { rx: 0, tx: 0 }
         },
         McsMaps { rx: 0, tx: 0 },
     ];
@@ -368,6 +405,7 @@ mod tests {
         for band in [Band::Ghz2, Band::Ghz5, Band::Ghz6] {
             for nss in 1..=4 {
                 let a = make(
+                    Chip::Mt7925,
                     band,
                     (1 << nss) - 1,
                     (1 << nss) - 1,
@@ -408,17 +446,117 @@ mod tests {
         };
         assert_eq!(m.reported_supported(), None);
         assert_eq!(
-            make(Band::Ghz5, 0, 0, Width::Mhz20, true, *b"US", m),
+            make(
+                Chip::Mt7925,
+                Band::Ghz5,
+                0,
+                0,
+                Width::Mhz20,
+                true,
+                *b"US",
+                m
+            ),
             Err(LocalError::UnsupportedNss)
         );
         assert_eq!(
-            make(Band::Ghz6, 3, 3, Width::Mhz320, true, *b"US", m),
+            make(
+                Chip::Mt7925,
+                Band::Ghz6,
+                3,
+                3,
+                Width::Mhz320,
+                true,
+                *b"US",
+                m
+            ),
             Err(LocalError::UnsupportedWidth)
         );
         assert_eq!(
-            make(Band::Ghz5, 3, 3, Width::Mhz80P80, true, *b"US", m),
+            make(
+                Chip::Mt7925,
+                Band::Ghz5,
+                3,
+                3,
+                Width::Mhz80P80,
+                true,
+                *b"US",
+                m
+            ),
             Err(LocalError::UnsupportedWidth)
         );
+    }
+
+    /// The element `id` (extension `extension` under 255) of `elements`.
+    fn find(elements: &[u8], id: u8, extension: Option<u8>) -> Option<&[u8]> {
+        let mut at = 0;
+        while at < elements.len() {
+            let len = usize::from(elements[at + 1]);
+            let body = &elements[at + 2..at + 2 + len];
+            if elements[at] == id && (id != 255 || Some(body[0]) == extension) {
+                return Some(if id == 255 { &body[1..] } else { body });
+            }
+            at += 2 + len;
+        }
+        None
+    }
+
+    #[test]
+    fn connac2_profiles_follow_mt7921_init_he_caps_and_register_device() {
+        if crate::test_process::isolate_model() {
+            return;
+        }
+        let m = MloObservations {
+            flags: None,
+            eml: None,
+        };
+        // MT7921 has no 160 MHz; MT7922 has the MT7925's. Neither has EHT,
+        // even when asked.
+        for (chip, phy0, phy4, phy8, vht, maps) in [
+            (Chip::Mt7921, 0x44, 0x0d, 0x42, 0x3390_71b2u32, 1),
+            (Chip::Mt7922, 0x4c, 0x6d, 0x4e, 0x3390_71f6, 2),
+        ] {
+            let a = make(chip, Band::Ghz5, 3, 3, Width::Mhz20, true, *b"US", m).unwrap();
+            let e = a.elements();
+            assert!(find(e, 255, Some(108)).is_none());
+            let ht = find(e, 45, None).unwrap();
+            assert_eq!(ht[..5], [0xf3, 0x09, 3, 0xff, 0xff]);
+            let v = find(e, 191, None).unwrap();
+            assert_eq!(v[..4], vht.to_le_bytes());
+            assert_eq!(v[4..12], [0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20]);
+            let he = find(e, 255, Some(35)).unwrap();
+            assert_eq!(he[..6], [1, 8, 0, 0x1a, 0x40, 0]);
+            assert_eq!(
+                he[6..17],
+                [phy0, 0x70, 0xce, 0x12, phy4, 0xc0, 0xb3, 6, phy8, 0x3f, 0]
+            );
+            let ppe = 17 + 4 * maps;
+            assert!(he[17..ppe].chunks(2).all(|m| m == [0xfa, 0xff]));
+            // mt76_connac_gen_ppe_thresh: NSS 2, RU mask 0xf.
+            assert_eq!(he[ppe..], [0x79, 0x1c, 0xc7, 0x71, 0x1c, 0xc7, 0x71]);
+            let wide = u16::from(chip == Chip::Mt7922) * 0xfffa;
+            assert_eq!(a.he_source_maps()[1], McsMaps { rx: wide, tx: wide });
+            assert_eq!(a.validate_capabilities(a.capabilities()), Ok(()));
+            // mt76_init_sband leaves the 2.4 GHz density at zero.
+            let a = make(chip, Band::Ghz2, 1, 1, Width::Mhz20, false, *b"US", m).unwrap();
+            assert_eq!(
+                find(a.elements(), 45, None).unwrap()[..4],
+                [0x73, 0x09, 3, 0xff]
+            );
+        }
+        // The 6 GHz capability derives from the 5 GHz HT and VHT as for MT7925.
+        let a = make(
+            Chip::Mt7922,
+            Band::Ghz6,
+            3,
+            3,
+            Width::Mhz20,
+            false,
+            *b"US",
+            m,
+        )
+        .unwrap();
+        assert_eq!(a.capabilities().he_6ghz(), Some(0x30b8));
+        assert!(find(a.elements(), 45, None).is_none());
     }
 
     #[test]
@@ -427,6 +565,7 @@ mod tests {
             return;
         }
         let source = make(
+            Chip::Mt7925,
             Band::Ghz5,
             3,
             3,
@@ -466,7 +605,17 @@ mod tests {
                 Err(LocalError::WrongAdvertisement)
             );
         }
-        let wrong_band = make(Band::Ghz2, 3, 3, Width::Mhz20, true, *b"US", source.mlo()).unwrap();
+        let wrong_band = make(
+            Chip::Mt7925,
+            Band::Ghz2,
+            3,
+            3,
+            Width::Mhz20,
+            true,
+            *b"US",
+            source.mlo(),
+        )
+        .unwrap();
         assert_eq!(
             source.validate_capabilities(wrong_band.capabilities()),
             Err(LocalError::WrongAdvertisement)
@@ -512,6 +661,7 @@ mod tests {
                     }
                     for enabled in [false, true] {
                         let a = make(
+                            Chip::Mt7925,
                             band,
                             (1 << nss) - 1,
                             (1 << nss) - 1,

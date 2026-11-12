@@ -56,10 +56,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             {
                 if request.channels().iter().any(|ch| ch.band == band) {
                     let actual = local::current(s, band).map_err(Error::Local)?;
-                    let domain = actual_policy
-                        .programmed_mt7925()
-                        .ok_or(Error::WrongProfile)?
-                        .0;
+                    let domain = actual_policy.programmed().ok_or(Error::WrongProfile)?.0;
                     let selection = local::scan::Selection::programmed(domain, band, he6);
                     elements[index] =
                         local::scan::with_extra(&actual, selection, request.extra_elements())

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 // Copyright (C) 2020-2023 MediaTek Inc.
-//! Source initial STATE_NONE peer/BSS and ROC20 codecs. This has
-//! no associated Configuration and cannot encode association/key/port success.
-use super::{Error, Profile};
+//! Source initial STATE_NONE peer/BSS and ROC20 codecs, in the chip's
+//! connac generation. This has no associated Configuration and cannot encode
+//! association/key/port success.
+use super::{Codec, Error, Outgoing, Profile, connac2};
 use crate::wifi::{
     Band,
     scan::result::Bss,
@@ -15,11 +16,17 @@ use alloc::vec::Vec;
 
 #[derive(Clone, Debug)]
 pub(in crate::wifi::mediatek) struct Preauthentication {
+    codec: Codec,
     profile: Profile,
     power_type: u8,
 }
 impl Preauthentication {
-    pub fn new(profile: Profile, local: &Capabilities, bss: &Bss) -> Result<Self, Error> {
+    pub fn new(
+        codec: Codec,
+        profile: Profile,
+        local: &Capabilities,
+        bss: &Bss,
+    ) -> Result<Self, Error> {
         profile.validate_inner(true)?;
         if profile.channel.band != Band::Ghz6
             || profile.aid != 0
@@ -86,6 +93,7 @@ impl Preauthentication {
             return Err(Error::InvalidTiming);
         }
         Ok(Self {
+            codec,
             profile,
             power_type,
         })
@@ -100,32 +108,49 @@ impl Preauthentication {
     pub fn set_band_index(&mut self, band: u8) {
         self.profile.interface.band_index = band;
     }
-    pub fn bss_request(&self) -> Result<Vec<u8>, Error> {
+    /// The disabled BSS's BSS_INFO_UPDATE bodies.
+    pub fn bss_requests(&self) -> Result<Vec<Vec<u8>>, Error> {
+        if let Codec::Connac2(_) = self.codec {
+            return connac2::station::six_ghz_bss(self.profile);
+        }
         let mut bytes = self
             .profile
             .bss_request_validated(false, None, None, true)?;
         // Real nonNULL initial zero-capability peer: source6GHz older-family
         // bitmap is unconditional A|AN|AC|AX5, extension remains zero.
         bytes[4 + 25] = 0xb1;
-        Ok(bytes)
+        Ok(alloc::vec![bytes])
     }
     pub fn peer_request(&self, enable: bool) -> Result<Vec<u8>, Error> {
-        self.profile
-            .peer_request_validated(enable, false, None, None, true)
+        match self.codec {
+            Codec::Connac3 => self
+                .profile
+                .peer_request_validated(enable, false, None, None, true),
+            Codec::Connac2(_) => connac2::station::six_ghz_peer(self.profile, enable),
+        }
     }
     pub fn broadcast_request(&self) -> Result<Vec<u8>, Error> {
-        self.profile.broadcast_request()
+        match self.codec {
+            Codec::Connac3 => self.profile.broadcast_request(),
+            Codec::Connac2(_) => connac2::station::six_ghz_broadcast(self.profile),
+        }
     }
-    pub fn disable_beacon_pm(&self) -> Result<Vec<u8>, Error> {
-        self.profile.disable_beacon_pm()
+    pub fn disable_beacon_pm(&self) -> Result<Outgoing, Error> {
+        self.codec.disable_beacon_pm(self.profile)
     }
     pub fn filter_request(&self, enable: bool) -> Result<super::super::init::Request, Error> {
-        self.profile.filter_request(enable)
+        self.codec.filter(self.profile, enable)
     }
     pub fn roc(&self, token: u8, duration: u32) -> Result<super::super::init::Request, Error> {
-        self.profile.roc_validated(token, duration, true)
+        match self.codec {
+            Codec::Connac3 => self.profile.roc_validated(token, duration, true),
+            Codec::Connac2(_) => self.codec.roc(self.profile, token, duration),
+        }
     }
     pub fn abort_roc(&self, token: u8) -> Result<super::super::init::Request, Error> {
-        self.profile.abort_roc_validated(token, true)
+        match self.codec {
+            Codec::Connac3 => self.profile.abort_roc_validated(token, true),
+            Codec::Connac2(_) => self.codec.abort_roc(self.profile, token),
+        }
     }
 }

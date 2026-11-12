@@ -78,7 +78,7 @@ fn custom_metadata_reaches_all_three_native_band_commands_without_phy_substituti
                 .policy
                 .as_ref()
                 .unwrap()
-                .programmed_mt7925()
+                .programmed()
                 .unwrap()
                 .0;
             local::scan::elements(

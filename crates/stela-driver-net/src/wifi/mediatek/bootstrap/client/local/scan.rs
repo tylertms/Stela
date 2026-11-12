@@ -36,16 +36,9 @@ impl Selection {
                 Band::Ghz5 => 1,
                 Band::Ghz6 => 2,
             };
-            let counts = domain.counts();
-            let first: usize = counts[..index].iter().map(|&n| usize::from(n)).sum();
-            domain.body()[16 + first * 8..16 + (first + usize::from(counts[index])) * 8]
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .any(|row| {
-                    u32::from_le_bytes(row[4..8].try_into().unwrap()) & (CHAN_DISABLED | excluded)
-                        == 0
-                })
+            domain.rows(index).iter().any(|row| {
+                u32::from_le_bytes(row[4..8].try_into().unwrap()) & (CHAN_DISABLED | excluded) == 0
+            })
         }
         Self {
             vht: usable(domain, band, CHAN_NO_80),
@@ -216,7 +209,10 @@ mod tests {
         Mac,
         wifi::{
             Channel,
-            mediatek::mcu::{client as wire, device::Context},
+            mediatek::{
+                identity::Chip,
+                mcu::{client as wire, device::Context},
+            },
             scan::Request,
             station::phy::Width,
         },
@@ -229,6 +225,7 @@ mod tests {
         }
         for band in [Band::Ghz2, Band::Ghz5, Band::Ghz6] {
             let actual = make(
+                Chip::Mt7925,
                 band,
                 3,
                 3,
@@ -260,6 +257,7 @@ mod tests {
             return;
         }
         let actual = make(
+            Chip::Mt7925,
             Band::Ghz2,
             3,
             3,
@@ -377,6 +375,7 @@ mod tests {
                             CHAN_NO_80 | CHAN_NO_HE | CHAN_NO_EHT,
                         ] {
                             let a = make(
+                                Chip::Mt7925,
                                 band,
                                 (1 << nss) - 1,
                                 (1 << nss) - 1,

@@ -44,9 +44,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             }
         }
         let disable = match &six {
-            Some(codec) => codec
-                .disable_beacon_pm()
-                .map(|body| wire::Outgoing::Uni(Command::BssInfo, body)),
+            Some(codec) => codec.disable_beacon_pm(),
             None => Self::codec(s).disable_beacon_pm(p),
         }
         .map_err(Error::Codec)?;
@@ -69,7 +67,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             .clear_peer_admission(p.wcid)
             .map_err(|e| Error::Bootstrap(super::super::Error::Control(e)))?;
         let bss = match &six {
-            Some(codec) => vec![codec.bss_request().map_err(Error::Codec)?],
+            Some(codec) => codec.bss_requests().map_err(Error::Codec)?,
             None => Self::bss_request(s, p, false)?,
         };
         for body in &bss {

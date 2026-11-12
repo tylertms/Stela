@@ -395,17 +395,21 @@ impl<C: 'static> Execution<C> {
 }
 
 impl<C: 'static> Execution<C> {
-    /// Private view of this owner's completed MT7925 chain.
+    /// Private view of this owner's completed chain: MT7925 repeats only the
+    /// domain at first start, MT7921 and MT7922 the rate power too.
     /// No public copied receipt can manufacture a programmed policy.
-    pub(in crate::wifi::mediatek) fn programmed_mt7925(
-        &self,
-    ) -> Option<(&domain::Request, &power::Plan)> {
+    pub(in crate::wifi::mediatek) fn programmed(&self) -> Option<(&domain::Request, &power::Plan)> {
         let state = self.owned();
         let chain = state.remaining.as_ref()?;
-        (state.phase == Phase::StartDomainFacts
-            && chain.domain.chip() == Chip::Mt7925
-            && chain.facts.len() == 1 + chain.power.requests().len()
-            && chain.start_facts.len() == 1
+        let powers = chain.power.requests().len();
+        let (phase, started) = if chain.domain.chip() == Chip::Mt7925 {
+            (Phase::StartDomainFacts, 1)
+        } else {
+            (Phase::StartPowerFacts, 1 + powers)
+        };
+        (state.phase == phase
+            && chain.facts.len() == 1 + powers
+            && chain.start_facts.len() == started
             && chain.interrupted.is_none())
         .then_some((&chain.domain, &chain.power))
     }
@@ -417,24 +421,14 @@ impl<C: 'static> Execution<C> {
         let Some(c) = self.owned().remaining.as_ref() else {
             return false;
         };
-        let counts = c.domain.counts();
         let index = match band {
             crate::wifi::Band::Ghz2 => 0,
             crate::wifi::Band::Ghz5 => 1,
             crate::wifi::Band::Ghz6 => 2,
         };
-        let first: usize = counts[..index].iter().map(|&n| usize::from(n)).sum();
-        let header = if c.domain.chip() == Chip::Mt7925 {
-            16
-        } else {
-            12
-        };
-        c.domain.body()[header..]
-            .as_chunks::<8>()
-            .0
+        c.domain
+            .rows(index)
             .iter()
-            .skip(first)
-            .take(counts[index] as usize)
             .any(|e| u16::from_le_bytes([e[0], e[1]]) == u16::from(channel))
     }
 }

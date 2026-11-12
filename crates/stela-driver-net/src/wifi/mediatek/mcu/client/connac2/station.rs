@@ -126,6 +126,32 @@ pub(in crate::wifi::mediatek) fn peer_request(
     associated: bool,
 ) -> Result<Vec<u8>, Error> {
     validate(p, modern)?;
+    peer(p, modern, enable, associated)
+}
+
+/// The 6 GHz SAE exchange's records, before any configuration: the
+/// STATE_NONE peer, the broadcast entry and the disabled BSS, as mt7921 adds
+/// them for an authentication on any band. The caller has checked the
+/// profile's 6 GHz channel against the BSS.
+pub(in crate::wifi::mediatek) fn six_ghz_peer(p: Profile, enable: bool) -> Result<Vec<u8>, Error> {
+    p.validate_inner(true)?;
+    peer(p, None, enable, false)
+}
+pub(in crate::wifi::mediatek) fn six_ghz_broadcast(p: Profile) -> Result<Vec<u8>, Error> {
+    p.validate_inner(true)?;
+    Ok(broadcast(p))
+}
+pub(in crate::wifi::mediatek) fn six_ghz_bss(p: Profile) -> Result<Vec<Vec<u8>>, Error> {
+    p.validate_inner(true)?;
+    bss(p, None, false)
+}
+
+fn peer(
+    p: Profile,
+    modern: Option<&Configuration>,
+    enable: bool,
+    associated: bool,
+) -> Result<Vec<u8>, Error> {
     let n = modern.map(Configuration::negotiated);
     let wme = n.is_some_and(|n| n.wmm.is_some());
     let mut out = sta_header(p, p.wcid, p.interface.omac_index);
@@ -321,11 +347,14 @@ pub(in crate::wifi::mediatek) fn broadcast_request(
     modern: Option<&Configuration>,
 ) -> Result<Vec<u8>, Error> {
     validate(p, modern)?;
+    Ok(broadcast(p))
+}
+fn broadcast(p: Profile) -> Vec<u8> {
     let wcid = p.interface.broadcast_wcid;
     let mut out = sta_header(p, wcid, 0xe);
     let at = wtbl(&mut out, wcid, WTBL_RESET_AND_SET);
     generic(&mut out, at, p, None);
-    Ok(out)
+    out
 }
 
 /// `mt76_connac_get_phy_mode` and `mt76_connac_get_phy_mode_v2` over the
@@ -356,6 +385,9 @@ pub(in crate::wifi::mediatek) fn bss_requests(
     enable: bool,
 ) -> Result<Vec<Vec<u8>>, Error> {
     validate(p, modern)?;
+    bss(p, modern, enable)
+}
+fn bss(p: Profile, modern: Option<&Configuration>, enable: bool) -> Result<Vec<Vec<u8>>, Error> {
     let c = p.interface;
     let mut requests = Vec::new();
     let mut basic = vec![c.bss_index, 0, 0, 0];
