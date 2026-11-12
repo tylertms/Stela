@@ -29,8 +29,6 @@ pub enum Error {
     WrongEpoch,
     EpochExhausted,
     UnknownToken(u16),
-    DuplicateFree(u16),
-    WrongStation(u16),
 }
 impl From<super::Error> for Error {
     fn from(e: super::Error) -> Self {
@@ -130,10 +128,17 @@ pub struct DataRing<Q: QueueIo, C: 'static> {
     tail: usize,
     queued: usize,
     outstanding: usize,
+    /// TX-free notifications or releases skipped as mt7925_mac_tx_free skips
+    /// them: a malformed notification, or an unknown or already freed token.
+    ignored_frees: u64,
     poisoned: bool,
     released: bool,
 }
 impl<Q: QueueIo, C: 'static> DataRing<Q, C> {
+    /// How many TX-free notifications or releases were skipped.
+    pub fn ignored_frees(&self) -> u64 {
+        self.ignored_frees
+    }
     /// # Safety
     /// All `super::TxRing::install` requester/coherent-WB/NoSnoop/ATS/idle
     /// validations apply. This owns the data queue and the complete
@@ -180,6 +185,7 @@ impl<Q: QueueIo, C: 'static> DataRing<Q, C> {
             tail: 0,
             queued: 0,
             outstanding: 0,
+            ignored_frees: 0,
             poisoned: true,
             released: false,
         };
@@ -430,22 +436,13 @@ impl<Q: QueueIo, C: 'static> DataRing<Q, C> {
         if epoch != self.epoch {
             return Err(Error::WrongEpoch);
         }
-        let notification = tx_free::parse(self.chip, bytes)?;
-        for event in &notification.events {
-            if let tx_free::Event::Release { wcid, token, .. } = *event {
-                let packet = self
-                    .tokens
-                    .get(usize::from(token))
-                    .and_then(Option::as_ref)
-                    .ok_or(Error::UnknownToken(token))?;
-                if packet.free.is_some() {
-                    return Err(Error::DuplicateFree(token));
-                }
-                if wcid.is_some_and(|w| w != packet.receipt.wcid) {
-                    return Err(Error::WrongStation(token));
-                }
-            }
-        }
+        // mt7925_mac_tx_free returns on a notification it cannot read and
+        // skips a token mt76_token_release does not hold; neither stops the
+        // queue. The token is the authority, whatever station it names.
+        let Ok(notification) = tx_free::parse(self.chip, bytes) else {
+            self.ignored_frees = self.ignored_frees.saturating_add(1);
+            return Ok(0);
+        };
         let mut pair_word = None;
         let mut accounting = None;
         let mut accounting_word = None;
@@ -466,9 +463,15 @@ impl<Q: QueueIo, C: 'static> DataRing<Q, C> {
                     accounting: local,
                     raw,
                 } => {
-                    let packet = self.tokens[usize::from(token)]
-                        .as_mut()
-                        .expect("whole batch validated");
+                    let Some(packet) = self
+                        .tokens
+                        .get_mut(usize::from(token))
+                        .and_then(Option::as_mut)
+                        .filter(|packet| packet.free.is_none())
+                    else {
+                        self.ignored_frees = self.ignored_frees.saturating_add(1);
+                        continue;
+                    };
                     packet.free = Some(FreeEvidence {
                         header: notification.header,
                         wcid,

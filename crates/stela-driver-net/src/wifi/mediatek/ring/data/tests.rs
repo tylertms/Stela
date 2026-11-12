@@ -306,7 +306,7 @@ fn requester_reads_txwi_then_late_payload_until_both_completions_through_wrap_an
     }
 }
 #[test]
-fn whole_free_batch_is_validated_before_any_token_changes() {
+fn free_batches_release_held_tokens_and_skip_the_rest_as_mt7925_does() {
     if crate::test_process::isolate_model() {
         return;
     }
@@ -330,8 +330,10 @@ fn whole_free_batch_is_validated_before_any_token_changes() {
                 )
                 .unwrap();
             let tokens = match case {
+                // An unknown token is skipped; a repeated one frees once.
                 0 => vec![a.token, 8192],
                 1 => vec![a.token, a.token],
+                // The token decides, whatever station the pair names.
                 _ => vec![a.token, b.token],
             };
             let wire = notification(chip, &tokens, if case == 2 { 8 } else { 7 });
@@ -346,19 +348,27 @@ fn whole_free_batch_is_validated_before_any_token_changes() {
                 // no other driver, worker or DMA touches them.
                 unsafe { ring.apply_tx_free(epoch, &one) }.unwrap();
             }
-            let before: Vec<_> = ring.tokens.iter().flatten().map(|p| p.free).collect();
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            assert!(unsafe { ring.apply_tx_free(epoch, &wire) }.is_err());
-            assert!(ring.is_poisoned());
-            assert_eq!(
-                ring.tokens
-                    .iter()
-                    .flatten()
-                    .map(|p| p.free)
-                    .collect::<Vec<_>>(),
-                before
-            );
+            let result = unsafe { ring.apply_tx_free(epoch, &wire) };
+            if case == 3 {
+                // A notification of another epoch is a caller error.
+                assert!(result.is_err());
+                assert!(ring.is_poisoned());
+            } else {
+                result.unwrap();
+                assert!(!ring.is_poisoned());
+                let freed = |token: u16| ring.tokens[usize::from(token)].as_ref().unwrap().free;
+                assert!(freed(a.token).is_some());
+                assert_eq!(freed(b.token).is_some(), case >= 2);
+                assert_eq!(ring.ignored_frees(), u64::from(matches!(case, 0 | 4)));
+            }
+            // A notification that does not parse is skipped whole.
+            if case != 3 {
+                // SAFETY: as above.
+                unsafe { ring.apply_tx_free(epoch, &[0; 3]) }.unwrap();
+                assert!(!ring.is_poisoned());
+            }
             assert_eq!(ring.outstanding_tokens(), 2);
             assert_eq!(model.drops.load(Ordering::Relaxed), 0);
             drop(quiesce(&mut ring, &mut model));

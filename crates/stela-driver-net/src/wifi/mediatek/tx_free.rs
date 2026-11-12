@@ -14,8 +14,6 @@ pub enum Error {
     TooLarge,
     WrongPacketType(u8),
     UnsupportedVersion(u8),
-    ExcessToken,
-    DuplicateToken(u16),
 }
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -96,9 +94,13 @@ pub fn parse(chip: Chip, bytes: &[u8]) -> Result<Notification<'_>, Error> {
         consumed_bytes: 8,
         raw: bytes,
     };
+    // mt7925_mac_tx_free counts every MSDU ID against the total and lets
+    // mt76_token_release skip one it no longer holds, so a repeated ID is
+    // counted and released once.
     let mut released = BTreeSet::new();
+    let mut count = 0usize;
     let mut wcid = None;
-    while released.len() < usize::from(total) {
+    while count < usize::from(total) {
         let raw = word(bytes, result.consumed_bytes)?;
         result.consumed_bytes += 4;
         if raw & (1 << 31) != 0 {
@@ -134,11 +136,9 @@ pub fn parse(chip: Chip, bytes: &[u8]) -> Result<Notification<'_>, Error> {
             if connac3 && token == 0x7fff {
                 continue;
             }
-            if released.len() >= usize::from(total) {
-                return Err(Error::ExcessToken);
-            }
+            count += 1;
             if !released.insert(token) {
-                return Err(Error::DuplicateToken(token));
+                continue;
             }
             result.events.push(Event::Release {
                 wcid,
@@ -282,18 +282,22 @@ mod tests {
                 Err(Error::UnsupportedVersion(version))
             );
         }
-        assert_eq!(
-            parse(Chip::Mt7925, &packet(Chip::Mt7925, 1, &[1 | (2 << 15)])),
-            Err(Error::ExcessToken)
-        );
-        assert_eq!(
-            parse(Chip::Mt7925, &packet(Chip::Mt7925, 2, &[1 | (1 << 15)])),
-            Err(Error::DuplicateToken(1))
-        );
-        assert_eq!(
-            parse(Chip::Mt7921, &packet(Chip::Mt7921, 2, &[1 << 16, 1 << 16])),
-            Err(Error::DuplicateToken(1))
-        );
+        // As mt7925_mac_tx_free: both IDs of a word are taken even past the
+        // total, and a repeated ID is counted but released once.
+        let releases = |chip, total, words: &[u32]| {
+            parse(chip, &packet(chip, total, words))
+                .unwrap()
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Release { token, .. } => Some(*token),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(releases(Chip::Mt7925, 1, &[1 | (2 << 15)]), [1, 2]);
+        assert_eq!(releases(Chip::Mt7925, 2, &[1 | (1 << 15)]), [1]);
+        assert_eq!(releases(Chip::Mt7921, 2, &[1 << 16, 1 << 16]), [1]);
         let mut words = vec![(1 << 31) | (2 << 14); 1000];
         words.push(1 << 16);
         assert_eq!(
