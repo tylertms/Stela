@@ -25,10 +25,11 @@ use super::{
 use crate::{
     Clock,
     bus::dma::{mapping::DmaDomain, memory::PageSource},
-    wifi::{Band, regulatory::database::Country, stepped::yield_now},
+    wifi::{Band, regulatory::database::Country},
 };
 use alloc::{alloc::alloc, boxed::Box, sync::Arc, vec::Vec};
 use core::{alloc::Layout, ptr::NonNull};
+use stela_driver_base::stepped::yield_now;
 
 pub mod client;
 

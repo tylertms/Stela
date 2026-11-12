@@ -360,8 +360,8 @@ mod tests {
     use crate::wifi::mediatek::mailbox::clc::remaining::tests::caps;
     use crate::wifi::mediatek::ring::rx::tests::device_receive;
     use crate::wifi::mediatek::ring::tests::Source;
-    use crate::wifi::stepped::block_on;
     use crate::wifi::{Band, Channel};
+    use stela_driver_base::stepped::block_on;
 
     const SIX: Channel = Channel {
         band: Band::Ghz6,

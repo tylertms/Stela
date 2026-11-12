@@ -1,7 +1,7 @@
 use super::*;
 use crate::wifi::mediatek::identity::Chip;
-use crate::wifi::stepped::block_on;
 use alloc::{collections::BTreeMap, vec::Vec};
+use stela_driver_base::stepped::block_on;
 extern crate std;
 
 struct Model {

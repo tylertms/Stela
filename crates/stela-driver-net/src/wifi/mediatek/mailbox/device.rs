@@ -10,8 +10,8 @@ use crate::wifi::mediatek::{
         runtime::Command,
     },
 };
-use crate::wifi::stepped::yield_now;
 use alloc::{boxed::Box, vec::Vec};
+use stela_driver_base::stepped::yield_now;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Step {

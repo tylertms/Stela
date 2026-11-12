@@ -20,7 +20,6 @@ pub mod sae;
 pub mod scan;
 pub mod security;
 pub mod station;
-pub mod stepped;
 pub mod supplicant;
 pub mod unsupported;
 

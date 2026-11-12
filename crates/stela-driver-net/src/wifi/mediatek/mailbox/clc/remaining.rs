@@ -7,8 +7,8 @@ use crate::wifi::mediatek::{
     identity::Chip,
     mcu::{Event, domain, power},
 };
-use crate::wifi::stepped::yield_now;
 use alloc::vec::Vec;
+use stela_driver_base::stepped::yield_now;
 
 pub struct Inputs<'a> {
     /// `clc_chan_conf` once MTCL masked it: within the UNII flags of the

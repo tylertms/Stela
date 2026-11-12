@@ -6,7 +6,6 @@ use crate::wifi::mediatek::{
     identity::Chip,
     mcu::Event,
 };
-use crate::wifi::stepped::block_on;
 use crate::wifi::{
     Band,
     mediatek::{
@@ -18,6 +17,7 @@ use crate::wifi::{
 };
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
+use stela_driver_base::stepped::block_on;
 
 pub(crate) fn caps(chip: Chip, bands: [bool; 3]) -> Vec<u8> {
     let mut bytes = vec![3, 0, 0xa5, 0x5a];

@@ -4,7 +4,8 @@
 //! Initial MT7925 WLAN reset from Linux mt792x_wfsys_reset_default. This private
 //! install step provides neither runtime recovery nor shared reset permission.
 use super::{BarIo, Control, Error, Observation};
-use crate::wifi::{mediatek::identity::Chip, stepped::until};
+use crate::wifi::mediatek::identity::Chip;
+use stela_driver_base::stepped::until;
 
 const WFSYS: u32 = 0x7c000140;
 const RESET_B: u32 = 1;
@@ -65,8 +66,8 @@ mod tests {
     extern crate std;
     use super::*;
     use crate::wifi::mediatek::registers::{self, Registers};
-    use crate::wifi::stepped::block_on;
     use alloc::vec::Vec;
+    use stela_driver_base::stepped::block_on;
 
     struct Model {
         value: u32,

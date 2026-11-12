@@ -13,7 +13,6 @@ use crate::wifi::mediatek::{
         tests::{Memory, Source},
     },
 };
-use crate::wifi::stepped::block_on;
 use crate::wifi::{Band, mediatek::bootstrap::Error as BootError};
 use crate::{
     Mac,
@@ -36,6 +35,7 @@ use alloc::collections::BTreeMap;
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use stela_driver_base::stepped::block_on;
 
 pub(crate) const LOCAL: Mac = Mac([2, 1, 2, 3, 4, 5]);
 pub(crate) const AP: Mac = Mac([2, 6, 7, 8, 9, 10]);

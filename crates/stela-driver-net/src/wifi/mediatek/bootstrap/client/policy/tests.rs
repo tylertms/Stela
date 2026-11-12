@@ -6,13 +6,13 @@ use crate::wifi::mediatek::{
     mcu::domain,
     ring::{rx::tests::device_receive, tests::Source},
 };
-use crate::wifi::stepped::block_on;
 use core::sync::atomic::Ordering;
 use reg::database::{
     Database,
     tests::{country, country_of, fixture},
 };
 use sha2::{Digest, Sha256};
+use stela_driver_base::stepped::block_on;
 
 pub(super) fn setup_modern() -> (Client<Bar, Q, NativeGuard>, Model) {
     setup_modern_power(false)

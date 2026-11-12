@@ -16,10 +16,10 @@ use crate::wifi::mediatek::{
     },
     mailbox::clc::{Error, Execution, Fact},
 };
-use crate::wifi::stepped::block_on;
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use stela_driver_base::stepped::block_on;
 
 pub(crate) struct Guard {
     pub(crate) model: Arc<Mutex<Response>>,

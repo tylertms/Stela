@@ -10,10 +10,10 @@ use crate::wifi::mediatek::ring::tests::Source;
 use crate::wifi::regulatory as reg;
 use crate::wifi::station::phy::{Mode, Width};
 use crate::wifi::station::wire::{AssociationRequest, six_ghz::tests::selected};
-use crate::wifi::stepped::block_on;
 use crate::wifi::{Band, Channel};
 use alloc::rc::Rc;
 use core::cell::Cell;
+use stela_driver_base::stepped::block_on;
 
 pub(crate) const SIX: Channel = Channel {
     band: Band::Ghz6,

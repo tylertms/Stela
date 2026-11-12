@@ -31,12 +31,14 @@ use crate::{
     wifi::{
         network::Network,
         regulatory::database::{self, Country, Database},
-        stepped::{Stepped, block_on},
     },
 };
 use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::{any::Any, fmt, ptr::NonNull, task::Poll};
-use stela_driver_base::entropy::Entropy;
+use stela_driver_base::{
+    entropy::Entropy,
+    stepped::{Stepped, block_on},
+};
 
 /// The services and platform facts the attach borrows.
 pub struct Inputs {

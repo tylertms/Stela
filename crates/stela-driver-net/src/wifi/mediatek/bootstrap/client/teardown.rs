@@ -201,7 +201,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         );
         // The same stop as the bring-up's, run to completion: one 100 ms
         // poll at most.
-        crate::wifi::stepped::block_on(s.controller.state_mut().control.stop_dma(false))
+        stela_driver_base::stepped::block_on(s.controller.state_mut().control.stop_dma(false))
             .map_err(|e| Error::Bootstrap(super::super::Error::Control(e)))?;
         s.phase = Phase::ControllerDrain;
         Ok(())

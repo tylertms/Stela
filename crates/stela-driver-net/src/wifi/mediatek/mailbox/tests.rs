@@ -7,7 +7,7 @@ use super::super::{
     },
 };
 use super::*;
-use crate::wifi::stepped::block_on;
+use stela_driver_base::stepped::block_on;
 extern crate std;
 use alloc::sync::Arc;
 use std::sync::Mutex;

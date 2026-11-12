@@ -8,9 +8,9 @@ use super::{
     firmware::{Patch, Prepared, Ram},
     identity::Chip,
 };
-use crate::wifi::stepped::yield_now;
 use alloc::vec::Vec;
 use core::fmt;
+use stela_driver_base::stepped::yield_now;
 
 const COMMAND_DOWNLOAD: u8 = 0x01;
 const COMMAND_START_FIRMWARE: u8 = 0x02;
@@ -393,9 +393,9 @@ impl<T: Transport> Downloader<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wifi::stepped::block_on;
     use alloc::rc::Rc;
     use core::cell::RefCell;
+    use stela_driver_base::stepped::block_on;
     #[derive(Default)]
     struct Model {
         operations: Vec<(u8, Vec<u8>)>,

@@ -14,7 +14,6 @@ use crate::wifi::mediatek::{
         tests::{Domain, Io, Memory, Source, State},
     },
 };
-use crate::wifi::stepped::block_on;
 use crate::wifi::{
     Band,
     mediatek::{
@@ -28,6 +27,31 @@ use alloc::collections::BTreeMap;
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+
+std::thread_local! {
+    static LONGEST: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Run `future` to completion a step at a time, as the attach does,
+/// keeping its longest step in counter ticks, which the model's virtual
+/// clock counts in microseconds.
+pub(crate) fn block_on<F: core::future::Future>(future: F) -> F::Output {
+    let mut future = core::pin::pin!(future);
+    loop {
+        let start = crate::Clock::ticks();
+        let poll = stela_driver_base::stepped::poll_once(future.as_mut());
+        let ticks = crate::Clock::ticks().wrapping_sub(start);
+        LONGEST.with(|longest| longest.set(longest.get().max(ticks)));
+        if let core::task::Poll::Ready(output) = poll {
+            return output;
+        }
+    }
+}
+
+/// The longest step [`block_on`] ran on this thread since the last call.
+fn longest_step() -> u64 {
+    LONGEST.with(|longest| longest.replace(0))
+}
 
 #[derive(Default)]
 pub(crate) struct DeviceBar {
@@ -1053,7 +1077,7 @@ fn every_bring_up_step_fits_a_recovery_step() {
         return;
     }
     let mut f = NativeFixture::new(Chip::Mt7925);
-    crate::wifi::stepped::longest::take();
+    longest_step();
     f.install().unwrap();
     f.boot(Chip::Mt7925);
     f.policy(Chip::Mt7925);
@@ -1065,7 +1089,7 @@ fn every_bring_up_step_fits_a_recovery_step() {
     let context = crate::wifi::mediatek::bootstrap::client::tests::profile().interface;
     // SAFETY: as above.
     let interface = unsafe { block_on(f.controller.register_interface(context)) }.unwrap();
-    let longest = crate::wifi::stepped::longest::take();
+    let longest = longest_step();
     assert!(longest > 0);
     assert!(
         longest <= crate::wifi::connection::keeper::RECOVERY_STEP_US,
@@ -1086,7 +1110,7 @@ fn a_bring_up_dropped_mid_download_leaves_the_device_to_the_next_reset() {
     let mut f = NativeFixture::new(Chip::Mt7925);
     let firmware_queue = f.queues[&0xd4400].clone();
     {
-        let mut stepped = crate::wifi::stepped::Stepped::new(async {
+        let mut stepped = stela_driver_base::stepped::Stepped::new(async {
             f.install_stepped().await.unwrap();
             f.boot_stepped(Chip::Mt7925).await;
         });

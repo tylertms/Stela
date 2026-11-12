@@ -9,8 +9,8 @@ use crate::wifi::mediatek::{
     mcu::domain,
     ring::{rx::tests::device_receive, tests::Source},
 };
-use crate::wifi::stepped::block_on;
 use core::sync::atomic::Ordering;
+use stela_driver_base::stepped::block_on;
 
 mod custom_probe;
 

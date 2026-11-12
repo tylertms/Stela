@@ -295,7 +295,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             .clear_peer_admission(interface.broadcast_wcid)
             .map_err(|e| Error::Bootstrap(super::super::Error::Control(e)))?;
         // A link's registration while associating: both commands now.
-        crate::wifi::stepped::block_on(
+        stela_driver_base::stepped::block_on(
             link.interface
                 .activate(roc.controller.state_mut().mailbox.as_mut().unwrap()),
         )

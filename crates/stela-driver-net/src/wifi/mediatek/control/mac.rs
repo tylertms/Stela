@@ -7,10 +7,8 @@ use super::{
     BarIo, Control, Error, MT_CONN_ON_LPCTL, MT_WFDMA0_TX_RING0_EXT_CTRL, Observation, rx_ring,
     tx_ring,
 };
-use crate::wifi::{
-    mediatek::identity::Chip,
-    stepped::{block_on, until},
-};
+use crate::wifi::mediatek::identity::Chip;
+use stela_driver_base::stepped::{block_on, until};
 
 #[derive(Debug)]
 pub struct MacInitialized {

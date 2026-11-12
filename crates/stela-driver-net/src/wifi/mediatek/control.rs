@@ -6,7 +6,7 @@ use super::{
     identity::Chip,
     registers::{self, BarIo, Registers},
 };
-use crate::wifi::stepped::until;
+use stela_driver_base::stepped::until;
 
 mod cold_start;
 pub mod dma;

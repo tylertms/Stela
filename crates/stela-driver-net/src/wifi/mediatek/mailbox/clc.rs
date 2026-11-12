@@ -11,9 +11,9 @@ use crate::wifi::mediatek::{
     mcu::{Event, clc as codec},
     ring::rx::Frame,
 };
-use crate::wifi::stepped::yield_now;
 use alloc::{alloc::alloc, boxed::Box, vec::Vec};
 use core::alloc::Layout;
+use stela_driver_base::stepped::yield_now;
 
 pub mod remaining;
 
