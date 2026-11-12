@@ -56,8 +56,8 @@ pub enum Stage {
     NeedsDrain,
     /// Anything between those.
     Busy,
-    /// The radio stopped for good, as a driver that gave up on its
-    /// hardware: nothing it does can bring the link back.
+    /// The radio gave up on its hardware: only [`Radio::recover`] can bring
+    /// the link back, and nothing does on a radio that cannot recover.
     Lost,
 }
 
@@ -123,6 +123,30 @@ pub trait Radio: Link {
 
     /// Service the radio.
     fn service(&mut self) -> Result<(), Self::Error>;
+
+    /// Whether [`Self::recover`] can bring the radio back once it is
+    /// [`Stage::Lost`].
+    fn recoverable(&self) -> bool {
+        false
+    }
+
+    /// One step of resetting the lost radio's hardware and bringing it back
+    /// to [`Stage::Idle`] with the same station address, as Linux's chip
+    /// reset work does (`mt7925_mac_reset_work`, iwlwifi's firmware restart,
+    /// rtw88's firmware crash recovery). Everything the radio held before is
+    /// gone; the keeper joins again once a step returns
+    /// [`Recovery::Done`].
+    ///
+    /// One call returns within [`RECOVERY_STEP_US`]: it does one bounded
+    /// slice of the bring-up, such as one reset wait, one batch of firmware
+    /// chunks or one command, and returns [`Recovery::Pending`] until the
+    /// bring-up is complete. The keeper calls it again on its next poll. The
+    /// radio bounds the whole attempt as Linux bounds each of its waits and
+    /// returns an error once it fails, saying why; the next attempt starts
+    /// over from the reset.
+    fn recover(&mut self) -> Result<Recovery, String> {
+        Err(format!("{}: cannot recover", Self::NAME))
+    }
     fn take_event(&mut self) -> Option<Event>;
     fn stage(&self) -> Stage;
     fn station(&self) -> &Station;
@@ -251,6 +275,26 @@ pub trait Radio: Link {
     /// polled with its interrupts masked.
     unsafe fn retire_peer(&mut self) -> Result<(), Self::Error>;
 }
+
+/// Where one [`Radio::recover`] step left the recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Recovery {
+    /// More steps follow, on the next polls.
+    Pending,
+    /// The radio is back at [`Stage::Idle`].
+    Done,
+}
+
+/// The longest one [`Radio::recover`] step may hold a poll: one runtime
+/// command at its bound, with room for the register accesses around it.
+pub const RECOVERY_STEP_US: u64 = RUNTIME_COMMAND_TIMEOUT_US + 10_000;
+
+/// `mt7925_mac_reset_work`'s ten chip reset attempts.
+pub const RECOVERY_ATTEMPTS: u32 = 10;
+
+/// The pause after a failed chip reset attempt, so that a radio that keeps
+/// failing still lets its caller run.
+const RECOVERY_RETRY_US: u64 = 1_000_000;
 
 /// The longest a scan may run.
 const SCAN_BUDGET_US: u64 = 30_000_000;
@@ -486,6 +530,10 @@ pub struct Keeper<R: Radio> {
     last_error: Option<String>,
     /// Why the radio stopped for good; the keeper no longer retries.
     lost: Option<String>,
+    /// Recovery attempts that failed since the radio was lost.
+    recovery_failures: u32,
+    /// When the next recovery attempt may start.
+    recover_at: u64,
     /// wpa_supplicant's `last_michael_mic_error`.
     michael_failed: Option<u64>,
     /// The last scan missed the network, so the next asks for it by name.
@@ -509,6 +557,8 @@ impl<R: Radio> Keeper<R> {
             noticed: Vec::new(),
             last_error: None,
             lost: None,
+            recovery_failures: 0,
+            recover_at: 0,
             michael_failed: None,
             directed: false,
         }
@@ -547,7 +597,56 @@ impl<R: Radio> Keeper<R> {
         self.lost.as_deref()
     }
 
-    /// The radio gave up on its hardware: report why once and stop
+    /// The radio gave up on its hardware. A radio that can recover is reset
+    /// step by step and joins again, as `mt7925_mac_reset_work` resets the
+    /// chip and mac80211 reconnects. Only a failed attempt waits before the
+    /// next; after [`RECOVERY_ATTEMPTS`] failures in a row the radio is lost
+    /// for good, and so is one that cannot recover.
+    fn recover(&mut self, now: u64) {
+        if !self.link.recoverable() {
+            self.lose();
+            return;
+        }
+        if now < self.recover_at {
+            return;
+        }
+        if let Some(reason) = self.last_error.take() {
+            self.fail(reason);
+        }
+        match self.link.recover() {
+            Ok(Recovery::Pending) => {}
+            Ok(Recovery::Done) => {
+                self.recovery_failures = 0;
+                self.fail(format!(
+                    "{}: recovered by a chip reset; joining again",
+                    R::NAME
+                ));
+                self.state = State::Waiting { at: now };
+            }
+            Err(error) => {
+                self.recovery_failures += 1;
+                let message = format!(
+                    "{}: chip reset {} of {RECOVERY_ATTEMPTS} failed: {error}",
+                    R::NAME,
+                    self.recovery_failures
+                );
+                if self.recovery_failures >= RECOVERY_ATTEMPTS {
+                    self.last_error = Some(message);
+                    self.lose();
+                } else {
+                    self.fail(message);
+                    self.recover_at = now + RECOVERY_RETRY_US;
+                }
+            }
+        }
+    }
+
+    /// Whether the radio is lost and waits for its recovery.
+    fn recovering(&self) -> bool {
+        self.lost.is_none() && self.link.recoverable() && self.link.stage() == Stage::Lost
+    }
+
+    /// The radio gave up on its hardware for good: report why once and stop
     /// retrying against it, as wpa_supplicant stops on an interface that
     /// is removed.
     fn lose(&mut self) {
@@ -595,7 +694,7 @@ impl<R: Radio> Keeper<R> {
             self.last_error = Some(message);
         }
         if self.link.stage() == Stage::Lost {
-            self.lose();
+            self.recover(now);
             return;
         }
         while let Some(event) = self.link.take_event() {
@@ -636,7 +735,7 @@ impl<R: Radio> Keeper<R> {
     fn advance(&mut self, now: u64) {
         let stage = self.link.stage();
         if stage == Stage::Lost {
-            self.lose();
+            self.recover(now);
             return;
         }
         match &self.state {
@@ -1560,8 +1659,9 @@ impl<R: Radio> Link for Keeper<R> {
     fn take_diagnostic(&mut self) -> Option<String> {
         self.notices.pop_front()
     }
+    /// A recovering radio is polled for its steps.
     fn signals(&self) -> bool {
-        self.lost.is_none() && self.link.signals()
+        self.lost.is_none() && !self.recovering() && self.link.signals()
     }
     fn due_us(&self) -> Option<u64> {
         self.lost.is_none().then(|| self.link.due_us()).flatten()
@@ -1570,7 +1670,14 @@ impl<R: Radio> Link for Keeper<R> {
         if let Some(lost) = &self.lost {
             return Err(LinkError::Adapter(lost.clone()));
         }
-        self.link.transmit(frame)
+        if self.recovering() {
+            return Err(LinkError::NoCarrier);
+        }
+        match self.link.transmit(frame) {
+            // The next poll recovers the radio.
+            Err(_) if self.recovering() => Err(LinkError::NoCarrier),
+            result => result,
+        }
     }
     /// A notice is never an error here: only a radio lost for good, or the
     /// radio's own receive error, is.
@@ -1579,7 +1686,14 @@ impl<R: Radio> Link for Keeper<R> {
         if let Some(lost) = &self.lost {
             return Err(LinkError::Adapter(lost.clone()));
         }
-        self.link.receive()
+        if self.recovering() {
+            return Ok(None);
+        }
+        match self.link.receive() {
+            // The next poll recovers the radio.
+            Err(_) if self.recovering() => Ok(None),
+            result => result,
+        }
     }
 }
 

@@ -121,6 +121,11 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> Radio for Mt7925
         self.link.service().map(|_| ())
     }
 
+    // No `recoverable`/`recover` yet: the chip reset that
+    // `mt7925_mac_reset_work` runs arrives with the stepped bring-up, whose
+    // steps fit `keeper::RECOVERY_STEP_US`. Until then a lost MT7925 stays
+    // lost.
+
     fn take_event(&mut self) -> Option<keeper::Event> {
         while let Some(notice) = self.link.take_notice() {
             let LinkEvent::Controller(event) = notice.event else {
