@@ -581,9 +581,10 @@ fn static_wep_with_shared_key_auth_carries_data_like_mt7925_set_key() {
         assert_eq!(&ethernet[12..14], &0x800u16.to_be_bytes());
     }
     // The ICV error is mt7925_mac_fill_rx's RX_FLAG_ONLY_MONITOR: never
-    // delivered, and reported once as rejected receive content.
+    // delivered, and counted as a refused frame.
     wep(true);
-    assert!(link.service().is_err());
+    link.service().unwrap();
+    assert_eq!(link.rejected_frames(), 1);
     assert!(link.receive().unwrap().is_none());
 }
 #[test]
@@ -734,14 +735,17 @@ fn unpublished_allocation_failure_and_bad_rx_never_forge_completion_or_close_val
     link.state().source.1.store(false, Ordering::Relaxed);
     incoming(&model, &data(false), Some((1, 0, 1)), false);
     assert!(link.receive().unwrap().is_some());
+    // The replay is dropped and counted.
     incoming(&model, &data(false), Some((1, 0, 1)), false);
-    assert!(matches!(link.receive(), Err(LinkError::Adapter(_))));
+    assert!(link.receive().unwrap().is_none());
+    assert_eq!(link.rejected_frames(), 1);
     link.transmit(&eth(0x800)).unwrap();
     finish_tx(&model);
     let mut bad = incoming_bytes(&data(false), Some((1, 0, 2)), false);
     bad[7] |= 2;
     device_receive(&model.queues[&0xd4520], &bad, true, 0);
-    assert!(matches!(link.receive(), Err(LinkError::Adapter(_))));
+    assert!(link.receive().unwrap().is_none());
+    assert_eq!(link.rejected_frames(), 2);
     assert!(
         link.state()
             .client
@@ -986,7 +990,8 @@ fn malformed_rx_preserves_authentication_timeout() {
         .clock;
     crate::test_clock::advance(clock, 550_000);
     incoming(&model, &response(0xb1, &[0, 0, 2, 0, 0, 0]), None, false);
-    assert!(link.service().is_err());
+    link.service().unwrap();
+    assert_eq!(link.rejected_frames(), 1);
     assert_eq!(link.phase(), Phase::Joining);
     // The rejected frame still permits the timed retry and packet release.
     assert_eq!(finish_tx(&model)[0][..2], [0xb0, 0]);
@@ -1016,17 +1021,8 @@ fn rejected_rx(model: &Model, protocol_version: bool) {
         device_receive(&model.queues[&0xd4520], &raw, true, 0);
     }
 }
-fn deferred_message(link: &TestLink) -> std::string::String {
-    format!(
-        "{}",
-        link.state()
-            .deferred_error
-            .as_ref()
-            .expect("original deferred RX error")
-    )
-}
 #[test]
-fn queued_valid_receive_alternates_original_error_under_repeated_bad_rx() {
+fn refused_frames_are_dropped_and_counted_while_valid_data_flows() {
     if crate::test_process::isolate_model() {
         return;
     }
@@ -1039,36 +1035,40 @@ fn queued_valid_receive_alternates_original_error_under_repeated_bad_rx() {
     }
     assert_eq!(link.queues().data_frames, 3);
     for n in 1..=3 {
+        // ieee80211_rx_handlers drops a frame of another protocol version
+        // or with a cipher mismatch and goes on.
         rejected_rx(&model, n % 2 == 0);
+        let head = model.queues[&0xd4520].lock().unwrap().head;
         let received = link.receive().unwrap().unwrap();
         assert_eq!(received.last(), Some(&n));
         assert_eq!(link.queues().data_frames, usize::from(3 - n));
-        let original = deferred_message(&link);
-        assert!(
-            if n % 2 == 0 {
-                original.contains("ProtocolVersion")
-            } else {
-                original.contains("WrongProfile")
-            },
-            "actual deferred diagnostic: {original}"
-        );
-        let head = model.queues[&0xd4520].lock().unwrap().head;
-        let syncs = model.memory.lock().unwrap().syncs.len();
-        assert_eq!(link.receive(), Err(LinkError::Adapter(original)));
-        // Error-only return did not consume/refill RX, service timers or
-        // retire/publish a packet; the next frame will service afresh.
-        assert_eq!(model.queues[&0xd4520].lock().unwrap().head, head);
-        assert_eq!(model.memory.lock().unwrap().syncs.len(), syncs);
-        assert!(link.state().deferred_error.is_none());
+        assert_eq!(link.rejected_frames(), u64::from(n));
+        // The refused frame was taken from the ring and its buffer reposted.
+        assert_ne!(model.queues[&0xd4520].lock().unwrap().head, head);
         assert!(link.carrier());
     }
     assert!(link.receive().unwrap().is_none());
+    // Valid frames around a refused one both arrive.
+    incoming(&model, &data(false), Some((1, 0, 4)), false);
+    rejected_rx(&model, true);
+    let mut last = data(false);
+    *last.last_mut().unwrap() = 0x44;
+    incoming(&model, &last, Some((1, 0, 5)), false);
+    let mut received = Vec::new();
+    for _ in 0..6 {
+        if let Some(frame) = link.receive().unwrap() {
+            received.push(frame);
+        }
+    }
+    assert_eq!(received.len(), 2);
+    assert_eq!(received[1].last(), Some(&0x44));
+    assert_eq!(link.rejected_frames(), 4);
     stop(&mut link, &model);
     drop(link);
     assert_eq!(provider.load(Ordering::Relaxed), 1);
 }
 #[test]
-fn shared_deferred_error_survives_explicit_service_and_prevents_next_tx_publication() {
+fn a_refused_frame_never_holds_back_transmission() {
     if crate::test_process::isolate_model() {
         return;
     }
@@ -1077,35 +1077,21 @@ fn shared_deferred_error_survives_explicit_service_and_prevents_next_tx_publicat
     let ptk = secure(&mut link);
     drop(drain_notices(&mut link));
     queued_data(&mut link, &model, 1, 0x41);
-    queued_data(&mut link, &model, 2, 0x42);
     rejected_rx(&model, false);
-    assert_eq!(link.receive().unwrap().unwrap().last(), Some(&0x41));
-    let original = deferred_message(&link);
     rejected_rx(&model, true);
-    let explicit = link.service().unwrap_err();
-    assert!(format!("{explicit}").contains("ProtocolVersion"));
-    assert_eq!(deferred_message(&link), original);
+    // Each pass takes one data frame, as one NAPI budget slot.
+    link.service().unwrap();
+    link.service().unwrap();
+    assert_eq!(link.rejected_frames(), 2);
     rejected_rx(&model, true);
-    let tx = model.queues[&0xd4300].lock().unwrap().head;
-    let rx = model.queues[&0xd4520].lock().unwrap().head;
-    assert_eq!(
-        link.transmit(&eth(0x800)),
-        Err(LinkError::Adapter(original))
-    );
-    assert_eq!(model.queues[&0xd4300].lock().unwrap().head, tx);
-    assert_eq!(model.queues[&0xd4520].lock().unwrap().head, rx);
-    assert!(link.state().deferred_error.is_none());
-    // The still-pending bad RX cannot starve control publication.
+    link.transmit(&eth(0x800)).unwrap();
     let receipt = link.send_control(&control(), Some(ptk)).unwrap();
-    let deferred = deferred_message(&link);
-    assert!(deferred.contains("ProtocolVersion"));
+    assert_eq!(link.rejected_frames(), 3);
     let frames = finish_tx(&model);
-    assert_eq!(frames.len(), 1);
-    assert_ne!(frames[0][1] & 0x40, 0);
-    link.service().unwrap(); // real TX retirement does not consume the error
-    assert_eq!(deferred_message(&link), deferred);
-    assert_eq!(link.receive(), Err(LinkError::Adapter(deferred)));
-    assert_eq!(link.receive().unwrap().unwrap().last(), Some(&0x42));
+    assert_eq!(frames.len(), 2);
+    assert_ne!(frames[1][1] & 0x40, 0);
+    link.service().unwrap();
+    assert_eq!(link.receive().unwrap().unwrap().last(), Some(&0x41));
     let notices = drain_notices(&mut link);
     assert_eq!(
         notices
@@ -1144,21 +1130,7 @@ fn data_and_eapol_alternate_single_publication() {
                 link.transmit(&frame).unwrap();
                 None
             };
-            let original = deferred_message(&link);
-            assert!(original.contains("ProtocolVersion"));
-            let head = model.queues[&0xd4300].lock().unwrap().head;
-            if control_port {
-                assert_eq!(
-                    format!("{}", link.send_control(&control(), None).unwrap_err()),
-                    original
-                );
-            } else {
-                assert_eq!(
-                    link.transmit(&eth(0x800)),
-                    Err(LinkError::Adapter(original))
-                );
-            }
-            assert_eq!(model.queues[&0xd4300].lock().unwrap().head, head);
+            assert_eq!(link.rejected_frames(), n as u64 + 1);
             let frames = finish_tx(&model);
             assert_eq!(frames.len(), 1 + usize::from(!control_port && n > 0));
             assert_eq!(frames.last().unwrap()[1] & 0x40 == 0, control_port);
@@ -1183,7 +1155,7 @@ fn data_and_eapol_alternate_single_publication() {
     }
 }
 #[test]
-fn soft_rx_followed_by_native_submission_failure_reports_both_without_fake_tx() {
+fn a_refused_frame_does_not_mask_a_native_submission_failure() {
     if crate::test_process::isolate_model() {
         return;
     }
@@ -1197,10 +1169,9 @@ fn soft_rx_followed_by_native_submission_failure_reports_both_without_fake_tx() 
     let submission = link.transmit(&eth(0x800)).unwrap_err();
     assert!(!format!("{submission:?}").contains("ProtocolVersion"));
     assert_eq!(model.queues[&0xd4300].lock().unwrap().head, head);
-    let original = deferred_message(&link);
-    assert!(original.contains("ProtocolVersion"));
+    assert_eq!(link.rejected_frames(), 1);
     link.state().source.1.store(false, Ordering::Relaxed);
-    assert_eq!(link.receive(), Err(LinkError::Adapter(original)));
+    assert_eq!(link.receive(), Ok(None));
     assert_eq!(model.queues[&0xd4300].lock().unwrap().head, head);
     link.transmit(&eth(0x800)).unwrap();
     assert_eq!(finish_tx(&model).len(), 1);
@@ -1210,7 +1181,7 @@ fn soft_rx_followed_by_native_submission_failure_reports_both_without_fake_tx() 
     assert_eq!(provider.load(Ordering::Relaxed), 1);
 }
 #[test]
-fn deferred_error_cannot_bypass_fresh_native_hard_failure_for_any_packet_io() {
+fn a_native_hard_failure_after_a_refused_frame_fails_the_next_packet_io() {
     if crate::test_process::isolate_model() {
         return;
     }
@@ -1223,23 +1194,12 @@ fn deferred_error_cannot_bypass_fresh_native_hard_failure_for_any_packet_io() {
         queued_data(&mut link, &model, 2, 0x52);
         rejected_rx(&model, true);
         assert_eq!(link.receive().unwrap().unwrap().last(), Some(&0x51));
-        let original = deferred_message(&link);
+        assert_eq!(link.rejected_frames(), 1);
         model.queues[&0xd4520].lock().unwrap().fail_publish = true;
         incoming(&model, &data(false), Some((1, 0, 3)), false);
         let tx = model.queues[&0xd4300].lock().unwrap().head;
-        let deferred = match operation {
-            0 => link.receive().map(|_| ()),
-            1 => link.transmit(&eth(0x800)),
-            _ => link
-                .send_control(&control(), None)
-                .map(|_| ())
-                .map_err(|e| LinkError::Adapter(format!("{e}"))),
-        };
-        assert_eq!(deferred, Err(LinkError::Adapter(original)));
-        assert!(link.carrier());
-        assert_eq!(link.queues().data_frames, 1);
-        // Next possible delivery/submission must observe the real failing
-        // RX DDONE refill, close carrier and discard held data first.
+        // The failing RX DDONE refill closes carrier and discards held data
+        // before any delivery or submission.
         let result = match operation {
             0 => link.receive().map(|_| ()),
             1 => link.transmit(&eth(0x800)),
@@ -1276,7 +1236,6 @@ fn revocation_and_new_association_never_deliver_held_old_epoch_data() {
         queued_data(&mut link, &model, 2, 0x62);
         rejected_rx(&model, true);
         assert_eq!(link.receive().unwrap().unwrap().last(), Some(&0x61));
-        let original = deferred_message(&link);
         if revoke {
             link.revoke().unwrap();
         } else {
@@ -1287,10 +1246,7 @@ fn revocation_and_new_association_never_deliver_held_old_epoch_data() {
         // SAFETY: model peer/key removal and all old users drained.
         unsafe { link.retire_peer_after_drain() }.unwrap();
         if revoke {
-            assert_eq!(
-                format!("{}", link.send_control(&control(), None).unwrap_err()),
-                original
-            );
+            assert!(link.send_control(&control(), None).is_err());
             assert!(link.transmit(&eth(0x800)).is_err());
             assert!(!matches!(link.receive(), Ok(Some(_))));
             model.response.lock().unwrap().clc_processing = false;
@@ -1302,8 +1258,6 @@ fn revocation_and_new_association_never_deliver_held_old_epoch_data() {
             associate(&mut link, &model, join, bss);
             secure(&mut link);
             assert_ne!(link.station().association_epoch(), Some(old_epoch));
-            assert_eq!(deferred_message(&link), original);
-            assert_eq!(link.receive(), Err(LinkError::Adapter(original)));
             assert!(link.receive().unwrap().is_none());
             queued_data(&mut link, &model, 1, 0x63);
             assert_eq!(link.receive().unwrap().unwrap().last(), Some(&0x63));
@@ -1315,7 +1269,7 @@ fn revocation_and_new_association_never_deliver_held_old_epoch_data() {
     }
 }
 #[test]
-fn soft_rx_plus_real_tx_retirement_poison_is_never_deferred_as_packet_rejection() {
+fn a_tx_retirement_poison_after_a_refused_frame_fails_at_once() {
     if crate::test_process::isolate_model() {
         return;
     }
@@ -1337,10 +1291,10 @@ fn soft_rx_plus_real_tx_retirement_poison_is_never_deferred_as_packet_rejection(
                 .map(|_| ())
                 .map_err(|e| LinkError::Adapter(format!("{e}"))),
         };
-        // Preserve the original first RX diagnostic, but a later native
-        // retirement failure makes the whole service failure immediate.
-        assert!(matches!(result,Err(LinkError::Adapter(ref e)) if e.contains("ProtocolVersion")));
-        assert!(link.state().deferred_error.is_none());
+        // The refused frame is only counted; the native retirement failure
+        // is the error.
+        assert!(matches!(result, Err(LinkError::Adapter(ref e)) if !e.contains("ProtocolVersion")));
+        assert_eq!(link.rejected_frames(), 1);
         let c = link.state().client.client.state();
         assert!(c.controller.state().data_tx.as_ref().unwrap().is_poisoned());
         assert_eq!(c.phase, Phase::Associated);

@@ -244,6 +244,8 @@ struct Owned<I: BarIo, Q: QueueIo, C: 'static> {
     transport_facts: Vec<mailbox::init::Fact>,
     asynchronous: Vec<crate::wifi::mediatek::ring::rx::Frame>,
     pending_rx: VecDeque<receive::ReceivedFrame>,
+    /// Events of a pass that a later frame failed, for the next pass.
+    carried_events: Vec<Event>,
     /// The last look at the receive rings found them empty.
     rings_empty: bool,
     receive_groups: receive::Groups<C>,
@@ -360,6 +362,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 transport_facts: Vec::new(),
                 asynchronous: Vec::new(),
                 pending_rx: VecDeque::new(),
+                carried_events: Vec::new(),
                 rings_empty: true,
                 receive_groups: receive::Groups::new(),
                 receive_ba: core::array::from_fn(|_| None),

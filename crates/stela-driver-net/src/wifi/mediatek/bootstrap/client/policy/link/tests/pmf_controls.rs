@@ -858,7 +858,9 @@ fn invalid_second_link_beacon_does_not_suppress_the_valid_beacons_gap_report() {
     let mut wrong_peer = beacon.clone();
     wrong_peer[32 + 10] ^= 4;
     device_receive(&model.queues[&0xd4520], &wrong_peer, true, 0);
-    assert!(link.service().is_err());
+    // Dropped and counted, as ieee80211_rx_handlers drops it.
+    link.service().unwrap();
+    assert_eq!(link.rejected_frames(), 1);
     drop(drain_notices(&mut link));
     device_receive(&model.queues[&0xd4520], &beacon, true, 0);
     link.service().unwrap();

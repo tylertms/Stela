@@ -14,6 +14,7 @@ use crate::{
     wifi::mediatek::{
         bootstrap,
         control::{self, Control},
+        mailbox::key,
     },
 };
 use alloc::{collections::VecDeque, format, vec::IntoIter};
@@ -105,9 +106,9 @@ struct State<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> {
     pending: Option<PendingEvents>,
     released: Option<IntoIter<Released<PacketOwner<C>>>>,
     epoch: Option<u64>,
-    // One original recoverable RX error deferred by successful packet I/O.
-    // The next packet I/O reports it before polling or publishing again.
-    deferred_error: Option<LinkControlError>,
+    /// Receive frames refused and dropped, as mac80211 counts what
+    /// `ieee80211_rx_handlers` drops.
+    rejected_frames: u64,
     /// The function raises a vector the caller has routed.
     vector: bool,
     /// The device may raise it now.
@@ -117,10 +118,6 @@ struct State<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> {
 /// jiffies behind each of these passes.
 const TIMER_TICK_US: u64 = 100_000;
 
-struct ServiceOutcome {
-    result: Result<LinkProgress, LinkControlError>,
-    soft_rx: bool,
-}
 /// Owns the exact existing native client and allocation provider. It has no raw
 /// mutable-client escape: controls, timers, packets and revocation serialize on
 /// this owner. Call service regularly even while there is no Ethernet traffic.
@@ -182,7 +179,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
                 pending: None,
                 released: None,
                 epoch: None,
-                deferred_error: None,
+                rejected_frames: 0,
                 vector: false,
                 armed: false,
             })),
@@ -394,7 +391,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
     /// an invented completion or discarding control-port/event bytes.
     pub fn service(&mut self) -> Result<LinkProgress, LinkControlError> {
         Self::capture(self.state_mut())?;
-        let result = self.service_inner().result;
+        let result = self.service_inner();
         let rearmed = Self::rearm(self.state_mut());
         result.and_then(|progress| rearmed.map(|()| progress))
     }
@@ -427,13 +424,12 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
     fn control_failed(error: control::Error) -> LinkControlError {
         PolicyError::Client(Error::Bootstrap(bootstrap::Error::Control(error))).into()
     }
-    fn service_inner(&mut self) -> ServiceOutcome {
+    fn service_inner(&mut self) -> Result<LinkProgress, LinkControlError> {
         let now = self.now();
         let s = self.state_mut();
         Self::reconcile(s);
         Self::drain(s);
         let mut failure = None;
-        let mut soft_rx = false;
         if s.pending.is_none()
             && s.notices.len() < NOTICES
             && matches!(
@@ -460,22 +456,19 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
                     });
                 }
                 Ok(_) => {}
-                Err(error) => {
-                    // Only rejected receive content may be deferred by packet
-                    // I/O. Native transport/ownership errors stay synchronous.
-                    soft_rx = matches!(
-                        &error,
-                        PolicyError::Client(
-                            Error::WrongProfile
-                                | Error::Rx(_)
-                                | Error::Frame(_)
-                                | Error::Data(_)
-                                | Error::Aggregate(_)
-                                | Error::IncompleteParent
-                        )
-                    );
-                    failure = Some(error);
-                }
+                // ieee80211_rx_handlers drops a frame it refuses (a replay,
+                // another key or BSS, a malformed or unexpected frame) and
+                // the link goes on; the frames before it were kept.
+                Err(PolicyError::Client(
+                    Error::WrongProfile
+                    | Error::Rx(_)
+                    | Error::Frame(_)
+                    | Error::Data(_)
+                    | Error::Aggregate(_)
+                    | Error::IncompleteParent
+                    | Error::Key(key::Error::Bip(key::bip::Error::Authentication(_))),
+                )) => s.rejected_frames = s.rejected_frames.saturating_add(1),
+                Err(error) => failure = Some(error),
             }
         }
         // A rejected receive frame must not starve timeouts or completed
@@ -493,7 +486,6 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
         if matches!(s.client.phase(), Phase::Joining | Phase::Associated)
             && let Err(error) = s.client.poll_station(timer_now, &s.source)
         {
-            soft_rx = false;
             failure.get_or_insert(error);
         }
         if s.released.is_none()
@@ -509,7 +501,6 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    soft_rx = false;
                     failure.get_or_insert(error);
                 }
             }
@@ -520,7 +511,6 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
             match s.client.update_edca() {
                 Ok(()) | Err(PolicyError::Client(Error::NeedsDrain)) => {}
                 Err(error) => {
-                    soft_rx = false;
                     failure.get_or_insert(error);
                 }
             }
@@ -529,7 +519,6 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
             match s.client.channel_switch(timer_now, &s.source) {
                 Ok(()) | Err(PolicyError::Client(Error::NeedsDrain)) => {}
                 Err(error) => {
-                    soft_rx = false;
                     failure.get_or_insert(error);
                 }
             }
@@ -538,7 +527,6 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
             match s.client.update_channel(&s.source) {
                 Ok(()) | Err(PolicyError::Client(Error::NeedsDrain)) => {}
                 Err(error) => {
-                    soft_rx = false;
                     failure.get_or_insert(error);
                 }
             }
@@ -547,7 +535,6 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
             match s.client.update_slot_time() {
                 Ok(()) | Err(PolicyError::Client(Error::NeedsDrain)) => {}
                 Err(error) => {
-                    soft_rx = false;
                     failure.get_or_insert(error);
                 }
             }
@@ -560,22 +547,17 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
                 match s.client.update_power_save(enable) {
                     Ok(()) | Err(PolicyError::Client(Error::NeedsDrain)) => {}
                     Err(error) => {
-                        soft_rx = false;
                         failure.get_or_insert(error);
                     }
                 }
             }
         }
         if let Err(error) = Self::block_ack(s, timer_now) {
-            soft_rx = false;
             failure.get_or_insert(error);
         }
         Self::reconcile(s);
         Self::drain(s);
-        ServiceOutcome {
-            result: failure.map_or_else(|| Ok(Self::progress(s)), |error| Err(error.into())),
-            soft_rx,
-        }
+        failure.map_or_else(|| Ok(Self::progress(s)), |error| Err(error.into()))
     }
     /// mac80211 runs a PMF association's decrypted block-ack actions itself
     /// (`ieee80211_process_addba_request` and the rest), dropping one it
@@ -707,19 +689,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
         Ok(())
     }
 
-    // An error-only call starts no new poll and performs no packet publication.
-    // Thus repeated bad RX can alternate useful packet I/O and the exact error,
-    // without overwriting/coalescing errors or an ambiguous post-publication Err.
-    fn service_for_io(&mut self) -> Result<Option<LinkControlError>, LinkControlError> {
-        if let Some(error) = self.state_mut().deferred_error.take() {
-            return Err(error);
-        }
-        let outcome = self.service_inner();
-        match outcome.result {
-            Ok(_) => Ok(None),
-            Err(error) if outcome.soft_rx => Ok(Some(error)),
-            Err(error) => Err(error),
-        }
+    /// The receive frames refused and dropped so far.
+    pub fn rejected_frames(&self) -> u64 {
+        self.state().rejected_frames
     }
     pub fn begin_scan(
         &mut self,
@@ -803,15 +775,15 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
         ethernet: &[u8],
         key: Option<KeyIdentity>,
     ) -> Result<Receipt, LinkControlError> {
-        let failure = self.service_for_io()?;
+        self.service_inner()?;
         let s = self.state_mut();
         // EAPOL may precede controlled-port/data carrier, but it still needs
         // the current association and a live native controller.
         if !Self::active(s) {
-            return Err(failure.unwrap_or(LinkControlError::WrongPhase));
+            return Err(LinkControlError::WrongPhase);
         }
         if Self::progress(s).backpressured {
-            return Err(failure.unwrap_or(LinkControlError::Backpressure));
+            return Err(LinkControlError::Backpressure);
         }
         let epoch = s
             .client
@@ -825,7 +797,6 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
             None,
             &s.source,
         );
-        s.deferred_error = failure;
         Self::reconcile(s);
         Ok(result?)
     }
@@ -904,20 +875,17 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> Link for Managed
     }
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
         crate::check_frame(frame)?;
-        let failure = self
-            .service_for_io()
+        self.service_inner()
             .map_err(|e| LinkError::Adapter(format!("{e}")))?;
         let s = self.state_mut();
         if !Self::up(s) {
-            return Err(
-                failure.map_or(LinkError::NoCarrier, |e| LinkError::Adapter(format!("{e}")))
-            );
+            return Err(LinkError::NoCarrier);
         }
         // ieee80211_vif_block_queues_csa: the AP asked for silence.
         if Self::progress(s).backpressured || s.client.client.channel_switch_blocks_tx() {
             return Err(LinkError::Adapter(format!(
                 "{}",
-                failure.unwrap_or(LinkControlError::Backpressure)
+                LinkControlError::Backpressure
             )));
         }
         let epoch = s
@@ -931,33 +899,26 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> Link for Managed
             && (Client::tx_ba_blocks_data(s.client.client.state(), tid)
                 || s.held.iter().any(|held| held.tid == tid))
         {
-            s.deferred_error = failure;
             return Self::hold(s, tid, frame);
         }
         let result = s
             .client
             .transmit(epoch, frame, TxClass::Data, tid, &s.source);
-        s.deferred_error = failure;
         Self::reconcile(s);
         result
             .map(|_| ())
             .map_err(|e| LinkError::Adapter(format!("MT7925 managed link: {e:?}")))
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
-        let failure = self
-            .service_for_io()
+        self.service_inner()
             .map_err(|e| LinkError::Adapter(format!("{e}")))?;
         let s = self.state_mut();
         if Self::up(s) {
             while let Some(packet) = s.data.pop_front() {
                 if Some(packet.association) == s.client.station().association_epoch() {
-                    s.deferred_error = failure;
                     return Ok(Some(packet.bytes));
                 }
             }
-        }
-        if let Some(error) = failure {
-            return Err(LinkError::Adapter(format!("{error}")));
         }
         Ok(None)
     }

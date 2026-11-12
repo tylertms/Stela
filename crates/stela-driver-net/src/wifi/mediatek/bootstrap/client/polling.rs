@@ -32,14 +32,37 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         s.rings_empty && s.pending_rx.is_empty()
     }
 
+    /// One pass over the rings. The events of the frames taken before a
+    /// frame that fails stay for the next pass, as mac80211 has already
+    /// handed them on when it drops a frame, so a refused frame never takes
+    /// the good ones before it with it.
     pub(super) fn poll_inner(
+        &mut self,
+        now: u64,
+        source: &dyn PageSource,
+        policy: &mut (impl station::RegulatoryPolicy + scan::Policy),
+        guard: Option<&mut wifi::regulatory::PmfAuthenticationGuard<'_>>,
+        six: Option<&mut wifi::regulatory::SixGhzAuthenticationGuard<'_>>,
+    ) -> Result<Vec<Event>, Error> {
+        let mut events = core::mem::take(&mut self.state_mut().carried_events);
+        match self.poll_frames(now, source, policy, guard, six, &mut events) {
+            Ok(()) => Ok(events),
+            Err(error) => {
+                self.state_mut().carried_events = events;
+                Err(error)
+            }
+        }
+    }
+
+    fn poll_frames(
         &mut self,
         now: u64,
         source: &dyn PageSource,
         policy: &mut (impl station::RegulatoryPolicy + scan::Policy),
         mut guard: Option<&mut wifi::regulatory::PmfAuthenticationGuard<'_>>,
         mut six: Option<&mut wifi::regulatory::SixGhzAuthenticationGuard<'_>>,
-    ) -> Result<Vec<Event>, Error> {
+        events: &mut Vec<Event>,
+    ) -> Result<(), Error> {
         // A live 6 GHz transport is serviced only under its held providers;
         // cleanup after removal needs none.
         if self.state().six_ghz.is_some() && six.is_none() && self.phase() == Phase::Joining {
@@ -87,7 +110,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         // TX-free stamps each release on the controller's clock, as mt76
         // times status out in jiffies.
         s.txs.expire(s.controller.state().control.clock.now_us());
-        let mut events: Vec<_> = s.txs.ready.drain(..).map(Event::TxStatus).collect();
+        events.extend(s.txs.ready.drain(..).map(Event::TxStatus));
         events.append(&mut s.cqm.ready);
         while let Some(received) = s.pending_rx.pop_front() {
             let receive::ReceivedFrame { queue, frame: f } = received;
@@ -200,7 +223,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 && matches!(frame.header().control & 0x00fc, 0x0080 | 0x0050)
                 && Self::other_link(s, &frame.radio).is_some()
             {
-                Self::beacon_of_other_link(s, frame, &mut events)?;
+                Self::beacon_of_other_link(s, frame, events)?;
                 events.push(Event::Raw(f));
                 continue;
             }
@@ -423,7 +446,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         if let Some((session, failure)) = s.authentication_end.take() {
             events.push(Event::ExternalAuthenticationEnded { session, failure });
         }
-        for event in &events {
+        for event in events.iter() {
             if let Event::TxStatus(status) = event
                 && Some(status.receipt) == s.mlme_receipt
             {
@@ -433,7 +456,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                     .map_err(Error::Station)?;
             }
         }
-        Ok(events)
+        Ok(())
     }
 
     /// `ieee80211_drop_unencrypted_mgmt` for a robust frame on a PMF

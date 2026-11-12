@@ -93,7 +93,9 @@ fn second_link_igtk_uses_its_gtk_batch_and_independent_ipn() {
     assert_eq!(model.response.lock().unwrap().client_commands.len(), before);
     let raw = group_frame(OTHER, 4, 0x66, 101, false);
     device_receive(&model.queues[&0xd4520], &raw, true, 0);
-    assert!(link.service().is_err());
+    // A replayed IPN is dropped and counted.
+    link.service().unwrap();
+    assert_eq!(link.rejected_frames(), 1);
     assert_eq!(
         link.state().client.client.state().links[0]
             .gtk
@@ -273,7 +275,9 @@ fn second_link_refuses_wrong_wcid_channel_and_mic_before_advancing_ipn() {
             _ => *raw.last_mut().unwrap() ^= 1,
         }
         device_receive(&model.queues[&0xd4520], &raw, true, 0);
-        assert!(link.service().is_err());
+        // Dropped and counted, as ieee80211_rx_handlers drops it.
+        link.service().unwrap();
+        assert_eq!(link.rejected_frames(), 1);
         assert_eq!(
             link.state().client.client.state().links[0]
                 .gtk
@@ -432,7 +436,10 @@ fn second_link_all_bip_suites_authenticate_independent_vectors() {
         let mut forged = raw.clone();
         *forged.last_mut().unwrap() ^= 1;
         device_receive(&model.queues[&0xd4520], &forged, true, 0);
-        assert!(link.service().is_err());
+        // A forged MIC is dropped and counted.
+        let rejected = link.rejected_frames();
+        link.service().unwrap();
+        assert_eq!(link.rejected_frames(), rejected + 1);
         assert!(link.carrier());
         assert_eq!(
             link.state().client.client.state().links[0]
