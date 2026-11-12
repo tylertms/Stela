@@ -760,7 +760,7 @@ fn sticky_path(code: &mut Code, operand: &Operand, target: TargetCpu, entry: Ent
     // An infinite result may be exact: the full path tells, from its inputs
     // and the host's status, rather than the helper.
     let mut full = full;
-    full.extend(zero_product_check(
+    let unexplained = zero_product_check(
         code,
         &ZeroProduct {
             format: operand.format,
@@ -771,7 +771,16 @@ fn sticky_path(code: &mut Code, operand: &Operand, target: TargetCpu, entry: Ent
         },
         resume,
         &mut crossing,
-    ));
+    );
+    if operand.operation.negate_left() || operand.operation.negate_addend() {
+        full.extend(unexplained);
+    } else {
+        let special = code.len();
+        for patch in unexplained {
+            resolve(code, patch, special);
+        }
+        full.extend(propagated_specials(code, operand, resume, &mut crossing));
+    }
     StickyPath {
         full,
         helper: vec![],
@@ -780,4 +789,285 @@ fn sticky_path(code: &mut Code, operand: &Operand, target: TargetCpu, entry: Ent
         cold,
         inline_end,
     }
+}
+
+/// Out of line after the sticky path's result check and its zero-product
+/// check, for FMLA and FMADD (no operand negated) with FPCR at the sticky
+/// defaults: return to `resume` when every active lane the checks rejected
+/// propagates a quiet NaN or keeps an infinite operand's infinity, and each
+/// other active lane is at least twice the minimum normal, which the
+/// checks accept. Those lanes round nothing and raise no status: a NaN
+/// lane takes FPProcessNaNs3's quiet NaN, the addend's, else Vn's, else
+/// Vm's, and an infinite result with an infinite operand overflowed
+/// nothing. A signalling NaN, an infinity times a zero, opposite
+/// infinities, an infinity from finite operands, DN and the remaining tiny
+/// lanes take the returned branches to the full path, which reads its
+/// operands again. `resumes` receives the branch to `resume`. Reads the
+/// operands again; clobbers XMM1 to XMM7, EAX, ECX, EDX and R8D to R11D,
+/// and LEFT only on the way to `resume`.
+fn propagated_specials(
+    code: &mut Code,
+    operand: &Operand,
+    resume: usize,
+    resumes: &mut Vec<usize>,
+) -> Vec<usize> {
+    use crate::aarch64::floating::FPCR_DN;
+    use crate::x86_64::asm::ShiftOp;
+    const LESS: u8 = 1;
+    const VN: u8 = 2;
+    const TEMPORARY: u8 = 3;
+    const ACTIVE: u8 = 4;
+    const OTHER: u8 = 5;
+    /// MOVMSKPS bits of each D lane's high dword.
+    const HIGH_DWORDS: i8 = 0b1010;
+    let (format, shape) = (operand.format, operand.shape);
+    let lanes = float_lanes(format, Shape::Vector128);
+    let double = format == Format::Double;
+    let (left_shift, right_shift) = if double {
+        (ShiftOpcode::LeftQword, ShiftOpcode::RightQword)
+    } else {
+        (ShiftOpcode::LeftDword, ShiftOpcode::RightDword)
+    };
+    let mask = |code: &mut Code, gpr: Gpr, xmm: u8| {
+        Host::DwordSignMask.register(code, gpr as u8, xmm, TargetCpu::Baseline);
+    };
+    // GPR = the lanes of `source` that are NaNs, as MOVMSKPS bits.
+    let nan_bits = |code: &mut Code, gpr: Gpr, source: u8| {
+        packed(code, Host::MoveAligned, TEMPORARY, source);
+        code.asm()
+            .float_compare(lanes, TEMPORARY, Rm::Xmm(TEMPORARY), UNORDERED);
+        mask(code, gpr, TEMPORARY);
+    };
+    // GPR = the lanes of `source` that are infinite or NaN: a zero times
+    // them is a NaN.
+    let unbounded_bits = |code: &mut Code, gpr: Gpr, source: u8| {
+        packed(code, Host::Xor, TEMPORARY, TEMPORARY);
+        code.asm()
+            .float(FloatOp::Mul, lanes, TEMPORARY, Rm::Xmm(source));
+        code.asm()
+            .float_compare(lanes, TEMPORARY, Rm::Xmm(TEMPORARY), UNORDERED);
+        mask(code, gpr, TEMPORARY);
+    };
+    // `destination` &= !`source`, through ECX.
+    let and_not = |code: &mut Code, destination: Gpr, source: Gpr| {
+        let mut asm = code.asm();
+        asm.mov(Size::Dword, Gpr::Rcx, source);
+        asm.alu_imm8(Alu::Xor, Size::Dword, Gpr::Rcx, -1);
+        asm.alu(Alu::And, Size::Dword, destination, Gpr::Rcx);
+    };
+    let mut full = Vec::new();
+    test_control(code, FPCR_DN);
+    full.push(branch(code, Condition::NotZero));
+    read_numerical_vector(code, shape, operand.left, VN);
+    read_numerical_vector(code, shape, operand.addend, ADDEND);
+    prepare_right(code, operand);
+    poisoned_accumulator(code, operand, resume, resumes);
+    read_numerical_vector(code, shape, operand.left, VN);
+    read_numerical_vector(code, shape, operand.addend, ADDEND);
+    prepare_right(code, operand);
+    // R8D: NaN operands; R9D: infinite operands; R10D: rejected lanes;
+    // R11D: NaN factors.
+    for gpr in [Gpr::R8, Gpr::R9, Gpr::R10] {
+        code.asm().alu(Alu::Xor, Size::Dword, gpr, gpr);
+    }
+    for source in [VN, RIGHT, ADDEND] {
+        if source == ADDEND {
+            code.asm().mov(Size::Dword, Gpr::R11, Gpr::R8);
+        }
+        nan_bits(code, Gpr::Rax, source);
+        code.asm().alu(Alu::Or, Size::Dword, Gpr::R8, Gpr::Rax);
+        // A signalling NaN: a NaN whose quiet bit, shifted to the sign, is
+        // clear.
+        packed(code, Host::MoveAligned, TEMPORARY, source);
+        left_shift.emit(
+            code,
+            TEMPORARY,
+            (format.bits() - format.fraction_bits()) as u8,
+        );
+        mask(code, Gpr::Rdx, TEMPORARY);
+        if double {
+            // Only each lane's high dword holds its quiet bit.
+            let mut asm = code.asm();
+            asm.alu_imm8(Alu::And, Size::Dword, Gpr::Rdx, HIGH_DWORDS);
+            asm.mov(Size::Dword, Gpr::Rcx, Gpr::Rdx);
+            asm.shift_imm(ShiftOp::Shr, Size::Dword, Gpr::Rcx, 1);
+            asm.alu(Alu::Or, Size::Dword, Gpr::Rdx, Gpr::Rcx);
+        }
+        and_not(code, Gpr::Rax, Gpr::Rdx);
+        code.asm().alu(Alu::Or, Size::Dword, Gpr::R10, Gpr::Rax);
+        // Infinite: unbounded and not a NaN.
+        nan_bits(code, Gpr::Rax, source);
+        unbounded_bits(code, Gpr::Rdx, source);
+        and_not(code, Gpr::Rdx, Gpr::Rax);
+        code.asm().alu(Alu::Or, Size::Dword, Gpr::R9, Gpr::Rdx);
+    }
+    // An infinity times a zero: a NaN product of factors that are not NaNs.
+    packed(code, Host::MoveAligned, OTHER, VN);
+    code.asm().float(FloatOp::Mul, lanes, OTHER, Rm::Xmm(RIGHT));
+    nan_bits(code, Gpr::Rax, OTHER);
+    and_not(code, Gpr::Rax, Gpr::R11);
+    code.asm().alu(Alu::Or, Size::Dword, Gpr::R10, Gpr::Rax);
+    // A NaN result without a NaN operand: opposite infinities.
+    nan_bits(code, Gpr::Rax, LEFT);
+    code.asm().mov(Size::Dword, Gpr::Rdx, Gpr::Rax);
+    and_not(code, Gpr::Rdx, Gpr::R8);
+    code.asm().alu(Alu::Or, Size::Dword, Gpr::R10, Gpr::Rdx);
+    // An infinite result without an infinite operand: an overflow.
+    unbounded_bits(code, Gpr::Rdx, LEFT);
+    and_not(code, Gpr::Rdx, Gpr::Rax);
+    and_not(code, Gpr::Rdx, Gpr::R9);
+    code.asm().alu(Alu::Or, Size::Dword, Gpr::R10, Gpr::Rdx);
+    // A magnitude below twice the minimum normal (a NaN compares false).
+    packed(code, Host::MoveAligned, TEMPORARY, LEFT);
+    left_shift.emit(code, TEMPORARY, 1);
+    right_shift.emit(code, TEMPORARY, 1);
+    code.asm().mov_imm64(Gpr::Rax, 2 << format.fraction_bits());
+    packed(code, Host::MoveGprQword, OTHER, Gpr::Rax as u8);
+    if double {
+        packed(code, Host::UnpackLowQword, OTHER, OTHER);
+    } else {
+        super::shuffle(code, OTHER, OTHER, 0);
+    }
+    code.asm()
+        .float_compare(lanes, TEMPORARY, Rm::Xmm(OTHER), LESS);
+    mask(code, Gpr::Rax, TEMPORARY);
+    code.asm().alu(Alu::Or, Size::Dword, Gpr::R10, Gpr::Rax);
+    active_lanes(code, shape, format, ACTIVE);
+    mask(code, Gpr::Rax, ACTIVE);
+    code.asm().test(Size::Dword, Gpr::R10, Gpr::Rax);
+    full.push(branch(code, Condition::NotZero));
+    // Vm's NaNs, then Vn's, then the addend's, each over the last.
+    for source in [RIGHT, VN, ADDEND] {
+        packed(code, Host::MoveAligned, TEMPORARY, source);
+        code.asm()
+            .float_compare(lanes, TEMPORARY, Rm::Xmm(TEMPORARY), UNORDERED);
+        packed(code, Host::And, TEMPORARY, ACTIVE);
+        packed(code, Host::MoveAligned, OTHER, TEMPORARY);
+        packed(code, Host::AndNot, OTHER, LEFT);
+        packed(code, Host::And, TEMPORARY, source);
+        packed(code, Host::Or, TEMPORARY, OTHER);
+        packed(code, Host::MoveAligned, LEFT, TEMPORARY);
+    }
+    let resumed = jump(code);
+    resolve(code, resumed, resume);
+    resumes.push(resumed);
+    full
+}
+
+/// [`propagated_specials`]' first check, for an accumulator a NaN has
+/// reached, with the operands read into XMM2 (Vn), RIGHT and ADDEND:
+/// return to `resume` when each active NaN result lane has a quiet NaN
+/// addend and factors whose product is finite (so neither is a NaN, an
+/// infinity or a signalling NaN, and no infinity meets a zero), where
+/// FPProcessNaNs3 gives the addend without status, and every other active
+/// lane is at least twice the minimum normal and finite. Otherwise fall
+/// through. Clobbers XMM1 to XMM5, XMM7, EAX, ECX and EDX, and LEFT only
+/// on the way to `resume`.
+fn poisoned_accumulator(
+    code: &mut Code,
+    operand: &Operand,
+    resume: usize,
+    resumes: &mut Vec<usize>,
+) {
+    use crate::x86_64::asm::ShiftOp;
+    const VN: u8 = 2;
+    const TEMPORARY: u8 = 3;
+    const QUIET: u8 = 4;
+    const OTHER: u8 = 5;
+    const NAN: u8 = 7;
+    /// PSHUFD selector copying each qword's high dword over its low one.
+    const HIGH_DWORDS: u8 = 0xf5;
+    let (format, shape) = (operand.format, operand.shape);
+    let lanes = float_lanes(format, Shape::Vector128);
+    let double = format == Format::Double;
+    let (left_shift, right_shift) = if double {
+        (ShiftOpcode::LeftQword, ShiftOpcode::RightQword)
+    } else {
+        (ShiftOpcode::LeftDword, ShiftOpcode::RightDword)
+    };
+    let mask = |code: &mut Code, gpr: Gpr, xmm: u8| {
+        Host::DwordSignMask.register(code, gpr as u8, xmm, TargetCpu::Baseline);
+    };
+    let unordered = |code: &mut Code, xmm: u8| {
+        code.asm()
+            .float_compare(lanes, xmm, Rm::Xmm(xmm), UNORDERED);
+    };
+    // TEMPORARY: lanes whose product is not finite.
+    packed(code, Host::Xor, OTHER, OTHER);
+    packed(code, Host::MoveAligned, TEMPORARY, VN);
+    code.asm()
+        .float(FloatOp::Mul, lanes, TEMPORARY, Rm::Xmm(RIGHT));
+    code.asm()
+        .float(FloatOp::Mul, lanes, TEMPORARY, Rm::Xmm(OTHER));
+    unordered(code, TEMPORARY);
+    // QUIET: lanes whose addend's quiet bit is set.
+    packed(code, Host::MoveAligned, QUIET, ADDEND);
+    left_shift.emit(code, QUIET, (format.bits() - format.fraction_bits()) as u8);
+    ShiftOpcode::ArithmeticDword.emit(code, QUIET, 31);
+    if double {
+        super::shuffle(code, QUIET, QUIET, HIGH_DWORDS);
+    }
+    // TEMPORARY: lanes with a quiet NaN addend and a finite product.
+    packed(code, Host::MoveAligned, OTHER, ADDEND);
+    unordered(code, OTHER);
+    packed(code, Host::And, OTHER, QUIET);
+    packed(code, Host::AndNot, TEMPORARY, OTHER);
+    // OTHER: NaN result lanes without them.
+    packed(code, Host::MoveAligned, NAN, LEFT);
+    unordered(code, NAN);
+    packed(code, Host::MoveAligned, OTHER, TEMPORARY);
+    packed(code, Host::AndNot, OTHER, NAN);
+    // QUIET: lanes whose result exponent is neither of the lowest two nor
+    // all ones; a D lane's lands in its low dword, its high dword zero.
+    packed(code, Host::MoveAligned, QUIET, LEFT);
+    left_shift.emit(code, QUIET, 1);
+    right_shift.emit(code, QUIET, format.fraction_bits() as u8 + 1);
+    packed(code, Host::EqualDword, RIGHT, RIGHT);
+    ShiftOpcode::RightDword.emit(code, RIGHT, 31);
+    packed(code, Host::EqualDword, VN, VN);
+    ShiftOpcode::RightDword.emit(
+        code,
+        VN,
+        (u32::BITS - (format.bits() - format.fraction_bits() - 1)) as u8,
+    );
+    packed(code, Host::MoveAligned, TEMPORARY, QUIET);
+    packed(code, Host::GreaterDword, TEMPORARY, RIGHT);
+    packed(code, Host::GreaterDword, VN, QUIET);
+    packed(code, Host::And, TEMPORARY, VN);
+    mask(code, Gpr::Rax, TEMPORARY);
+    if double {
+        let mut asm = code.asm();
+        asm.alu_imm8(Alu::And, Size::Dword, Gpr::Rax, 0b0101);
+        asm.mov(Size::Dword, Gpr::Rcx, Gpr::Rax);
+        asm.shift_imm(ShiftOp::Shl, Size::Dword, Gpr::Rcx, 1);
+        asm.alu(Alu::Or, Size::Dword, Gpr::Rax, Gpr::Rcx);
+    }
+    // Rejected: lanes neither in range nor NaNs, and the NaNs in OTHER.
+    mask(code, Gpr::Rdx, NAN);
+    let mut asm = code.asm();
+    asm.alu(Alu::Or, Size::Dword, Gpr::Rax, Gpr::Rdx);
+    asm.alu_imm8(Alu::Xor, Size::Dword, Gpr::Rax, -1);
+    mask(code, Gpr::Rdx, OTHER);
+    let mut asm = code.asm();
+    asm.alu(Alu::Or, Size::Dword, Gpr::Rax, Gpr::Rdx);
+    let active: i8 = match (shape, format) {
+        (Shape::Vector128, _) => 0b1111,
+        (Shape::Vector64, Format::Single) | (Shape::Scalar, Format::Double) => 0b0011,
+        _ => 0b0001,
+    };
+    asm.alu_imm8(Alu::And, Size::Dword, Gpr::Rax, active);
+    let rejected = branch(code, Condition::NotZero);
+    // The active NaN lanes take the addend.
+    active_lanes(code, shape, format, TEMPORARY);
+    packed(code, Host::And, NAN, TEMPORARY);
+    packed(code, Host::MoveAligned, OTHER, NAN);
+    packed(code, Host::AndNot, OTHER, LEFT);
+    packed(code, Host::And, NAN, ADDEND);
+    packed(code, Host::Or, NAN, OTHER);
+    packed(code, Host::MoveAligned, LEFT, NAN);
+    let resumed = jump(code);
+    resolve(code, resumed, resume);
+    resumes.push(resumed);
+    let end = code.len();
+    resolve(code, rejected, end);
 }

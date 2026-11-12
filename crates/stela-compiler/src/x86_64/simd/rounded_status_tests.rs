@@ -788,6 +788,140 @@ fn fused_special_lanes_complete_inline_beside_ordinary_lanes() {
     assert!(runs > 0);
 }
 
+/// With FPSR.IXC already set (the sticky-inexact path), FMLA, FMLS and
+/// FMADD with infinities, zeros, NaNs (quiet with payloads, signalling,
+/// either sign), subnormals, the minimum normal and the largest finite in
+/// lane 0, the last lane or every lane of one operand or two, beside
+/// ordinary inexact lanes, as poisoned accumulators and fresh factors: on
+/// every tier each vector completes inline and matches the reference in
+/// every lane and FPSR, with FPCR at its defaults and under DN, so the
+/// out-of-line NaN and infinity completion and the full path agree.
+#[test]
+fn fused_specials_after_sticky_inexact_match_the_reference() {
+    let (mut runs, mut inline) = (0, 0);
+    for target in targets() {
+        if target.data_independent_timing() {
+            continue;
+        }
+        for format in [Format::Single, Format::Double] {
+            let fraction_bits = format.fraction_bits();
+            let infinity = format.exponent_mask();
+            let quiet = 1u64 << (fraction_bits - 1);
+            let sign = format.sign_mask();
+            let bias = u64::from(format.exponent_bias());
+            let specials = [
+                infinity,
+                infinity | sign,
+                0,
+                sign,
+                infinity | quiet,
+                infinity | quiet | 0x15,
+                sign | infinity | quiet | 3,
+                infinity | 0x11,
+                sign | infinity | 1,
+                1,
+                1 << fraction_bits,
+                infinity - 1,
+            ];
+            let ordinary = [
+                bias << fraction_bits | quiet,
+                sign | (bias + 1) << fraction_bits | quiet,
+                (bias + 1) << fraction_bits | quiet >> 3,
+                ((bias - 2) << fraction_bits) | ((quiet * 2 - 1) / 3 * 2),
+            ];
+            let full = if format == Format::Double { 2 } else { 4 };
+            let mut forms = vec![
+                Form::Vector(false, full),
+                Form::Vector(true, full),
+                Form::Element(full),
+                Form::Scalar,
+            ];
+            if format == Format::Single {
+                forms.push(Form::Vector(false, 2));
+            }
+            for form in forms {
+                let lanes = match form {
+                    Form::Vector(_, lanes) | Form::Element(lanes) => lanes as usize,
+                    Form::Scalar => 1,
+                };
+                let code = compile(fused_word(form, format), target);
+                for &special in &specials {
+                    // One special operand, or two with every pairing.
+                    let pairs = [(0, None, 0), (1, None, 0), (2, None, 0)]
+                        .into_iter()
+                        .chain(specials.iter().flat_map(|&other| {
+                            [
+                                (0, Some(1), other),
+                                (0, Some(2), other),
+                                (1, Some(2), other),
+                            ]
+                        }));
+                    for (operand, second, other) in pairs {
+                        for every in [false, true] {
+                            let mut vectors = [[0u64; 2]; 3];
+                            for (which, vector) in vectors.iter_mut().enumerate() {
+                                for index in 0..full as usize {
+                                    set_lane(vector, format, index, ordinary[(index + which) % 4]);
+                                }
+                            }
+                            let chosen: Vec<usize> = if every {
+                                (0..lanes).collect()
+                            } else {
+                                vec![0, lanes - 1]
+                            };
+                            for index in chosen {
+                                set_lane(&mut vectors[operand], format, index, special);
+                                if let Some(second) = second {
+                                    set_lane(&mut vectors[second], format, index, other);
+                                }
+                            }
+                            for fpcr in [0, FPCR_DN] {
+                                let mut initial = GuestState {
+                                    fpcr,
+                                    fpsr: 0x0800_0010,
+                                    ..GuestState::default()
+                                };
+                                initial.x[30] = RETURN;
+                                initial.v[D as usize] = vectors[0];
+                                initial.v[A as usize] = vectors[0];
+                                initial.v[N as usize] = vectors[1];
+                                initial.v[M as usize] = vectors[2];
+                                let label = alloc::format!(
+                                    "{form:?} {format:?} {vectors:x?} {fpcr:#x} {target:?}"
+                                );
+                                let mut actual = initial.clone();
+                                let exit = run(&code, &mut actual);
+                                runs += 1;
+                                if exit != RETURN {
+                                    // Only the helper may exit, unchanged.
+                                    assert_eq!(actual, initial, "exited: {label}");
+                                    continue;
+                                }
+                                inline += 1;
+                                let mut expected = initial.clone();
+                                let mut result = [0; 2];
+                                for (index, (operation, addend, left, right)) in
+                                    fused_lanes(form, format, &initial).into_iter().enumerate()
+                                {
+                                    let outcome = floating::fused::evaluate(
+                                        format, operation, fpcr, addend, left, right,
+                                    )
+                                    .unwrap();
+                                    expected.fpsr |= outcome.exceptions;
+                                    set_lane(&mut result, format, index, outcome.bits);
+                                }
+                                expected.v[D as usize] = result;
+                                assert_eq!(actual, expected, "{label}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(inline > runs / 2, "{inline} of {runs} inline");
+}
+
 /// Under FZ with AH clear, fused results tiny before rounding in lane 0
 /// and the last lane, beside ordinary lanes: inexact ones rounding to
 /// zero, to a subnormal or up to the minimum normal, exact subnormal sums,
