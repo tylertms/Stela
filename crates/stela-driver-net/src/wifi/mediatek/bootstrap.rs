@@ -356,6 +356,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
         s.aspm = Some(aspm);
         s.control.driver_own(aspm).map_err(Error::Control)?;
         if s.identity.chip == Chip::Mt7925 {
+            s.control
+                .enable_sleep_protection()
+                .map_err(Error::Control)?;
             // SAFETY: mt7925_pci_probe: driver-own, WFSYS reset, then DMA init.
             // No ring is allocated/published or engine enabled before its ACK.
             unsafe { s.control.initial_wfsys_reset() }.map_err(Error::Control)?;

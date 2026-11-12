@@ -38,6 +38,8 @@ const MT_HW_BOUND: u32 = 0x70010020;
 const MT_HW_CHIPID: u32 = 0x70010200;
 const MT_HW_REV: u32 = 0x70010204;
 const MT_CONN_ON_MISC: u32 = 0x7c0600f0;
+const MT_HW_EMI_CTL: u32 = 0x18011100;
+const EMI_SLEEP_PROTECTION: u32 = 1 << 1;
 const DISABLE: u32 = 1 | (1 << 2) | (1 << 15) | (1 << 28) | (1 << 27) | (1 << 21);
 const BUSY: u32 = (1 << 1) | (1 << 3);
 
@@ -303,6 +305,13 @@ impl<I: BarIo> Control<I> {
         let receipt = self.finish(result)?;
         self.dma_stopped = true;
         Ok(receipt)
+    }
+    /// `mt7925_pci_probe`'s `MT_HW_EMI_CTL` sleep protection before its
+    /// WLAN subsystem reset, so the reset cannot cut an EMI access short.
+    pub fn enable_sleep_protection(&mut self) -> Result<(), Error> {
+        self.guard(true)?;
+        let result = self.modify(MT_HW_EMI_CTL, EMI_SLEEP_PROTECTION, EMI_SLEEP_PROTECTION);
+        self.finish(result)
     }
     /// Poll the pre-download power state for 1 s. Linux warns on a timeout
     /// and downloads anyway, so a timeout is `None`, not a failure, and

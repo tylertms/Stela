@@ -429,6 +429,19 @@ fn initial_mt7925_wfsys_ack_precedes_dma_stop_and_every_queue_publication() {
             .position(|v| v.0 == 1 && v.1 == 0xd4208)
             .unwrap();
         let queue = b.log.iter().position(|v| v.0 == 2).unwrap();
+        // MT_HW_EMI_CTL through the L1 window: 0x18010000 selected, then
+        // SLPPROT_EN set at 0x130000 + 0x1100, before the reset.
+        let select = b
+            .log
+            .iter()
+            .position(|v| v.0 == 1 && v.1 == 0x155024 && v.2 >> 16 == 0x1801)
+            .unwrap();
+        let protect = b
+            .log
+            .iter()
+            .position(|v| v.0 == 1 && v.1 == 0x131100 && v.2 & 2 != 0)
+            .unwrap();
+        assert!(own < select && select < protect && protect < clear);
         assert!(own < clear && clear < set && set < ack && ack < dma && dma < queue);
         assert_eq!(
             b.log.iter().filter(|v| v.0 == 1 && v.1 == 0xf0140).count(),
