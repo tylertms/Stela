@@ -646,25 +646,36 @@ fn publication_failures_keep_guard_and_context() {
     }
 }
 #[test]
-fn dormant_foreign_queue_is_refused_before_any_dma_publication() {
+fn rings_another_owner_left_counted_are_emptied_before_dma_starts() {
     if crate::test_process::isolate_model() {
         return;
     }
     let mut f = NativeFixture::new(Chip::Mt7925);
-    f.bar.0.lock().unwrap().values.insert(0xd4514, 17);
-    assert!(matches!(
-        f.install(),
-        Err(BootError::Control(
-            crate::wifi::mediatek::control::Error::Readback {
-                address: 0xd4514,
-                ..
-            }
-        ))
-    ));
-    assert!(f.memory.lock().unwrap().mappings.is_empty());
-    let drops = f.drops.clone();
-    drop(f);
-    assert_eq!(drops.load(Ordering::Relaxed), 0);
+    // RX ring 1 and TX ring 2: outside MT7925's layout, left by another OS.
+    {
+        let mut b = f.bar.0.lock().unwrap();
+        for (register, value) in [(0xd4510, 0x1234_5000), (0xd4514, 17), (0xd4518, 3)] {
+            b.values.insert(register, value);
+        }
+        b.values.insert(0xd4324, 64);
+    }
+    f.install().unwrap();
+    assert_eq!(f.controller.cleared_rings(), 2);
+    {
+        let b = f.bar.0.lock().unwrap();
+        for register in [0xd4510, 0xd4514, 0xd4518, 0xd4324] {
+            assert_eq!(b.values[&register], 0, "{register:x}");
+        }
+        // Emptied before the engine was enabled.
+        let cleared = b.log.iter().position(|v| *v == (1, 0xd4514, 0)).unwrap();
+        let enabled = b
+            .log
+            .iter()
+            .position(|v| v.0 == 1 && v.1 == 0xd4208 && v.2 & 5 == 5)
+            .unwrap();
+        assert!(cleared < enabled);
+    }
+    f.retire();
 }
 
 #[test]

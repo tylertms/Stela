@@ -144,6 +144,8 @@ struct Owned<I: BarIo, Q: QueueIo, C: 'static> {
     mac: Option<MacInitialized>,
     counters: Option<[u32; 11]>,
     counter_reset_ticks: Option<u64>,
+    /// Rings outside the layout another owner left counted, emptied at install.
+    cleared_rings: u8,
 }
 /// Drop after the first mutation keeps the entire real context,
 /// including fully completed facts. Independent quiescence is required
@@ -287,6 +289,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
                 mac: None,
                 counters: None,
                 counter_reset_ticks: None,
+                cleared_rings: 0,
             });
             Ok(Self {
                 owned: Some(Box::from_raw(p)),
@@ -313,6 +316,11 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
     }
     pub fn policy(&self) -> Option<&Execution<Arc<C>>> {
         self.state().policy.as_ref()
+    }
+    /// How many rings outside this chip's layout install found counted and
+    /// emptied.
+    pub fn cleared_rings(&self) -> u8 {
+        self.state().cleared_rings
     }
     fn require(&self, phase: Phase) -> Result<(), Error> {
         if self.phase() == phase {
@@ -345,7 +353,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
         }
         s.control.stop_dma(true).map_err(Error::Control)?;
         s.control.mask_interrupts().map_err(Error::Control)?;
-        s.control.verify_unused_queues().map_err(Error::Control)?;
+        s.cleared_rings = s.control.clear_unused_queues().map_err(Error::Control)?;
         s.control
             .disable_global_translation()
             .map_err(Error::Control)?;

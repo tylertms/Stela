@@ -218,44 +218,42 @@ impl<I: BarIo> Control<I> {
             .map_err(Error::from);
         self.finish(r)
     }
-    /// Reject stale dormant queue counts before enabling this exact ordinary
-    /// source layout. No speculative queue is installed and no live foreign
-    /// queue is silently reset. Fresh namespace ownership is required.
-    pub(in crate::wifi::mediatek) fn verify_unused_queues(&mut self) -> Result<(), Error> {
+    /// Empty every ring outside this chip's layout that another owner (an
+    /// earlier OS's driver, or a reset default) left with a count, while the
+    /// engine is stopped, so none stays reachable once WFDMA is enabled.
+    /// Linux never reads these rings; refusing the device for them would be
+    /// stricter than it. Returns how many rings were emptied.
+    pub(in crate::wifi::mediatek) fn clear_unused_queues(&mut self) -> Result<u8, Error> {
         self.guard(true)?;
         let result = (|| {
             let c3 = self.chip() == Chip::Mt7925;
-            for qid in 0..=17 {
-                if qid == 0 || qid == 16 || qid == if c3 { 15 } else { 17 } {
+            let tx = (0..=17)
+                .filter(|&qid| qid != 0 && qid != 16 && qid != if c3 { 15 } else { 17 })
+                .map(tx_ring);
+            let rx = (0..=5)
+                .filter(|&qid| qid != 0 && qid != 2 && (c3 || qid != 4))
+                .map(rx_ring);
+            let mut cleared = 0;
+            for ring in tx.chain(rx) {
+                if self.read_control(ring + 4)? == 0 {
                     continue;
                 }
-                let address = tx_ring(qid) + 4;
-                let actual = self.read_control(address)?;
+                // Base, count, then CPU index: the ring holds nothing.
+                for register in [ring, ring + 4, ring + 8] {
+                    self.registers.write32(register, 0)?;
+                }
+                let actual = self.read_control(ring + 4)?;
                 if actual != 0 {
                     return Err(Error::Readback {
-                        address,
+                        address: ring + 4,
                         mask: u32::MAX,
                         expected: 0,
                         actual,
                     });
                 }
+                cleared += 1;
             }
-            for qid in 0..=5 {
-                if qid == 0 || qid == 2 || (!c3 && qid == 4) {
-                    continue;
-                }
-                let address = rx_ring(qid) + 4;
-                let actual = self.read_control(address)?;
-                if actual != 0 {
-                    return Err(Error::Readback {
-                        address,
-                        mask: u32::MAX,
-                        expected: 0,
-                        actual,
-                    });
-                }
-            }
-            Ok(())
+            Ok(cleared)
         })();
         self.finish(result)
     }
