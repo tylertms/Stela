@@ -466,7 +466,7 @@ fn an_exit_after_an_unstored_write_is_refused() {
 /// Running emitted code until it faults, as the engine's exception entry
 /// does: the GPRs and XMM8-15 at the faulting instruction.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-mod faulting {
+pub(super) mod faulting {
     use crate::GuestState;
     use core::{arch::global_asm, cell::Cell, ffi::c_void};
 
@@ -508,10 +508,10 @@ mod faulting {
     /// Where a run faulted: its offset in the code, the GPRs in x86
     /// encoding order and XMM8-15.
     #[derive(Debug, Clone, Copy)]
-    pub(super) struct Fault {
-        pub(super) offset: usize,
-        pub(super) gprs: [u64; 16],
-        pub(super) vectors: [[u64; 2]; 8],
+    pub(in crate::x86_64::block) struct Fault {
+        pub(in crate::x86_64::block) offset: usize,
+        pub(in crate::x86_64::block) gprs: [u64; 16],
+        pub(in crate::x86_64::block) vectors: [[u64; 2]; 8],
     }
 
     struct Active {
@@ -615,7 +615,7 @@ mod faulting {
     }
 
     /// A page no access may touch, which stays mapped for the test.
-    pub(super) fn guard_page() -> u64 {
+    pub(in crate::x86_64::block) fn guard_page() -> u64 {
         // SAFETY: an anonymous PROT_NONE mapping, never unmapped.
         let page = unsafe {
             mmap(
@@ -632,7 +632,7 @@ mod faulting {
     }
 
     /// Run `code` with RDI = `state`: its exit's RAX, or the fault.
-    pub(super) fn run(
+    pub(in crate::x86_64::block) fn run(
         code: &[u8],
         state: &mut GuestState,
     ) -> Result<u64, alloc::boxed::Box<Fault>> {

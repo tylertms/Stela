@@ -7,6 +7,10 @@
 //! gives. Three instructions form it and leave the host flags with the same
 //! meaning, so the next instruction may branch on them.
 //!
+//! Within a block the word may lag: a flag setter whose readers follow it
+//! leaves NZCV in the host flags alone, and the block stores the word
+//! before anything else needs it ([`capture`]).
+//!
 //! The entry from the engine, the return to it and a fault's settlement
 //! ([`super::pinned`]) convert, as does the frame a frame-bound emitter sees.
 //! The engine and frame code see only Arm words. Code under PSTATE.DIT forms
@@ -91,8 +95,13 @@ pub(super) fn capture_in_rax(code: &mut Code, borrow: bool) {
 /// Only register operations the regions also take as pure qualify, so a
 /// block's last instruction's NZCV is never dead: an exit follows.
 pub(super) fn dead_after(instructions: &[crate::aarch64::Instruction], index: usize) -> bool {
+    dead_from(instructions, index + 1)
+}
+
+/// Whether NZCV is dead at `instructions[start]` ([`dead_after`]).
+pub(super) fn dead_from(instructions: &[crate::aarch64::Instruction], start: usize) -> bool {
     use crate::aarch64::Operation;
-    for instruction in instructions.iter().skip(index + 1) {
+    for instruction in instructions.iter().skip(start) {
         match instruction.operation {
             Operation::AddSub { flags, .. }
             | Operation::AddSubRegister { flags, .. }
@@ -171,8 +180,15 @@ pub(super) fn store_captured(asm: &mut Asm) {
     asm.with_flags(0, |asm, word| asm.mov_store(Size::Word, word, Rax));
 }
 
-/// [`capture_in_rax`] and [`store_captured`].
+/// [`capture_in_rax`] and [`store_captured`], or nothing where the code
+/// defers it ([`Code::defer_nzcv`]): the host flags then hold NZCV, the
+/// host CF the complement of C where `borrow`, until the block captures
+/// them or a reader takes them ([`host_condition`]).
 pub(super) fn capture(code: &mut Code, borrow: bool) {
+    if code.deferring_nzcv() {
+        code.record_deferred_nzcv(borrow);
+        return;
+    }
     capture_in_rax(code, borrow);
     store_captured(&mut code.asm());
 }
@@ -272,6 +288,34 @@ pub(super) fn condition(code: &mut Code, condition: u8, live: bool) -> Cond {
     if condition / 2 == 4 {
         asm.cmc();
     }
+    if condition & 1 == 0 {
+        positive
+    } else {
+        negative
+    }
+}
+
+/// The host condition under which Arm `condition` (below 14) holds, from
+/// host flags that hold NZCV with the host CF the complement of C where
+/// `borrow`. HI and LS take C as a borrow, so with a carry they turn the
+/// host CF over first, which leaves `borrow` set.
+pub(super) fn host_condition(code: &mut Code, condition: u8, borrow: &mut bool) -> Cond {
+    debug_assert!(condition < 14);
+    let group = condition / 2;
+    if group == 4 && !*borrow {
+        code.asm().cmc();
+        *borrow = true;
+    }
+    let (positive, negative) = match group {
+        0 => (Cond::E, Cond::Ne),
+        1 if *borrow => (Cond::Ae, Cond::B),
+        1 => (Cond::B, Cond::Ae),
+        2 => (Cond::S, Cond::Ns),
+        3 => (Cond::O, Cond::No),
+        4 => (Cond::A, Cond::Be),
+        5 => (Cond::Ge, Cond::L),
+        _ => (Cond::G, Cond::Le),
+    };
     if condition & 1 == 0 {
         positive
     } else {

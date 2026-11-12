@@ -3386,8 +3386,9 @@ fn pinned_select_consumes_the_preceding_compare_flags() {
     .unwrap()
     .native;
     let select = &code.x86_64_code[code.source_map[1].1..code.source_map[2].1];
-    // CMC converts Arm carry into the x86 borrow for the HI predicate.
-    assert_eq!(select[0], 0xf5);
+    // The compare's flags stay in the host's, whose borrow HI reads as it
+    // is: no CMC before the select.
+    assert_ne!(select[0], 0xf5, "{select:02x?}");
     let entry = pinned::entered(&code.x86_64_code);
     for (operand, selected, nzcv) in [
         (0, 33, 0x8000_0000),
@@ -3418,8 +3419,11 @@ fn pinned_conditional_increment_consumes_the_preceding_compare_flags() {
     // CMP X0, #1; CSINC W8, W2, W8, HI; RET.
     let csinc = 0x1a88_8448;
     for (select, prefix) in [
-        (cset, &[0x0f, 0x94, 0xc0][..]),                // SETE AL
-        (csinc, &[0x8b, 0xd6, 0x8d, 0x52, 0x01, 0xf5]), // MOV EDX, LEA, CMC
+        (cset, &[0x0f, 0x94, 0xc0][..]), // SETE AL
+        (
+            csinc,
+            &[0x8b, 0xd6, 0x8d, 0x52, 0x01, 0x8b, 0x77, 0x10, 0x0f, 0x46],
+        ), // MOV EDX, LEA, MOV ESI, CMOVBE
     ] {
         let source: Vec<_> = [0xf100_041fu32, select, 0xd65f_03c0]
             .into_iter()
@@ -3639,7 +3643,8 @@ fn masked_base_reuse_matches_the_unmasked_block() {
 }
 
 /// A flag setter whose NZCV the next one overwrites before any read, fault
-/// or exit keeps no capture in system mode; every other one keeps its own.
+/// or exit keeps no capture in system mode, nor does one whose readers take
+/// it from the host flags before that; every other one keeps its own.
 #[test]
 fn dead_nzcv_captures_are_dropped_in_system_mode() {
     use crate::{Lifter, TargetCpu, aarch64::Decoder};
@@ -3657,7 +3662,7 @@ fn dead_nzcv_captures_are_dropped_in_system_mode() {
         (&[ADDS_X0, ADD_X3, MOVZ_X4, SUBS_X2], 1),
         (&[ADDS_X0, ADDS_X1, ADD_X3], 1),
         (&[ADDS_X0, TST_X0, SUBS_X2, ADDS_X1], 1),
-        (&[ADDS_X0, CSEL_X7, ADDS_X1], 2),
+        (&[ADDS_X0, CSEL_X7, ADDS_X1], 1),
         (&[ADDS_X0, LDR_X9, ADDS_X1], 2),
         (&[ADDS_X0], 1),
     ] {

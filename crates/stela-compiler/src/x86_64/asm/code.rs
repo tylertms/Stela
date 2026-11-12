@@ -41,6 +41,11 @@ pub(crate) struct Code {
     base_applied: Option<super::super::masked_base::Plan>,
     /// Guest vectors kept in host XMM registers ([`super::super::vector_cache`]).
     pub(in crate::x86_64) vectors: super::super::vector_cache::VectorCache,
+    /// Pinned NZCV captures are deferred ([`super::super::flag_word::capture`]):
+    /// the flags stay in the host's, and the carry of the one an emitter
+    /// left there is kept.
+    defer_nzcv: bool,
+    deferred_nzcv: Option<bool>,
 }
 
 /// Exact faulting instruction interval, separate from source retirement.
@@ -115,6 +120,8 @@ impl Code {
             base_request: None,
             base_applied: None,
             vectors: Default::default(),
+            defer_nzcv: false,
+            deferred_nzcv: None,
         }
     }
     /// Code that keeps [`super::super::pinned`] guest registers in host
@@ -124,6 +131,27 @@ impl Code {
             pinned: true,
             ..Self::new()
         }
+    }
+    /// Defer the pinned NZCV capture of the instruction emitted next: its
+    /// flags stay in the host's ([`Self::take_deferred_nzcv`]).
+    pub(crate) fn defer_nzcv(&mut self) {
+        self.defer_nzcv = true;
+        self.deferred_nzcv = None;
+    }
+    /// Whether a pinned NZCV capture is deferred.
+    pub(crate) const fn deferring_nzcv(&self) -> bool {
+        self.defer_nzcv
+    }
+    /// The deferred capture's `borrow`: the host CF is the complement of
+    /// the Arm carry.
+    pub(crate) fn record_deferred_nzcv(&mut self, borrow: bool) {
+        debug_assert!(self.defer_nzcv && self.deferred_nzcv.is_none());
+        self.deferred_nzcv = Some(borrow);
+    }
+    /// Stop deferring: the borrow of the capture deferred, if one was.
+    pub(crate) fn take_deferred_nzcv(&mut self) -> Option<bool> {
+        self.defer_nzcv = false;
+        self.deferred_nzcv.take()
     }
     /// The instructions from here on have `index` in the block's source map.
     pub(crate) fn set_instruction(&mut self, index: usize) {
@@ -429,6 +457,8 @@ impl Code {
             base_request: None,
             base_applied: None,
             vectors: Default::default(),
+            defer_nzcv: false,
+            deferred_nzcv: None,
         };
         self.instructions = at.instructions;
         tail

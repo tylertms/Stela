@@ -61,7 +61,66 @@ pub(super) fn emit_compare(code: &mut Code, operand: &CompareOperand, live_nzcv:
     }
 }
 
+/// Where a select finds NZCV.
+enum Source {
+    /// The state block.
+    Frame,
+    /// The host flags a capture just left ([`condition_holds`]).
+    Live,
+    /// The host flags of a deferred capture ([`flag_word::host_condition`]).
+    Host { borrow: bool },
+}
+
+impl Source {
+    /// The host condition under which Arm `condition` holds, or `None` for
+    /// AL and NV.
+    fn predicate(&mut self, code: &mut Code, condition: u8) -> Option<Cond> {
+        match self {
+            Self::Frame => condition_holds(code, condition, false),
+            Self::Live => condition_holds(code, condition, true),
+            Self::Host { borrow } => {
+                (condition < 14).then(|| flag_word::host_condition(code, condition, borrow))
+            }
+        }
+    }
+}
+
 pub(super) fn emit(code: &mut Code, operand: &Operand, live_nzcv: bool) {
+    let mut source = if live_nzcv {
+        Source::Live
+    } else {
+        Source::Frame
+    };
+    emit_from(code, operand, &mut source);
+}
+
+/// A select of pinned code on NZCV that only the host flags hold, the host
+/// CF the complement of C where `borrow`. Every form but CSETM and CSNEG
+/// leaves them as they were, but for a carry HI or LS turns over
+/// ([`flag_word::host_condition`]), which `borrow` then says.
+pub(super) fn emit_host(code: &mut Code, operand: &Operand, borrow: &mut bool) {
+    debug_assert!(keeps_host_flags(operand));
+    let mut source = Source::Host { borrow: *borrow };
+    emit_from(code, operand, &mut source);
+    if let Source::Host { borrow: after } = source {
+        *borrow = after;
+    }
+}
+
+/// Whether [`emit_host`] takes `operand` and leaves the host flags: CSETM
+/// and CSNEG negate after the predicate, and AL and NV need none.
+pub(super) fn keeps_host_flags(operand: &Operand) -> bool {
+    let setm = operand.left == Register::Zero && operand.right == Register::Zero;
+    operand.condition < 14
+        && match operand.otherwise {
+            Otherwise::Unchanged | Otherwise::Increment => true,
+            Otherwise::Invert => !setm,
+            Otherwise::Negate => false,
+        }
+}
+
+fn emit_from(code: &mut Code, operand: &Operand, source: &mut Source) {
+    let live_nzcv = !matches!(source, Source::Frame);
     let size = Size::of(operand.width == Width::X64);
     // The false arm's scratch: RDX in pinned code, whose predicates leave it
     // alone, which leaves R8 to a run's locals (`pinned::Span`).
@@ -71,7 +130,7 @@ pub(super) fn emit(code: &mut Code, operand: &Operand, live_nzcv: bool) {
     if operand.left == Register::Zero
         && operand.right == Register::Zero
         && matches!(operand.otherwise, Otherwise::Increment | Otherwise::Invert)
-        && let Some(predicate) = condition_holds(code, operand.condition, live_nzcv)
+        && let Some(predicate) = source.predicate(code, operand.condition)
     {
         // CSET and CSETM materialize the condition as a bit or a mask.
         let mut asm = code.asm();
@@ -121,7 +180,7 @@ pub(super) fn emit(code: &mut Code, operand: &Operand, live_nzcv: bool) {
     } else {
         (operand.left, otherwise)
     };
-    let predicate = condition_holds(code, operand.condition, live_nzcv);
+    let predicate = source.predicate(code, operand.condition);
     let mut asm = code.asm();
     let selected = predicate.zip(alternate);
     let already_placed = destination.is_some() && initial == operand.destination;

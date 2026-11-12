@@ -680,6 +680,13 @@ fn emit_selected(
     // faults the fault table settles from the state block the cache keeps
     // current at every fault site and exit.
     let vectors = pinned && fault_table && !code.constant_time() && !checks.translated;
+    // Pinned code leaves a flag setter's NZCV in the host flags while only
+    // its readers follow, the host CF the complement of C where `borrow`
+    // (`flag_word::capture`): `pending` holds `borrow` then. It stores the
+    // word before any other instruction that may need it, and at the end of
+    // the body, so every fault, exit and frame-bound emitter finds it.
+    let lazy_flags = pinned && !code.constant_time();
+    let mut pending: Option<bool> = None;
     for copy in 0..if self_loop.is_some() { 2_usize } else { 1 } {
         if copy == 0
             && self_loop.is_some()
@@ -715,6 +722,17 @@ fn emit_selected(
             loop_exits.landings[copy] = vec![None; instructions.len() + 1];
         }
         while cursor < instructions.len() {
+            if let Some(borrow) = pending
+                && (landing[cursor]
+                    || joins.iter().any(|&(at, _)| at == cursor)
+                    || !reads_host_flags(&instructions[cursor].operation))
+            {
+                pending = None;
+                if !super::flag_word::dead_from(instructions, cursor) {
+                    super::flag_word::capture(code, borrow);
+                    after.rax = super::Rax::Nzcv;
+                }
+            }
             if vectors {
                 if landing[cursor] {
                     // A join lands here from a point that stored them all.
@@ -1021,8 +1039,10 @@ fn emit_selected(
                                 target,
                                 checks: checks_at(cursor + index),
                                 live_nzcv: native_branch_after(cursor + index),
+                                defer_flags: false,
                             },
                             after,
+                            &mut None,
                         );
                     }
                     debug_assert!(fixups.is_empty());
@@ -1142,8 +1162,13 @@ fn emit_selected(
             block.source_map.push((instruction.pc, code.len()));
             code.set_instruction(block.source_map.len() - 1);
             if let Some(target) = instruction.operation.conditional_target() {
-                let taken = branch_condition(code, &instruction.operation, held.rax)
-                    .expect("a conditional branch's condition");
+                let taken = match (&instruction.operation, pending.as_mut()) {
+                    (Operation::BranchCondition { condition, .. }, Some(borrow)) => {
+                        super::flag_word::host_condition(code, *condition, borrow)
+                    }
+                    _ => branch_condition(code, &instruction.operation, held.rax)
+                        .expect("a conditional branch's condition"),
+                };
                 // A side exit's stub is its link slot and exit alone, which is
                 // where `successor_exits` finds it: what the run has written is
                 // stored before the branch, flags untouched.
@@ -1156,7 +1181,18 @@ fn emit_selected(
                         active.flush(code);
                     }
                 }
-                let jump = code.asm().jcc(taken);
+                let jump = match pending {
+                    // The exit stores the word the fallthrough keeps in the
+                    // host flags.
+                    Some(borrow) => {
+                        let stay = code.asm().jcc(taken.negate());
+                        super::flag_word::capture(code, borrow);
+                        let jump = code.asm().jmp();
+                        code.asm().bind(stay);
+                        jump
+                    }
+                    None => code.asm().jcc(taken),
+                };
                 if self_loop.is_some() {
                     // Both copies' jumps go to one exit, which settles first.
                     let rows = block.source_map.len() - loop_exits.first_rows * copy;
@@ -1247,8 +1283,10 @@ fn emit_selected(
                     target,
                     checks: checks_at(cursor),
                     live_nzcv: native_branch_after(cursor),
+                    defer_flags: lazy_flags && !frame_bound,
                 },
                 held,
+                &mut pending,
             );
             if frame_bound {
                 super::pinned::reload(code);
@@ -1279,6 +1317,11 @@ fn emit_selected(
         } else if let Some((mut active, _)) = run.take() {
             active.emitted(code, &instructions[run_emitted..]);
             active.leave(code);
+        }
+        // The block's exits and the back edge's count need the word.
+        if let Some(borrow) = pending.take() {
+            super::flag_word::capture(code, borrow);
+            after.rax = super::Rax::Nzcv;
         }
         if let (Some(self_loop), Some((pc, Terminator::Branch(operation)))) = (self_loop, terminal)
         {
@@ -1423,10 +1466,11 @@ fn emit_selected(
         fixups.is_empty(),
         "ordinary instruction prefix cannot branch"
     );
-    out_of_line.place(code);
     // A capture the body ends with leaves the host flags live for the
-    // terminal's branch: only the jump over the paths below comes between.
+    // terminal's branch: only the jumps over the moved code and the paths
+    // below come between, and moved code returns into the body.
     let flags_live = after.rax == super::Rax::Nzcv && code.ends_with(&nzcv_store(code.is_pinned()));
+    out_of_line.place(code);
     // Before the terminal, whose direct exits end the code.
     if !pointer_paths.is_empty() || !mirrored_paths.is_empty() || !amx_paths.is_empty() {
         let over = code.asm().jmp();
@@ -1728,6 +1772,35 @@ struct SingleOptions {
     target: crate::TargetCpu,
     checks: super::MemoryChecks,
     live_nzcv: bool,
+    /// Leave a flag setter's NZCV in the host flags ([`sets_flags_alone`]).
+    defer_flags: bool,
+}
+
+/// Whether `operation` sets all of NZCV from its own result, reading none
+/// of it, in an emission whose last flag-setting host instruction leaves
+/// them: one pinned code may leave in the host flags.
+fn sets_flags_alone(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::AddSub { flags: true, .. }
+            | Operation::AddSubRegister { flags: true, .. }
+            | Operation::AddSubExtended { flags: true, .. }
+            | Operation::LogicalImmediate { flags: true, .. }
+            | Operation::LogicalRegister { flags: true, .. }
+    )
+}
+
+/// Whether `operation` takes NZCV from the host flags of a setter before
+/// it ([`sets_flags_alone`]) and leaves them: a conditional branch, or a
+/// select that does ([`super::conditional_select::keeps_host_flags`]).
+fn reads_host_flags(operation: &Operation) -> bool {
+    match operation {
+        Operation::BranchCondition { condition, .. } => *condition < 14,
+        Operation::ConditionalSelect(operand) => {
+            super::conditional_select::keeps_host_flags(operand)
+        }
+        _ => false,
+    }
 }
 
 /// One instruction outside the regions, after an emission that left
@@ -1735,6 +1808,9 @@ struct SingleOptions {
 /// register the previous one just stored from RAX finds it there, and one
 /// that reads a vector XMM0 holds may take it from there. With
 /// `out_of_line`, numerical instructions move their slow paths there.
+/// `flags` holds the borrow of NZCV that only the host flags hold, before
+/// the instruction and after it.
+#[allow(clippy::too_many_arguments)]
 fn emit_single(
     code: &mut Code,
     scratch: &mut Code,
@@ -1743,11 +1819,13 @@ fn emit_single(
     fixups: &mut Vec<(GuestAddress, GuestAddress, usize)>,
     options: SingleOptions,
     held: Held,
+    flags: &mut Option<bool>,
 ) -> Held {
     let SingleOptions {
         target,
         checks,
         live_nzcv,
+        defer_flags,
     } = options;
     if let Operation::FloatingPoint(operand) = &instruction.operation {
         let Some(out_of_line) = out_of_line else {
@@ -1773,7 +1851,15 @@ fn emit_single(
         super::nzcv
     };
     let start = code.len();
-    if let Operation::Simd(operand) = &instruction.operation {
+    let deferred = defer_flags && sets_flags_alone(&instruction.operation);
+    if deferred {
+        code.defer_nzcv();
+    }
+    if let Some(borrow) = flags.as_mut()
+        && let Operation::ConditionalSelect(operand) = &instruction.operation
+    {
+        super::conditional_select::emit_host(code, operand, borrow);
+    } else if let Operation::Simd(operand) = &instruction.operation {
         super::simd::emit_after(code, operand, target, checks, held.xmm0, held.xmm_pair);
         // A first load of the vector XMM0 holds changes nothing.
         if let Some(vector) = held.xmm0 {
@@ -1932,7 +2018,16 @@ fn emit_single(
     {
         code.remove_instruction(start..start + load.len());
     }
+    if deferred {
+        *flags = Some(
+            code.take_deferred_nzcv()
+                .expect("a flag setter's emission captures NZCV"),
+        );
+    } else {
+        debug_assert!(flags.is_none() || reads_host_flags(&instruction.operation));
+    }
     let rax = match super::rax_after(&instruction.operation, code, checks) {
+        super::Rax::Nzcv if deferred => super::Rax::Unknown,
         // A direct form may leave the result only in its host register.
         super::Rax::Guest(register)
             if code.is_pinned()
@@ -2407,6 +2502,8 @@ fn branch_condition_with(
 mod flag_cost_tests;
 #[cfg(test)]
 mod host_cost;
+#[cfg(test)]
+mod lazy_flags_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
