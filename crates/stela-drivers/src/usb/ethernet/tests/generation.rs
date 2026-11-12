@@ -42,22 +42,21 @@ pub(crate) fn queue(peer: &mut UsbEthernet) {
 
 pub(crate) fn refuse(peer: &mut UsbEthernet, target: &Shared) {
     peer.controller = target.clone();
-    let io = match &mut peer.chip {
-        Backend::Realtek(chip) => &mut chip.io,
-        Backend::Asix(_) => unreachable!(),
+    let Some(Backend::Realtek(chip)) = &mut peer.chip else {
+        unreachable!()
     };
+    let io = &mut chip.io;
     io.source_mut().controller = target.clone();
     let before_id = peer.id;
     let before_pending = peer.pending.clone();
     let before_send = peer.send.bytes().to_vec();
     let before_receive = peer.receive.bytes().to_vec();
-    assert!(
-        stela_driver_base::stepped::block_on(io.control(setup(0xc0, 5, 0, 0, 4), &[])).is_err()
-    );
+    assert!(block_on(io.control(setup(0xc0, 5, 0, 0, 4), &[])).is_err());
     assert!(!peer.carrier());
     assert!(peer.transmit(&[0x88; 60]).is_err());
     assert!(peer.receive().is_err());
-    assert!(peer.quiesce().is_err());
+    let endpoints = [peer.binding.input.dci(), peer.binding.output.dci()];
+    assert!(block_on(quiesce(&peer.controller, peer.id, endpoints)).is_err());
     assert!(peer.stop().is_err());
     assert_eq!(peer.id, before_id);
     assert_eq!(peer.pending, before_pending);

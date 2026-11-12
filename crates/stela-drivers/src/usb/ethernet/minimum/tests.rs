@@ -81,6 +81,7 @@ fn actual_host_bridge_reports_retained_model_timer_failure_without_later_device_
     let mut control = MinimumControl::new(super::super::HostControl {
         controller: controller.clone(),
         id: device.id,
+        stepped: Default::default(),
     });
     assert_eq!(
         block_on(control.minimum_wait(u64::MAX)),

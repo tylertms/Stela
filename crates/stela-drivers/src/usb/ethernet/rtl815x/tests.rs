@@ -557,6 +557,7 @@ fn rtl8152b_binds_real_xhci_dma_moves_aggregates_wraps_and_quiesces() {
             &[vec![9, 2, 9, 0, 0, 7, 0, 0x80, 50]],
         );
         controller.set_slot_speed(1, HIGH_SPEED);
+        model::minimum_on_controller_clock(&mut controller);
         model.borrow_mut().ethernet = Some(ethernet::rtl815x::tests::Model::new(revision));
         let configuration = vec![
             9, 2, 32, 0, 1, 7, 0, 0x80, 50, 9, 4, 0, 0, 2, 0xff, 0, 0, 0, 7, 5, 0x81, 2, 0, 2, 0,
@@ -618,10 +619,10 @@ fn rtl8152b_binds_real_xhci_dma_moves_aggregates_wraps_and_quiesces() {
         match scenario {
             0 => {
                 model.borrow_mut().ethernet.as_mut().unwrap().link = false;
-                assert!(!link.carrier());
+                assert!(!link.checked_carrier());
                 assert!(model.borrow().active[3].is_none());
                 model.borrow_mut().ethernet.as_mut().unwrap().link = true;
-                assert!(link.carrier());
+                assert!(link.checked_carrier());
                 link.transmit(&[1; 60]).unwrap();
                 link.stop().unwrap();
                 assert!(link.transmit(&[2; 60]).is_err());
@@ -694,6 +695,7 @@ fn rtl815x_firmware_uses_ep0_dma_wrapping_and_poison_guards() {
             let io = ethernet::HostControl {
                 controller: shared.clone(),
                 id: shared.borrow().test_device_id(1).unwrap(),
+                stepped: Default::default(),
             };
             let mut chip = block_on(Chip::probe(io, Revision(revision))).unwrap();
             if fail {
@@ -1008,7 +1010,7 @@ fn rtl8153_native_usb2_usb3_binding_uploads_exact_provider_and_keeps_owned_recei
             assert!(link.firmware.is_none());
         }
         drop(provider); // Native link must not borrow the image/catalog.
-        assert!(link.carrier());
+        assert!(link.settled_carrier());
         link.transmit(&[0x5a; 1514]).unwrap();
         assert_eq!(model.borrow().outgoing[0].len(), 1522);
         assert_eq!(link.receive().unwrap(), None);
@@ -1069,3 +1071,85 @@ fn every_patched_revision_starts_without_its_firmware_file() {
 }
 
 mod minimum;
+
+/// The RTL8152B link of [`a_transmit_in_flight_makes_the_next_busy_until_it_ends_or_times_out`]
+/// through carrier, a frame each way, a lost link and its return, with
+/// calls bounded by `calls`; what the device saw.
+fn rtl_link_through_loss(late: bool) -> ethernet::tests::stepped::Effects {
+    use crate::net::{Link, LinkError};
+    use ethernet::tests::stepped::{Calls, effects};
+    let mut dma = TestRegion::new(128 * 1024 * 8);
+    let (mut controller, model) = unconfigured_cancellation_controller_with_configurations(
+        &mut dma,
+        &[vec![9, 2, 9, 0, 0, 7, 0, 0x80, 50]],
+    );
+    controller.set_slot_speed(1, HIGH_SPEED);
+    model::minimum_on_controller_clock(&mut controller);
+    model.borrow_mut().ethernet = Some(ethernet::rtl815x::tests::Model::new(0x4c10));
+    let configuration = vec![
+        9, 2, 32, 0, 1, 7, 0, 0x80, 50, 9, 4, 0, 0, 2, 0xff, 0, 0, 0, 7, 5, 0x81, 2, 0, 2, 0, 7, 5,
+        0x02, 2, 0, 2, 0,
+    ];
+    let mut device = model::addressed_device(&controller, vec![configuration]);
+    device.speed = HIGH_SPEED;
+    device.descriptor[8..12].copy_from_slice(&[0xda, 0x0b, 0x52, 0x81]);
+    controller.preflight_vendor_ethernet(&mut device).unwrap();
+    model::select(&mut device).unwrap();
+    let shared = Rc::new(RefCell::new(controller));
+    let mut found = Found::default();
+    bind(&shared, device, &mut dma, &mut found);
+    let mut link = found.vendor_links.pop().unwrap();
+    let clock = shared.borrow().clock;
+    let mut calls = Calls::new(model.clone(), clock, late);
+    let not_busy = |result: &Result<(), LinkError>| result != &Err(LinkError::Busy);
+
+    calls.until(|| link.carrier(), |up| *up);
+    calls
+        .until(|| link.transmit(&[0x5a; 60]), not_busy)
+        .unwrap();
+    calls
+        .until(|| link.transmit(&[0x6a; 60]), not_busy)
+        .unwrap();
+    calls.until(
+        || link.receive().unwrap(),
+        |_| model.borrow().active[3].is_some(),
+    );
+    let mut aggregate = vec![0; 88];
+    aggregate[..4].copy_from_slice(&64u32.to_le_bytes());
+    aggregate[24..84].fill(0x7a);
+    model.borrow_mut().push_event(aggregate);
+    let frame = calls.until(|| link.receive().unwrap(), Option::is_some);
+    assert_eq!(frame, Some(vec![0x7a; 60]));
+
+    // The lost link: both bulk endpoints cancelled, then the MAC stopped.
+    model.borrow_mut().ethernet.as_mut().unwrap().link = false;
+    calls.wait(ethernet::LINK_POLL_US);
+    calls.until(
+        || (link.carrier(), link.running.is_some()),
+        |(up, busy)| !up && !busy,
+    );
+    assert!(model.borrow().active[3].is_none());
+    model.borrow_mut().ethernet.as_mut().unwrap().link = true;
+    calls.wait(ethernet::LINK_POLL_US);
+    calls.until(|| link.carrier(), |up| *up);
+    calls
+        .until(|| link.transmit(&[0x8a; 60]), not_busy)
+        .unwrap();
+    calls
+        .until(|| link.transmit(&[0x9a; 60]), not_busy)
+        .unwrap();
+    assert_eq!(calls.answered_late > 0, late);
+    let seen = effects(&model.borrow(), |_| false);
+    calls.answer_at_once();
+    seen
+}
+
+/// A device that answers each control transfer and command only after the
+/// link call that asked returned: the carrier check, the MAC set up for the
+/// new link, transmit, receive and the lost link's quiesce and MAC stop with
+/// its 20 ms ALDPS wait run in steps, no call holding the processor beyond
+/// its bound, and the device sees what one that answers at once sees.
+#[test]
+fn rtl8152_link_calls_run_in_steps_when_the_device_answers_late() {
+    assert_eq!(rtl_link_through_loss(true), rtl_link_through_loss(false));
+}

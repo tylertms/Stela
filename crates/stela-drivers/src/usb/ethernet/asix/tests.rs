@@ -362,7 +362,7 @@ fn unchanged_linux_asix_exact_ids_and_shared_callback_flags() {
 
 #[test]
 fn ax88772_native_all_candidates_revisions_split_rx_and_quarantine() {
-    use crate::net::Link;
+    use crate::net::{Link, LinkError};
     let mut cases = 0;
     for (vid, pid) in ethernet::asix_legacy_ids() {
         for code in [0, 0x10, 0x20] {
@@ -382,6 +382,7 @@ fn ax88772_native_all_candidates_revisions_split_rx_and_quarantine() {
                             &[vec![9, 2, 9, 0, 0, 9, 0, 0x80, 50]],
                         );
                     controller.set_slot_speed(1, speed);
+                    model::minimum_on_controller_clock(&mut controller);
                     model.borrow_mut().asix_legacy = Some(ethernet::LegacyModel::new(
                         code,
                         if code == 0x10 { 0x003b1861 } else { 0x003b1881 },
@@ -458,12 +459,13 @@ fn ax88772_native_all_candidates_revisions_split_rx_and_quarantine() {
                     let mut link = found.vendor_links.pop().unwrap();
                     assert_eq!(link.driver(), "usb-asix");
                     assert_eq!(link.mac().0, [2, 0x27, 0x72, 0x43, 0x54, 0x65]);
+                    // Each check's waits advance the autonegotiation clock.
                     for _ in 0..4 {
-                        if link.carrier() {
+                        if link.checked_carrier() {
                             break;
                         }
                     }
-                    if !link.carrier() {
+                    if !link.settled_carrier() {
                         let result = link.receive();
                         panic!(
                             "code {code} scenario {scenario} phy {:?} RX {:?}",
@@ -477,7 +479,12 @@ fn ax88772_native_all_candidates_revisions_split_rx_and_quarantine() {
                     } else {
                         1
                     } {
-                        link.transmit(&vec![0x5a; length]).unwrap();
+                        // A carrier check that comes due holds the chip
+                        // for a few calls; the frame is busy until it ends.
+                        let frame = vec![0x5a; length];
+                        while let Err(error) = link.transmit(&frame) {
+                            assert_eq!(error, LinkError::Busy);
+                        }
                     }
                     let sent = model.borrow().outgoing.last().unwrap().clone();
                     let n = length.max(60) as u32;
@@ -513,15 +520,15 @@ fn ax88772_native_all_candidates_revisions_split_rx_and_quarantine() {
                     match scenario {
                         0 => {
                             model.borrow_mut().asix_legacy.as_mut().unwrap().link = false;
-                            assert!(!link.carrier());
+                            assert!(!link.checked_carrier());
                             assert!(model.borrow().active[in_dci].is_none());
                             model.borrow_mut().asix_legacy.as_mut().unwrap().link = true;
                             for _ in 0..4 {
-                                if link.carrier() {
+                                if link.checked_carrier() {
                                     break;
                                 }
                             }
-                            if !link.carrier() {
+                            if !link.settled_carrier() {
                                 let result = link.receive();
                                 panic!(
                                     "code {code} scenario {scenario} phy {:?} RX {:?}",
@@ -708,7 +715,7 @@ fn ax179_aliases_use_shared_dma_and_quarantine() {
                     assert!(setting < first_vendor);
                     assert_eq!(hw.setup[setting].0, setup(1, SET_INTERFACE, 2, 0, 0));
                 }
-                assert!(link.carrier());
+                assert!(link.settled_carrier());
                 let length = 68usize.next_multiple_of(packet as usize) - 8;
                 let frames = if vid == 0x0b95 && pid == 0x1790 && scenario == 0 {
                     300
@@ -756,7 +763,7 @@ fn ax179_aliases_use_shared_dma_and_quarantine() {
                             .unwrap()
                             .phy
                             .insert((0, 0, 0x11), 0);
-                        assert!(!link.carrier());
+                        assert!(!link.checked_carrier());
                         assert!(model.borrow().active[in_dci].is_none());
                         model
                             .borrow_mut()
@@ -765,7 +772,7 @@ fn ax179_aliases_use_shared_dma_and_quarantine() {
                             .unwrap()
                             .phy
                             .insert((0, 0, 0x11), 0xa400);
-                        assert!(link.carrier());
+                        assert!(link.checked_carrier());
                         link.stop().unwrap();
                         assert!(link.transmit(&[0; 60]).is_err());
                     }
@@ -811,4 +818,151 @@ fn ax179_aliases_use_shared_dma_and_quarantine() {
             }
         }
     }
+}
+
+/// An ASIX link through carrier, a frame each way, a lost link and its
+/// return, its calls bounded by [`ethernet::tests::stepped::Calls`]; what
+/// the device saw, apart from the control writes `ignored` keeps out.
+fn asix_link_through_loss(
+    late: bool,
+    legacy: bool,
+    ignored: impl Fn(&[u8; 8]) -> bool,
+) -> ethernet::tests::stepped::Effects {
+    use crate::net::{Link, LinkError};
+    use ethernet::tests::stepped::{Calls, effects};
+    let mut dma = TestRegion::new(128 * 1024 * 8);
+    let value = if legacy { 9 } else { 7 };
+    let (mut controller, model) = unconfigured_cancellation_controller_with_configurations(
+        &mut dma,
+        &[vec![9, 2, 9, 0, 0, value, 0, 0x80, 50]],
+    );
+    controller.set_slot_speed(1, HIGH_SPEED);
+    model::minimum_on_controller_clock(&mut controller);
+    let mut config = vec![9, 2, 0, 0, 1, value, 0, 0x80, 50];
+    if legacy {
+        model.borrow_mut().asix_legacy = Some(ethernet::LegacyModel::new(0x10, 0x003b1861));
+        config.extend_from_slice(&[9, 4, 0, 0, 2, 0xff, 0, 0, 0]);
+    } else {
+        model.borrow_mut().asix = Some(ethernet::AsixModel::new(2, false));
+        config.extend_from_slice(&[9, 4, 0, 0, 3, 0xff, 0xff, 0, 0]);
+    }
+    for address in [0x81, 0x02] {
+        config.extend_from_slice(&[7, 5, address, 2, 0, 2, 0]);
+    }
+    if !legacy {
+        config.extend_from_slice(&[7, 5, 0x83, 3, 8, 0, 4]);
+    }
+    let total = config.len() as u16;
+    config[2..4].copy_from_slice(&total.to_le_bytes());
+    let mut device = model::addressed_device(&controller, vec![config]);
+    device.speed = HIGH_SPEED;
+    let product: u16 = if legacy { 0x7720 } else { 0x1790 };
+    device.descriptor[8..10].copy_from_slice(&0x0b95u16.to_le_bytes());
+    device.descriptor[10..12].copy_from_slice(&product.to_le_bytes());
+    model::select(&mut device).unwrap();
+    let shared = Rc::new(RefCell::new(controller));
+    let mut found = Found::default();
+    bind(&shared, device, &mut dma, &mut found);
+    assert!(
+        found.vendor_failures.is_empty(),
+        "{:?}",
+        found.vendor_failures
+    );
+    let mut link = found.vendor_links.pop().unwrap();
+    let clock = shared.borrow().clock;
+    let mut calls = Calls::new(model.clone(), clock, late);
+    let not_busy = |result: &Result<(), LinkError>| result != &Err(LinkError::Busy);
+    let set_link = |up: bool| {
+        let mut model = model.borrow_mut();
+        match &mut model.asix_legacy {
+            Some(legacy) => legacy.link = up,
+            None => {
+                let status = if up { 0xa400 } else { 0 };
+                model
+                    .asix
+                    .as_mut()
+                    .unwrap()
+                    .phy
+                    .insert((0, 0, 0x11), status);
+            }
+        }
+    };
+
+    calls.until(|| link.carrier(), |up| *up);
+    calls
+        .until(|| link.transmit(&[0x5a; 60]), not_busy)
+        .unwrap();
+    calls
+        .until(|| link.transmit(&[0x6a; 60]), not_busy)
+        .unwrap();
+    calls.until(
+        || link.receive().unwrap(),
+        |_| model.borrow().active[3].is_some(),
+    );
+    let bytes = if legacy {
+        let mut bytes = (60u32 | (0xffc3 << 16)).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[0x7a; 60]);
+        bytes
+    } else {
+        let mut bytes = vec![0; 2];
+        bytes.extend_from_slice(&[0x7a; 60]);
+        bytes.resize(64, 0);
+        bytes.extend_from_slice(&(62u32 << 16).to_le_bytes());
+        bytes.extend_from_slice(&0x80000000u32.to_le_bytes());
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&(64u32 << 16 | 2).to_le_bytes());
+        bytes
+    };
+    model.borrow_mut().push_event(bytes);
+    let frame = calls.until(|| link.receive().unwrap(), Option::is_some);
+    assert_eq!(frame, Some(vec![0x7a; 60]));
+
+    // The lost link: both bulk endpoints cancelled, then the MAC stopped;
+    // the AX88772A's PHY reset with its twelve 50 ms waits runs in steps.
+    set_link(false);
+    calls.wait(ethernet::LINK_POLL_US);
+    calls.until(
+        || (link.carrier(), link.running.is_some()),
+        |(up, busy)| !up && !busy,
+    );
+    assert!(model.borrow().active[3].is_none());
+    set_link(true);
+    calls.wait(ethernet::LINK_POLL_US);
+    calls.until(|| link.carrier(), |up| *up);
+    calls
+        .until(|| link.transmit(&[0x8a; 60]), not_busy)
+        .unwrap();
+    calls
+        .until(|| link.transmit(&[0x9a; 60]), not_busy)
+        .unwrap();
+    assert_eq!(calls.answered_late > 0, late);
+    let seen = effects(&model.borrow(), ignored);
+    calls.answer_at_once();
+    seen
+}
+
+/// A device that answers each control transfer and command only after the
+/// link call that asked returned: the AX88179's carrier check and medium
+/// set up with its FIFO wait, transmit, receive and the lost link's quiesce
+/// and MAC stop run in steps, no call holding the processor beyond its
+/// bound, and the device sees what one that answers at once sees.
+#[test]
+fn ax88179_link_calls_run_in_steps_when_the_device_answers_late() {
+    let everything = |_: &[u8; 8]| false;
+    assert_eq!(
+        asix_link_through_loss(true, false, everything),
+        asix_link_through_loss(false, false, everything)
+    );
+}
+
+/// The AX88772A alike, its lost link also resetting the PHY. Each carrier
+/// check takes and returns MII ownership, and a device that answers late
+/// is checked more often, so those writes are left out.
+#[test]
+fn ax88772_link_calls_run_in_steps_when_the_device_answers_late() {
+    let ownership = |request: &[u8; 8]| request[0] == 0x40 && matches!(request[1], 0x06 | 0x0a);
+    assert_eq!(
+        asix_link_through_loss(true, true, ownership),
+        asix_link_through_loss(false, true, ownership)
+    );
 }

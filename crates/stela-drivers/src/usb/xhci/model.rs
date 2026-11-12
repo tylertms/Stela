@@ -387,6 +387,11 @@ pub(crate) struct CancelModel {
     pub(crate) asix: Option<ethernet::AsixModel>,
     pub(crate) asix_legacy: Option<ethernet::LegacyModel>,
     pub(crate) asix_ticks: u64,
+    /// Command completions and EP0 transfer events wait in [`Self::held`]
+    /// until [`Self::release`]: the device answers late, after the call that
+    /// asked has returned.
+    pub(crate) late: bool,
+    pub(crate) held: Vec<(u64, u32, u32, u8, usize)>,
     /// Runs the controller's one-tick-per-microsecond deadlines on virtual time.
     _clock: crate::test_clock::Guard,
 }
@@ -410,6 +415,10 @@ impl CancelModel {
         }
     }
     pub(crate) fn event(&mut self, parameter: u64, code: u32, kind: u32, dci: u8, residual: usize) {
+        if self.late && (kind == COMMAND_COMPLETION || (kind == TRANSFER_EVENT && dci == 1)) {
+            self.held.push((parameter, code, kind, dci, residual));
+            return;
+        }
         let cycle = u32::from((self.event_index / RING_TRBS).is_multiple_of(2));
         let address = self.events + ((self.event_index % RING_TRBS) * TRB) as u64;
         // SAFETY: all three fields are in the still-live test event ring.
@@ -420,6 +429,14 @@ impl CancelModel {
                 .write_volatile(1 << 24 | u32::from(dci) << 16 | kind << 10 | cycle);
         }
         self.event_index += 1;
+    }
+    /// Post the events held while [`Self::late`].
+    pub(crate) fn release(&mut self) {
+        let late = core::mem::replace(&mut self.late, false);
+        for (parameter, code, kind, dci, residual) in core::mem::take(&mut self.held) {
+            self.event(parameter, code, kind, dci, residual);
+        }
+        self.late = late;
     }
     /// The device sends interrupt-IN (DCI 3) data, bulk-IN (DCI 5) data or
     /// an independent peripheral's bulk-IN data, as soon as a TD waits.
@@ -1004,6 +1021,8 @@ fn cancellation_controller_with_context(
         asix: None,
         asix_legacy: None,
         asix_ticks: 0,
+        late: false,
+        held: Vec::new(),
         _clock: crate::test_clock::virtualize(),
     }));
     model.borrow_mut().set_state(1, 1);
@@ -1017,6 +1036,13 @@ fn cancellation_controller_with_context(
         controller.current_descriptions(1, configurations).unwrap();
     }
     (controller, model)
+}
+
+/// Put the controller's minimum provider on the controller clock's own
+/// calibration, so minimum intervals pass on the virtual time its deadlines
+/// and a link's runtime calls count.
+pub(crate) fn minimum_on_controller_clock(controller: &mut Controller) {
+    controller.minimum = super::minimum::fixture(controller.clock);
 }
 
 pub(crate) fn cancellation_controller(

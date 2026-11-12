@@ -21,13 +21,13 @@ use crate::{
     bus::dma::{DmaAllocator, DmaBuffer},
     net::{Link, LinkError, Mac},
 };
-use alloc::{collections::VecDeque, format, string::String, vec::Vec};
+use alloc::{collections::VecDeque, format, rc::Rc, string::String, vec::Vec};
 #[cfg(test)]
 pub(crate) use asix::LegacyModel;
 #[cfg(test)]
 pub(crate) use asix::model::Hardware as AsixModel;
-use core::future::Future;
-use stela_driver_base::stepped::{block_on, yield_now};
+use core::{cell::Cell, future::Future, task::Poll};
+use stela_driver_base::stepped::{Stepped, block_on, until, yield_now};
 #[cfg(test)]
 pub(crate) fn asix_legacy_ids() -> Vec<(u16, u16)> {
     asix::legacy_ids()
@@ -159,6 +159,10 @@ impl Binding {
 pub(super) struct HostControl {
     pub(super) controller: Shared,
     pub(super) id: SlotId,
+    /// Whether a wait ends the step until it passes rather than holding the
+    /// processor through it: off while attach runs to completion, on for
+    /// the link's work in steps.
+    pub(super) stepped: Rc<Cell<bool>>,
 }
 
 impl Control for HostControl {
@@ -172,12 +176,37 @@ impl Control for HostControl {
         .await
     }
     async fn delay_us(&mut self, microseconds: u64) {
-        self.controller.borrow().clock.delay(microseconds);
+        let clock = self.controller.borrow().clock;
+        if self.stepped.get() {
+            until(clock.deadline(microseconds)).await;
+        } else {
+            clock.delay(microseconds);
+        }
     }
     async fn minimum_wait(&mut self, microseconds: u64) -> Result<(), BlockError> {
-        let mut controller = self.controller.borrow_mut();
-        controller.device(self.id)?.connected()?;
-        controller.minimum_wait(microseconds)
+        let interval = {
+            let mut controller = self.controller.borrow_mut();
+            controller.device(self.id)?.connected()?;
+            if !self.stepped.get() {
+                return controller.minimum_wait(microseconds);
+            }
+            controller.begin_minimum(microseconds)?
+        };
+        let Some(interval) = interval else {
+            // A timer that keeps no interval waits in full; the step ends
+            // after it.
+            self.controller.borrow_mut().minimum_wait(microseconds)?;
+            yield_now().await;
+            return Ok(());
+        };
+        while !self
+            .controller
+            .borrow_mut()
+            .minimum_elapsed(interval.as_ref())?
+        {
+            yield_now().await;
+        }
+        Ok(())
     }
 }
 
@@ -208,22 +237,22 @@ impl Backend {
             Self::Asix(chip) => chip.receive_bytes(),
         }
     }
-    fn carrier(&mut self) -> Result<bool, BlockError> {
+    async fn carrier(&mut self) -> Result<bool, BlockError> {
         match self {
-            Self::Realtek(chip) => block_on(chip.carrier()),
-            Self::Asix(chip) => block_on(chip.carrier()),
+            Self::Realtek(chip) => chip.carrier().await,
+            Self::Asix(chip) => chip.carrier().await,
         }
     }
-    fn link_down(&mut self) -> Result<(), BlockError> {
+    async fn link_down(&mut self) -> Result<(), BlockError> {
         match self {
-            Self::Realtek(c) => block_on(c.stop()),
-            Self::Asix(c) => block_on(c.link_down()),
+            Self::Realtek(c) => c.stop().await,
+            Self::Asix(c) => c.link_down().await,
         }
     }
-    fn stop(&mut self) -> Result<(), BlockError> {
+    async fn stop(&mut self) -> Result<(), BlockError> {
         match self {
-            Self::Realtek(chip) => block_on(chip.stop()),
-            Self::Asix(chip) => block_on(chip.stop()),
+            Self::Realtek(chip) => chip.stop().await,
+            Self::Asix(chip) => chip.stop().await,
         }
     }
     fn encode(&self, frame: &[u8], output: &mut [u8], packet: u16) -> Result<usize, &'static str> {
@@ -242,13 +271,59 @@ impl Backend {
 
 /// How long one transmit TD may stay outstanding before it is cancelled.
 const TRANSMIT_US: u64 = 1_000_000;
+/// How often the PHY is asked for the link. Linux's drivers learn of link
+/// changes from the adapter's interrupt endpoint, polled at its bInterval;
+/// a tenth of a second keeps about that latency without a control transfer
+/// on every link call.
+const LINK_POLL_US: u64 = 100_000;
 
-/// A transmit TD the controller still owns: its ticket, its length and when
-/// it times out.
-struct Sending {
-    ticket: TransferTicket,
-    bytes: usize,
-    deadline: Deadline,
+/// The transmit TD, which holds the send buffer.
+enum Sending {
+    /// The controller owns it: its ticket, its length and when it times out.
+    InFlight {
+        ticket: TransferTicket,
+        bytes: usize,
+        deadline: Deadline,
+    },
+    /// It failed with this error, reported once its endpoint's reset, which
+    /// work in steps runs, acknowledged the buffer free.
+    Failed(BlockError),
+}
+
+/// What work in steps does.
+enum Work {
+    /// The carrier check: the PHY's link read, and the MAC set up for a new
+    /// link.
+    Carrier,
+    /// The lost link: both bulk endpoints cancelled, then the MAC stopped.
+    LinkDown,
+    /// A failed receive transfer's endpoint reset.
+    ClearInput,
+    /// The transmit TD's endpoint reset after a STALL, or its cancellation
+    /// past its deadline.
+    ResetOutput,
+}
+
+/// Device work run a step per link call, each step ending at the first
+/// control transfer, command or wait not yet complete, so no call holds the
+/// processor for the seconds a slow device's transfers may take. It holds
+/// the chip until it ends; meanwhile receive finds nothing and transmit is
+/// busy.
+struct Running {
+    work: Work,
+    task: Stepped<'static, Finished>,
+}
+struct Finished {
+    chip: Backend,
+    result: Result<bool, BlockError>,
+}
+
+/// Cancel both bulk endpoints' outstanding TDs, a command or poll per step.
+async fn quiesce(controller: &Shared, id: SlotId, endpoints: [u8; 2]) -> Result<(), BlockError> {
+    for dci in endpoints {
+        operation(controller, id, |c| c.start_cancel(dci)).await?;
+    }
+    Ok(())
 }
 
 /// One receive TD and one transmit TD, each in flight across link calls, as
@@ -258,13 +333,17 @@ pub struct UsbEthernet {
     controller: Shared,
     id: SlotId,
     binding: Binding,
-    chip: Backend,
+    /// The chip, which work in steps holds while it runs.
+    chip: Option<Backend>,
+    running: Option<Running>,
+    /// When the next carrier check is due; none when it is due now.
+    link_due: Option<Deadline>,
     mac: Mac,
     receive: DmaBuffer,
     send: DmaBuffer,
     queued: Option<TransferTicket>,
-    /// The transmit TD in flight; the send buffer is the controller's until
-    /// it completes or its cancellation is acknowledged.
+    /// The transmit TD; the send buffer is the controller's until it
+    /// completes or its cancellation is acknowledged.
     sending: Option<Sending>,
     pending: VecDeque<Vec<u8>>,
     carrier: bool,
@@ -286,9 +365,9 @@ impl UsbEthernet {
         self.rx_dropped
     }
     pub fn driver(&self) -> &'static str {
-        match self.chip {
-            Backend::Realtek(_) => "usb-rtl815x",
-            Backend::Asix(_) => "usb-asix",
+        match self.binding.kind {
+            Kind::Realtek(_) => "usb-rtl815x",
+            Kind::Asix(_) => "usb-asix",
         }
     }
 
@@ -312,9 +391,11 @@ impl UsbEthernet {
                 &[],
             )?;
         }
+        let stepped = Rc::new(Cell::new(false));
         let io = HostControl {
             controller: controller.clone(),
             id: device.id,
+            stepped: stepped.clone(),
         };
         let (chip, mac, firmware, family, firmware_skipped) = match binding.kind {
             Kind::Realtek(revision) => {
@@ -374,12 +455,16 @@ impl UsbEthernet {
                 (Backend::Asix(chip), mac, None, family, None)
             }
         };
+        // Attach ran to completion; the link's work runs in steps.
+        stepped.set(true);
         let receive_bytes = chip.receive_bytes();
         Ok(Self {
             controller,
             id: device.id,
             binding,
-            chip,
+            chip: Some(chip),
+            running: None,
+            link_due: None,
             mac,
             receive: dma.allocate(receive_bytes, receive_bytes.next_power_of_two())?,
             send: dma.allocate(2048, 2048)?,
@@ -407,43 +492,158 @@ impl UsbEthernet {
         Ok(())
     }
 
-    fn quiesce(&mut self) -> Result<(), BlockError> {
-        let mut controller = self.controller.borrow_mut();
-        let mut c = controller.device(self.id)?;
-        c.cancel(self.binding.input.dci())?;
-        self.queued = None;
-        c.cancel(self.binding.output.dci())?;
-        self.sending = None;
-        self.pending.clear();
+    /// Hand the chip to `work`, which runs `run` on it a step per call.
+    fn begin<F>(&mut self, work: Work, run: impl FnOnce(Backend) -> F)
+    where
+        F: Future<Output = Finished> + 'static,
+    {
+        let chip = self.chip.take().expect("no work holds the chip");
+        self.running = Some(Running {
+            work,
+            task: Stepped::new(run(chip)),
+        });
+    }
+
+    fn begin_carrier(&mut self) {
+        self.begin(Work::Carrier, |mut chip| async move {
+            let result = chip.carrier().await;
+            Finished { chip, result }
+        });
+    }
+
+    fn begin_link_down(&mut self) {
+        let (controller, id) = (self.controller.clone(), self.id);
+        let endpoints = [self.binding.input.dci(), self.binding.output.dci()];
+        self.begin(Work::LinkDown, move |mut chip| async move {
+            let result = async {
+                quiesce(&controller, id, endpoints).await?;
+                chip.link_down().await
+            }
+            .await;
+            Finished {
+                chip,
+                result: result.map(|()| false),
+            }
+        });
+    }
+
+    /// Reset one bulk endpoint's host side, with CLEAR_FEATURE(ENDPOINT_HALT)
+    /// for a STALL (`clear`), or only cancel its TD.
+    fn begin_reset(&mut self, work: Work, endpoint: Endpoint, clear: bool) {
+        let (controller, id) = (self.controller.clone(), self.id);
+        self.begin(work, move |chip| async move {
+            let result = operation(&controller, id, |c| match clear {
+                true => c.start_clear(&endpoint),
+                false => c.start_cancel(endpoint.dci()),
+            })
+            .await;
+            Finished {
+                chip,
+                result: result.map(|_| true),
+            }
+        });
+    }
+
+    /// One step of the work under way, and of any work its end starts:
+    /// pending while it runs, otherwise the first failure. A failure closes
+    /// the link, as the chip and endpoint it leaves cannot be trusted.
+    fn advance(&mut self) -> Poll<Result<(), BlockError>> {
+        while let Some(running) = &mut self.running {
+            let Poll::Ready(finished) = running.task.step() else {
+                return Poll::Pending;
+            };
+            let work = self.running.take().unwrap().work;
+            self.chip = Some(finished.chip);
+            if let Err(error) = finished
+                .result
+                .and_then(|linked| self.finished(work, linked))
+            {
+                self.closed = true;
+                self.carrier = false;
+                return Poll::Ready(Err(error));
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    /// What ended work leaves behind.
+    fn finished(&mut self, work: Work, linked: bool) -> Result<(), BlockError> {
+        match work {
+            Work::Carrier => {
+                // A clock that keeps no deadline checks at every call.
+                self.link_due = self
+                    .controller
+                    .borrow()
+                    .clock
+                    .try_deadline(LINK_POLL_US)
+                    .ok();
+                if self.carrier && !linked {
+                    self.carrier = false;
+                    self.begin_link_down();
+                } else {
+                    self.carrier = linked;
+                }
+            }
+            Work::LinkDown => {
+                self.queued = None;
+                self.sending = None;
+                self.pending.clear();
+            }
+            Work::ClearInput => self.rx_dropped = self.rx_dropped.saturating_add(1),
+            Work::ResetOutput => {}
+        }
         Ok(())
     }
 
-    fn update_carrier(&mut self) -> Result<bool, BlockError> {
-        self.open()?;
-        let linked = self.chip.carrier()?;
-        if self.carrier
-            && !linked
-            && let Err(error) = self.quiesce().and_then(|()| self.chip.link_down())
-        {
-            self.closed = true;
-            self.carrier = false;
-            return Err(error);
+    /// The work under way run to its end in this call, as teardown may.
+    fn finish(&mut self) -> Result<(), BlockError> {
+        loop {
+            if let Poll::Ready(result) = self.advance() {
+                return result;
+            }
+            crate::waiting();
+            core::hint::spin_loop();
         }
-        self.carrier = linked;
-        Ok(linked)
+    }
+
+    /// A step of the work under way, and a carrier check when one is due;
+    /// work that ended in this call had its step, so a due check starts at
+    /// the next.
+    fn update_carrier(&mut self) -> Result<(), BlockError> {
+        self.open()?;
+        let busy = self.running.is_some();
+        match self.advance() {
+            Poll::Pending => return Ok(()),
+            Poll::Ready(result) => result?,
+        }
+        if !busy && self.link_due.as_ref().is_none_or(Deadline::passed) {
+            self.begin_carrier();
+            if let Poll::Ready(result) = self.advance() {
+                result?;
+            }
+        }
+        Ok(())
     }
 
     /// Stop requires acknowledged cancellation of both bulk endpoints before
     /// the device reset; failed stops remain closed and never reuse DMA.
+    /// Work under way ends first. It runs to completion, as teardown may.
     pub fn stop(&mut self) -> Result<(), BlockError> {
         self.controller.borrow_mut().device(self.id)?;
         if self.stopped {
             return Ok(());
         }
         self.closed = true;
+        // Work that failed left a chip or endpoint that refuses the stop.
+        let _ = self.finish();
         self.carrier = false;
-        self.quiesce()?;
-        self.chip.stop()?;
+        let endpoints = [self.binding.input.dci(), self.binding.output.dci()];
+        block_on(quiesce(&self.controller, self.id, endpoints))?;
+        self.queued = None;
+        self.sending = None;
+        self.pending.clear();
+        let chip = self.chip.as_mut().expect("no work holds the chip");
+        block_on(chip.stop())?;
         self.stopped = true;
         Ok(())
     }
@@ -464,38 +664,54 @@ impl UsbEthernet {
     /// Whether the send buffer is free: no transmit TD in flight, or the one
     /// in flight completed. A failed TD is reported once its endpoint is
     /// reset, and one past its deadline once its cancellation is
-    /// acknowledged; until then the buffer stays the controller's.
+    /// acknowledged, both as work in steps; until then the buffer stays the
+    /// controller's.
     fn sent(&mut self) -> Result<bool, LinkError> {
-        let Some(sending) = &self.sending else {
-            return Ok(true);
+        let (ticket, bytes, deadline) = match &self.sending {
+            None => return Ok(true),
+            Some(Sending::InFlight {
+                ticket,
+                bytes,
+                deadline,
+            }) => (ticket, *bytes, deadline),
+            // No work runs: its reset ended.
+            Some(Sending::Failed(_)) => return self.reset_sent(),
         };
-        let mut controller = self.controller.borrow_mut();
-        let mut c = controller.device(self.id).map_err(link_error)?;
-        let result = match c.completed_ticket(&sending.ticket) {
-            Some(result) => result,
-            None if sending.deadline.passed() => {
-                c.cancel(self.binding.output.dci()).map_err(link_error)?;
-                self.sending = None;
-                return Err(link_error(BlockError::Timeout));
-            }
-            None => return Ok(false),
+        let result = {
+            let mut controller = self.controller.borrow_mut();
+            let mut c = controller.device(self.id).map_err(link_error)?;
+            c.completed_ticket(ticket)
         };
-        let bytes = sending.bytes;
-        match result {
-            Ok(actual) => {
+        let (error, clear) = match result {
+            Some(Ok(actual)) => {
                 self.sending = None;
                 if actual != bytes {
                     return Err(LinkError::Adapter("USB Ethernet short TX transfer".into()));
                 }
-                Ok(true)
+                return Ok(true);
             }
-            Err(error) => {
-                // A STALL completes the request but the halted hardware can
-                // still reference its old TD until Reset/Set Dequeue succeeds.
-                c.clear(&self.binding.output).map_err(link_error)?;
-                self.sending = None;
-                Err(link_error(error))
-            }
+            // A STALL completes the request but the halted hardware can
+            // still reference its old TD until Reset/Set Dequeue succeeds.
+            Some(Err(error)) => (error, true),
+            None if deadline.passed() => (BlockError::Timeout, false),
+            None => return Ok(false),
+        };
+        self.sending = Some(Sending::Failed(error));
+        self.begin_reset(Work::ResetOutput, self.binding.output, clear);
+        if let Poll::Ready(result) = self.advance() {
+            result.map_err(link_error)?;
+        }
+        if self.running.is_some() {
+            return Ok(false);
+        }
+        self.reset_sent()
+    }
+
+    /// The failed transmit TD's error, its endpoint reset.
+    fn reset_sent(&mut self) -> Result<bool, LinkError> {
+        match self.sending.take() {
+            Some(Sending::Failed(error)) => Err(link_error(error)),
+            _ => unreachable!("only a failed TD is reset"),
         }
     }
 }
@@ -505,16 +721,18 @@ impl Link for UsbEthernet {
         self.mac
     }
     fn carrier(&mut self) -> bool {
-        self.update_carrier().unwrap_or(false)
+        self.update_carrier().is_ok() && self.carrier
     }
     /// Queue `frame` and return without waiting for the controller, as
     /// usbnet_start_xmit submits its URB. While the previous frame is still
-    /// in flight the ring is full: the frame is refused as busy at once.
+    /// in flight the ring is full, and while work in steps holds the chip
+    /// it is busy: the frame is refused as busy at once.
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
-        if !self.update_carrier().map_err(link_error)? {
+        self.update_carrier().map_err(link_error)?;
+        if !self.carrier {
             return Err(LinkError::Adapter("USB Ethernet carrier down".into()));
         }
-        if !self.sent()? {
+        if self.running.is_some() || !self.sent()? {
             return Err(LinkError::Busy);
         }
         let deadline = self
@@ -529,6 +747,8 @@ impl Link for UsbEthernet {
             .map_err(link_error)?;
         let bytes = self
             .chip
+            .as_ref()
+            .expect("no work holds the chip")
             .encode(frame, self.send.bytes_mut(), self.binding.output.max_packet)
             .map_err(|why| LinkError::Adapter(why.into()))?;
         fence(Ordering::Release);
@@ -537,7 +757,7 @@ impl Link for UsbEthernet {
             .submit_ticket(self.binding.output.dci(), self.send.physical(), bytes)
             .map_err(link_error)?;
         drop(controller);
-        self.sending = Some(Sending {
+        self.sending = Some(Sending::InFlight {
             ticket,
             bytes,
             deadline,
@@ -546,22 +766,26 @@ impl Link for UsbEthernet {
         self.sent().map(|_| ())
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
-        if !self.update_carrier().map_err(link_error)? {
+        self.update_carrier().map_err(link_error)?;
+        if !self.carrier || self.running.is_some() {
             return Ok(None);
         }
         if let Some(frame) = self.pending.pop_front() {
             return Ok(Some(frame));
         }
-        let mut controller = self.controller.borrow_mut();
-        let mut c = controller.device(self.id).map_err(link_error)?;
         let endpoint = self.binding.input;
-        if self.queued.is_none() {
-            let token = c
-                .submit_ticket(endpoint.dci(), self.receive.physical(), self.receive.len())
-                .map_err(link_error)?;
-            self.queued = Some(token);
-        }
-        let Some(result) = c.completed_ticket(self.queued.as_ref().unwrap()) else {
+        let result = {
+            let mut controller = self.controller.borrow_mut();
+            let mut c = controller.device(self.id).map_err(link_error)?;
+            if self.queued.is_none() {
+                let token = c
+                    .submit_ticket(endpoint.dci(), self.receive.physical(), self.receive.len())
+                    .map_err(link_error)?;
+                self.queued = Some(token);
+            }
+            c.completed_ticket(self.queued.as_ref().unwrap())
+        };
+        let Some(result) = result else {
             return Ok(None);
         };
         self.queued = None;
@@ -572,8 +796,10 @@ impl Link for UsbEthernet {
                 // is counted and dropped once its endpoint is reset, as
                 // r8152 and usbnet resubmit; an endpoint that cannot be
                 // reset is a dead device.
-                c.clear(&endpoint).map_err(link_error)?;
-                self.rx_dropped = self.rx_dropped.saturating_add(1);
+                self.begin_reset(Work::ClearInput, endpoint, true);
+                if let Poll::Ready(result) = self.advance() {
+                    result.map_err(link_error)?;
+                }
                 return Ok(None);
             }
         };
@@ -585,7 +811,13 @@ impl Link for UsbEthernet {
         fence(Ordering::Acquire);
         // An aggregate that fails its checks is dropped whole, as a NIC
         // drops a frame that fails its own.
-        match self.chip.decode(&self.receive.bytes()[..actual]) {
+        let bytes = &self.receive.bytes()[..actual];
+        match self
+            .chip
+            .as_mut()
+            .expect("no work holds the chip")
+            .decode(bytes)
+        {
             Ok(frames) => self.pending.extend(frames),
             Err(_) => self.rx_dropped = self.rx_dropped.saturating_add(1),
         }
@@ -596,7 +828,29 @@ impl Link for UsbEthernet {
 #[cfg(test)]
 pub(crate) mod tests {
     pub(crate) mod generation;
+    pub(crate) mod stepped;
     use super::*;
+
+    impl UsbEthernet {
+        /// The carrier once the work under way, and any work it starts,
+        /// ended.
+        pub(crate) fn settled_carrier(&mut self) -> bool {
+            for _ in 0..100_000 {
+                let up = self.carrier();
+                if self.running.is_none() {
+                    return up;
+                }
+            }
+            panic!("link work never ended");
+        }
+
+        /// The carrier a check due now finds, once its work ended.
+        pub(crate) fn checked_carrier(&mut self) -> bool {
+            let clock = self.controller.borrow().clock;
+            crate::test_clock::advance(clock, LINK_POLL_US);
+            self.settled_carrier()
+        }
+    }
 
     #[test]
     #[ignore = "oracle: STELA_RTL815X_IDS_ORACLE"]
