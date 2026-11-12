@@ -875,10 +875,17 @@ fn fused_specials_after_sticky_inexact_match_the_reference() {
                                     set_lane(&mut vectors[second], format, index, other);
                                 }
                             }
-                            for fpcr in [0, FPCR_DN] {
+                            // IXC sticky, alone or with UFC, or with UFC and OFC.
+                            for (fpcr, fpsr) in [
+                                (0, 0x0800_0010),
+                                (FPCR_DN, 0x0800_0010),
+                                (0, 0x0800_0018),
+                                (FPCR_DN, 0x0800_0018),
+                                (0, 0x0800_001c),
+                            ] {
                                 let mut initial = GuestState {
                                     fpcr,
-                                    fpsr: 0x0800_0010,
+                                    fpsr,
                                     ..GuestState::default()
                                 };
                                 initial.x[30] = RETURN;
@@ -887,7 +894,7 @@ fn fused_specials_after_sticky_inexact_match_the_reference() {
                                 initial.v[N as usize] = vectors[1];
                                 initial.v[M as usize] = vectors[2];
                                 let label = alloc::format!(
-                                    "{form:?} {format:?} {vectors:x?} {fpcr:#x} {target:?}"
+                                    "{form:?} {format:?} {vectors:x?} {fpcr:#x} {fpsr:#x} {target:?}"
                                 );
                                 let mut actual = initial.clone();
                                 let exit = run(&code, &mut actual);

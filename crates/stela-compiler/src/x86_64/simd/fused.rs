@@ -757,6 +757,7 @@ fn sticky_path(code: &mut Code, operand: &Operand, target: TargetCpu, entry: Ent
     let check = code.len();
     resolve(code, rejected, check);
     let mut crossing = vec![rejected];
+    sticky_status_results(code, operand, resume, &mut crossing);
     // An infinite result may be exact: the full path tells, from its inputs
     // and the host's status, rather than the helper.
     let mut full = full;
@@ -957,8 +958,7 @@ fn propagated_specials(
 /// [`propagated_specials`]' first check, for an accumulator a NaN has
 /// reached, with the operands read into XMM2 (Vn), RIGHT and ADDEND:
 /// return to `resume` when each active NaN result lane has a quiet NaN
-/// addend and factors whose product is finite (so neither is a NaN, an
-/// infinity or a signalling NaN, and no infinity meets a zero), where
+/// addend, no signalling NaN factor and no infinity times a zero, where
 /// FPProcessNaNs3 gives the addend without status, and every other active
 /// lane is at least twice the minimum normal and finite. Otherwise fall
 /// through. Clobbers XMM1 to XMM5, XMM7, EAX, ECX and EDX, and LEFT only
@@ -992,22 +992,41 @@ fn poisoned_accumulator(
         code.asm()
             .float_compare(lanes, xmm, Rm::Xmm(xmm), UNORDERED);
     };
-    // TEMPORARY: lanes whose product is not finite.
-    packed(code, Host::Xor, OTHER, OTHER);
+    // `destination`: the lanes of `source` whose quiet bit is set.
+    let quiet_bits = |code: &mut Code, destination: u8, source: u8| {
+        packed(code, Host::MoveAligned, destination, source);
+        left_shift.emit(
+            code,
+            destination,
+            (format.bits() - format.fraction_bits()) as u8,
+        );
+        ShiftOpcode::ArithmeticDword.emit(code, destination, 31);
+        if double {
+            super::shuffle(code, destination, destination, HIGH_DWORDS);
+        }
+    };
+    // TEMPORARY: lanes with a signalling NaN factor or an infinity times a
+    // zero (a NaN product of factors that are not NaNs).
+    packed(code, Host::MoveAligned, OTHER, VN);
+    unordered(code, OTHER);
+    packed(code, Host::MoveAligned, NAN, RIGHT);
+    unordered(code, NAN);
     packed(code, Host::MoveAligned, TEMPORARY, VN);
     code.asm()
         .float(FloatOp::Mul, lanes, TEMPORARY, Rm::Xmm(RIGHT));
-    code.asm()
-        .float(FloatOp::Mul, lanes, TEMPORARY, Rm::Xmm(OTHER));
     unordered(code, TEMPORARY);
-    // QUIET: lanes whose addend's quiet bit is set.
-    packed(code, Host::MoveAligned, QUIET, ADDEND);
-    left_shift.emit(code, QUIET, (format.bits() - format.fraction_bits()) as u8);
-    ShiftOpcode::ArithmeticDword.emit(code, QUIET, 31);
-    if double {
-        super::shuffle(code, QUIET, QUIET, HIGH_DWORDS);
+    packed(code, Host::MoveAligned, QUIET, OTHER);
+    packed(code, Host::Or, QUIET, NAN);
+    packed(code, Host::AndNot, QUIET, TEMPORARY);
+    packed(code, Host::MoveAligned, TEMPORARY, QUIET);
+    for (factor, nan) in [(VN, OTHER), (RIGHT, NAN)] {
+        quiet_bits(code, QUIET, factor);
+        packed(code, Host::AndNot, QUIET, nan);
+        packed(code, Host::Or, TEMPORARY, QUIET);
     }
-    // TEMPORARY: lanes with a quiet NaN addend and a finite product.
+    // QUIET: lanes whose addend's quiet bit is set.
+    quiet_bits(code, QUIET, ADDEND);
+    // TEMPORARY: lanes with a quiet NaN addend and neither of those.
     packed(code, Host::MoveAligned, OTHER, ADDEND);
     unordered(code, OTHER);
     packed(code, Host::And, OTHER, QUIET);
@@ -1070,4 +1089,58 @@ fn poisoned_accumulator(
     resumes.push(resumed);
     let end = code.len();
     resolve(code, rejected, end);
+}
+
+/// First out of line after the sticky path's result check, which has
+/// rejected a lane: with FPSR.UFC sticky as well as IXC, return to
+/// `resume` when no active lane is a NaN, nor infinite unless FPSR.OFC is
+/// sticky too. With FPCR at the sticky defaults (round to nearest, FZ
+/// clear) the host's single rounding gives FPMulAdd's finite or infinite
+/// result bit for bit, and such a lane can raise only IXC, UFC (a tiny
+/// inexact result, zeros and the minimum normal included) and OFC, none
+/// of them new; a NaN lane needs FPProcessNaNs3 or an invalid operation.
+/// Otherwise fall through with every input of [`zero_product_check`]
+/// intact. Clobbers XMM3, XMM7, EAX and EDX.
+fn sticky_status_results(
+    code: &mut Code,
+    operand: &Operand,
+    resume: usize,
+    resumes: &mut Vec<usize>,
+) {
+    const NAN: u8 = 3;
+    const UNBOUNDED: u8 = 7;
+    /// FPSR.OFC and FPSR.UFC.
+    const OVERFLOW: u8 = 1 << 2;
+    let (format, shape) = (operand.format, operand.shape);
+    let lanes = float_lanes(format, Shape::Vector128);
+    let fpsr = super::numerical::state(core::mem::offset_of!(crate::GuestState, fpsr));
+    code.asm().test_imm(Size::Byte, fpsr, FPSR_UNDERFLOW.into());
+    let unsticky = branch(code, Condition::Zero);
+    packed(code, Host::MoveAligned, NAN, LEFT);
+    code.asm()
+        .float_compare(lanes, NAN, Rm::Xmm(NAN), UNORDERED);
+    packed(code, Host::Xor, UNBOUNDED, UNBOUNDED);
+    code.asm()
+        .float(FloatOp::Mul, lanes, UNBOUNDED, Rm::Xmm(LEFT));
+    code.asm()
+        .float_compare(lanes, UNBOUNDED, Rm::Xmm(UNBOUNDED), UNORDERED);
+    Host::DwordSignMask.register(code, Gpr::Rax as u8, UNBOUNDED, TargetCpu::Baseline);
+    code.asm().test_imm(Size::Byte, fpsr, OVERFLOW.into());
+    let unbounded = branch(code, Condition::Zero);
+    // OFC is sticky: only the NaN lanes count.
+    Host::DwordSignMask.register(code, Gpr::Rax as u8, NAN, TargetCpu::Baseline);
+    let counted = code.len();
+    resolve(code, unbounded, counted);
+    let active: i8 = match (shape, format) {
+        (Shape::Vector128, _) => 0b1111,
+        (Shape::Vector64, Format::Single) | (Shape::Scalar, Format::Double) => 0b0011,
+        _ => 0b0001,
+    };
+    code.asm()
+        .alu_imm8(Alu::And, Size::Dword, Gpr::Rax, active);
+    let resumed = branch(code, Condition::Zero);
+    resolve(code, resumed, resume);
+    resumes.push(resumed);
+    let end = code.len();
+    resolve(code, unsticky, end);
 }
