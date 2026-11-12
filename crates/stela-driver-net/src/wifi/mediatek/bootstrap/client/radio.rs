@@ -33,6 +33,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         // Complete fallible codec/capacity checks before Scanner owns the
         // request. A refused RNR list must leave this same owner reusable.
         let mut elements = [Vec::new(), Vec::new(), Vec::new()];
+        let mut connac2_elements = Vec::new();
         // A 6 GHz probe carries the HE 6 GHz capability, as mac80211 builds it.
         // mt76_connac_mcu_hw_scan copies mac80211's elements into every
         // active connac2 scan.
@@ -54,6 +55,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             } else {
                 0
             };
+            let mut parts = Vec::new();
             for (index, band) in [wifi::Band::Ghz2, wifi::Band::Ghz5, wifi::Band::Ghz6]
                 .into_iter()
                 .enumerate()
@@ -62,10 +64,21 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                     let actual = local::current(s, band).map_err(Error::Local)?;
                     let domain = actual_policy.programmed().ok_or(Error::WrongProfile)?.0;
                     let selection = local::scan::Selection::programmed(domain, band, he6);
-                    elements[index] =
-                        local::scan::with_extra(&actual, selection, request.extra_elements())
-                            .map_err(Error::Local)?;
+                    if connac2 {
+                        parts.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                        parts.push((actual, selection));
+                    } else {
+                        elements[index] =
+                            local::scan::with_extra(&actual, selection, request.extra_elements())
+                                .map_err(Error::Local)?;
+                    }
                 }
+            }
+            // A connac2 scan carries mac80211's one buffer: each band's
+            // part, then the common elements once.
+            if connac2 {
+                connac2_elements = local::scan::with_extra_bands(&parts, request.extra_elements())
+                    .map_err(Error::Local)?;
             }
         }
         let context = s.interface.registered_context().unwrap();
@@ -76,7 +89,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             // A connac2 scan carries one element list for every band, as
             // mac80211 fills a single all-band scan request's.
             let elements = if prepared {
-                elements.concat()
+                connac2_elements
             } else {
                 request.extra_elements().to_vec()
             };

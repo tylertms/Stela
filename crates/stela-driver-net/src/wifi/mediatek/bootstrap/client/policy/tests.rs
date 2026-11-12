@@ -221,6 +221,81 @@ fn connac2_clients_admit_their_policy_and_scan_with_their_probe_elements() {
         finish_stop(&mut driver, &model);
     }
 }
+#[test]
+fn a_connac2_scan_carries_each_bands_part_then_the_common_elements_once() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    use super::super::local::scan::{Selection, elements, with_extra};
+    let two = Channel {
+        band: Band::Ghz2,
+        number: 1,
+        frequency_mhz: 2412,
+    };
+    // Extended Capabilities, which go with the first band's HT group, then
+    // a vendor element, which no group takes.
+    let extended = [127, 3, 4, 0, 0];
+    let vendor = [221, 4, 0, 0x10, 0x18, 1];
+    let extra = [&extended[..], &vendor[..]].concat();
+    for chip in [Chip::Mt7921, Chip::Mt7922] {
+        let (client, model) = setup_on(chip);
+        let local = [Band::Ghz2, Band::Ghz5].map(|band| client.local_advertisement(band).unwrap());
+        let mut driver = ManagedClient::new(client, country(), Environment::Indoor).unwrap();
+        let expected = {
+            let domain = driver
+                .client
+                .state()
+                .controller
+                .state()
+                .policy
+                .as_ref()
+                .unwrap()
+                .programmed()
+                .unwrap()
+                .0;
+            // ieee80211_build_preq_ies: the 2.4 GHz part takes the Extended
+            // Capabilities; the 5 GHz part finds none left, and the vendor
+            // element follows both once.
+            let first = with_extra(
+                &local[0],
+                Selection::programmed(domain, Band::Ghz2, 0),
+                &extended,
+            )
+            .unwrap();
+            let mut second = Vec::new();
+            let generated =
+                elements(&local[1], Selection::programmed(domain, Band::Ghz5, 0)).unwrap();
+            let mut rest = &generated[..];
+            while let [id, n, tail @ ..] = rest {
+                let (data, next) = tail.split_at(usize::from(*n));
+                if *id != 127 {
+                    second.extend_from_slice(&[*id, *n]);
+                    second.extend_from_slice(data);
+                }
+                rest = next;
+            }
+            [first, second, vendor.to_vec()].concat()
+        };
+        let count = model.response.lock().unwrap().client_commands.len();
+        driver
+            .begin_scan(
+                scan::Request::new(vec![two, CHANNEL], vec![vec![]], extra.clone()).unwrap(),
+                0,
+                1000,
+            )
+            .unwrap();
+        let commands = model.response.lock().unwrap().client_commands.clone();
+        let body = &commands[count][64..];
+        let length = usize::from(u16::from_le_bytes([body[224], body[225]]));
+        assert_eq!(&body[226..226 + length], &expected[..]);
+        connac2_done(&model);
+        driver.poll(2, &Source).unwrap();
+        // SAFETY: modeled terminal/notifications/DMA drained.
+        unsafe { driver.retire_scan_after_drain() }.unwrap();
+        driver.stop().unwrap();
+        finish_stop(&mut driver, &model);
+    }
+}
 fn finish_stop(driver: &mut ManagedClient<Bar, Q, NativeGuard>, model: &Model) {
     model.response.lock().unwrap().clc_processing = false;
     model.bar.0.lock().unwrap().values.insert(0xd4208, 0);

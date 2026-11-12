@@ -18,6 +18,7 @@ const CHAN_NO_EHT: u32 = 1 << 20;
 
 /// Source any-usable-channel decisions over this owner's completed domain.
 /// These only select advertised families; they grant no probe permission.
+#[derive(Clone, Copy)]
 pub(in crate::wifi::mediatek::bootstrap::client) struct Selection {
     vht: bool,
     he: bool,
@@ -99,13 +100,52 @@ pub(in crate::wifi::mediatek::bootstrap::client) fn with_extra(
     selection: Selection,
     extra: &[u8],
 ) -> Result<Vec<u8>, LocalError> {
+    let (mut out, offset) = band_part(advertisement, selection, extra, 0)?;
+    out.extend_from_slice(&extra[offset..]);
+    Ok(out)
+}
+
+/// `ieee80211_build_preq_ies` over each scanned band's advertisement and
+/// selection, in band order, as a connac2 scan's one element list carries
+/// them (`mt76_connac_mcu_hw_scan` copies mac80211's whole buffer): each
+/// band's part takes the OS elements its groups find from where the last
+/// band's part stopped, and the OS elements no group took follow all parts
+/// once, as the common elements.
+pub(in crate::wifi::mediatek::bootstrap::client) fn with_extra_bands(
+    parts: &[(Advertisement, Selection)],
+    extra: &[u8],
+) -> Result<Vec<u8>, LocalError> {
+    let mut offset = 0;
+    let mut out = Vec::new();
+    for (advertisement, selection) in parts {
+        let (part, next) = band_part(advertisement, *selection, extra, offset)?;
+        out.try_reserve(part.len())
+            .map_err(|_| LocalError::NoMemory)?;
+        out.extend_from_slice(&part);
+        offset = next;
+    }
+    out.try_reserve(extra.len() - offset)
+        .map_err(|_| LocalError::NoMemory)?;
+    out.extend_from_slice(&extra[offset..]);
+    Ok(out)
+}
+
+/// `ieee80211_build_preq_ies_band`: one band's generated elements with the
+/// OS elements from `from` that go before each of its groups, and where
+/// those stopped.
+fn band_part(
+    advertisement: &Advertisement,
+    selection: Selection,
+    extra: &[u8],
+    from: usize,
+) -> Result<(Vec<u8>, usize), LocalError> {
     validate_extra(extra)?;
     let generated = elements(advertisement, selection)?;
     let replaced = names_extended_capabilities(extra);
     let mut out = Vec::new();
     out.try_reserve_exact(generated.len() + extra.len())
         .map_err(|_| LocalError::NoMemory)?;
-    let mut offset = 0;
+    let mut offset = from;
     for stage in 0..5 {
         let mut rest = generated.as_slice();
         while !rest.is_empty() {
@@ -149,8 +189,7 @@ pub(in crate::wifi::mediatek::bootstrap::client) fn with_extra(
             out.extend_from_slice(&extra[start..offset]);
         }
     }
-    out.extend_from_slice(&extra[offset..]);
-    Ok(out)
+    Ok((out, offset))
 }
 
 /// The OS's Extended Capabilities stand for the device's, as wpa_supplicant's
