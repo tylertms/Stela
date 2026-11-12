@@ -22,7 +22,7 @@ use super::{
     station::{Station, Wifi},
 };
 use crate::{
-    Clock,
+    Clock, Mac,
     bus::dma::{mapping::DmaDomain, memory::PageSource},
     firmware::Provider,
     wifi::{
@@ -64,7 +64,8 @@ pub enum AttachError {
     Country([u8; 2], database::Error),
     Firmware(LoadError),
     Bootstrap(bootstrap::Error),
-    /// Neither the capabilities nor the EEPROM report a station address.
+    /// The firmware reports no valid station address and no entropy gives a
+    /// random one.
     NoAddress,
     /// The country enables no channel the radio may start on.
     NoChannel,
@@ -103,6 +104,22 @@ pub struct Attached<C: 'static> {
     /// (`MT7925_REGD_SUPPORTED`). The link programs and verifies
     /// regulatory.db's country instead, so the firmware's stays unused.
     pub firmware_domain_unused: bool,
+    /// The firmware reported no valid station address, so the station took
+    /// a random locally administered one, as `mt76_eeprom_override` does.
+    pub random_address: bool,
+}
+
+/// `mt76_eeprom_override`: the firmware's station address when it is a
+/// valid unicast address, else `eth_random_addr`'s random locally
+/// administered unicast address; `None` only when no entropy is available.
+fn station_address(reported: Option<Mac>, entropy: &dyn Entropy) -> Option<(Mac, bool)> {
+    if let Some(mac) = reported.filter(|mac| !mac.is_multicast() && mac.0 != [0; 6]) {
+        return Some((mac, false));
+    }
+    let mut bytes = [0; 6];
+    entropy.fill(&mut bytes).ok()?;
+    bytes[0] = (bytes[0] & 0xfe) | 0x02;
+    Some((Mac(bytes), true))
 }
 
 /// Identify, boot and program the function `pci` names, then register its
@@ -172,10 +189,13 @@ pub unsafe fn attach<C: 'static>(
     let channel = plan.default_channel().ok_or(AttachError::NoChannel)?;
     // SAFETY: the programmed domain holds `channel`.
     unsafe { controller.start(channel.band, channel.number as u8, channel.frequency_mhz) }?;
-    let address = controller
-        .capabilities()
-        .and_then(|report| report.observed().mac())
-        .ok_or(AttachError::NoAddress)?;
+    let (address, random_address) = station_address(
+        controller
+            .capabilities()
+            .and_then(|report| report.observed().mac()),
+        &*inputs.entropy,
+    )
+    .ok_or(AttachError::NoAddress)?;
     // `mt7925_add_interface`'s first interface: BSS, OMAC and WMM 0, no band
     // yet, and the broadcast WCID `MT792x_WTBL_RESERVED - 0`.
     let context = Context {
@@ -211,5 +231,42 @@ pub unsafe fn attach<C: 'static>(
             inputs.clock,
         ),
         firmware_domain_unused,
+        random_address,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stela_driver_base::entropy::EntropyError;
+
+    struct Fixed(u8);
+    impl Entropy for Fixed {
+        fn fill(&self, output: &mut [u8]) -> Result<(), EntropyError> {
+            output.fill(self.0);
+            Ok(())
+        }
+    }
+    struct Empty;
+    impl Entropy for Empty {
+        fn fill(&self, _: &mut [u8]) -> Result<(), EntropyError> {
+            Err(EntropyError::Unavailable)
+        }
+    }
+
+    #[test]
+    fn an_invalid_or_missing_address_becomes_a_random_local_one_as_mt76_does() {
+        let good = Mac([0x00, 0x0a, 0xf5, 1, 2, 3]);
+        assert_eq!(
+            station_address(Some(good), &Fixed(0xff)),
+            Some((good, false))
+        );
+        for reported in [None, Some(Mac([0; 6])), Some(Mac([0x01, 0, 0, 0, 0, 1]))] {
+            let (mac, random) = station_address(reported, &Fixed(0xff)).unwrap();
+            assert!(random);
+            assert_eq!(mac.0, [0xfe, 0xff, 0xff, 0xff, 0xff, 0xff]);
+            assert!(!mac.is_multicast() && mac.0[0] & 2 != 0);
+        }
+        assert_eq!(station_address(None, &Empty), None);
+    }
 }
