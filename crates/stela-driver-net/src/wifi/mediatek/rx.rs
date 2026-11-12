@@ -333,7 +333,7 @@ pub fn decode(chip: Chip, bytes: &[u8]) -> Result<Decoded<'_>, Error> {
 
 /// `mt76_rates` hardware values, CCK then OFDM, as `mt76_get_rate` searches
 /// them. The 5 and 6 GHz bands hold only the OFDM ones.
-const LEGACY_RATES: [u8; 12] = [0, 1, 2, 3, 11, 15, 10, 14, 9, 13, 8, 12];
+pub(crate) const LEGACY_RATES: [u8; 12] = [0, 1, 2, 3, 11, 15, 10, 14, 9, 13, 8, 12];
 
 /// Linux `mt76_get_rate`: the band's bitrate index, or 0 when none matches.
 fn legacy_index(band: Band, index: u8, cck: bool) -> u8 {

@@ -114,8 +114,13 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                     .is_some_and(|m| m.context().negotiated().max_tx_amsdu != 0),
             fixed_rate: if s.modern.is_some() && !management && !minimum_rate {
                 None
-            } else {
+            } else if s.controller.state().identity.chip == Chip::Mt7925 {
                 Some(txwi::FixedRate::Connac3(index))
+            } else {
+                Some(txwi::FixedRate::Connac2(connac2_fixed_rate(
+                    p.channel.band,
+                    p.basic_rates,
+                )))
             },
         };
         let context = PacketOwner {
@@ -485,5 +490,38 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             });
         }
         Ok(frame)
+    }
+}
+
+/// `mt76_connac2_mac_tx_rate_val` on MT7921 and MT7922: the lowest basic
+/// rate, through `mt76_calculate_default_rate`'s `mt76_rates` value, as the
+/// TXD's fixed rate word (index, then the CCK or OFDM mode from bit 6).
+fn connac2_fixed_rate(band: wifi::Band, basic_rates: u16) -> u16 {
+    let offset = if band == wifi::Band::Ghz2 { 0 } else { 4 };
+    let lowest = if basic_rates == 0 {
+        0
+    } else {
+        basic_rates.trailing_zeros() as usize
+    };
+    let index = match lowest + offset {
+        index if index < crate::wifi::mediatek::rx::LEGACY_RATES.len() => index,
+        _ => offset,
+    };
+    let mode = u16::from(index >= 4);
+    u16::from(crate::wifi::mediatek::rx::LEGACY_RATES[index]) | mode << 6
+}
+
+#[cfg(test)]
+mod connac2_rate_tests {
+    use super::*;
+
+    #[test]
+    fn the_lowest_basic_rate_is_the_fixed_rate_word() {
+        // 1 Mbps CCK; 6 Mbps OFDM (hardware index 11); 24 Mbps (9).
+        assert_eq!(connac2_fixed_rate(wifi::Band::Ghz2, 0b1111), 0);
+        assert_eq!(connac2_fixed_rate(wifi::Band::Ghz5, 0x15), 11 | 1 << 6);
+        assert_eq!(connac2_fixed_rate(wifi::Band::Ghz6, 0x10), 9 | 1 << 6);
+        // 6 Mbps when the only basic rate is OFDM on 2.4 GHz.
+        assert_eq!(connac2_fixed_rate(wifi::Band::Ghz2, 0x10), 11 | 1 << 6);
     }
 }
