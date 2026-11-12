@@ -167,11 +167,16 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                     .control
                     .clear_peer_admission(profile.wcid)
                     .map_err(|e| Error::Bootstrap(super::super::Error::Control(e)))?;
-                // MT7925's order; each connac2 BSS body is its own command.
-                for (command, bytes) in bss.iter().map(|b| (Command::BssInfo, b)).chain([
-                    (Command::StationRecord, &peer),
-                    (Command::StationRecord, &broadcast),
-                ]) {
+                // MT7925's order (`mt7925_mac_link_sta_add`); connac2 sends
+                // only the peer's STATE_NONE record (`mt7921_mac_sta_add`).
+                let connac2 = s.controller.state().identity.chip != Chip::Mt7925;
+                for (command, bytes) in bss
+                    .iter()
+                    .filter(|_| !connac2)
+                    .map(|b| (Command::BssInfo, b))
+                    .chain([(Command::StationRecord, &peer)])
+                    .chain((!connac2).then_some((Command::StationRecord, &broadcast)))
+                {
                     Self::qualify_six(s, guard, Use::PreparePeer, now)?;
                     Self::command(s, command, bytes)?;
                 }

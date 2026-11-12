@@ -39,7 +39,10 @@ impl Drop for Provider {
 }
 type TestLink = ManagedLink<Bar, Q, NativeGuard, Provider>;
 fn setup_link() -> (TestLink, Model, Join, scan::result::Bss, Arc<AtomicUsize>) {
-    let (client, model) = setup_modern();
+    setup_link_on(Chip::Mt7925)
+}
+fn setup_link_on(chip: Chip) -> (TestLink, Model, Join, scan::result::Bss, Arc<AtomicUsize>) {
+    let (client, model) = setup_on(chip);
     let (join, bss) = modern_inputs(&client);
     let client = ManagedClient::new(client, country(), Environment::Indoor).unwrap();
     let drops = Arc::new(AtomicUsize::new(0));
@@ -601,6 +604,43 @@ fn aborting_a_join_deauthenticates_like_ieee80211_mgd_deauth() {
     assert_eq!(departed[0][..2], [0xc0, 0]);
     assert_eq!(departed[0][24..], 3u16.to_le_bytes());
     retire(&mut link, &model);
+}
+#[test]
+fn a_connac2_join_adds_only_the_peer_before_authentication_like_mt7921_mac_sta_add() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    for chip in [Chip::Mt7921, Chip::Mt7922] {
+        let (mut link, model, join, bss, _) = setup_link_on(chip);
+        scan_join(&mut link, &model, join, bss);
+        assert_eq!(finish_tx(&model)[0][..2], [0xb0, 0]);
+        // After the CE scan request, one UNI STA_REC_UPDATE: the peer's
+        // BASIC record first, in STATE_NONE; no BSS or broadcast entry.
+        let commands = model.response.lock().unwrap().client_commands.clone();
+        let scan = commands
+            .iter()
+            .rposition(|p| p[43] & 2 == 0 && p[36] == 3)
+            .unwrap();
+        let after = &commands[scan + 1..];
+        assert_eq!(after.len(), 1);
+        let record = &after[0];
+        assert_eq!((record[43] & 2, record[34]), (2, 3));
+        assert_eq!(record[49], 1);
+        let mut rest = &record[56..];
+        let mut tags = Vec::new();
+        while rest.len() >= 4 {
+            let n = usize::from(u16::from_le_bytes([rest[2], rest[3]]));
+            assert!(n >= 4 && n <= rest.len(), "{tags:?} {n}");
+            let tag = u16::from_le_bytes([rest[0], rest[1]]);
+            if tag == 7 {
+                assert_eq!(rest[8], 0);
+            }
+            tags.push(tag);
+            rest = &rest[n..];
+        }
+        assert_eq!(tags.first(), Some(&0));
+        assert!(tags.contains(&7));
+    }
 }
 #[test]
 fn the_link_carries_each_aes_cipher_like_mt7925_set_key() {

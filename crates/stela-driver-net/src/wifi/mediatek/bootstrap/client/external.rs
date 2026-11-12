@@ -111,12 +111,8 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             .control
             .clear_peer_admission(profile.wcid)
             .map_err(|e| Error::Bootstrap(super::super::Error::Control(e)))?;
-        for body in &bss {
-            Self::command(s, Command::BssInfo, body)?;
-        }
-        Self::command(s, Command::StationRecord, &peer)?;
-        s.format_generation = Some(generation);
-        Self::command(s, Command::StationRecord, &broadcast)?;
+        let connac2 = s.controller.state().identity.chip != Chip::Mt7925;
+        Self::add_peer(s, connac2, &bss, &peer, &broadcast, generation)?;
         s.phase = Phase::Joining;
         Ok(session)
     }
