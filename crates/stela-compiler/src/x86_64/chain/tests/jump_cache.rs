@@ -23,9 +23,9 @@ const PAGE: usize = 4096;
 /// The cached tail's site, the plain tail's, the probes of BTYPE 0 and 2.
 const CACHED: usize = 64;
 const PLAIN: usize = 256;
-const PROBES: usize = 1024;
+const PROBES: usize = 4096;
 const BRANCH_CACHED: usize = 384;
-const BRANCH_PROBES: usize = 2048;
+const BRANCH_PROBES: usize = 8192;
 const REGION: usize = 4 * PAGE;
 const BLOCKS: usize = 8;
 const RAN: u32 = 3;

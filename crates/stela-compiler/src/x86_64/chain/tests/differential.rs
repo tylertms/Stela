@@ -198,8 +198,8 @@ const PAGE: usize = 4096;
 /// Per variant: the entry stub and tail at 0, the four dispatchers from
 /// [`PROBES`]; the blocks are in a page of their own both enter.
 const PROBES: usize = 512;
-const DISPATCHER_BYTES: usize = 1536;
-const REGION: usize = 2 * PAGE;
+const DISPATCHER_BYTES: usize = 2048;
+const REGION: usize = 3 * PAGE;
 const BLOCKS: usize = 8;
 const CONTEXTS: [u64; 3] = [
     5 << LOOKUP_SALT_BITS,

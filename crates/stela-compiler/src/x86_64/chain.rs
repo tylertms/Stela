@@ -2276,6 +2276,9 @@ pub const PROBE_ENTRY: usize = CELL_PROBE_BYTES;
 /// Where a [`lookup_dispatcher`]'s stamping cell probe begins, after the
 /// table probe: a [`stamped_tail`]'s miss takes it.
 pub const STAMPING_PROBE_ENTRY: usize = PROBE_ENTRY + 512;
+/// Where a [`lookup_dispatcher`]'s jump cache probe begins, after the
+/// stamping cell probe: every [`lookup_tail`] of its BTYPE calls it.
+pub const JUMP_PROBE_ENTRY: usize = STAMPING_PROBE_ENTRY + 512;
 /// Bytes in a [`lookup_tail`]: `mov edx, word` and `jmp probe`.
 pub const TAIL_BYTES: usize = 5 + 5;
 /// Bytes in a [`cell_tail`].
@@ -2294,7 +2297,9 @@ pub const CELL_TAIL_BYTES: usize = 10 + TAIL_BYTES;
 /// key. Each enters the block it found, the transfer counted and `block`
 /// named, or returns to the engine with RAX and RDX as the exit left them.
 /// Neither touches the stack: R10 and R11, free between blocks, hold what
-/// a probe keeps.
+/// a probe keeps. A lookup tail calls the jump cache probe
+/// ([`JUMP_PROBE_ENTRY`]), which returns a hit to the tail and drops the
+/// tail's return for anything else.
 /// Other cores write the table and cells meanwhile: a probe takes an entry
 /// only when its last word, read before its fields, was not busy and is
 /// unchanged after them ([`Slot`]); a cell read torn starts the table
@@ -2388,7 +2393,61 @@ fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     let (to_table, to_probe) = cell_probe(&mut code, policy, true, btype);
     crate::x86_64::asm::resolve(&mut code, to_table, table);
     crate::x86_64::asm::resolve(&mut code, to_probe, PROBE_ENTRY);
+    let padding = JUMP_PROBE_ENTRY
+        .checked_sub(code.len())
+        .expect("the stamping cell probe fits its bytes");
+    for _ in 0..padding {
+        code.asm().int3();
+    }
+    let to_probe = jump_probe(&mut code, policy, btype);
+    crate::x86_64::asm::resolve(&mut code, to_probe, PROBE_ENTRY);
     Some(code.into_bytes())
+}
+
+/// The jump cache probe at the end of `code` that every [`lookup_tail`] of
+/// a branch that sets `btype` calls, the target in RAX and the tail's word
+/// in EDX: a target this PE's jump cache holds in its current serial (and
+/// that accepts `btype`) is counted as a probe counts its transfers, named
+/// in `block`, and returned to the tail in R9, whose own jump enters it. A
+/// spent budget drops the tail's return and returns to the engine, EDX
+/// whole; any other target drops it and takes the table probe, whose jump
+/// the patch returned leads to. The call and its return pair, so the host
+/// predicts the return, and each site keeps its own indirect jump.
+fn jump_probe(code: &mut Code, policy: Interruption, btype: u8) -> crate::x86_64::asm::Patch {
+    let entry = |field: i32| Mem::indexed(R10, R9, 8, JUMP_CACHE + field);
+    let mut asm = code.asm();
+    asm.place(Rcx, CONTROL);
+    let mut misses: Vec<_> = gate(&mut asm, policy, R8, false).into_iter().collect();
+    // R10 = this PE's stamps, R9 = 8 times the entry's index.
+    asm.mov_load(Qword, R10, Mem::base(Rcx, STAMPS));
+    asm.mov(Dword, R9, Rax);
+    asm.alu_imm32(Alu::And, Dword, R9, JUMP_INDEX);
+    asm.alu_load(Alu::Cmp, Qword, Rax, entry(JUMP_PC));
+    misses.push(asm.jcc8(Cond::Ne));
+    asm.mov_load(Qword, R8, Mem::base(R10, JUMP_SERIAL));
+    asm.alu_load(Alu::Cmp, Qword, R8, entry(JUMP_ENTRY_SERIAL));
+    misses.push(asm.jcc8(Cond::Ne));
+    if btype != 0 {
+        asm.test_imm(Size::Byte, entry(JUMP_TARGETS), 1 << btype);
+        misses.push(asm.jcc8(Cond::E));
+    }
+    spend_budget(&mut asm, policy);
+    let exhausted = asm.jcc8(Cond::B);
+    asm.mov(Dword, R8, Rdx);
+    asm.shift_imm(ShiftOp::Shr, Dword, R8, ExitWord::RAN_SHIFT as u8);
+    asm.alu(Alu::Add, Qword, Mem::base(Rcx, RETIRED), R8);
+    asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
+    asm.mov_load(Dword, R8, entry(JUMP_BLOCK));
+    entered_btype(&mut asm, R8, btype);
+    asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
+    asm.jmp_rm(entry(JUMP_CODE));
+    // A spent budget returns as the probe's would, its word in EDX whole.
+    asm.bind(exhausted);
+    missed(&mut asm);
+    for miss in misses {
+        asm.bind(miss);
+    }
+    asm.jmp()
 }
 
 /// The BTYPE bits of `block` ([`BLOCK_BTYPE_SHIFT`]) set in `register`,
@@ -2776,23 +2835,24 @@ fn missed(asm: &mut crate::x86_64::asm::Asm) {
     asm.ret();
 }
 
-/// Bytes in a [`lookup_tail`]: the jump cache's hit, its exhausted
-/// budget's return, and the plain tail ([`TAIL_BYTES`]) of a miss.
-pub const LOOKUP_TAIL_BYTES: usize = 144;
+/// Bytes in a [`lookup_tail`]: `mov edx, word`, the call of the jump cache
+/// probe and the site's jump, padded.
+pub const LOOKUP_TAIL_BYTES: usize = 16;
 // The engine installs a lookup tail where a stamped tail may go.
 const _: () = assert!(LOOKUP_TAIL_BYTES <= STAMPED_TAIL_BYTES);
 
 /// The tail at host address `at` that an exit's patch point jumps to once
 /// the exit is redirected through a lookup, for a branch that sets
-/// `btype`: a target this PE's jump cache holds in its current serial
-/// (and that accepts `btype`) is entered from here, counted as a probe
-/// counts its transfers, by a jump of the site's own; any other takes EDX
-/// the exit's `word` with the `ran` instructions of the block it leaves,
-/// which only a probe reads, then a jump to the table probe at `probe`,
-/// which enters the block it finds, filling the cache, or returns to the
-/// engine. An interruption or a spent budget leaves as the probe would.
-/// `None` when `ran` exceeds its field, `btype` is no BTYPE or `probe` is
-/// out of a 32-bit jump's reach.
+/// `btype`: EDX takes the exit's `word` with the `ran` instructions of the
+/// block it leaves, then the tail calls the jump cache probe of the
+/// dispatcher whose table probe is at `probe` ([`JUMP_PROBE_ENTRY`]). A
+/// target this PE's jump cache holds in its current serial (and that
+/// accepts `btype`) comes back in R9, counted as a probe counts its
+/// transfers, and is entered by a jump of the site's own; any other takes
+/// the table probe, which enters the block it finds, filling the cache, or
+/// returns to the engine. An interruption or a spent budget leaves as the
+/// probe would. `None` when `ran` exceeds its field, `btype` is no BTYPE or
+/// the jump cache probe is out of a 32-bit call's reach.
 ///
 /// An entry holds only for the serial it was written in, which moves at
 /// every native entry and at every native change of the lookup contexts
@@ -2809,55 +2869,17 @@ pub fn lookup_tail(
     probe: u64,
     btype: u8,
 ) -> Option<[u8; LOOKUP_TAIL_BYTES]> {
-    lookup_tail_with_policy(at, word.into(), ran, probe, btype, Interruption::Epoch)
-}
-
-fn lookup_tail_with_policy(
-    at: u64,
-    word: ExitWord,
-    ran: u32,
-    probe: u64,
-    btype: u8,
-    policy: Interruption,
-) -> Option<[u8; LOOKUP_TAIL_BYTES]> {
+    let word = word.into();
     if btype > 3 || ran >= 1 << (u32::BITS - ExitWord::RAN_SHIFT) {
         return None;
     }
-    let entry = |field: i32| Mem::indexed(R10, R9, 8, JUMP_CACHE + field);
+    let jump_probe = probe.checked_add((JUMP_PROBE_ENTRY - PROBE_ENTRY) as u64)?;
     let mut code = Code::new();
     let mut asm = code.asm();
-    asm.place(Rcx, CONTROL);
-    let mut misses: Vec<_> = gate(&mut asm, policy, R8, false).into_iter().collect();
-    // R10 = this PE's stamps, R9 = 8 times the entry's index.
-    asm.mov_load(Qword, R10, Mem::base(Rcx, STAMPS));
-    asm.mov(Dword, R9, Rax);
-    asm.alu_imm32(Alu::And, Dword, R9, JUMP_INDEX);
-    asm.alu_load(Alu::Cmp, Qword, Rax, entry(JUMP_PC));
-    misses.push(asm.jcc8(Cond::Ne));
-    asm.mov_load(Qword, R8, Mem::base(R10, JUMP_SERIAL));
-    asm.alu_load(Alu::Cmp, Qword, R8, entry(JUMP_ENTRY_SERIAL));
-    misses.push(asm.jcc8(Cond::Ne));
-    if btype != 0 {
-        asm.test_imm(Size::Byte, entry(JUMP_TARGETS), 1 << btype);
-        misses.push(asm.jcc8(Cond::E));
-    }
-    spend_budget(&mut asm, policy);
-    let exhausted = asm.jcc8(Cond::B);
-    asm.alu_imm32(Alu::Add, Qword, Mem::base(Rcx, RETIRED), ran as i32);
-    asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
-    asm.mov_load(Dword, R8, entry(JUMP_BLOCK));
-    entered_btype(&mut asm, R8, btype);
-    asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
-    asm.jmp_rm(entry(JUMP_CODE));
-    // A spent budget returns as the probe's would, its word in EDX whole.
-    asm.bind(exhausted);
     asm.mov_imm32(Rdx, word.encoded() | ran << ExitWord::RAN_SHIFT);
-    missed(&mut asm);
-    for miss in misses {
-        asm.bind(miss);
-    }
-    // The plain tail's jump is relative to its own end in `code`.
-    tail(&mut code, at, word, ran, probe)?;
+    let call = asm.jmp();
+    let relative = relative(at + call.end() as u64, jump_probe)?;
+    code.patch(call.offset(), relative.to_le_bytes());
     let padding = LOOKUP_TAIL_BYTES.checked_sub(code.len())?;
     for _ in 0..padding {
         code.asm().int3();
