@@ -131,10 +131,14 @@ fn setup_modern_bands(
             queues,
             memory,
             drops,
+            chip,
         },
     )
 }
 pub(super) fn done(model: &Model) {
+    if model.chip != Chip::Mt7925 {
+        return connac2_done(model);
+    }
     let mut done = vec![0; 52];
     done[..4].copy_from_slice(&(7u32 << 27).to_le_bytes());
     done[36] = 14;
@@ -142,10 +146,12 @@ pub(super) fn done(model: &Model) {
     done[50] = 4;
     device_receive(&model.queues[&0xd4500], &done, true, 0);
 }
-/// A connac2 client of `chip` on the modern client's board.
-pub(crate) fn setup_connac2(chip: Chip) -> (Client<Bar, Q, NativeGuard>, Model) {
+/// A client of `chip` on the modern client's board.
+pub(crate) fn setup_on(chip: Chip) -> (Client<Bar, Q, NativeGuard>, Model) {
     setup_modern_bands(chip, false, CHANNEL, 0, None)
 }
+/// The chips whose station journeys run in the model.
+pub(crate) const CHIPS: [Chip; 3] = [Chip::Mt7925, Chip::Mt7921, Chip::Mt7922];
 /// connac2's unsolicited SCAN_DONE event, 0x0d, after its 24-byte RXD.
 pub(crate) fn connac2_done(model: &Model) {
     let mut done = vec![0; 52];
@@ -160,7 +166,7 @@ fn connac2_clients_admit_their_policy_and_scan_with_their_probe_elements() {
         return;
     }
     for chip in [Chip::Mt7921, Chip::Mt7922] {
-        let (client, model) = setup_connac2(chip);
+        let (client, model) = setup_on(chip);
         // mt7921_register_device: 160 MHz VHT only on MT7922.
         let local = client.local_advertisement(Band::Ghz5).unwrap();
         let vht = local.capabilities().vht().unwrap().capability;
@@ -614,6 +620,7 @@ fn active_six_ghz_rnr_requires_programmed_probe_policy_and_reuses_refused_owner(
         queues,
         memory,
         drops,
+        chip: Chip::Mt7925,
     };
     let country = three_band_country();
     let mut driver = ManagedClient::new(client, country, Environment::Indoor).unwrap();

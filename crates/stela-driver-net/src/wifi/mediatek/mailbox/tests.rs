@@ -341,20 +341,23 @@ unsafe impl QueueIo for DeviceIo {
                         assert_eq!(&body[4..8], &[0, 0, 24, 0]);
                         model.roc_requests.push(body.to_vec());
                         model.roc_channel = Some(body[10]);
-                        let mut grant = vec![0; 68];
+                        // UNI_EVENT_ROC after the chip's RXD: the grant TLV
+                        // after the event's four reserved bytes.
+                        let at = base + 20;
+                        let mut grant = vec![0; at + 16];
                         grant[..4].copy_from_slice(&(7u32 << 27).to_le_bytes());
-                        grant[36] = 0x27;
-                        grant[38] = 6;
-                        grant[50] = 20;
-                        grant[52] = body[8];
-                        grant[53] = body[9].wrapping_add(u8::from(model.wrong_roc_token));
-                        grant[54] = 0xa5; // raw status is not inspected by source grant callback
-                        grant[55] = body[10];
-                        grant[57] = body[12];
-                        grant[59] = body[14];
-                        grant[61] = body[19];
-                        grant[62] = 0;
-                        grant[64..68].copy_from_slice(&body[20..24]);
+                        grant[base + 4] = 0x27;
+                        grant[base + 6] = 6;
+                        grant[at - 2] = 20;
+                        grant[at] = body[8];
+                        grant[at + 1] = body[9].wrapping_add(u8::from(model.wrong_roc_token));
+                        grant[at + 2] = 0xa5; // raw status is not inspected by source grant callback
+                        grant[at + 3] = body[10];
+                        grant[at + 5] = body[12];
+                        grant[at + 7] = body[14];
+                        grant[at + 9] = body[19];
+                        grant[at + 10] = 0;
+                        grant[at + 12..at + 16].copy_from_slice(&body[20..24]);
                         device_receive(&self.rx, &grant, true, 0);
                     } else {
                         assert_eq!(body.len(), 16);
@@ -501,9 +504,12 @@ unsafe impl QueueIo for DeviceIo {
                     model.raw_disabled.insert(u16::from(body[1]));
                     model.initial_commands.push(packet.clone());
                 }
+                // STA_REC_KEY_V3, or connac2's STA_REC_KEY_V2.
+                let key_tag = if self.chip == Chip::Mt7925 { 0x27 } else { 17 };
+                let connac2 = self.chip != Chip::Mt7925;
                 if model.key_execution
                     && command == 3
-                    && (!model.client_execution || packet.get(56) == Some(&0x27))
+                    && (!model.client_execution || packet.get(56) == Some(&key_tag))
                 {
                     // Execute the DMA-read key body before ACK. A
                     // negative/absent ACK may still leave programmed state;
@@ -529,7 +535,12 @@ unsafe impl QueueIo for DeviceIo {
                 if model.client_execution {
                     model.client_commands.push(packet.clone());
                     // The model transmits on BSS 0, an MLD association's setup link.
-                    if command == 2 && packet[48] == 0 && packet[52] == 0 && packet.len() > 84 {
+                    // connac2's RLM is a BSS_INFO_UPDATE of its own, after
+                    // the BASIC one (mt76_connac_mcu_uni_set_chctx).
+                    if command == 2
+                        && packet[48] == 0
+                        && ((packet[52] == 0 && packet.len() > 84) || (connac2 && packet[52] == 2))
+                    {
                         let mut rest = &packet[52..];
                         while !rest.is_empty() {
                             let len = u16::from_le_bytes(rest[2..4].try_into().unwrap()) as usize;
@@ -539,7 +550,11 @@ unsafe impl QueueIo for DeviceIo {
                             rest = &rest[len..];
                         }
                     }
-                    if command == 3 && packet.get(56) != Some(&0x27) {
+                    if connac2 && command == 3 && packet.get(56) != Some(&key_tag) {
+                        let body = &packet[48..];
+                        let slot = u16::from(body[1]) | u16::from(body[6]) << 8;
+                        Self::connac2_station_record(&mut model, slot, body);
+                    } else if command == 3 && packet.get(56) != Some(&key_tag) {
                         let body = &packet[48..];
                         let slot = u16::from(body[1]);
                         if body[8] == 6 {
@@ -612,6 +627,96 @@ unsafe impl QueueIo for DeviceIo {
             device_receive(&self.rx, &response, true, if drop { 1 << 14 } else { 0 });
         }
         Ok(())
+    }
+}
+impl DeviceIo {
+    /// A connac2 client's STA_REC_UPDATE as the firmware applies it: the
+    /// peer's BASIC record and its connection state, the broadcast entry's
+    /// WTBL, the WTBL half of a block-ack session (whose STA_REC_BA half
+    /// follows) and the 12-byte STA_REC_BA record.
+    fn connac2_station_record(model: &mut Response, slot: u16, body: &[u8]) {
+        let tags = |mut rest: &[u8]| {
+            let mut out = Vec::new();
+            while rest.len() >= 4 {
+                let len = u16::from_le_bytes([rest[2], rest[3]]) as usize;
+                assert!(len >= 4 && len <= rest.len());
+                out.push((u16::from_le_bytes([rest[0], rest[1]]), rest[..len].to_vec()));
+                rest = &rest[len..];
+            }
+            assert!(rest.is_empty());
+            out
+        };
+        let records = tags(&body[8..]);
+        assert_eq!(
+            usize::from(u16::from_le_bytes([body[2], body[3]])),
+            records.len()
+        );
+        // Every request ends with its WTBL, whose nested TLVs it counts.
+        let (tag, wtbl) = records.last().unwrap();
+        if *tag != 6 {
+            assert_eq!(*tag, 13);
+            assert_eq!(u16::from(wtbl[4]) | u16::from(wtbl[8]) << 8, slot);
+            let nested = tags(&wtbl[12..]);
+            assert_eq!(
+                usize::from(u16::from_le_bytes([wtbl[6], wtbl[7]])),
+                nested.len()
+            );
+            if nested.iter().any(|(tag, _)| *tag == 8) {
+                // The WTBL BA half; STA_REC_BA carries the session.
+                assert_eq!(records.len(), 1);
+                assert_eq!(wtbl[5], 2); // WTBL_SET
+                return;
+            }
+            assert_eq!(wtbl[5], 1); // WTBL_RESET_AND_SET
+        }
+        match records[0].0 {
+            0 => {
+                let basic = &records[0].1;
+                assert_eq!(basic.len(), 20);
+                if basic[8] != 0 {
+                    // The RX header translation stays off for raw 802.11.
+                    let nested = tags(&records.last().unwrap().1[12..]);
+                    let translation = nested.iter().find(|(tag, _)| *tag == 6).unwrap();
+                    assert_eq!(&translation.1[4..8], &[1, 0, 1, 0]);
+                    model.peers.insert(slot, body.to_vec());
+                    model.raw_disabled.insert(slot);
+                } else {
+                    model.peers.remove(&slot);
+                    model.raw_disabled.remove(&slot);
+                }
+            }
+            13 => {
+                // The interface's own broadcast entry, without BASIC.
+                assert_eq!(records.len(), 1);
+                model.peers.insert(slot, body.to_vec());
+                model.raw_disabled.insert(slot);
+            }
+            6 => {
+                assert_eq!(body.len(), 20);
+                assert_eq!(&body[8..12], &[6, 0, 12, 0]);
+                let tid = body[12];
+                assert!(tid < 8);
+                if body[13] == 1 {
+                    assert!(body[14] <= 1);
+                    if body[15] == 0 {
+                        model.transmit_ba.remove(&(slot, tid));
+                    } else {
+                        assert_eq!(body[15], 1 << tid);
+                        assert_ne!(body[18..20], [0, 0]);
+                        model.transmit_ba.insert((slot, tid), body.to_vec());
+                    }
+                } else {
+                    assert_eq!(body[13], 2); // recipient direction
+                    if body[15] == 0 {
+                        model.receive_ba.remove(&(slot, tid));
+                    } else {
+                        assert_eq!(body[15], 1 << tid);
+                        model.receive_ba.insert((slot, tid), body.to_vec());
+                    }
+                }
+            }
+            tag => panic!("unmodeled connac2 STA_REC {tag}"),
+        }
     }
 }
 pub(crate) fn identity(chip: Chip) -> Identity {

@@ -1,5 +1,5 @@
 extern crate std;
-use super::super::tests::{done, setup_modern, setup_modern_radio};
+use super::super::tests::{CHIPS, done, setup_modern, setup_modern_radio, setup_on};
 use super::*;
 use crate::bus::dma::memory::{CacheAttribute, MemoryError, PageGeometry, PinnedPages};
 use crate::wifi::mediatek::{
@@ -177,7 +177,7 @@ fn incoming_control(model: &Model, pn: Option<u64>, marker: u8) {
     if pn.is_none() {
         bytes[1] &= !0x40;
     }
-    let mut raw = incoming_bytes(&bytes, pn.map(|n| (1, 0, n)), false);
+    let mut raw = incoming_bytes_on(model.chip, &bytes, pn.map(|n| (1, 0, n)), false);
     raw[4] = 1; // source WCID remains required for plaintext data too
     device_receive(&model.queues[&0xd4520], &raw, true, 0);
 }
@@ -318,7 +318,7 @@ fn an_open_network_carries_plaintext_ethernet_once_associated() {
     assert_eq!(frames[0][1] & 0x40, 0);
     let mut bytes = data(false);
     bytes[1] &= !0x40;
-    let mut raw = incoming_bytes(&bytes, None, false);
+    let mut raw = incoming_bytes_on(model.chip, &bytes, None, false);
     raw[4] = 1;
     device_receive(&model.queues[&0xd4520], &raw, true, 0);
     link.service().unwrap();

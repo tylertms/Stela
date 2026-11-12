@@ -508,6 +508,7 @@ mod tests {
             queues,
             memory,
             drops,
+            chip: Chip::Mt7925,
         };
         // SAFETY: the just-registered matching interface and native controller.
         let mut driver = unsafe { Client::new(controller, interface) }.unwrap();

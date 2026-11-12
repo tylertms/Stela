@@ -141,6 +141,7 @@ fn six_setup() -> (Client<Bar, Q, NativeGuard>, Model) {
         queues,
         memory,
         drops,
+        chip: Chip::Mt7925,
     };
     (driver, model)
 }

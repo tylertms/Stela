@@ -64,7 +64,12 @@ pub(in super::super) fn modern_inputs_cipher(
         10,
         local.clone(),
         actual.capabilities().clone(),
-        Mode::Eht,
+        // A connac2 chip advertises HE at most.
+        if actual.capabilities().eht().is_some() {
+            Mode::Eht
+        } else {
+            Mode::He
+        },
         Width::Mhz80,
     )
     .unwrap();

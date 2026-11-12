@@ -302,7 +302,11 @@ pub(in crate::wifi::mediatek::bootstrap::client) fn inputs_akm_cipher(
         10,
         replace_rsn(join.request.elements(), &selected),
         local.capabilities().clone(),
-        Mode::Eht,
+        if local.capabilities().eht().is_some() {
+            Mode::Eht
+        } else {
+            Mode::He
+        },
         Width::Mhz80,
     )
     .unwrap();

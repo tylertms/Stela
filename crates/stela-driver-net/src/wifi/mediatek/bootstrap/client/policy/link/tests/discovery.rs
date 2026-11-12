@@ -78,6 +78,7 @@ fn setup(six_capability: bool, six_programmed: bool, flags: u32) -> (TestLink, M
         queues,
         memory,
         drops,
+        chip: Chip::Mt7925,
     };
     // It cannot override NIC, CLC, domain or per-channel power.
     let client = ManagedClient::new(client, three_band_country(), Environment::Indoor).unwrap();
