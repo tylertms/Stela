@@ -113,3 +113,23 @@ fn connac2_scan_commands_refuse_the_mt7925_and_overlong_elements() {
     assert!(!cancel.expects_response());
     assert!(scan_done(0x0d) && scan_done(0x23) && !scan_done(14));
 }
+
+#[test]
+fn rssi_notify_reports_the_bss_slot_and_tx_done_carries_one_txs_record() {
+    // mt76_connac_rssi_notify_event: rssi[4], by BSS index; 0 is no report.
+    let mut payload = [0u8; 16];
+    payload[4..8].copy_from_slice(&(-61i32).to_le_bytes());
+    assert_eq!(rssi(&payload, 1), Some(-61));
+    assert_eq!(rssi(&payload, 0), None);
+    assert_eq!(rssi(&payload[..6], 1), None);
+    // mt7921_mcu_tx_done_event: txs[28] at offset 28.
+    let mut event = [0u8; 88];
+    for (i, byte) in event[28..56].iter_mut().enumerate() {
+        *byte = i as u8 + 1;
+    }
+    let packet = tx_done_status(&event).unwrap();
+    assert_eq!(packet[..8], [0; 8]);
+    assert_eq!(packet[8..36], event[28..56]);
+    assert_eq!(packet[36..], [0; 4]);
+    assert!(tx_done_status(&event[..55]).is_none());
+}

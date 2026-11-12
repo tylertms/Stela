@@ -19,6 +19,28 @@ const CANCEL_HW_SCAN: u32 = (1 << 18) | 0x1b;
 pub(in crate::wifi::mediatek) const SCAN_DONE_EVENTS: [u8; 2] = [0x0d, 0x23];
 /// `MCU_EVENT_BSS_BEACON_LOSS`.
 pub(in crate::wifi::mediatek) const BEACON_LOSS_EVENT: u8 = 0x13;
+/// `MCU_EVENT_RSSI_NOTIFY`.
+pub(in crate::wifi::mediatek) const RSSI_NOTIFY_EVENT: u8 = 0x96;
+/// `MCU_EVENT_TX_DONE`.
+pub(in crate::wifi::mediatek) const TX_DONE_EVENT: u8 = 0x0f;
+
+/// `mt7921_mcu_rssi_monitor_iter`: the RSSI `mt76_connac_rssi_notify_event`
+/// reports for BSS `bss`; none when the firmware reports 0 for it.
+pub(in crate::wifi::mediatek) fn rssi(payload: &[u8], bss: u8) -> Option<i32> {
+    let at = usize::from(bss) * 4;
+    let rssi = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().unwrap());
+    (rssi != 0).then_some(rssi)
+}
+
+/// `mt7921_mcu_tx_done_event`'s TXS words (`txs[28]` at offset 28), as the
+/// data path's TXS packet carries one record: two header words, then the
+/// record's eight words, the last absent here and zero.
+pub(in crate::wifi::mediatek) fn tx_done_status(payload: &[u8]) -> Option<[u8; 40]> {
+    let words = payload.get(28..56)?;
+    let mut packet = [0; 40];
+    packet[8..36].copy_from_slice(words);
+    Some(packet)
+}
 /// `MT76_CONNAC_SCAN_IE_LEN`, the probe request elements one scan carries.
 pub(in crate::wifi::mediatek) const SCAN_IE_LEN: usize = 600;
 /// `sizeof(struct mt76_connac_hw_scan_req)`.

@@ -431,8 +431,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         // later completed RX is classified under the current agreement,
         // matching source SSN/PN semantics without inventing a wire generation.
         s.receive_groups.discard_tid(session.tid());
+        let chip = s.controller.state().identity.chip;
         s.pending_rx.retain(|f| {
-            rx::decode(Chip::Mt7925, &f.frame.bytes)
+            rx::decode(chip, &f.frame.bytes)
                 .ok()
                 .and_then(|d| Header::parse(d.payload).ok())
                 .is_none_or(|h| h.tid != Some(session.tid()))

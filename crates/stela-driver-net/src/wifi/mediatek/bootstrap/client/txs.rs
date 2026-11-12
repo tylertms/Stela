@@ -47,9 +47,19 @@ pub(super) struct State {
     pub(super) ready: Vec<TxStatus>,
     /// `wcid->rate`: the rate of the last reported frame.
     pub(super) rate: Option<RxRate>,
+    /// The record takes connac2's layout (`mt76_connac2_mac.h`): a 10-bit
+    /// WCID, a 2-bit bandwidth, a 3-bit NSS and STBC in the rate word.
+    connac2: bool,
 }
 
 impl State {
+    /// The TX status state of a chip's connac generation.
+    pub(super) fn of(chip: Chip) -> Self {
+        Self {
+            connac2: chip != Chip::Mt7925,
+            ..Self::default()
+        }
+    }
     /// The TXWI packet ID for a frame to the peer.
     pub(super) fn pid(&self, no_ack: bool, request: bool, now: u64) -> u8 {
         if no_ack {
@@ -126,13 +136,18 @@ impl State {
             let word = |i: usize| u32::from_le_bytes(record[i * 4..i * 4 + 4].try_into().unwrap());
             let (w0, w3) = (word(0), word(3));
             let pid = (w3 >> 24) as u8;
-            let wcid = ((word(2) >> 16) & 0xfff) as u16;
+            let wcid_mask = if self.connac2 { 0x3ff } else { 0xfff };
+            let wcid = ((word(2) >> 16) & wcid_mask) as u16;
             if (w0 >> 23) & 3 > 1 || pid < FIRST || !wcids.contains(&wcid) {
                 continue;
             }
             let acked = w0 & (7 << 16) == 0;
             if wcids.first() == Some(&wcid)
-                && let Some(rate) = rate(w0, w3, band, self.rate)
+                && let Some(rate) = if self.connac2 {
+                    connac2_rate(w0, band, self.rate)
+                } else {
+                    rate(w0, w3, band, self.rate)
+                }
             {
                 self.rate = Some(rate);
             }
@@ -157,6 +172,30 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
     pub fn tx_rate(&self) -> Option<RxRate> {
         self.state().txs.rate
     }
+}
+
+/// `mt76_connac2_mac_fill_txs`'s rate: as [`rate`] in connac2's fields,
+/// without EHT.
+fn connac2_rate(w0: u32, band: wifi::Band, last: Option<RxRate>) -> Option<RxRate> {
+    let txrate = w0 & 0x3fff;
+    // MT_TX_RATE_NSS is 12:10 and MT_TX_RATE_STBC bit 13 here.
+    let mut nss = ((txrate >> 10) & 7) as u8 + 1;
+    if txrate & (1 << 13) != 0 && nss > 1 {
+        nss >>= 1;
+    }
+    if (txrate >> 6) & 15 >= 12 {
+        return None;
+    }
+    // MT_TXS0_BW is 30:29.
+    let mut rate = rate(w0 & !(7 << 29) & !(1 << 13), 0, band, last)?;
+    rate.nss = nss;
+    rate.bandwidth = match (w0 >> 29) & 3 {
+        3 => Bandwidth::Mhz160,
+        2 => Bandwidth::Mhz80,
+        1 => Bandwidth::Mhz40,
+        _ => Bandwidth::Mhz20,
+    };
+    Some(rate)
 }
 
 /// `mt7925_mac_add_txs_skb`'s rate: `None` for a mode or MCS it leaves
@@ -213,6 +252,36 @@ mod tests {
         out[8..12].copy_from_slice(&(u32::from(wcid) << 16).to_le_bytes());
         out[12..16].copy_from_slice(&(u32::from(pid) << 24).to_le_bytes());
         out
+    }
+
+    #[test]
+    fn connac2_status_takes_its_wcid_bandwidth_nss_and_stbc_fields() {
+        let mut state = State::of(Chip::Mt7921);
+        // A 10-bit WCID: bit 26 belongs to the next field.
+        let mut bytes = vec![0; 8];
+        let mut stray = record(true, 2 << 6 | 1 << 10 | 3, 1, 3, 5);
+        stray[11] |= 1 << 2;
+        bytes.extend_from_slice(&stray);
+        state.receive(&bytes, &[5], wifi::Band::Ghz5);
+        let ht = state.rate.unwrap();
+        assert_eq!(
+            (ht.encoding, ht.index, ht.nss, ht.bandwidth),
+            (Encoding::Ht, 3, 2, Bandwidth::Mhz40)
+        );
+        // Bit 31 is MT_TXS0_FIXED_RATE and bit 13 STBC: four streams by
+        // STBC are two; the bandwidth stays 160 MHz.
+        let mut bytes = vec![0; 8];
+        let mut record = record(true, 8 << 6 | 1 << 13 | 3 << 10 | 9, 3, 4, 5);
+        record[3] |= 0x80;
+        bytes.extend_from_slice(&record);
+        state.receive(&bytes, &[5], wifi::Band::Ghz5);
+        let he = state.rate.unwrap();
+        assert_eq!(
+            (he.encoding, he.index, he.nss, he.bandwidth),
+            (Encoding::He, 9, 2, Bandwidth::Mhz160)
+        );
+        // connac2 has no EHT modes.
+        assert_eq!(connac2_rate(13 << 6, wifi::Band::Ghz5, None), None);
     }
 
     #[test]

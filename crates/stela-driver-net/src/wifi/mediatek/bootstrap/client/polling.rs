@@ -165,12 +165,42 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 }
                 // mt7925_mcu_rssi_monitor_event: each INFO TLV reports
                 // the first TLV's RSSI against the threshold.
-                if event.event_id == 0x41
+                if chip == Chip::Mt7925
+                    && event.event_id == 0x41
                     && event.is_unsolicited()
                     && s.phase == Phase::Associated
                     && let Some(monitor) = s.cqm.monitor.filter(|m| m.firmware)
                 {
                     events.extend(rssi_events(event.payload, monitor.threshold));
+                    continue;
+                }
+                // mt7921_mcu_rssi_monitor_event: the RSSI of each BSS.
+                if chip != Chip::Mt7925
+                    && event.event_id == wire::connac2::RSSI_NOTIFY_EVENT
+                    && event.is_unsolicited()
+                    && s.phase == Phase::Associated
+                    && let Some(monitor) = s.cqm.monitor.filter(|m| m.firmware)
+                {
+                    let bss = s.profile.unwrap().interface.bss_index;
+                    if let Some(rssi) = wire::connac2::rssi(event.payload, bss) {
+                        events.push(Event::Rssi {
+                            rssi,
+                            high: rssi > monitor.threshold,
+                        });
+                    }
+                    continue;
+                }
+                // mt7921_mcu_tx_done_event: one TXS record by event.
+                if chip != Chip::Mt7925
+                    && event.event_id == wire::connac2::TX_DONE_EVENT
+                    && event.is_unsolicited()
+                    && let Some(p) = s.profile
+                    && let Some(packet) = wire::connac2::tx_done_status(event.payload)
+                {
+                    let reports = s
+                        .txs
+                        .receive(&packet, &Self::peer_wcids(s, p), p.channel.band);
+                    events.extend(reports.into_iter().map(Event::TxStatus));
                     continue;
                 }
                 // mt7921_mcu_connection_loss_event takes the CE beacon-loss

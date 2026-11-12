@@ -65,7 +65,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             18
         } + p.basic_rates.trailing_zeros() as u8;
         let config = txwi::Config {
-            chip: Chip::Mt7925,
+            chip: s.controller.state().identity.chip,
             wcid: p.wcid,
             vif: Some(txwi::Vif {
                 omac: p.interface.omac_index,
@@ -344,7 +344,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         grouped: bool,
         policy: &mut impl scan::Policy,
     ) -> Result<Mpdu, Error> {
-        let d = rx::decode(Chip::Mt7925, raw).map_err(Error::Rx)?;
+        let d = rx::decode(s.controller.state().identity.chip, raw).map_err(Error::Rx)?;
         let band = match d.channel.band {
             rx::Band::Ghz2 => wifi::Band::Ghz2,
             rx::Band::Ghz5 => wifi::Band::Ghz5,

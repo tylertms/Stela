@@ -437,7 +437,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         let session = s.management.as_ref().ok_or(Error::WrongPhase)?.clone();
         Self::validate_management(s, &session)?;
         let p = s.profile.ok_or(Error::WrongProfile)?;
-        let d = rx::decode(Chip::Mt7925, raw).map_err(Error::Rx)?;
+        let d = rx::decode(s.controller.state().identity.chip, raw).map_err(Error::Rx)?;
         let h = frame.header();
         let group = h.receiver.is_multicast();
         let other = Self::other_link(s, &frame.radio);

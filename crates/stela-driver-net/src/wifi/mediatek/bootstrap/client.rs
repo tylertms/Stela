@@ -332,6 +332,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         {
             return Err(Error::WrongDevice);
         }
+        let chip = controller.state().identity.chip;
         let station = Station::new(context.address).map_err(Error::Station)?;
         let scanner = scan::Scanner::new(context.address).map_err(Error::Scan)?;
         // The attach is complete: the station's commands run from its polls.
@@ -348,7 +349,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 station,
                 pmf_observations: Vec::new(),
                 fragments: Default::default(),
-                txs: txs::State::default(),
+                txs: txs::State::of(chip),
                 pmf_selected: None,
                 pmf_authentication: None,
                 scanner,
