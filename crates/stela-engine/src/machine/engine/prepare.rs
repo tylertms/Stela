@@ -417,4 +417,96 @@ mod tests {
         };
         assert!(Preparation::from_description(&split).is_err());
     }
+
+    #[test]
+    #[ignore = "density harness"]
+    fn density_dump() {
+        use std::io::Write;
+        let input = std::env::var("DENSITY_IN").unwrap();
+        let output = std::env::var("DENSITY_OUT").unwrap();
+        let chip = crate::machine::test_chip();
+        let checks = MemoryChecks::system(true, false, true, false)
+            .with_range(stela_compiler::x86_64::RangeCheck::four_level(4).one_sided(true));
+        let system = NativeSystem {
+            exclusive: true,
+            pointer: Some(super::super::pointer::CELLS),
+            self_loops: true,
+            ..NativeSystem::NONE
+        };
+        let preparation = Preparation::new(
+            chip,
+            Arc::new(chip.admit_table(0).expect("admit")),
+            TargetCpu::detect(),
+            true,
+            checks,
+            None,
+            system,
+        );
+        let mut out = std::fs::File::create(output).unwrap();
+        for line in std::fs::read_to_string(input).unwrap().lines() {
+            let mut fields = line.split(' ');
+            let pc = u64::from_str_radix(fields.next().unwrap(), 16).unwrap();
+            let weight = fields.next().unwrap();
+            let hex = fields.next().unwrap();
+            let bytes: Vec<u8> = (0..hex.len() / 2)
+                .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+                .collect();
+            let len = bytes.len();
+            match preparation.prepare_window(&bytes, pc, len, true) {
+                Some(Ok(Prepared::Block { compiled, .. })) => {
+                    let map: Vec<String> = compiled
+                        .native
+                        .source_map
+                        .iter()
+                        .map(|(a, o)| format!("{:x}:{o}", a.0))
+                        .collect();
+                    let code: String = compiled
+                        .native
+                        .x86_64_code
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    writeln!(
+                        out,
+                        "{pc:x} {weight} {} {code} {}",
+                        compiled.source_bytes,
+                        map.join(",")
+                    )
+                    .unwrap();
+                }
+                other => writeln!(out, "{pc:x} {weight} refused {other:?}").unwrap(),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "density harness"]
+    fn chain_dump() {
+        use stela_compiler::x86_64::chain;
+        let output = std::env::var("DENSITY_OUT").unwrap();
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let mut text = String::new();
+        let (_, body) = chain::link(0x10_0000, chain::LINK_BYTES, 5, 7, 0x20_0000).unwrap();
+        text += &format!("link {}\n", hex(&body));
+        let dispatcher = chain::lookup_dispatcher(0).unwrap();
+        text += &format!("cell {}\n", hex(&dispatcher[..chain::PROBE_ENTRY]));
+        text += &format!(
+            "probe {}\n",
+            hex(&dispatcher[chain::PROBE_ENTRY..chain::STAMPING_PROBE_ENTRY])
+        );
+        let stamped = chain::stamped_tail(
+            0x10_0000,
+            0x30_0000,
+            9,
+            0x4000,
+            stela_compiler::block::ExitKind::Direct,
+            5,
+            7,
+            0x20_0000,
+            0x10_8000,
+        )
+        .unwrap();
+        text += &format!("stamped {}\n", hex(&stamped));
+        std::fs::write(output, text).unwrap();
+    }
 }
