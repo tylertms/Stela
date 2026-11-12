@@ -10,6 +10,7 @@ use crate::{
 };
 use alloc::vec::Vec;
 
+pub(in crate::wifi::mediatek) mod connac2;
 pub mod modern;
 pub(in crate::wifi::mediatek) mod six_ghz;
 
@@ -29,6 +30,8 @@ pub enum Error {
     InvalidNegotiation,
     InvalidGeometry,
     InvalidAggregation,
+    /// A command of the other connac generation's layout.
+    WrongChip,
 }
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

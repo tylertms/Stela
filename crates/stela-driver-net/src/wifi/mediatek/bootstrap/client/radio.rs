@@ -67,12 +67,20 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 }
             }
         }
-        let encoded = wire::scan_with_elements(
-            s.interface.registered_context().unwrap(),
-            sequence,
-            &request,
-            prepared.then_some(&elements),
-        )
+        let context = s.interface.registered_context().unwrap();
+        let chip = s.controller.state().identity.chip;
+        let encoded = if chip == Chip::Mt7925 {
+            wire::scan_with_elements(context, sequence, &request, prepared.then_some(&elements))
+        } else {
+            // A connac2 scan carries one element list for every band, as
+            // mac80211 fills a single all-band scan request's.
+            let elements = if prepared {
+                elements.concat()
+            } else {
+                request.extra_elements().to_vec()
+            };
+            wire::connac2::scan(chip, context, sequence, &request, &elements)
+        }
         .map_err(Error::Codec)?;
         let ticket = s
             .scanner
@@ -116,7 +124,12 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         let s = self.state_mut();
         let t = s.scan_ticket.ok_or(Error::WrongPhase)?;
         s.scanner.cancel(t).map_err(Error::Scan)?;
-        let request = wire::cancel_scan(s.interface.registered_context().unwrap(), s.scan_sequence);
+        let chip = s.controller.state().identity.chip;
+        let request = if chip == Chip::Mt7925 {
+            wire::cancel_scan(s.interface.registered_context().unwrap(), s.scan_sequence)
+        } else {
+            wire::connac2::cancel_scan(chip, s.scan_sequence).map_err(Error::Codec)?
+        };
         s.transport_facts
             .try_reserve(1)
             .map_err(|_| Error::NoMemory)?;

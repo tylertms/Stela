@@ -145,12 +145,19 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 s.asynchronous.push(f);
                 continue;
             }
-            if let Ok(event) = crate::wifi::mediatek::mcu::Event::parse(Chip::Mt7925, &f.bytes) {
-                if event.event_id == 14
-                    && event.is_unsolicited()
+            let chip = s.controller.state().identity.chip;
+            if let Ok(event) = crate::wifi::mediatek::mcu::Event::parse(chip, &f.bytes) {
+                // mt7921_mcu_scan_event ends the scan on either CE scan-done
+                // event; the MT7925's UNI event carries a done TLV.
+                let scan_done = event.is_unsolicited()
                     && s.phase == Phase::Scanning
-                    && wire::scan_done(event.payload).map_err(Error::Codec)?
-                {
+                    && if chip == Chip::Mt7925 {
+                        event.event_id == 14
+                            && wire::scan_done(event.payload).map_err(Error::Codec)?
+                    } else {
+                        wire::connac2::scan_done(event.event_id)
+                    };
+                if scan_done {
                     s.scanner
                         .completed(s.scan_ticket.unwrap(), scan::Outcome::Completed)
                         .map_err(Error::Scan)?;
@@ -166,10 +173,17 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                     events.extend(rssi_events(event.payload, monitor.threshold));
                     continue;
                 }
-                if event.event_id == 12
+                // mt7921_mcu_connection_loss_event takes the CE beacon-loss
+                // event's bss_idx; the MT7925's UNI event leads its TLV with it.
+                let (lost, length) = if chip == Chip::Mt7925 {
+                    (12, 12)
+                } else {
+                    (wire::connac2::BEACON_LOSS_EVENT, 4)
+                };
+                if event.event_id == lost
                     && event.is_unsolicited()
                     && s.phase == Phase::Associated
-                    && event.payload.len() >= 12
+                    && event.payload.len() >= length
                     && event.payload[0] == s.profile.unwrap().interface.bss_index
                 {
                     let action = s.station.disconnect().map_err(Error::Station)?;

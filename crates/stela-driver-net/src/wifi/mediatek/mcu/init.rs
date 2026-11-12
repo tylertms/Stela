@@ -279,6 +279,16 @@ impl Request {
     }
     /// MT7925 scan uses the generic source response path, unlike plain
     /// DEV/BSS/STA commands with a status record. An ACK is not scan done.
+    /// A connac2 chip's CE scan request or cancellation, which the firmware
+    /// does not acknowledge.
+    pub(in crate::wifi::mediatek) fn connac2_scan(chip: Chip, command: u32, body: Vec<u8>) -> Self {
+        let kind = if command & 0xff == 0x1b {
+            Kind::CancelScan
+        } else {
+            Kind::Scan
+        };
+        Self::new(chip, kind, command, body, false)
+    }
     pub(in crate::wifi::mediatek) fn scan(body: Vec<u8>, cancel: bool) -> Self {
         Self::new(
             Chip::Mt7925,
