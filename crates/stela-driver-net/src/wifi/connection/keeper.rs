@@ -38,7 +38,7 @@ use crate::{
         supplicant::{self, Akm, EAPOL, IntegrityKey, MultiLink, Step, Supplicant},
     },
 };
-use alloc::{boxed::Box, format, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, format, string::String, sync::Arc, vec, vec::Vec};
 use core::fmt::Display;
 use stela_driver_base::entropy::Entropy;
 use zeroize::Zeroizing;
@@ -56,6 +56,9 @@ pub enum Stage {
     NeedsDrain,
     /// Anything between those.
     Busy,
+    /// The radio stopped for good, as a driver that gave up on its
+    /// hardware: nothing it does can bring the link back.
+    Lost,
 }
 
 /// What the radio reported since the keeper last looked.
@@ -445,6 +448,10 @@ enum State<H, M> {
     },
 }
 
+/// How many diagnostics wait at most, and how many are remembered so
+/// that each is queued once.
+const MAX_NOTICES: usize = 32;
+
 /// `WLAN_REASON_MICHAEL_MIC_FAILURE`.
 const MICHAEL_FAILURE: u16 = 14;
 /// How near two Michael failures start countermeasures, and how long they last.
@@ -460,9 +467,14 @@ pub struct Keeper<R: Radio> {
     state: State<R::Handle, R::Management>,
     /// wpa_supplicant's `auth_failures` for the network.
     failures: u32,
-    /// The latest failure, which `receive` reports once.
-    failure: Option<String>,
-    reported: Option<String>,
+    /// Diagnostics not taken yet, each message once.
+    notices: VecDeque<String>,
+    /// Every message queued so far, so that each is queued once.
+    noticed: Vec<String>,
+    /// The radio's latest error, the reason if it is lost.
+    last_error: Option<String>,
+    /// Why the radio stopped for good; the keeper no longer retries.
+    lost: Option<String>,
     /// wpa_supplicant's `last_michael_mic_error`.
     michael_failed: Option<u64>,
     /// The last scan missed the network, so the next asks for it by name.
@@ -482,8 +494,10 @@ impl<R: Radio> Keeper<R> {
             clock,
             state: State::Waiting { at: 0 },
             failures: 0,
-            failure: None,
-            reported: None,
+            notices: VecDeque::new(),
+            noticed: Vec::new(),
+            last_error: None,
+            lost: None,
             michael_failed: None,
             directed: false,
         }
@@ -501,10 +515,42 @@ impl<R: Radio> Keeper<R> {
         &mut self.link
     }
 
+    /// A diagnostic, queued for [`Self::take_notice`] once per message, as
+    /// wpa_supplicant logs an event: it never fails the link.
     fn fail(&mut self, message: String) {
-        if self.reported.as_ref() != Some(&message) {
-            self.failure = Some(message);
+        if self.noticed.contains(&message) {
+            return;
         }
+        if self.noticed.len() == MAX_NOTICES {
+            self.noticed.remove(0);
+        }
+        self.noticed.push(message.clone());
+        if self.notices.len() == MAX_NOTICES {
+            self.notices.pop_front();
+        }
+        self.notices.push_back(message);
+    }
+
+    /// The next diagnostic to log, each distinct message once.
+    pub fn take_notice(&mut self) -> Option<String> {
+        self.notices.pop_front()
+    }
+
+    /// Why the radio stopped for good, once it has.
+    pub fn lost(&self) -> Option<&str> {
+        self.lost.as_deref()
+    }
+
+    /// The radio gave up on its hardware: report why once and stop
+    /// retrying against it, as wpa_supplicant stops on an interface that
+    /// is removed.
+    fn lose(&mut self) {
+        let reason = self
+            .last_error
+            .take()
+            .unwrap_or_else(|| format!("{}: the radio stopped for good", R::NAME));
+        self.fail(reason.clone());
+        self.lost = Some(reason);
     }
 
     /// A connection attempt failed: leave it and wait as wpa_supplicant
@@ -522,6 +568,9 @@ impl<R: Radio> Keeper<R> {
 
     /// Service the link, take its notices and advance the connection.
     fn poll(&mut self) {
+        if self.lost.is_some() {
+            return;
+        }
         let now = self.clock.now_us();
         // A rotation waits for the frames queued before it to be taken.
         if let State::Connected {
@@ -535,7 +584,13 @@ impl<R: Radio> Keeper<R> {
             }
         }
         if let Err(error) = self.link.service() {
-            self.fail(format!("{error}"));
+            let message = format!("{error}");
+            self.fail(message.clone());
+            self.last_error = Some(message);
+        }
+        if self.link.stage() == Stage::Lost {
+            self.lose();
+            return;
         }
         while let Some(event) = self.link.take_event() {
             match event {
@@ -574,6 +629,10 @@ impl<R: Radio> Keeper<R> {
 
     fn advance(&mut self, now: u64) {
         let stage = self.link.stage();
+        if stage == Stage::Lost {
+            self.lose();
+            return;
+        }
         match &self.state {
             State::Waiting { at } if now >= *at && stage == Stage::Idle => self.scan(now),
             State::Scanning(_) if stage == Stage::Scanned => self.scanned(now),
@@ -1478,13 +1537,6 @@ impl<R: Radio> Keeper<R> {
         }
         Ok(())
     }
-
-    /// The failure `receive` has not reported yet.
-    fn take_failure(&mut self) -> Option<String> {
-        let failure = self.failure.take()?;
-        self.reported = Some(failure.clone());
-        Some(failure)
-    }
 }
 
 impl<R: Radio> Link for Keeper<R> {
@@ -1493,21 +1545,26 @@ impl<R: Radio> Link for Keeper<R> {
     }
     fn carrier(&mut self) -> bool {
         self.poll();
-        self.link.carrier()
+        self.lost.is_none() && self.link.carrier()
     }
     fn signals(&self) -> bool {
-        self.link.signals()
+        self.lost.is_none() && self.link.signals()
     }
     fn due_us(&self) -> Option<u64> {
-        self.link.due_us()
+        self.lost.is_none().then(|| self.link.due_us()).flatten()
     }
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
+        if let Some(lost) = &self.lost {
+            return Err(LinkError::Adapter(lost.clone()));
+        }
         self.link.transmit(frame)
     }
+    /// A notice is never an error here: only a radio lost for good, or the
+    /// radio's own receive error, is.
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
         self.poll();
-        if let Some(failure) = self.take_failure() {
-            return Err(LinkError::Adapter(failure));
+        if let Some(lost) = &self.lost {
+            return Err(LinkError::Adapter(lost.clone()));
         }
         self.link.receive()
     }

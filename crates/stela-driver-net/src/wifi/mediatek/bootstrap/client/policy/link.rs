@@ -286,6 +286,13 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
     pub fn phase(&self) -> Phase {
         self.state().client.phase()
     }
+    /// Whether the adapter is gone for good: the client or its controller
+    /// quarantined the hardware, or it was stopped.
+    pub fn lost(&self) -> bool {
+        let client = &self.state().client;
+        matches!(client.phase(), Phase::Quarantined | Phase::Stopped)
+            || client.client.state().controller.phase() == ControllerPhase::Quarantined
+    }
     pub fn station(&self) -> &Station {
         self.state().client.station()
     }

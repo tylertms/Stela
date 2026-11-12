@@ -147,6 +147,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> Radio for Mt7925
     }
 
     fn stage(&self) -> Stage {
+        if self.link.lost() {
+            return Stage::Lost;
+        }
         match self.link.phase() {
             Phase::Idle => Stage::Idle,
             Phase::ScanCompleted => Stage::Scanned,
