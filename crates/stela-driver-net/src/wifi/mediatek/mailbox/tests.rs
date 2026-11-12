@@ -960,11 +960,13 @@ fn unmatched_dropped_and_late_runtime_responses_never_acknowledge_a_context() {
             assert_eq!(
                 failure.cause,
                 match case {
-                    5 => Cause::Message(mcu::Error::NotResponse),
                     6 => Cause::CoreDump,
+                    // A dropped reply is freed as mt76 frees it; the command
+                    // then waits for its deadline like an unmatched one.
                     _ => Cause::Timeout,
                 }
             );
+            assert_eq!(mailbox.dropped_events(), u64::from(case == 5));
             if case == 7 {
                 let actual = mailbox
                     .interrupted_unified_reply()
@@ -2594,4 +2596,40 @@ fn pinned_downloads_bind_same_owned_clc_input_past_provider_lifetime() {
         // SAFETY: modeled requester/firmware/all users stopped.
         unsafe { mailbox.release_after_quiesce() }.unwrap();
     }
+}
+#[test]
+fn dropped_and_surplus_events_are_freed_while_the_command_still_completes() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    use super::super::mcu::runtime::Command as Uni;
+    let (mut mailbox, _, _, rx) = setup(Chip::Mt7925, true, false, 0);
+    let event = |n: u32| {
+        let mut actual = vec![0; 48];
+        actual[..4].copy_from_slice(&(7u32 << 27).to_le_bytes());
+        actual[36] = 0x27;
+        actual[38] = 6;
+        actual[44..48].copy_from_slice(&n.to_le_bytes());
+        actual
+    };
+    // A frame the hardware marked dropped (MT_DMA_CTL_DROP) is freed.
+    device_receive(&rx, &event(0), true, 1 << 14);
+    let reply = mailbox.unified(Uni::BssInfo, &[0; 8]).unwrap();
+    assert_eq!(reply.status, 0);
+    assert!(mailbox.take_events().is_empty());
+    assert_eq!(mailbox.dropped_events(), 1);
+    // More asynchronous events than the mailbox holds: the surplus is
+    // freed and the mailbox stays usable, as mt76 frees what it cannot take.
+    // Events held across commands until the controller takes them.
+    for n in 0..(MAX_EVENTS as u32 + 3) {
+        device_receive(&rx, &event(n), true, 0);
+        assert_eq!(mailbox.unified(Uni::BssInfo, &[0; 8]).unwrap().status, 0);
+    }
+    assert_eq!(mailbox.take_events().len(), MAX_EVENTS);
+    assert_eq!(mailbox.dropped_events(), 4);
+    assert!(!mailbox.is_poisoned());
+    assert_eq!(mailbox.unified(Uni::BssInfo, &[0; 8]).unwrap().status, 0);
+    // SAFETY: the model device is stopped and drained, so nothing still uses what this
+    // releases.
+    unsafe { mailbox.release_after_quiesce() }.unwrap();
 }

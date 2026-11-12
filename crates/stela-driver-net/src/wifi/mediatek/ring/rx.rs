@@ -142,19 +142,18 @@ impl<Q: QueueIo> RxRing<Q> {
         // SAFETY: real DDONE transferred this exact descriptor to the CPU.
         unsafe { self.descriptors.dma.sync_for_cpu(at..at + DESC_BYTES)? };
         let length = ((control >> 16) & 0x3fff) as usize;
-        if length == 0 || length > BUFFER_BYTES {
-            return Err(Error::InvalidDeviceLength);
-        }
-        // VER_MASK belongs to WED/RRO formats. Never interpret one as ordinary RX.
-        if control & (1 << 7) != 0 {
-            return Err(Error::UnsupportedDescriptor);
-        }
+        // mt76_dma_rx_process drops a buffer whose length does not fit it,
+        // and VER_MASK belongs to WED/RRO formats this ring never carries:
+        // either is a dropped, empty fragment, and the descriptor is
+        // reposted as any other. No byte of it is interpreted.
+        let malformed = length == 0 || length > BUFFER_BYTES || control & (1 << 7) != 0;
         let buffer1 = self.descriptors.read32(at + 8)?;
         let info = self.descriptors.read32(at + 12)?;
         let slot = &mut self.slots[self.tail];
         // SAFETY: observed real DDONE on the checked-coherent descriptor transfers this payload
         // to the CPU. Reposting happens only after all bytes have been copied.
         unsafe { slot.data.dma.sync_for_cpu(0..BUFFER_BYTES)? };
+        let length = if malformed { 0 } else { length };
         let mut bytes = vec![0u8; length];
         // SAFETY: the buffer is CPU-owned after the sync above, and `pointer` bounds
         // the copy to `length` bytes.
@@ -178,7 +177,7 @@ impl<Q: QueueIo> RxRing<Q> {
         Ok(Some(Fragment {
             bytes,
             more: control & LAST == 0,
-            drop: control & ((1 << 12) | (1 << 14)) != 0,
+            drop: malformed || control & ((1 << 12) | (1 << 14)) != 0,
             control,
             buffer1,
             info,
@@ -212,11 +211,16 @@ impl<Q: QueueIo> Drop for RxRing<Q> {
 
 /// Bounded receive-chain assembly, preserving any fragment's hardware-drop
 /// indication. It never clears a failed chain into a successful-looking frame.
+/// A chain longer than its bounds is dropped whole, as mt76 frees an
+/// over-long `rx_head`, and assembly goes on with the next chain.
 #[derive(Default)]
 pub struct Assembly {
     bytes: Vec<u8>,
     descriptors: Vec<Descriptor>,
     drop: bool,
+    /// The current chain outgrew its bounds: its parts are counted, not kept.
+    overflowed: bool,
+    fragments: usize,
     poisoned: bool,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -244,32 +248,40 @@ impl Assembly {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        if fragment.bytes.is_empty() || fragment.bytes.len() > BUFFER_BYTES {
-            self.poisoned = true;
-            return Err(Error::InvalidDeviceLength);
+        self.fragments += 1;
+        // A dropped part carries no bytes; an empty or oversized one that is
+        // not marked dropped is dropped here.
+        self.drop |=
+            fragment.drop || fragment.bytes.is_empty() || fragment.bytes.len() > BUFFER_BYTES;
+        if !self.overflowed
+            && (self.descriptors.len() == 8 || self.bytes.len() + fragment.bytes.len() > 16 * 1024)
+        {
+            self.overflowed = true;
+            self.drop = true;
+            self.bytes = Vec::new();
+            self.descriptors = Vec::new();
         }
-        if self.descriptors.len() == 8 || self.bytes.len() + fragment.bytes.len() > 16 * 1024 {
-            self.poisoned = true;
-            return Err(Error::ReceiveChainLimit);
+        if !self.overflowed && fragment.bytes.len() <= BUFFER_BYTES {
+            self.bytes.extend_from_slice(&fragment.bytes);
+            self.descriptors.push(Descriptor {
+                length: fragment.bytes.len(),
+                control: fragment.control,
+                buffer1: fragment.buffer1,
+                info: fragment.info,
+            });
         }
-        self.bytes.extend_from_slice(&fragment.bytes);
-        self.descriptors.push(Descriptor {
-            length: fragment.bytes.len(),
-            control: fragment.control,
-            buffer1: fragment.buffer1,
-            info: fragment.info,
-        });
-        self.drop |= fragment.drop;
         if fragment.more {
             return Ok(None);
         }
         let frame = Frame {
             bytes: core::mem::take(&mut self.bytes),
             drop: self.drop,
-            fragments: self.descriptors.len(),
+            fragments: self.fragments,
             descriptors: core::mem::take(&mut self.descriptors),
         };
         self.drop = false;
+        self.overflowed = false;
+        self.fragments = 0;
         Ok(Some(frame))
     }
 }
@@ -379,7 +391,7 @@ pub(crate) mod tests {
         );
     }
     #[test]
-    fn corrupt_length_and_unimplemented_wed_format_poison_without_reuse() {
+    fn corrupt_length_and_wed_format_are_dropped_and_the_ring_goes_on() {
         if crate::test_process::isolate_model() {
             return;
         }
@@ -396,14 +408,15 @@ pub(crate) mod tests {
             // SAFETY: the pointer addresses live memory this test's model owns, in bounds, and
             // nothing accesses it concurrently.
             unsafe { (pointer as *mut u32).write_volatile(ctrl.to_le()) };
-            let expected = if ctrl & 128 != 0 {
-                Error::UnsupportedDescriptor
-            } else {
-                Error::InvalidDeviceLength
-            };
-            assert_eq!(ring.poll(), Err(expected));
-            assert!(ring.is_poisoned());
-            assert_eq!(ring.poll(), Err(Error::Poisoned));
+            state.lock().unwrap().index = 1;
+            let dropped = ring.poll().unwrap().unwrap();
+            assert!(dropped.drop && dropped.bytes.is_empty() && !dropped.more);
+            assert!(!ring.is_poisoned());
+            // The next descriptor is received as ever.
+            device_receive(&state, &[0x5a; 300], true, 0);
+            let frame = ring.poll().unwrap().unwrap();
+            assert_eq!(frame.bytes, [0x5a; 300]);
+            assert!(!frame.drop);
             // SAFETY: no device continues accessing this stopped model queue.
             unsafe { ring.release_after_quiesce() }.unwrap();
         }
@@ -475,14 +488,24 @@ pub(crate) mod tests {
         let f = a.push(fragment(false, false)).unwrap().unwrap();
         assert!(!f.drop);
         assert_eq!(f.fragments, 1);
+        // An over-long chain is dropped whole; the next one assembles.
         for _ in 0..8 {
             assert_eq!(a.push(fragment(true, false)).unwrap(), None);
         }
-        assert_eq!(
-            a.push(fragment(false, false)),
-            Err(Error::ReceiveChainLimit)
-        );
-        assert_eq!(a.push(fragment(false, false)), Err(Error::Poisoned));
+        let f = a.push(fragment(false, false)).unwrap().unwrap();
+        assert!(f.drop && f.bytes.is_empty() && f.descriptors.is_empty());
+        assert_eq!(f.fragments, 9);
+        let f = a.push(fragment(false, false)).unwrap().unwrap();
+        assert_eq!((f.drop, f.bytes.len(), f.fragments), (false, 2048, 1));
+        // A dropped empty part drops its chain without its bytes.
+        let empty = Fragment {
+            bytes: Vec::new(),
+            ..fragment(true, true)
+        };
+        assert_eq!(a.push(empty).unwrap(), None);
+        let f = a.push(fragment(false, false)).unwrap().unwrap();
+        assert!(f.drop);
+        assert_eq!((f.bytes.len(), f.fragments), (2048, 2));
     }
     #[test]
     fn donor_1536_entry_data_queue_is_supported_without_power_of_two_assumptions() {

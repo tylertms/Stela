@@ -91,9 +91,12 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         events.append(&mut s.cqm.ready);
         while let Some(received) = s.pending_rx.pop_front() {
             let receive::ReceivedFrame { queue, frame: f } = received;
+            // mt76_dma_rx_process frees a frame the hardware or the ring
+            // dropped and goes on with the next; a split A-MSDU it belonged
+            // to cannot complete.
             if f.drop {
                 s.receive_groups.discard(queue);
-                return Err(Error::WrongProfile);
+                continue;
             }
             let kind = f
                 .bytes
