@@ -203,6 +203,12 @@ impl Security {
     /// It carries no PMKID: wpa_supplicant's `sae_pmkid_in_assoc` defaults
     /// to leaving an SAE exchange's out of the association request.
     pub fn element(&self) -> Vec<u8> {
+        self.element_with(None)
+    }
+
+    /// The RSN element naming `pmkid`, the cached PMKSA an association
+    /// resumes, as `wpa_write_rsn_ie` writes `sm->pmksa`'s.
+    pub fn element_with(&self, pmkid: Option<[u8; 16]>) -> Vec<u8> {
         let akm = match self.akm {
             Akm::Psk => PSK,
             Akm::PskSha256 => PSK_SHA256,
@@ -222,9 +228,14 @@ impl Security {
         let management = self
             .management
             .filter(|&cipher| cipher != ManagementCipher::Cmac128);
-        // An empty PMKID list precedes the group management cipher.
-        if let Some(cipher) = management {
+        if let Some(pmkid) = pmkid {
+            body.extend_from_slice(&[1, 0]);
+            body.extend_from_slice(&pmkid);
+        } else if management.is_some() {
+            // An empty PMKID list precedes the group management cipher.
             body.extend_from_slice(&[0, 0]);
+        }
+        if let Some(cipher) = management {
             body.extend_from_slice(&[0, 0x0f, 0xac, cipher.suite()]);
         }
         let mut element = Vec::from([48, body.len() as u8]);

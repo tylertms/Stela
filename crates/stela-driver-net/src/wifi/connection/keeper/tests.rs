@@ -480,3 +480,40 @@ fn a_recovery_resets_the_failure_count_and_an_unrecoverable_radio_is_lost_at_onc
 fn keeper_lost() -> Keeper<Recovering> {
     keeper(Recovering::new(false, Vec::new()))
 }
+
+/// pmksa_cache_add and pmksa_cache_get: an SAE exchange's PMKSA per AP,
+/// replaced by a newer one, gone after its 12 hours or a failed resumption.
+#[test]
+fn a_cached_pmksa_lasts_its_lifetime_and_goes_when_its_resumption_fails() {
+    let mut radio = Recovering::new(false, Vec::new());
+    radio.stage = Stage::Idle;
+    let mut keeper = keeper(radio);
+    let ap = Mac([2, 0, 0, 0, 0, 7]);
+    let other = Mac([2, 0, 0, 0, 0, 8]);
+    keeper.remember(ap, Zeroizing::new([1; 32]), [1; 16], false, 0);
+    keeper.remember(other, Zeroizing::new([2; 32]), [2; 16], true, 0);
+    keeper.remember(ap, Zeroizing::new([3; 32]), [3; 16], true, 100);
+    let (pmk, pmkid, h2e) = keeper.cached(ap, 1_000).unwrap();
+    assert_eq!((*pmk, pmkid, h2e), ([3; 32], [3; 16], true));
+    assert_eq!(keeper.pmksa.len(), 2);
+    // The first entry's 12 hours pass; the newer one's have not.
+    assert!(keeper.cached(other, PMK_LIFETIME_US).is_none());
+    assert!(keeper.cached(ap, PMK_LIFETIME_US).is_some());
+    // A resumption that fails drops its entry, so the next runs SAE.
+    keeper.resuming = Some(ap);
+    keeper.failed(PMK_LIFETIME_US, String::from("model: association failed"));
+    assert!(keeper.cached(ap, PMK_LIFETIME_US).is_none());
+    // The cache keeps at most its 32 newest entries.
+    for n in 0..=PMKSA_ENTRIES as u8 {
+        keeper.remember(
+            Mac([2, 1, 0, 0, 0, n]),
+            Zeroizing::new([n; 32]),
+            [n; 16],
+            false,
+            0,
+        );
+    }
+    assert_eq!(keeper.pmksa.len(), PMKSA_ENTRIES);
+    assert!(keeper.cached(Mac([2, 1, 0, 0, 0, 0]), 0).is_none());
+    assert!(keeper.cached(Mac([2, 1, 0, 0, 0, 1]), 0).is_some());
+}

@@ -142,3 +142,26 @@ fn six_ghz_takes_sae_by_hash_to_element_alone() {
         Akm::Sae
     );
 }
+
+/// wpa_write_rsn_ie with a cached PMKSA: one PMKID after the capabilities,
+/// before a non-default group management cipher.
+#[test]
+fn a_resumed_association_names_its_pmkid_in_the_rsn_element() {
+    let sae = Security::select(&ap(&rsn(4, &[4], &[8], MFPC)), true).unwrap();
+    let plain = sae.element();
+    let named = sae.element_with(Some([0xab; 16]));
+    assert_eq!(named[1] as usize, named.len() - 2);
+    assert_eq!(named[..2], [48, plain[1] + 18]);
+    assert_eq!(named[2..plain.len()], plain[2..]);
+    assert_eq!(named[plain.len()..plain.len() + 2], [1, 0]);
+    assert_eq!(named[plain.len() + 2..], [0xab; 16]);
+    let gcmp = Security {
+        management: Some(crate::wifi::security::management::ManagementCipher::Gmac256),
+        ..sae
+    };
+    let named = gcmp.element_with(Some([0xcd; 16]));
+    let end = named.len();
+    assert_eq!(named[end - 22..end - 20], [1, 0]);
+    assert_eq!(named[end - 20..end - 4], [0xcd; 16]);
+    assert_eq!(named[end - 4..end - 1], [0, 0x0f, 0xac]);
+}

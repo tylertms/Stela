@@ -298,6 +298,10 @@ const RECOVERY_RETRY_US: u64 = 1_000_000;
 
 /// The longest a scan may run.
 const SCAN_BUDGET_US: u64 = 30_000_000;
+/// wpa_supplicant's `dot11RSNAConfigPMKLifetime`: 12 hours.
+const PMK_LIFETIME_US: u64 = 43_200_000_000;
+/// How many PMKSAs the station keeps, as `pmksa_cache_add` caps its list.
+const PMKSA_ENTRIES: usize = 32;
 /// The longest one firmware command may hold a station poll. Firmware
 /// answers in a few milliseconds; polls run from guest exits, which must end
 /// well inside the platform's exit bound (about 0.5 s), so a hung firmware
@@ -405,14 +409,37 @@ fn keyed_link(link_id: u8, local: Mac, bss: &Bss) -> supplicant::Link {
 
 /// The handshake of an association with `bss` under `security` and `pmk`.
 fn candidate(bss: &Bss, security: Security, pmk: Zeroizing<[u8; 32]>) -> Candidate {
+    cached_candidate(bss, security, pmk, None)
+}
+
+/// The candidate of an association that names `pmkid`, whose 4-way
+/// handshake repeats the request's RSN element.
+fn cached_candidate(
+    bss: &Bss,
+    security: Security,
+    pmk: Zeroizing<[u8; 32]>,
+    pmkid: Option<[u8; 16]>,
+) -> Candidate {
     Candidate {
         bssid: bss.bssid,
         security,
         pmk,
-        own_rsn: security.element(),
+        own_rsn: security.element_with(pmkid),
         peer_rsn: element(48, security::rsn_element(&bss.elements).unwrap_or_default()),
         links: None,
     }
+}
+
+/// A PMKSA cache entry: the PMK and PMKID an SAE exchange with `bssid`
+/// gave, until `expires`.
+struct Pmksa {
+    bssid: Mac,
+    pmk: Zeroizing<[u8; 32]>,
+    pmkid: [u8; 16],
+    /// Whether the exchange was hash-to-element, so a resumed association
+    /// carries the same RSNXE.
+    h2e: bool,
+    expires: u64,
 }
 
 /// The chosen BSS of the network.
@@ -533,6 +560,11 @@ pub struct Keeper<R: Radio> {
     last_error: Option<String>,
     /// Why the radio stopped for good; the keeper no longer retries.
     lost: Option<String>,
+    /// wpa_supplicant's PMKSA cache: an SAE exchange's PMK and PMKID per AP.
+    pmksa: Vec<Pmksa>,
+    /// The AP whose cached PMKSA the current association resumes; the entry
+    /// goes if the association or its handshake fails.
+    resuming: Option<Mac>,
     /// Recovery attempts that failed since the radio was lost.
     recovery_failures: u32,
     /// When the next recovery attempt may start.
@@ -560,6 +592,8 @@ impl<R: Radio> Keeper<R> {
             noticed: Vec::new(),
             last_error: None,
             lost: None,
+            pmksa: Vec::new(),
+            resuming: None,
             recovery_failures: 0,
             recover_at: 0,
             michael_failed: None,
@@ -660,9 +694,45 @@ impl<R: Radio> Keeper<R> {
         self.lost = Some(reason);
     }
 
+    /// `pmksa_cache_add`: keep the SAE exchange's PMKSA with `bssid`,
+    /// replacing an older one, the oldest going once the cache is full.
+    fn remember(
+        &mut self,
+        bssid: Mac,
+        pmk: Zeroizing<[u8; 32]>,
+        pmkid: [u8; 16],
+        h2e: bool,
+        now: u64,
+    ) {
+        self.pmksa.retain(|entry| entry.bssid != bssid);
+        if self.pmksa.len() == PMKSA_ENTRIES {
+            self.pmksa.remove(0);
+        }
+        self.pmksa.push(Pmksa {
+            bssid,
+            pmk,
+            pmkid,
+            h2e,
+            expires: now.saturating_add(PMK_LIFETIME_US),
+        });
+    }
+
+    /// `pmksa_cache_get`: the unexpired PMKSA with `bssid`.
+    fn cached(&mut self, bssid: Mac, now: u64) -> Option<(Zeroizing<[u8; 32]>, [u8; 16], bool)> {
+        self.pmksa.retain(|entry| entry.expires > now);
+        self.pmksa
+            .iter()
+            .find(|entry| entry.bssid == bssid)
+            .map(|entry| (entry.pmk.clone(), entry.pmkid, entry.h2e))
+    }
+
     /// A connection attempt failed: leave it and wait as wpa_supplicant
-    /// waits after `failures` attempts.
+    /// waits after `failures` attempts. One that resumed a cached PMKSA
+    /// drops it, as `wpa_sm_aborted_cached` does, so the next runs SAE.
     fn failed(&mut self, now: u64, message: String) {
+        if let Some(bssid) = self.resuming.take() {
+            self.pmksa.retain(|entry| entry.bssid != bssid);
+        }
         self.failures = self.failures.saturating_add(1);
         self.fail(message);
         if self.link.stage() != Stage::Idle {
@@ -928,7 +998,27 @@ impl<R: Radio> Keeper<R> {
         };
         let bss = bss.clone();
         drop(observed);
-        let started = if security.akm == Akm::Sae {
+        let cached = (security.akm == Akm::Sae)
+            .then(|| self.cached(bss.bssid, now))
+            .flatten();
+        let started = if let Some((pmk, pmkid, h2e)) = cached {
+            // pmksa_cache_get: resume the AP's PMKSA by open-system
+            // authentication and its PMKID, as wpa_supplicant's SME does.
+            let rsnxe = h2e.then_some(&sae::H2E_RSNXE[..]);
+            self.resuming = Some(bss.bssid);
+            self.association_with(&bss, security, rsnxe, Some(pmkid))
+                .and_then(|(join, profile)| {
+                    self.link
+                        .join(handle, join, profile)
+                        .map_err(|error| format!("{error}"))?;
+                    Ok(State::Joining(Box::new(cached_candidate(
+                        &bss,
+                        security,
+                        pmk,
+                        Some(pmkid),
+                    ))))
+                })
+        } else if security.akm == Akm::Sae {
             self.authenticate(handle, bss, security)
                 .map(State::Authenticating)
         } else {
@@ -1220,6 +1310,12 @@ impl<R: Radio> Keeper<R> {
         let Some(pmk) = exchange.as_ref().and_then(Exchange::pmk) else {
             return self.failed(now, format!("{}: SAE gave no PMK", R::NAME));
         };
+        // pmksa_cache_add after SAE, for a single-link AP.
+        if links.is_none()
+            && let Some(pmkid) = exchange.as_ref().and_then(Exchange::pmkid)
+        {
+            self.remember(bss.bssid, pmk.clone(), pmkid, h2e, now);
+        }
         let rsnxe = h2e.then_some(&sae::H2E_RSNXE[..]);
         let started =
             self.association(&bss, security, rsnxe)
@@ -1253,6 +1349,17 @@ impl<R: Radio> Keeper<R> {
         security: Security,
         rsnxe: Option<&[u8]>,
     ) -> Result<(Join, R::Profile), String> {
+        self.association_with(bss, security, rsnxe, None)
+    }
+
+    /// The association whose RSN element names `pmkid`.
+    fn association_with(
+        &self,
+        bss: &Bss,
+        security: Security,
+        rsnxe: Option<&[u8]>,
+        pmkid: Option<[u8; 16]>,
+    ) -> Result<(Join, R::Profile), String> {
         let band = bss.channel.band;
         let advertisement = self
             .link
@@ -1278,7 +1385,7 @@ impl<R: Radio> Keeper<R> {
                 self.link.supported_channels(band),
             )
         });
-        let own_rsn = security.element();
+        let own_rsn = security.element_with(pmkid);
         let elements = connection::request_elements(
             &Request {
                 ssid: &self.network.ssid,
@@ -1638,6 +1745,8 @@ impl<R: Radio> Keeper<R> {
         else {
             unreachable!("matched above")
         };
+        // The resumed PMKSA keyed the handshake: it stays cached.
+        self.resuming = None;
         self.state = State::Connected {
             supplicant,
             bssid,
