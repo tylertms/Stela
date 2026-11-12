@@ -12,8 +12,9 @@
 //!   for a stream its DeviceTree has bypass, unless bypass is supported.
 //!   Its `_hwVersion` accepts versions 1.0, 1.1, 2.0 to 2.4 and 3.0, and
 //!   SPTM's `t8110dart_init_instance` also 3.2; SPTM requires a VA space
-//!   above 40 bits from version 2 on, so this two-level DART of 36-bit VAs
-//!   (and 42-bit PAs, its entries' address field) reports version 1.0.
+//!   above 40 bits from version 2 on. The ordinary 36-bit profile reports
+//!   1.0; T6020 nodes that request wide DVAs and ranged flushes in the same
+//!   16 KiB register window report 2.0, without the 2.2 fault extension.
 //! - TLB_CMD (0x80): BUSY 31, OP [10:8] (0 flush all, 1 flush one stream;
 //!   SPTM also issues 2 and 4, see `TLB_OPS`),
 //!   STREAM [7:0]; SPTM's completion barrier at 0x600/0x604 (`TLB_SYNC`).
@@ -190,6 +191,7 @@ const PARAMS3: u64 = 0x08;
 const PARAMS4: u64 = 0x0c;
 /// PARAMS3 versions of the two register files.
 const VERSION_1_0: u16 = 0x0100;
+const VERSION_2_0: u16 = 0x0200;
 const VERSION_2_2: u16 = 0x0202;
 /// Revision 2.2: the TRAD capture count (low 16 bits), the per-stream
 /// pending words and records, and the moved ERROR_MASK.
@@ -422,7 +424,7 @@ impl Dart {
             "the T8110 layout addresses 1..256 streams"
         );
         assert!(
-            [VERSION_1_0, VERSION_2_2].contains(&version),
+            [VERSION_1_0, VERSION_2_0, VERSION_2_2].contains(&version),
             "a modelled T8110 register file"
         );
         Self {
@@ -578,7 +580,7 @@ impl Dart {
     }
 
     const fn iova_bits(&self) -> u32 {
-        if self.revision_2_2() {
+        if self.version >= VERSION_2_0 {
             IOVA_BITS_2_2
         } else {
             IOVA_BITS
@@ -735,7 +737,7 @@ impl Dart {
             return Err(fault(Fault::NoTtbr));
         }
         let four_level = tcr & TCR_FOUR_LEVEL != 0;
-        if four_level && !self.revision_2_2() {
+        if four_level && self.version < VERSION_2_0 {
             return Err(DmaError::Unsupported(refuse!("four-level DART tables")));
         }
         if !four_level && !TWO_LEVEL_WINDOWS.contains(&(iova >> IOVA_BITS)) {
@@ -849,6 +851,7 @@ impl Dart {
 /// The PARAMS3 version of a `dart,t8110` profile.
 pub(super) const fn version(profile: Profile) -> u16 {
     match profile {
+        Profile::T8110Rev20 => VERSION_2_0,
         Profile::T8110Rev22 => VERSION_2_2,
         _ => VERSION_1_0,
     }

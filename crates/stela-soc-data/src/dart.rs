@@ -18,6 +18,8 @@ pub enum Profile {
     T6000,
     /// `dart,t8110` revision 1.0: one 16 KiB register file.
     T8110,
+    /// The pre-2.2 16 KiB register file with a wide DVA space and ranged flush.
+    T8110Rev20,
     /// `dart,t8110` revision 2.2: per-stream exception records above 0x4000
     /// make the register file 0xc000 bytes. A compatible string never names
     /// it; the node's translation window selects it.
@@ -52,22 +54,22 @@ impl Profile {
     pub const fn stream_limit(self) -> usize {
         match self {
             Self::T8020 | Self::T6000 => 16,
-            Self::T8110 | Self::T8110Rev22 => 256,
+            Self::T8110 | Self::T8110Rev20 | Self::T8110Rev22 => 256,
         }
     }
 
     /// Whether the profile is a revision of the `dart,t8110` family, which
     /// shares its 16-byte DT instance descriptors and modern properties.
     pub const fn is_t8110(self) -> bool {
-        matches!(self, Self::T8110 | Self::T8110Rev22)
+        matches!(self, Self::T8110 | Self::T8110Rev20 | Self::T8110Rev22)
     }
 
     /// Refine a compatible family by the bytes of its first translation
     /// window. Registers above 0x4000 exist only from revision 2.2: SPTM's
     /// error-mask table moves ERROR_MASK to 0x4060 at 0x202 (T8112 file
     /// 0x15a38/0x159d0) and the per-stream exception records reach 0xc000.
-    /// A 16 KiB window is therefore revision 1.0 and a larger one revision
-    /// 2.2, the minimal revision with that register file. The silicon's own
+    /// A larger window implies at least revision 2.2. The default for a
+    /// 16 KiB window is 1.0 unless the node requires wide DVA. The silicon's own
     /// revision is read from PARAMS3 by iBoot, SPTM and the kernel and is not
     /// recoverable statically, so this is an inference.
     pub fn for_translation_window(self, bytes: u64) -> Option<Self> {
@@ -77,6 +79,18 @@ impl Profile {
             profile => profile,
         };
         profile.admits_window(bytes).then_some(profile)
+    }
+
+    /// A 16 KiB T8110 window with an explicit DVA-flush request and a
+    /// high DMA window needs at least 2.0. 26B123 T6020 SPTM rejects the
+    /// request on 1.0/1.1 (file 0xdbdc0..0xdbdf0); the 2.2 fault register
+    /// bank cannot fit this window. Infer 2.0 as the earliest matching profile.
+    pub fn for_device_window(self, bytes: u64, flush_by_dva: bool, vm_base: u64) -> Option<Self> {
+        if self.is_t8110() && bytes == DAPF_BYTES && flush_by_dva && vm_base >> 36 == 0x10 {
+            Some(Self::T8110Rev20)
+        } else {
+            self.for_translation_window(bytes)
+        }
     }
 
     /// Whether a translation window of `bytes` fits this register file: one
