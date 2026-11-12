@@ -43,42 +43,26 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 );
             }
         }
-        Self::command(
-            s,
-            Command::BssInfo,
-            &match &six {
-                Some(codec) => codec.disable_beacon_pm(),
-                None => p.disable_beacon_pm(),
-            }
-            .map_err(Error::Codec)?,
-        )?;
-        s.transport_facts
-            .try_reserve(1)
-            .map_err(|_| Error::NoMemory)?;
-        let fact = s
-            .controller
-            .state_mut()
-            .mailbox
-            .as_mut()
-            .unwrap()
-            .initial(
-                &match &six {
-                    Some(codec) => codec.filter_request(false),
-                    None => p.filter_request(false),
-                }
-                .map_err(Error::Codec)?,
-            )
-            .map_err(Error::Transport)?;
-        s.transport_facts.push(fact);
-        Self::command(
-            s,
-            Command::StationRecord,
-            &match &six {
-                Some(codec) => codec.peer_request(false),
-                None => Self::codec(s).peer(p, None, false, false),
-            }
-            .map_err(Error::Codec)?,
-        )?;
+        let disable = match &six {
+            Some(codec) => codec
+                .disable_beacon_pm()
+                .map(|body| wire::Outgoing::Uni(Command::BssInfo, body)),
+            None => Self::codec(s).disable_beacon_pm(p),
+        }
+        .map_err(Error::Codec)?;
+        Self::send(s, &disable)?;
+        let filter = match &six {
+            Some(codec) => codec.filter_request(false),
+            None => Self::codec(s).filter(p, false),
+        }
+        .map_err(Error::Codec)?;
+        Self::send(s, &wire::Outgoing::Mailbox(filter))?;
+        let peer = match &six {
+            Some(codec) => codec.peer_request(false),
+            None => Self::codec(s).peer(p, None, false, false),
+        }
+        .map_err(Error::Codec)?;
+        Self::command(s, Command::StationRecord, &peer)?;
         s.controller
             .state_mut()
             .control

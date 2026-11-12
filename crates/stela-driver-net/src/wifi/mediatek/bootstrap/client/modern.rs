@@ -8,7 +8,7 @@ use crate::wifi::station::AssociationContext;
 pub(super) struct Configuration {
     context: Arc<AssociationContext>,
     pub(super) wire: wire::modern::Configuration,
-    commands: Vec<(Command, Vec<u8>)>,
+    commands: Vec<wire::Outgoing>,
     filter: crate::wifi::mediatek::mcu::init::Request,
     completed: usize,
     pub(super) prepared_edca: [station::phy::AccessCategory; 4],
@@ -247,16 +247,20 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             return Err(Error::WrongPhase);
         }
         let p = s.profile.ok_or(Error::WrongProfile)?;
-        let body = m
-            .wire
+        // The restriction is checked against the negotiated set first.
+        m.wire
             .edca_restricted_request(p, effective)
+            .map_err(Error::Codec)?;
+        let n = m.wire.negotiated();
+        let outgoing = wire::Codec::of(s.controller.state().identity.chip)
+            .edca(p, &n.edca(), effective, n.wmm.is_some())
             .map_err(Error::Codec)?;
         let pending = m
             .commands
             .iter_mut()
-            .find(|(command, _)| *command == Command::Edca)
+            .find(|outgoing| outgoing.is_edca())
             .ok_or(Error::WrongPhase)?;
-        pending.1 = body;
+        *pending = outgoing;
         m.prepared_edca = *effective;
         Ok(())
     }
@@ -303,7 +307,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             .try_reserve(m.commands.len())
             .map_err(|_| Error::NoMemory)?;
         s.transport_facts
-            .try_reserve(1)
+            .try_reserve(1 + m.commands.len())
             .map_err(|_| Error::NoMemory)?;
         let clock = s.controller.state().control.clock;
         let began = clock.now_us();
@@ -335,7 +339,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                     |_, _| {
                         started = true;
                         *format = None;
-                        for (index, (command, body)) in m.commands.iter().enumerate() {
+                        for (index, outgoing) in m.commands.iter().enumerate() {
                             if index == 1 {
                                 roc.controller
                                     .state_mut()
@@ -358,7 +362,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                                     .map_err(Error::Transport)?;
                                 roc.transport_facts.push(fact);
                             }
-                            Self::command_parts(roc.controller, replies, *command, body)?;
+                            Self::deliver(roc.controller, replies, roc.transport_facts, outgoing)?;
                             m.completed += 1;
                         }
                         for link in links.iter_mut() {
@@ -478,29 +482,42 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         commands
             .try_reserve_exact(6 + bss.len())
             .map_err(|_| Error::NoMemory)?;
-        commands.extend(bss.into_iter().map(|body| (Command::BssInfo, body)));
-        commands.push((
+        commands.extend(
+            bss.into_iter()
+                .map(|body| wire::Outgoing::Uni(Command::BssInfo, body)),
+        );
+        commands.push(wire::Outgoing::Uni(
             Command::StationRecord,
             codec
                 .peer(p, Some(&wire), true, true)
                 .map_err(Error::Codec)?,
         ));
-        commands.push((
+        commands.push(wire::Outgoing::Uni(
             Command::StationRecord,
             codec.broadcast(p, Some(&wire)).map_err(Error::Codec)?,
         ));
-        commands.push((Command::Edca, wire.edca_request(p).map_err(Error::Codec)?));
-        if context.negotiated().eht.is_some() {
-            commands.push((
+        // edca_request checks the negotiated set against the profile.
+        wire.edca_request(p).map_err(Error::Codec)?;
+        let n = context.negotiated();
+        commands.push(
+            codec
+                .edca(p, &n.edca(), &n.edca(), n.wmm.is_some())
+                .map_err(Error::Codec)?,
+        );
+        if n.eht.is_some() {
+            commands.push(wire::Outgoing::Uni(
                 Command::BssInfo,
                 wire.puncture_request(p).map_err(Error::Codec)?,
             ));
         }
-        commands.push((Command::BssInfo, p.beacon_filter().map_err(Error::Codec)?));
-        commands.push((Command::BssInfo, p.awake().map_err(Error::Codec)?));
+        commands.push(codec.beacon_filter(p).map_err(Error::Codec)?);
+        commands.push(wire::Outgoing::Uni(
+            Command::BssInfo,
+            p.awake().map_err(Error::Codec)?,
+        ));
         Self::prepare_links(s, links, p, &wire)?;
         s.profile = Some(p);
-        let filter = p.filter_request(true).map_err(Error::Codec)?;
+        let filter = codec.filter(p, true).map_err(Error::Codec)?;
         let prepared_edca = context.negotiated().edca();
         s.modern = Some(Configuration {
             context,

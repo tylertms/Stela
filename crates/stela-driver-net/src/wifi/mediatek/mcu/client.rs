@@ -6,7 +6,7 @@
 use super::device::{Context, Requests};
 use crate::{
     Mac,
-    wifi::{Band, Channel},
+    wifi::{Band, Channel, mediatek::identity::Chip},
 };
 use alloc::vec::Vec;
 
@@ -75,21 +75,160 @@ pub struct MldLink {
     pub eml: Option<u16>,
 }
 
+/// `ieee80211_frequency_to_channel` within `band`.
+fn frequency_channel(band: Band, mhz: u32) -> u8 {
+    (match band {
+        Band::Ghz2 if mhz == 2484 => 14,
+        Band::Ghz2 => (mhz - 2407) / 5,
+        Band::Ghz5 if mhz < 5000 => (mhz - 4000) / 5,
+        Band::Ghz5 => (mhz - 5000) / 5,
+        Band::Ghz6 if mhz == 5935 => 2,
+        Band::Ghz6 => (mhz - 5950) / 5,
+    }) as u8
+}
+
+/// One station command as the client sends it: a UNI command with its
+/// status result, or a request through the mailbox's generic path, as
+/// connac2's unacknowledged CE commands and ROC go.
+pub enum Outgoing {
+    Uni(super::runtime::Command, Vec<u8>),
+    Mailbox(super::init::Request),
+}
+impl Outgoing {
+    /// Whether this is the association's EDCA update.
+    pub fn is_edca(&self) -> bool {
+        match self {
+            Self::Uni(command, _) => *command == super::runtime::Command::Edca,
+            Self::Mailbox(request) => request.kind() == super::init::Kind::Edca,
+        }
+    }
+}
+
 /// The station command layouts of a chip's connac generation: the one
 /// place the client chooses between the MT7925's connac3 records and the
 /// MT7921 and MT7922's connac2 records.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Codec {
-    Connac2,
+    Connac2(Chip),
     Connac3,
 }
 impl Codec {
-    pub fn of(chip: crate::wifi::mediatek::identity::Chip) -> Self {
-        if chip == crate::wifi::mediatek::identity::Chip::Mt7925 {
+    pub fn of(chip: Chip) -> Self {
+        if chip == Chip::Mt7925 {
             Self::Connac3
         } else {
-            Self::Connac2
+            Self::Connac2(chip)
         }
+    }
+    /// `mt7925_mcu_set_roc` or `mt7921_mcu_set_roc`: the join's channel
+    /// request.
+    pub fn roc(
+        self,
+        p: Profile,
+        token: u8,
+        duration_ms: u32,
+    ) -> Result<super::init::Request, Error> {
+        match self {
+            Self::Connac3 => p.roc(token, duration_ms),
+            Self::Connac2(chip) => connac2::runtime::roc(chip, p, token, duration_ms),
+        }
+    }
+    /// The abort of the channel request `token`.
+    pub fn abort_roc(self, p: Profile, token: u8) -> Result<super::init::Request, Error> {
+        match self {
+            Self::Connac3 => p.abort_roc(token),
+            Self::Connac2(chip) => connac2::runtime::abort_roc(chip, p, token),
+        }
+    }
+    /// The firmware's beacon filter for the associated BSS.
+    pub fn beacon_filter(self, p: Profile) -> Result<Outgoing, Error> {
+        let body = match self {
+            Self::Connac3 => p.beacon_filter()?,
+            Self::Connac2(_) => connac2::runtime::beacon_filter(p)?,
+        };
+        Ok(Outgoing::Uni(super::runtime::Command::BssInfo, body))
+    }
+    /// The RX filter's drop of other BSSs' beacons, on or off.
+    pub fn filter(self, p: Profile, enable: bool) -> Result<super::init::Request, Error> {
+        match self {
+            Self::Connac3 => p.filter_request(enable),
+            Self::Connac2(chip) => connac2::runtime::filter(chip, p, enable),
+        }
+    }
+    /// The end of the firmware's beacon power management for the BSS:
+    /// UNI PM_DISABLE, or connac2's SET_BSS_ABORT.
+    pub fn disable_beacon_pm(self, p: Profile) -> Result<Outgoing, Error> {
+        Ok(match self {
+            Self::Connac3 => {
+                Outgoing::Uni(super::runtime::Command::BssInfo, p.disable_beacon_pm()?)
+            }
+            Self::Connac2(chip) => Outgoing::Mailbox(connac2::runtime::bss_abort(chip, p)?),
+        })
+    }
+    /// Firmware RSSI events past `high` and `low` dBm while `enable`.
+    pub fn rssi_monitor(
+        self,
+        p: Profile,
+        enable: bool,
+        high: i8,
+        low: i8,
+    ) -> Result<Outgoing, Error> {
+        Ok(match self {
+            Self::Connac3 => Outgoing::Uni(
+                super::runtime::Command::RssiMonitor,
+                p.rssi_monitor_request(enable, high, low)?,
+            ),
+            Self::Connac2(chip) => {
+                Outgoing::Mailbox(connac2::runtime::rssi_monitor(chip, p, enable, high, low)?)
+            }
+        })
+    }
+    /// The RLM update for the BSS's channel `definition`.
+    pub fn channel(
+        self,
+        p: Profile,
+        definition: &crate::wifi::station::operations::ChannelDefinition,
+    ) -> Result<Vec<u8>, Error> {
+        match self {
+            Self::Connac3 => p.channel_request(definition),
+            Self::Connac2(_) => {
+                p.validate_inner(true)?;
+                let band = p.channel.band;
+                Ok(connac2::station::rlm(
+                    p,
+                    definition.width,
+                    frequency_channel(band, definition.center1_mhz),
+                    definition
+                        .center2_mhz
+                        .map_or(0, |mhz| frequency_channel(band, mhz)),
+                ))
+            }
+        }
+    }
+    /// The slot time's update: connac3's IFS record. connac2 programs it in
+    /// the MAC's timing registers (`mt792x_mac_set_timeing`), not by command.
+    pub fn timing(self, p: Profile) -> Result<Option<Vec<u8>>, Error> {
+        match self {
+            Self::Connac3 => p.timing().map(Some),
+            Self::Connac2(_) => Ok(None),
+        }
+    }
+    /// The association's EDCA parameters `effective`, no more permissive
+    /// than the AP's `original`, with the BSS's QoS `qos`.
+    pub fn edca(
+        self,
+        p: Profile,
+        original: &[crate::wifi::station::phy::AccessCategory; 4],
+        effective: &[crate::wifi::station::phy::AccessCategory; 4],
+        qos: bool,
+    ) -> Result<Outgoing, Error> {
+        let body = modern::Configuration::observed_edca_request(p, original, effective)?;
+        Ok(match self {
+            Self::Connac3 => Outgoing::Uni(super::runtime::Command::Edca, body),
+            Self::Connac2(chip) => {
+                Outgoing::Mailbox(connac2::runtime::edca(chip, p, effective, qos)?)
+            }
+        })
     }
     /// The BSS_INFO_UPDATE bodies that configure the BSS: one connac3
     /// request, or the connac2 sequence of `mt76_connac_mcu_uni_add_bss`.
@@ -104,7 +243,7 @@ impl Codec {
                 Some(m) => m.bss_request(p, enable)?,
                 None => p.bss_request(enable)?,
             }]),
-            Self::Connac2 => connac2::station::bss_requests(p, modern, enable),
+            Self::Connac2(_) => connac2::station::bss_requests(p, modern, enable),
         }
     }
     /// The AP peer's STA_REC_UPDATE body; `associated` is the association's
@@ -119,7 +258,7 @@ impl Codec {
         match (self, modern) {
             (Self::Connac3, Some(m)) if enable => m.peer_request(p, associated),
             (Self::Connac3, _) => p.peer_request(enable, associated),
-            (Self::Connac2, _) => connac2::station::peer_request(p, modern, enable, associated),
+            (Self::Connac2(_), _) => connac2::station::peer_request(p, modern, enable, associated),
         }
     }
     /// The STA_REC_UPDATE body of the interface's broadcast entry.
@@ -130,7 +269,7 @@ impl Codec {
     ) -> Result<Vec<u8>, Error> {
         match self {
             Self::Connac3 => p.broadcast_request(),
-            Self::Connac2 => connac2::station::broadcast_request(p, modern),
+            Self::Connac2(_) => connac2::station::broadcast_request(p, modern),
         }
     }
     /// The STA_REC_UPDATE bodies of one block-ack agreement's change.
@@ -149,7 +288,7 @@ impl Codec {
             Self::Connac3 => Ok(vec![modern::ba_request(
                 p, tid, ssn, window, amsdu, enable, transmit,
             )?]),
-            Self::Connac2 => {
+            Self::Connac2(_) => {
                 connac2::station::ba_requests(p, tid, ssn, window, amsdu, enable, transmit)
                     .map(Vec::from)
             }
@@ -400,17 +539,7 @@ impl Profile {
     ) -> Result<Vec<u8>, Error> {
         use crate::wifi::station::phy::Width;
         self.validate_inner(true)?;
-        // ieee80211_frequency_to_channel
-        let channel = |mhz: u32| -> u8 {
-            (match self.channel.band {
-                Band::Ghz2 if mhz == 2484 => 14,
-                Band::Ghz2 => (mhz - 2407) / 5,
-                Band::Ghz5 if mhz < 5000 => (mhz - 4000) / 5,
-                Band::Ghz5 => (mhz - 5000) / 5,
-                Band::Ghz6 if mhz == 5935 => 2,
-                Band::Ghz6 => (mhz - 5950) / 5,
-            }) as u8
-        };
+        let channel = |mhz| frequency_channel(self.channel.band, mhz);
         let mut b = vec![self.interface.bss_index, 0, 0, 0];
         let r = tlv(&mut b, 2, 16);
         r[4] = self.channel.number as u8;

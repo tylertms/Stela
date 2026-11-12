@@ -461,6 +461,43 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             }
         }
     }
+    /// Send one station command from an owned state, as [`Self::command`].
+    fn send(s: &mut Owned<I, Q, C>, outgoing: &wire::Outgoing) -> Result<(), Error> {
+        s.phase = Phase::Quarantined;
+        Self::deliver(
+            &mut s.controller,
+            &mut s.replies,
+            &mut s.transport_facts,
+            outgoing,
+        )
+    }
+    /// Send one station command: a UNI command whose status result is kept
+    /// in `replies`, or a mailbox request whose transport fact is kept in
+    /// `facts`.
+    fn deliver(
+        controller: &mut Controller<I, Q, C>,
+        replies: &mut Vec<mailbox::UnifiedReply>,
+        facts: &mut Vec<mailbox::init::Fact>,
+        outgoing: &wire::Outgoing,
+    ) -> Result<(), Error> {
+        match outgoing {
+            wire::Outgoing::Uni(command, body) => {
+                Self::command_parts(controller, replies, *command, body)
+            }
+            wire::Outgoing::Mailbox(request) => {
+                facts.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                let fact = controller
+                    .state_mut()
+                    .mailbox
+                    .as_mut()
+                    .unwrap()
+                    .initial(request)
+                    .map_err(Error::Transport)?;
+                facts.push(fact);
+                Ok(())
+            }
+        }
+    }
     fn action(
         s: &mut Owned<I, Q, C>,
         action: Action,
@@ -548,15 +585,12 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                     .map_err(|e| Error::Bootstrap(super::Error::Control(e)))?;
                 Self::command(s, Command::StationRecord, &peer)?;
                 Self::command(s, Command::StationRecord, &broadcast)?;
-                Self::command(
-                    s,
-                    Command::BssInfo,
-                    &p.beacon_filter().map_err(Error::Codec)?,
-                )?;
+                let beacon_filter = codec.beacon_filter(p).map_err(Error::Codec)?;
+                Self::send(s, &beacon_filter)?;
                 s.transport_facts
                     .try_reserve(1)
                     .map_err(|_| Error::NoMemory)?;
-                let filter = p.filter_request(true).map_err(Error::Codec)?;
+                let filter = codec.filter(p, true).map_err(Error::Codec)?;
                 let fact = s
                     .controller
                     .state_mut()

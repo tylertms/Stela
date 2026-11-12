@@ -255,6 +255,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             return Err(Error::WrongPhase);
         }
         Self::command_ready(s)?;
+        let codec = Self::codec(s);
         let (pending, current, profile) = if s.channel_change.is_some() {
             (
                 &mut s.channel_change,
@@ -276,7 +277,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         let Some(Some(definition)) = *pending else {
             return Err(Error::WrongPhase);
         };
-        let body = profile.channel_request(&definition).map_err(Error::Codec)?;
+        let body = codec.channel(profile, &definition).map_err(Error::Codec)?;
         s.replies.try_reserve(1).map_err(|_| Error::NoMemory)?;
         let phase = &mut s.phase;
         let controller = &mut s.controller;
@@ -388,8 +389,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         let profile = s.profile.ok_or(Error::WrongPhase)?;
         let (threshold, hysteresis) = monitor.unwrap_or_default();
         let hysteresis = hysteresis as i32;
-        let body = profile
-            .rssi_monitor_request(
+        let outgoing = Self::codec(s)
+            .rssi_monitor(
+                profile,
                 monitor.is_some(),
                 threshold.wrapping_add(hysteresis) as i8,
                 threshold.wrapping_sub(hysteresis) as i8,
@@ -399,6 +401,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         let phase = &mut s.phase;
         let controller = &mut s.controller;
         let replies = &mut s.replies;
+        let facts = &mut s.transport_facts;
         // SAFETY: covered by this function's own safety contract.
         unsafe {
             authority.publish_association(
@@ -407,7 +410,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 wifi::regulatory::AssociationUse::Management,
                 |_, _| {
                     *phase = Phase::Quarantined;
-                    Self::command_parts(controller, replies, Command::RssiMonitor, &body)?;
+                    Self::deliver(controller, replies, facts, &outgoing)?;
                     *phase = Phase::Associated;
                     Ok(())
                 },
@@ -444,7 +447,17 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         Self::command_ready(s)?;
         let mut profile = s.profile.ok_or(Error::WrongPhase)?;
         profile.slot_time = slot;
-        let body = profile.timing().map_err(Error::Codec)?;
+        let Some(body) = Self::codec(s).timing(profile).map_err(Error::Codec)? else {
+            // connac2 keeps the slot time in the MAC's timing registers
+            // (`mt792x_mac_set_timeing`), which this driver does not
+            // program: report the change and keep the current timing.
+            s.slot_time = None;
+            s.csa.ready.try_reserve(1).map_err(|_| Error::NoMemory)?;
+            s.csa.ready.push(Event::Unsupported(
+                "a 2.4 GHz slot time change on MT7921 or MT7922: the MAC keeps its timing",
+            ));
+            return Ok(());
+        };
         s.replies.try_reserve(1).map_err(|_| Error::NoMemory)?;
         let phase = &mut s.phase;
         let current = &mut s.profile;
@@ -566,6 +579,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         Self::command_ready(s)?;
         s.replies.try_reserve(1).map_err(|_| Error::NoMemory)?;
         let clock = s.controller.state().control.clock;
+        let codec = Self::codec(s);
         let (pending, applied) = if s.edca.is_some() {
             (
                 &mut s.edca,
@@ -583,6 +597,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         let phase = &mut s.phase;
         let controller = &mut s.controller;
         let replies = &mut s.replies;
+        let facts = &mut s.transport_facts;
         // SAFETY: covered by this function's exact-controller/policy contract.
         let result = unsafe {
             authority.publish_edca(
@@ -603,14 +618,12 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                         return Err(Error::GrantTimeout);
                     }
                     let effective = *operation.effective();
-                    let body = wire::modern::Configuration::observed_edca_request(
-                        observed.profile,
-                        operation.observed(),
-                        &effective,
-                    )
-                    .map_err(Error::Codec)?;
+                    // The AP's EDCA parameters come in its WMM element: QoS.
+                    let outgoing = codec
+                        .edca(observed.profile, operation.observed(), &effective, true)
+                        .map_err(Error::Codec)?;
                     *phase = Phase::Quarantined;
-                    Self::command_parts(controller, replies, Command::Edca, &body)?;
+                    Self::deliver(controller, replies, facts, &outgoing)?;
                     if clock
                         .now_us()
                         .checked_sub(observed.seen)

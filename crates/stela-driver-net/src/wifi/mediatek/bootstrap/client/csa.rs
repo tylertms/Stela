@@ -291,9 +291,10 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             .switched(target, operation, definition.width)
             .map_err(Error::Codec)?;
         let token = s.roc_token.checked_add(1).ok_or(Error::NeedsDrain)?;
-        let request = target.roc(token, 4000).map_err(Error::Codec)?;
-        let abort = target.abort_roc(token).map_err(Error::Codec)?;
-        let body = target.channel_request(&definition).map_err(Error::Codec)?;
+        let codec = Self::codec(s);
+        let request = codec.roc(target, token, 4000).map_err(Error::Codec)?;
+        let abort = codec.abort_roc(target, token).map_err(Error::Codec)?;
+        let body = codec.channel(target, &definition).map_err(Error::Codec)?;
         s.replies.try_reserve(1).map_err(|_| Error::NoMemory)?;
         s.transport_facts
             .try_reserve(2)

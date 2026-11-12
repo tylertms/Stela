@@ -27,8 +27,16 @@ pub enum Kind {
     MacEnable(bool),
     RxPath,
     RadioLed(u8),
-    RawTranslation { wcid: u16 },
+    RawTranslation {
+        wcid: u16,
+    },
     ChipConfig,
+    /// connac2's CE SET_EDCA_PARMS.
+    Edca,
+    /// connac2's CE SET_BSS_ABORT.
+    BssAbort,
+    /// connac2's CE RSSI_MONITOR.
+    RssiMonitor,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -303,6 +311,16 @@ impl Request {
     }
     pub(in crate::wifi::mediatek) fn roc(body: Vec<u8>) -> Self {
         Self::new(Chip::Mt7925, Kind::Roc, (1 << 17) | 0x27, body, true)
+    }
+    /// A connac2 chip's station command the firmware does not acknowledge:
+    /// UNI ROC as `mt7921_mcu_set_roc` sends it, or a CE command.
+    pub(in crate::wifi::mediatek) fn connac2_client(
+        chip: Chip,
+        kind: Kind,
+        command: u32,
+        body: Vec<u8>,
+    ) -> Self {
+        Self::new(chip, kind, command, body, false)
     }
     pub fn chip(&self) -> Chip {
         self.chip

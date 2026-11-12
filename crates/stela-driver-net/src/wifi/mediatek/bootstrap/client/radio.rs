@@ -182,7 +182,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         }
         let req = match s.six_ghz.as_ref() {
             Some(six) => six.codec().abort_roc(s.roc_token),
-            None => s.profile.ok_or(Error::WrongProfile)?.abort_roc(s.roc_token),
+            None => Self::codec(s).abort_roc(s.profile.ok_or(Error::WrongProfile)?, s.roc_token),
         }
         .map_err(Error::Codec)?;
         s.transport_facts
@@ -209,8 +209,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         // one in this owner while an old notification could still exist.
         let token = s.roc_token.checked_add(1).ok_or(Error::NeedsDrain)?;
         let p = s.profile.ok_or(Error::WrongProfile)?;
-        let req = p.roc(token, 1000).map_err(Error::Codec)?;
-        let abort = p.abort_roc(token).map_err(Error::Codec)?;
+        let codec = Self::codec(s);
+        let req = codec.roc(p, token, 1000).map_err(Error::Codec)?;
+        let abort = codec.abort_roc(p, token).map_err(Error::Codec)?;
         Self::await_grant(s, p, token, &req, &abort)
     }
     /// Publish one ROC request and wait for its matching grant, which assigns
@@ -282,6 +283,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             .map_err(Error::Transport)?;
         s.transport_facts.push(fact);
         let clock = s.controller.state().control.clock;
+        let chip = s.controller.state().identity.chip;
         let deadline = clock.deadline(4_000_000);
         loop {
             let frames = s
@@ -298,8 +300,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 s.asynchronous.push(f);
                 let retained = s.asynchronous.last().unwrap();
                 if !retained.drop
-                    && let Ok(e) =
-                        crate::wifi::mediatek::mcu::Event::parse(Chip::Mt7925, &retained.bytes)
+                    && let Ok(e) = crate::wifi::mediatek::mcu::Event::parse(chip, &retained.bytes)
                     && e.is_unsolicited()
                     && e.event_id == 0x27
                 {
