@@ -163,6 +163,13 @@ pub trait Link {
     fn due_us(&self) -> Option<u64> {
         None
     }
+    /// The next one-time diagnostic the adapter wants logged while it runs,
+    /// such as an operation it declines or a connection attempt that
+    /// failed; each is given once, and none is an error. Problems found
+    /// while attaching stay with the probe's warnings.
+    fn take_diagnostic(&mut self) -> Option<String> {
+        None
+    }
 }
 
 mod timing;

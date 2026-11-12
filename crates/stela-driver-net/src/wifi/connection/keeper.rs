@@ -519,7 +519,7 @@ impl<R: Radio> Keeper<R> {
         &mut self.link
     }
 
-    /// A diagnostic, queued for [`Self::take_notice`] once per message, as
+    /// A diagnostic, queued for [`Link::take_diagnostic`] once per message, as
     /// wpa_supplicant logs an event: it never fails the link.
     fn fail(&mut self, message: String) {
         if self.noticed.contains(&message) {
@@ -533,11 +533,6 @@ impl<R: Radio> Keeper<R> {
             self.notices.pop_front();
         }
         self.notices.push_back(message);
-    }
-
-    /// The next diagnostic to log, each distinct message once.
-    pub fn take_notice(&mut self) -> Option<String> {
-        self.notices.pop_front()
     }
 
     /// Why the radio stopped for good, once it has.
@@ -1553,6 +1548,10 @@ impl<R: Radio> Link for Keeper<R> {
     }
     fn carrier_wait_us(&self) -> u64 {
         CARRIER_WAIT_US
+    }
+    /// Each distinct message once.
+    fn take_diagnostic(&mut self) -> Option<String> {
+        self.notices.pop_front()
     }
     fn signals(&self) -> bool {
         self.lost.is_none() && self.link.signals()

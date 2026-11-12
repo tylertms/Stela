@@ -421,6 +421,15 @@ impl Link for Adapter {
             _ => None,
         }
     }
+    fn take_diagnostic(&mut self) -> Option<String> {
+        match self {
+            #[cfg(feature = "native-acpi")]
+            Self::IntelWifi(device) => device.take_diagnostic(),
+            Self::MediatekWifi(device) => device.take_diagnostic(),
+            Self::RealtekWifi(device) => device.take_diagnostic(),
+            _ => None,
+        }
+    }
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
         match self {
             Self::Virtio(device) => device.transmit(frame),

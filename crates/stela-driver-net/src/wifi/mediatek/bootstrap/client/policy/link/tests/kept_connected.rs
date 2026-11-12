@@ -736,7 +736,7 @@ fn an_attached_mt7925_carries_dhcp_under_the_handshake_keys_through_the_link() {
     assert_eq!(station.radio_mut().link_mut().rejected_frames(), 1);
     assert!(station.carrier());
     // No diagnostic so far became an error.
-    while station.take_notice().is_some() {}
+    while station.take_diagnostic().is_some() {}
     // A receive buffer the device cannot get back quarantines the adapter
     // for good: the keeper reports why once and stops retrying.
     model.queues[&0xd4520].lock().unwrap().fail_publish = true;
@@ -744,7 +744,7 @@ fn an_attached_mt7925_carries_dhcp_under_the_handshake_keys_through_the_link() {
     let error = station.receive().unwrap_err();
     let reason = alloc::string::String::from(station.lost().expect("the radio is lost"));
     assert_eq!(error, LinkError::Adapter(reason.clone()));
-    assert_eq!(station.take_notice(), Some(reason.clone()));
+    assert_eq!(station.take_diagnostic(), Some(reason.clone()));
     let tx = model.queues[&0xd4300].lock().unwrap().head;
     for _ in 0..4 {
         assert!(!station.carrier());
@@ -754,6 +754,6 @@ fn an_attached_mt7925_carries_dhcp_under_the_handshake_keys_through_the_link() {
         );
         assert!(station.transmit(&ethernet).is_err());
     }
-    assert_eq!(station.take_notice(), None);
+    assert_eq!(station.take_diagnostic(), None);
     assert_eq!(model.queues[&0xd4300].lock().unwrap().head, tx);
 }
