@@ -286,9 +286,7 @@ impl<C: 'static> HardwareKey<C> {
                 let status = reply.status;
                 state.reply = Some(reply);
                 if accepted {
-                    if mailbox.identity.chip == crate::wifi::mediatek::identity::Chip::Mt7925 {
-                        bip::remember(state, ticket.identity(), material);
-                    }
+                    bip::remember(state, ticket.identity(), material);
                     Ok(ticket.identity())
                 } else {
                     Err(Error::Firmware(status))

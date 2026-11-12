@@ -164,11 +164,6 @@ impl<C: 'static> HardwareKey<C> {
         receive: PacketNumber,
     ) -> Result<Identity, super::Error> {
         self.check(mailbox)?;
-        if mailbox.identity.chip != Chip::Mt7925 {
-            return Err(super::Error::Request(
-                crate::wifi::mediatek::mcu::key::Error::UnsupportedBip,
-            ));
-        }
         let s = self.owned_mut();
         if s.phase != Phase::Installed {
             return Err(super::Error::Bip(Error::DataKeyRequired));

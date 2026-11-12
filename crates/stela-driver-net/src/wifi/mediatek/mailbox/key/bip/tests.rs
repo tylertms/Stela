@@ -320,8 +320,8 @@ fn invalid_igtk_admission_never_publishes_or_changes_the_original_key() {
         return;
     }
     for (chip, group, cipher) in [
-        (Chip::Mt7921, true, Cipher::Ccmp128),
-        (Chip::Mt7922, true, Cipher::Ccmp128),
+        (Chip::Mt7921, false, Cipher::Ccmp128),
+        (Chip::Mt7922, true, Cipher::Gcmp128),
         (Chip::Mt7925, false, Cipher::Ccmp128),
         (Chip::Mt7925, true, Cipher::Gcmp128),
         (Chip::Mt7925, true, Cipher::Ccmp128),
@@ -369,9 +369,7 @@ fn invalid_igtk_admission_never_publishes_or_changes_the_original_key() {
             .unwrap();
         let before = wm.lock().unwrap().completed.len();
         for (index, length) in [(3, 16), (6, 16), (4, 15), (5, 17)] {
-            let expected = if chip != Chip::Mt7925 {
-                super::super::Error::Request(crate::wifi::mediatek::mcu::key::Error::UnsupportedBip)
-            } else if !group {
+            let expected = if !group {
                 super::super::Error::Bip(Error::DataKeyRequired)
             } else if !(4..=5).contains(&index) {
                 super::super::Error::Request(
@@ -400,8 +398,8 @@ fn invalid_igtk_admission_never_publishes_or_changes_the_original_key() {
             assert!(key.installed_igtk().is_none());
             assert!(!key.is_quarantined());
         }
-        if chip != Chip::Mt7925 || !group || cipher != Cipher::Ccmp128 {
-            // SAFETY: model namespace is drained; unsupported scope/chip stays explicit.
+        if !group || cipher != Cipher::Ccmp128 {
+            // SAFETY: model namespace is drained; unsupported scope stays explicit.
             let result = unsafe {
                 key.install_igtk(
                     &mut mailbox,
@@ -411,14 +409,7 @@ fn invalid_igtk_admission_never_publishes_or_changes_the_original_key() {
                     PacketNumber::new(1).unwrap(),
                 )
             };
-            if chip != Chip::Mt7925 {
-                assert_eq!(
-                    result,
-                    Err(super::super::Error::Request(
-                        crate::wifi::mediatek::mcu::key::Error::UnsupportedBip,
-                    ))
-                );
-            } else if !group {
+            if !group {
                 assert_eq!(
                     result,
                     Err(super::super::Error::Bip(Error::DataKeyRequired))

@@ -11,7 +11,6 @@ pub mod bip;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     NoMemory,
-    UnsupportedBip,
     InvalidBipDataKey,
     InvalidBipIndex,
     InvalidWcid,
