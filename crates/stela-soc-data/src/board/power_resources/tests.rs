@@ -287,6 +287,39 @@ fn mmio_ownership_follows_supported_parent_aliases() {
 }
 
 #[test]
+fn t6020_hpm_children_use_the_i2c_controller_lifecycle() {
+    let hpm = encode(&[("name", b"hpm0"), ("compatible", b"usbc,cd3217")], &[]);
+    let manager = encode(
+        &[("name", b"hpmBusManager"), ("compatible", b"usbc,manager")],
+        &[hpm],
+    );
+    let reg = [0x4000u64, 0x4000]
+        .into_iter()
+        .flat_map(u64::to_le_bytes)
+        .collect::<Vec<_>>();
+    let i2c = encode(
+        &[
+            ("name", b"i2c0"),
+            ("compatible", b"i2c,t6020\0i2c,s5l8940x\0iic,soft\0"),
+            ("reg", &reg),
+            ("clock-gates", &words(&[1])),
+        ],
+        &[manager],
+    );
+    let bytes = flat_bus(&[i2c]);
+    let resources = inventory(&Node::root(&bytes).unwrap()).unwrap();
+    for path in [
+        "/arm-io/i2c0",
+        "/arm-io/i2c0/hpmBusManager",
+        "/arm-io/i2c0/hpmBusManager/hpm0",
+    ] {
+        let resource = resources.iter().find(|entry| entry.name == path).unwrap();
+        assert_eq!(resource.owner, Some(PowerOwner::Mmio(0x4000)), "{path}");
+        assert_eq!(resource.clocks, [domain_id(1)], "{path}");
+    }
+}
+
+#[test]
 fn dma_dependencies_do_not_inherit_mapper_power_ownership() {
     let mapper = encode(
         &[
