@@ -945,3 +945,50 @@ fn the_room_is_what_no_block_was_carved_from_and_comes_back_when_freed() {
     }
     assert_eq!(heap.room(), total);
 }
+
+#[test]
+fn owners_count_their_blocks_until_freed_wherever_neighbours_merge() {
+    let heap = Heap::new();
+    let mut ram = backing();
+    // SAFETY: exclusive test backing, kept through every exact free.
+    unsafe { heap.initialize(ram.0.as_mut_ptr(), ram.0.len()) };
+    let large = Layout::from_size_align(8192, 16).unwrap();
+    let small = Layout::from_size_align(48, 8).unwrap();
+    // SAFETY: valid layouts; each block is freed once with its layout.
+    unsafe {
+        heap.set_owner(3);
+        let before = heap.alloc(large);
+        heap.set_owner(5);
+        let middle = heap.alloc(large);
+        let little = heap.alloc(small);
+        heap.set_owner(0);
+        let after = heap.alloc(large);
+        let mut owners = [0; OWNERS];
+        owners[3] = 8192;
+        owners[5] = 8192 + 64;
+        assert_eq!(heap.owners(), owners);
+        // Freeing the neighbours rewrites the middle block's `previous`
+        // and merges around it: its owner stays.
+        heap.dealloc(before, large);
+        heap.dealloc(after, large);
+        owners[3] = 0;
+        assert_eq!(heap.owners(), owners);
+        // A block grown in place keeps its owner and counts its new size.
+        let grown = heap.realloc(middle, large, 12288);
+        assert_eq!(grown, middle);
+        owners[5] = 12288 + 64;
+        assert_eq!(heap.owners(), owners);
+        heap.dealloc(grown, Layout::from_size_align(12288, 16).unwrap());
+        // A size-class block reused under another owner counts there.
+        heap.dealloc(little, small);
+        heap.set_owner(7);
+        let reused = heap.alloc(small);
+        assert_eq!(reused, little);
+        owners[5] = 0;
+        owners[7] = 64;
+        assert_eq!(heap.owners(), owners);
+        heap.dealloc(reused, small);
+    }
+    assert_eq!(heap.owners(), [0; OWNERS]);
+    assert_eq!(heap.usage().live, 0);
+}

@@ -119,6 +119,13 @@ const MIN_BLOCK: usize = HEADER_BYTES + core::mem::size_of::<Links>();
 const FREE: usize = 1;
 const PREVIOUS_FREE: usize = 2;
 const FLAGS: usize = FREE | PREVIOUS_FREE;
+/// The owners a live block can be counted under ([`Heap::set_owner`]):
+/// owner 0 counts nothing, the rest of the heap, and the others count each
+/// block they allocate until its free. A block's owner lies in the low bits
+/// of its header's `previous`, which a granule-aligned address leaves
+/// clear and which only the lock's holder reads, masked.
+pub const OWNERS: usize = GRANULE;
+const OWNER_BITS: usize = OWNERS - 1;
 /// Bins per power of two.
 const SUB_BITS: u32 = 4;
 const SUBS: usize = 1 << SUB_BITS;
@@ -159,6 +166,61 @@ fn bin_round(size: usize) -> Option<usize> {
 unsafe fn size(block: *mut Header) -> usize {
     // SAFETY: the caller's live header.
     unsafe { (*block).size & !FLAGS }
+}
+
+/// The address of the block before `block`, its owner bits masked.
+///
+/// # Safety
+/// `block` is a block header of the heap, read with its lock held.
+unsafe fn previous(block: *mut Header) -> usize {
+    // SAFETY: the caller's header; its owner's core may change the owner
+    // bits meanwhile, only atomically.
+    unsafe { previous_word(block).load(Ordering::Relaxed) & !OWNER_BITS }
+}
+
+/// `block`'s `previous` word, which the lock's holder and the core that
+/// owns the block share: the address bits are the holder's, the owner bits
+/// the owning core's, and each changes only its own, atomically.
+///
+/// # Safety
+/// `block` is a block header of the heap.
+unsafe fn previous_word<'a>(block: *mut Header) -> &'a AtomicUsize {
+    // SAFETY: the header's first word, aligned for an atomic access.
+    unsafe { AtomicUsize::from_ptr(&raw mut (*block).previous) }
+}
+
+/// Set the address bits of `block`'s `previous` to `address`, keeping its
+/// owner bits.
+///
+/// # Safety
+/// The lock is held and `block` is a block header of the heap.
+unsafe fn set_previous(block: *mut Header, address: usize) {
+    // SAFETY: the caller's header.
+    let word = unsafe { previous_word(block) };
+    let old = word.load(Ordering::Relaxed);
+    word.fetch_xor((old ^ address) & !OWNER_BITS, Ordering::Relaxed);
+}
+
+/// The owner of the live block whose payload is `pointer`.
+///
+/// # Safety
+/// `pointer` is a live allocation of the heap.
+unsafe fn owner_of(pointer: *mut u8) -> usize {
+    // SAFETY: the allocation's header precedes its payload.
+    unsafe { previous_word(pointer.sub(HEADER_BYTES).cast()).load(Ordering::Relaxed) & OWNER_BITS }
+}
+
+/// Name `owner` the owner of the live block whose payload is `pointer`.
+///
+/// # Safety
+/// `pointer` is a live allocation of the heap that the caller owns.
+unsafe fn set_owner_of(pointer: *mut u8, owner: usize) {
+    // SAFETY: the allocation's header precedes its payload.
+    let word = unsafe { previous_word(pointer.sub(HEADER_BYTES).cast()) };
+    let old = word.load(Ordering::Relaxed);
+    if old & OWNER_BITS != owner {
+        word.fetch_xor((old ^ owner) & OWNER_BITS, Ordering::Relaxed);
+    }
 }
 
 /// A free `block`'s links.
@@ -224,6 +286,11 @@ struct Core {
     own: AtomicIsize,
     /// [`Self::own`]'s size-class blocks by class.
     own_classes: [AtomicIsize; CLASSES],
+    /// The owner the core's allocations are counted under.
+    owner: AtomicUsize,
+    /// The core's bytes allocated less those it freed, by the owner each
+    /// block was allocated under.
+    owned: [AtomicIsize; OWNERS],
 }
 
 impl Core {
@@ -233,6 +300,8 @@ impl Core {
             cached: AtomicIsize::new(0),
             own: AtomicIsize::new(0),
             own_classes: [const { AtomicIsize::new(0) }; CLASSES],
+            owner: AtomicUsize::new(0),
+            owned: [const { AtomicIsize::new(0) }; OWNERS],
         }
     }
 }
@@ -435,7 +504,7 @@ impl State {
                 } else {
                     0
                 };
-                (*following).previous = block as usize;
+                set_previous(following, block as usize);
                 (*following).size = (*following).size & !PREVIOUS_FREE | free;
             }
         }
@@ -507,6 +576,10 @@ pub struct Heap {
     /// The heap's bytes not carved, the reserve's with the main bins'.
     room: AtomicUsize,
     waits: AtomicU64,
+    /// The owner, and the counts by owner, of allocations on cores without
+    /// a cache.
+    default_owner: AtomicUsize,
+    unowned: [AtomicIsize; OWNERS],
 }
 // SAFETY: all list/header mutations use the real acquire/release exclusion.
 // UEFI callers mask local interrupts before acquiring the lock. Critical
@@ -551,6 +624,8 @@ impl Heap {
             carved: AtomicUsize::new(0),
             room: AtomicUsize::new(0),
             waits: AtomicU64::new(0),
+            default_owner: AtomicUsize::new(0),
+            unowned: [const { AtomicIsize::new(0) }; OWNERS],
             state: UnsafeCell::new(State {
                 start: 0,
                 end: 0,
@@ -760,6 +835,11 @@ impl Heap {
         // shared body checks initialization before accessing backing storage.
         let block = unsafe { allocate_locked(&mut *self.state.get(), layout, class(layout)) };
         drop(guard);
+        if !block.is_null() {
+            let bytes = class(layout).map_or(layout.size(), |class| SMALLEST << class);
+            // SAFETY: the new allocation, which only this call holds.
+            unsafe { self.claim(self.cpu(), block, bytes) };
+        }
         if class(layout).is_none() {
             tracked(block, layout.size(), true);
         }
@@ -828,6 +908,8 @@ impl Heap {
         if !block.is_null() {
             // SAFETY: the selected full payload is exclusively owned and live.
             unsafe { block.write_bytes(0, layout.size()) };
+            // SAFETY: the new allocation, which only this call holds.
+            unsafe { self.claim(self.cpu(), block, layout.size()) };
             tracked(block, layout.size(), true);
         }
         block
@@ -982,6 +1064,78 @@ impl Heap {
         cache.blocks[class][cache.counts[class]] = block.cast();
         cache.counts[class] += 1;
         self.count_cached(cpu, -((SMALLEST << class) as isize));
+    }
+
+    /// Count the calling core's later allocations under `owner`, below
+    /// [`OWNERS`] (0: under none), until the next call; the owner before.
+    /// A core without a cache sets the owner of all such cores.
+    pub fn set_owner(&self, owner: usize) -> usize {
+        let owner = owner & OWNER_BITS;
+        match self.cpu() {
+            Some(cpu) => {
+                let current = &self.cores[cpu].owner;
+                let before = current.load(Ordering::Relaxed);
+                current.store(owner, Ordering::Relaxed);
+                before
+            }
+            None => self.default_owner.swap(owner, Ordering::Relaxed),
+        }
+    }
+
+    /// The live bytes each owner allocated, owner 0 none: the rest of
+    /// [`Usage::live`].
+    pub fn owners(&self) -> [isize; OWNERS] {
+        let cores = self.tagged.load(Ordering::Relaxed).min(CPUS);
+        core::array::from_fn(|owner| {
+            self.unowned[owner].load(Ordering::Relaxed)
+                + self.cores[..cores]
+                    .iter()
+                    .map(|core| core.owned[owner].load(Ordering::Relaxed))
+                    .sum::<isize>()
+        })
+    }
+
+    /// Add `bytes` to `owner`'s count on core `cpu`, which only it writes,
+    /// or on the shared count without one.
+    fn count_owned(&self, cpu: Option<usize>, owner: usize, bytes: isize) {
+        if owner == 0 {
+            return;
+        }
+        match cpu {
+            Some(cpu) => {
+                let count = &self.cores[cpu].owned[owner];
+                count.store(count.load(Ordering::Relaxed) + bytes, Ordering::Relaxed);
+            }
+            None => {
+                self.unowned[owner].fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Name the calling core's owner the owner of new block `pointer` of
+    /// `bytes` and count them under it.
+    ///
+    /// # Safety
+    /// `pointer` is a live allocation of the heap that the caller owns.
+    unsafe fn claim(&self, cpu: Option<usize>, pointer: *mut u8, bytes: usize) {
+        let owner = match cpu {
+            Some(cpu) => self.cores[cpu].owner.load(Ordering::Relaxed),
+            None => self.default_owner.load(Ordering::Relaxed),
+        };
+        // SAFETY: the caller's live allocation.
+        unsafe { set_owner_of(pointer, owner) };
+        self.count_owned(cpu, owner, bytes as isize);
+    }
+
+    /// Take `bytes` of block `pointer`, about to be freed, off its owner's
+    /// count.
+    ///
+    /// # Safety
+    /// `pointer` is a live allocation of the heap that the caller owns.
+    unsafe fn disclaim(&self, cpu: Option<usize>, pointer: *mut u8, bytes: usize) {
+        // SAFETY: the caller's live allocation.
+        let owner = unsafe { owner_of(pointer) };
+        self.count_owned(cpu, owner, -(bytes as isize));
     }
 
     /// Add `bytes` to core `cpu`'s count, which only it writes.
@@ -1244,6 +1398,9 @@ unsafe impl GlobalAlloc for Heap {
             if let Some(cpu) = cpu {
                 self.count_own(cpu, layout, class, true);
             }
+            let bytes = class.map_or(layout.size(), |class| SMALLEST << class);
+            // SAFETY: the new allocation, which only this call holds.
+            unsafe { self.claim(cpu, block, bytes) };
             if class.is_none() {
                 tracked(block, layout.size(), true);
             }
@@ -1252,7 +1409,11 @@ unsafe impl GlobalAlloc for Heap {
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         let class = class(layout);
-        if let Some(cpu) = self.cpu() {
+        let cpu = self.cpu();
+        let bytes = class.map_or(layout.size(), |class| SMALLEST << class);
+        // SAFETY: the caller's live allocation, freed below.
+        unsafe { self.disclaim(cpu, pointer, bytes) };
+        if let Some(cpu) = cpu {
             self.count_own(cpu, layout, class, false);
             if let Some(class) = class {
                 let flags = interrupts_off();
@@ -1319,10 +1480,14 @@ unsafe impl GlobalAlloc for Heap {
                 resized
             };
             if resized {
-                if let Some(cpu) = self.cpu() {
+                let cpu = self.cpu();
+                if let Some(cpu) = cpu {
                     self.count_own(cpu, layout, None, false);
                     self.count_own(cpu, new_layout, None, true);
                 }
+                // SAFETY: the caller's live allocation, resized in place.
+                let owner = unsafe { owner_of(pointer) };
+                self.count_owned(cpu, owner, new_size as isize - layout.size() as isize);
                 tracked(pointer, layout.size(), false);
                 tracked(pointer, new_size, true);
                 return pointer;
@@ -1447,7 +1612,7 @@ unsafe fn take(state: &mut State, block: *mut Header, user: usize, payload: usiz
             state.insert(block);
             (base, PREVIOUS_FREE)
         } else {
-            ((*block).previous, before)
+            (previous(block), before)
         };
         let mut used_end = user + payload;
         if end - used_end < MIN_BLOCK {
@@ -1610,7 +1775,7 @@ unsafe fn release(state: &mut State, pointer: *mut u8) {
             bytes += size(following);
         }
         if (*block).size & PREVIOUS_FREE != 0 && block as usize != state.floor {
-            let previous = (*block).previous as *mut Header;
+            let previous = previous(block) as *mut Header;
             state.remove(previous);
             bytes += size(previous);
             block = previous;
