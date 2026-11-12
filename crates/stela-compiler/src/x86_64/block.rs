@@ -2089,9 +2089,11 @@ const REL32_BYTES: usize = size_of::<i32>();
 ///
 /// Consecutive such instructions form a run in which only the first
 /// checks FPCR and FPSR: a sticky path changes neither, so the next one
-/// holds whenever it is reached inline, and the moved part of one
-/// continues in the next one's full path, which is correct in every
-/// state. Moved code accesses no guest memory, so the source map entry
+/// holds whenever it is reached inline. The moved part of one checks them
+/// again: where they hold (a result, not FPCR or FPSR, took it out of
+/// line), it returns inline to the next instruction's sticky path, and
+/// otherwise continues in the next one's full path, which is correct in
+/// every state. Moved code accesses no guest memory, so the source map entry
 /// of the last ordinary instruction that also covers it names no fault.
 ///
 /// [`ColdSplit`]: super::simd::numerical::ColdSplit
@@ -2155,6 +2157,20 @@ impl OutOfLine {
                 .push((place(site, inline), place(target, inline)));
         }
         self.code.append(code.split_off(split.cold));
+        // Where the sticky conditions hold again (a value, not FPCR or
+        // FPSR, sent this instruction here), the next instruction's sticky
+        // path follows inline; otherwise the run continues below.
+        let unmet = super::simd::numerical::sticky_inexact(
+            &mut self.code,
+            super::simd::numerical::Entry::UNKNOWN,
+        );
+        let rejoin = self.code.asm().jmp();
+        self.fixups
+            .push((Place::OutOfLine(rejoin.offset()), Place::Inline(inline_end)));
+        let chained = self.code.len();
+        for site in unmet {
+            super::simd::numerical::resolve(&mut self.code, site, chained);
+        }
         let back = self.code.asm().jmp();
         self.open = Some((back.offset(), inline_end));
         code.truncate(split.inline_end);

@@ -922,6 +922,114 @@ fn fused_specials_after_sticky_inexact_match_the_reference() {
     assert!(inline > runs / 2, "{inline} of {runs} inline");
 }
 
+/// Two dependent FMLAs in one block, the first with an infinity, a zero,
+/// a NaN, a subnormal or the minimum normal in lane 0 and the last lane of
+/// one operand (its result often taken out of line, after which the
+/// second's sticky path follows inline when FPCR and FPSR allow it, and
+/// its full path otherwise), with FPSR.IXC set or clear and FPCR at its
+/// defaults, DN, FZ or a directed rounding: every run that completes
+/// matches the reference applied in order in every lane and FPSR.
+#[test]
+fn fused_runs_rejoin_their_sticky_paths_after_a_full_path() {
+    const SECOND: u32 = 5;
+    let (mut runs, mut inline) = (0, 0);
+    for target in targets() {
+        for format in [Format::Single, Format::Double] {
+            let fraction_bits = format.fraction_bits();
+            let infinity = format.exponent_mask();
+            let quiet = 1u64 << (fraction_bits - 1);
+            let sign = format.sign_mask();
+            let bias = u64::from(format.exponent_bias());
+            let specials = [
+                infinity,
+                0,
+                sign,
+                infinity | quiet | 0x15,
+                infinity | 0x11,
+                1,
+                sign | 3,
+                1 << fraction_bits,
+            ];
+            let ordinary = [
+                bias << fraction_bits | quiet,
+                sign | (bias + 1) << fraction_bits | quiet,
+                (bias + 1) << fraction_bits | quiet >> 3,
+                ((bias - 2) << fraction_bits) | ((quiet * 2 - 1) / 3 * 2),
+            ];
+            let lanes = if format == Format::Double { 2 } else { 4 };
+            let double = u32::from(format == Format::Double);
+            let fmla = |d: u32, n: u32, m: u32| 0x4e20_cc00 | double << 22 | m << 16 | n << 5 | d;
+            let source = [fmla(D, N, M), fmla(SECOND, D, M), 0xd65f_03c0]
+                .map(u32::to_le_bytes)
+                .concat();
+            let code =
+                CompilationPlan::new(&source, PC, &Options::new(BlockProfile::ORDINARY, target))
+                    .unwrap()
+                    .compile()
+                    .unwrap()
+                    .native
+                    .x86_64_code;
+            for &special in &specials {
+                for operand in 0..3 {
+                    let mut vectors = [[0u64; 2]; 4];
+                    for (which, vector) in vectors.iter_mut().enumerate() {
+                        for index in 0..lanes {
+                            set_lane(vector, format, index, ordinary[(index + which) % 4]);
+                        }
+                    }
+                    for index in [0, lanes - 1] {
+                        set_lane(&mut vectors[operand], format, index, special);
+                    }
+                    for fpcr in [0, FPCR_DN, FPCR_FZ, 2 << FPCR_ROUNDING_SHIFT] {
+                        for fpsr in [0, 0x10] {
+                            let mut initial = GuestState {
+                                fpcr,
+                                fpsr,
+                                ..GuestState::default()
+                            };
+                            initial.x[30] = RETURN;
+                            initial.v[D as usize] = vectors[0];
+                            initial.v[N as usize] = vectors[1];
+                            initial.v[M as usize] = vectors[2];
+                            initial.v[SECOND as usize] = vectors[3];
+                            let label = alloc::format!(
+                                "{format:?} {vectors:x?} {fpcr:#x} {fpsr:#x} {target:?}"
+                            );
+                            let mut actual = initial.clone();
+                            let exit = run(&code, &mut actual);
+                            runs += 1;
+                            if exit != RETURN {
+                                continue;
+                            }
+                            inline += 1;
+                            let mut expected = initial.clone();
+                            for (destination, left) in [(D, N), (SECOND, D)] {
+                                let mut result = [0; 2];
+                                for index in 0..lanes {
+                                    let outcome = floating::fused::evaluate(
+                                        format,
+                                        FusedOperation::Add,
+                                        fpcr,
+                                        lane(expected.v[destination as usize], format, index),
+                                        lane(expected.v[left as usize], format, index),
+                                        lane(expected.v[M as usize], format, index),
+                                    )
+                                    .unwrap();
+                                    expected.fpsr |= outcome.exceptions;
+                                    set_lane(&mut result, format, index, outcome.bits);
+                                }
+                                expected.v[destination as usize] = result;
+                            }
+                            assert_eq!(actual, expected, "{label}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(inline > runs / 2, "{inline} of {runs} inline");
+}
+
 /// Under FZ with AH clear, fused results tiny before rounding in lane 0
 /// and the last lane, beside ordinary lanes: inexact ones rounding to
 /// zero, to a subnormal or up to the minimum normal, exact subnormal sums,

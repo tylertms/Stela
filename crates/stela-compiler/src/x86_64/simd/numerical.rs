@@ -281,7 +281,7 @@ const FPSR_INEXACT: u8 = 1 << 4;
 ///
 /// Unless `entry.checked`, the caller knows the conditions hold
 /// ([`Entry`]). There are then no branches.
-pub(super) fn sticky_inexact(code: &mut Code, entry: Entry) -> Vec<usize> {
+pub(in crate::x86_64) fn sticky_inexact(code: &mut Code, entry: Entry) -> Vec<usize> {
     if !entry.checked {
         return vec![];
     }
