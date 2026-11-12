@@ -4132,6 +4132,8 @@ mod tests {
     mod shared;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mod stamped;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    mod transfers;
 
     /// A block's entry goes from its set and from the cells of its PC by
     /// its PC, key and block alone: another block's entry of the PC and
