@@ -608,6 +608,59 @@ fn decrypted_from_ap(model: &Model, destination: Mac, datagram: &[u8], index: u8
 }
 
 #[test]
+fn a_runtime_command_answered_past_the_bound_loses_the_radio_once() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let (client, model) = setup_modern();
+    let client = ManagedClient::new(client, country(), Environment::Indoor).unwrap();
+    let link = ManagedLink::new(
+        client,
+        Provider(Arc::new(AtomicUsize::new(0)), Default::default()),
+    )
+    .unwrap();
+    let network = Network {
+        ssid: b"x".to_vec(),
+        secret: Secret::parse(b"correct horse battery").unwrap(),
+        country: None,
+    };
+    let mut station = Station::new(
+        link,
+        profile().interface,
+        country(),
+        network,
+        Arc::new(Fixed),
+        crate::Clock {
+            ticks_per_microsecond: 1,
+        },
+    );
+    // The firmware answers the first poll's scan request 60 ms late, which
+    // the attach's 3 s would wait out: the poll ends the command instead.
+    model.response.lock().unwrap().pause_next_index_us =
+        crate::wifi::connection::keeper::RUNTIME_COMMAND_TIMEOUT_US + 10_000;
+    let start = crate::Clock::ticks();
+    assert!(!station.carrier());
+    assert!(crate::Clock::ticks() - start < 100_000);
+    // The next poll finds the radio lost and reports why once.
+    assert!(!station.carrier());
+    let Some(reason) = station.lost().map(alloc::string::String::from) else {
+        let reported: Vec<_> = core::iter::from_fn(|| station.take_diagnostic()).collect();
+        panic!("not lost: {reported:?}");
+    };
+    // The scan's own report names the command timeout before it.
+    let reported: Vec<_> = core::iter::from_fn(|| station.take_diagnostic()).collect();
+    assert_eq!(reported.last(), Some(&reason));
+    assert_eq!(reported.iter().filter(|r| **r == reason).count(), 1);
+    assert!(
+        reported.iter().any(|r| r.contains("Timeout")),
+        "{reported:?}"
+    );
+    for _ in 0..3 {
+        assert!(!station.carrier());
+    }
+    assert_eq!(station.take_diagnostic(), None);
+}
+#[test]
 fn an_attached_mt7925_carries_dhcp_under_the_handshake_keys_through_the_link() {
     if crate::test_process::isolate_model() {
         return;

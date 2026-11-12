@@ -254,6 +254,13 @@ pub trait Radio: Link {
 
 /// The longest a scan may run.
 const SCAN_BUDGET_US: u64 = 30_000_000;
+/// The longest one firmware command may hold a station poll. Firmware
+/// answers in a few milliseconds; polls run from guest exits, which must end
+/// well inside the platform's exit bound (about 0.5 s), so a hung firmware
+/// costs the radio, never the machine. Every driver's runtime commands use
+/// this bound and report a command past it as a timeout, which loses the
+/// radio through `Stage::Lost`. Boot-time attach keeps its own longer waits.
+pub const RUNTIME_COMMAND_TIMEOUT_US: u64 = 50_000;
 /// wpa_supplicant's default `scan_interval` after a scan finds nothing.
 const SCAN_INTERVAL_US: u64 = 5_000_000;
 /// The delay before reconnecting once the AP drops the association.

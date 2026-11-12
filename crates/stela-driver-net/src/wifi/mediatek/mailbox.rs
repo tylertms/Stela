@@ -29,6 +29,9 @@ static NEXT_OWNER: crate::wifi::Identities = crate::wifi::Identities::new();
 // PCI send callbacks override the generic fill helper's 20*HZ with
 // 3*HZ before the common MCU owner computes its response expiry.
 const PCI_TIMEOUT_US: u64 = 3_000_000;
+/// Once the station runs, a command past the keeper's bound is a command
+/// timeout, as one past [`PCI_TIMEOUT_US`] is during the attach.
+pub use crate::wifi::connection::keeper::RUNTIME_COMMAND_TIMEOUT_US as RUNTIME_TIMEOUT_US;
 const MAX_EVENTS: usize = 64;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -259,8 +262,15 @@ pub struct Mailbox<W: QueueIo, F: QueueIo, R: QueueIo> {
     download_binding: Option<firmware::Binding>,
     source_restart_cookie: Option<u64>,
     interrupted_initial_reply: Option<init::Reply>,
+    /// The station runs: each command waits at most [`RUNTIME_TIMEOUT_US`].
+    runtime: bool,
 }
 impl<W: QueueIo, F: QueueIo, R: QueueIo> Mailbox<W, F, R> {
+    /// Bound every later command by [`RUNTIME_TIMEOUT_US`]; the attach's
+    /// longer waits are over.
+    pub(in crate::wifi::mediatek) fn enter_runtime(&mut self) {
+        self.runtime = true;
+    }
     /// # Safety
     /// All three queues must belong exclusively to this one
     /// observed identity/requester and the same coherent native DMA attachment.
@@ -313,6 +323,7 @@ impl<W: QueueIo, F: QueueIo, R: QueueIo> Mailbox<W, F, R> {
             download_binding: None,
             source_restart_cookie: None,
             interrupted_initial_reply: None,
+            runtime: false,
         })
     }
     /// # Safety
@@ -627,6 +638,11 @@ impl<W: QueueIo, F: QueueIo, R: QueueIo> Mailbox<W, F, R> {
             Queue::FirmwareDownload => self.fwdl.submit(cookie, packet.bytes()),
         };
         submit.map_err(|e| self.failure(command, sequence, false, Cause::Ring(e)))?;
+        let timeout_us = if self.runtime {
+            timeout_us.min(RUNTIME_TIMEOUT_US)
+        } else {
+            timeout_us
+        };
         let deadline = self.clock.deadline(timeout_us);
         let mut dma_released = false;
         let mut reply: Option<(u32, ReplySlot)> = None;

@@ -315,7 +315,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
     /// new OS key exchange must supply fresh TX material for a new owner.
     /// Hardware stop/drain alone never proves old material was unused.
     pub unsafe fn new(
-        controller: Controller<I, Q, C>,
+        mut controller: Controller<I, Q, C>,
         interface: Interface<Arc<C>>,
     ) -> Result<Self, Error> {
         if controller.phase() != ControllerPhase::StartFacts
@@ -332,6 +332,13 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         }
         let station = Station::new(context.address).map_err(Error::Station)?;
         let scanner = scan::Scanner::new(context.address).map_err(Error::Scan)?;
+        // The attach is complete: the station's commands run from its polls.
+        controller
+            .state_mut()
+            .mailbox
+            .as_mut()
+            .unwrap()
+            .enter_runtime();
         Ok(Self {
             owned: Some(Box::new(Owned {
                 controller,

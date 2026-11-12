@@ -396,17 +396,20 @@ fn rssi_events_report_crossings_like_mt7925_mcu_rssi_monitor_event() {
     assert!(super::rssi_events(&payload[..6], -70).is_empty());
 }
 #[test]
-fn late_legacy_configuration_ack_cannot_reuse_cached_poll_time() {
+fn late_legacy_configuration_ack_is_a_runtime_command_timeout() {
     if crate::test_process::isolate_model() {
         return;
     }
     let (mut driver, model) = setup();
-    assert!(matches!(
-        associated_with_configuration_delay(&mut driver, &model, 0, 600_000),
-        Err(ClientError::Station(station::Error::Timeout))
-    ));
+    // An ACK past the configuration lifetime is past the runtime command
+    // bound long before: the command ends as a timeout.
+    let result = associated_with_configuration_delay(&mut driver, &model, 0, 600_000);
+    assert!(
+        matches!(result, Err(ClientError::Transport(_))),
+        "{result:?}"
+    );
     assert_eq!(driver.phase(), ClientPhase::Quarantined);
-    assert_eq!(driver.station().phase(), station::Phase::Quarantined);
+    assert_eq!(driver.station().phase(), station::Phase::Configuring);
     drop(driver);
     assert_eq!(model.drops.load(Ordering::Relaxed), 0);
     assert!(!model.memory.lock().unwrap().mappings.is_empty());

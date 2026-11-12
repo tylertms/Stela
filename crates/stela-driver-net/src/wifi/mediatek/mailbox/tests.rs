@@ -2639,3 +2639,30 @@ fn dropped_and_surplus_events_are_freed_while_the_command_still_completes() {
     // releases.
     unsafe { mailbox.release_after_quiesce() }.unwrap();
 }
+#[test]
+fn a_runtime_command_the_firmware_never_answers_ends_within_the_runtime_bound() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    for runtime in [false, true] {
+        let response = Arc::new(Mutex::new(Response::default()));
+        let (mut mailbox, _, _, _) = setup_controlled(Chip::Mt7925, false, false, 1, response);
+        if runtime {
+            mailbox.enter_runtime();
+        }
+        let start = crate::Clock::ticks();
+        let result = mailbox.unified(mcu::runtime::Command::StationRecord, &[0; 8]);
+        let waited = crate::Clock::ticks() - start;
+        assert_eq!(result.unwrap_err().port, PortState::Uncertain);
+        assert_eq!(mailbox.last_failure().unwrap().cause, Cause::Timeout);
+        assert!(mailbox.is_poisoned());
+        // The attach waits out its 3 s; a station poll ends within a model
+        // counter read or two past the runtime bound.
+        if runtime {
+            assert!(waited >= RUNTIME_TIMEOUT_US, "{waited}");
+            assert!(waited <= RUNTIME_TIMEOUT_US + 1_000, "{waited}");
+        } else {
+            assert!(waited >= PCI_TIMEOUT_US, "{waited}");
+        }
+    }
+}

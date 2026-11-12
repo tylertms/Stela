@@ -947,7 +947,7 @@ fn modern_failed_real_configuration_keeps_current_context_and_peer() {
 }
 
 #[test]
-fn late_firmware_completion_cannot_reuse_precommand_configuration_time() {
+fn late_firmware_completion_is_a_runtime_command_timeout() {
     if crate::test_process::isolate_model() {
         return;
     }
@@ -955,18 +955,21 @@ fn late_firmware_completion_cannot_reuse_precommand_configuration_time() {
     let (mut driver, model, _) = awaiting();
     let (mut authority, _) = authority(&driver, &model);
     let permit = admit(&mut authority, &driver, AssociationUse::Configure);
-    // Real publication/ACK remains within PCI3s. Its elapsed time must
-    // nevertheless exceed the independent canonical500ms Configure lifetime.
+    // An ACK past the 500 ms Configure lifetime is past the runtime command
+    // bound long before: the command ends as a timeout.
     model.response.lock().unwrap().pause_next_index_us = 600_000;
-    assert!(matches!(
+    let result = unsafe {
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        unsafe { driver.configure_modern(&mut authority, permit, 105) },
-        Err(ClientError::Station(station::Error::Timeout))
-    ));
+        driver.configure_modern(&mut authority, permit, 105)
+    };
+    assert!(
+        matches!(result, Err(ClientError::Transport(_))),
+        "{result:?}"
+    );
     assert_eq!(driver.phase(), ClientPhase::Quarantined);
-    assert_eq!(driver.station().phase(), station::Phase::Quarantined);
-    assert_eq!(driver.completed_modern_requests(), 7);
+    assert_eq!(driver.station().phase(), station::Phase::Configuring);
+    assert_eq!(driver.completed_modern_requests(), 0);
     assert!(
         driver
             .authorize_port(driver.station().association_epoch().unwrap())
