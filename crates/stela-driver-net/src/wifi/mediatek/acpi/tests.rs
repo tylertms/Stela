@@ -112,3 +112,17 @@ fn geographic_rows_cap_dynamic_limits_by_region_and_band() {
         assert_eq!(sar.range_power(0, start, region), Some(expected));
     }
 }
+
+#[test]
+fn mtfg_maps_flags_1_and_4_to_the_clc_bits() {
+    // mt792x_acpi_get_flags: 0 off ACPI, bit 0 on it, MTFG flags 1 and 4.
+    assert_eq!(Sar::default().flags(), 0);
+    assert_eq!(Sar::default().on_acpi(None).flags(), 1);
+    assert_eq!(Sar::default().on_acpi(Some(vec![0; 7])).flags(), 1);
+    let mut mtfg = vec![0; 8];
+    mtfg.extend_from_slice(&[4, 2, 1]);
+    mtfg[6] = 2;
+    assert_eq!(Sar::default().on_acpi(Some(mtfg.clone())).flags(), 5);
+    mtfg[6] = 9;
+    assert_eq!(Sar::default().on_acpi(Some(mtfg)).flags(), 7);
+}

@@ -2,7 +2,8 @@
 // Copyright (C) 2023 MediaTek Inc.
 //! The platform tables `mt792x_acpi_sar.c` reads from the function's ACPI
 //! companion: MTCL, the countries allowed 5.9 GHz, 6 GHz and EHT operation;
-//! MTDS, the dynamic SAR power limits; and MTGS, their per-region caps.
+//! MTDS, the dynamic SAR power limits; MTGS, their per-region caps; and
+//! MTFG, the platform's flags for MT7921 and MT7922's CLC.
 //! A table that is absent or malformed is not used, as there.
 
 use alloc::vec::Vec;
@@ -28,6 +29,8 @@ const EHT_COUNTRIES: [&[u8]; 25] = [
 /// `sizeof(struct mt792x_asar_cl)` and its v3 extension.
 const MTCL_BYTES: usize = 19;
 const MTCL_V3_BYTES: usize = 26;
+/// `MT792x_ASAR_MIN_FG`.
+const MTFG_MIN_BYTES: usize = 8;
 
 /// One function's SAR tables, as `mt792x_init_acpi_sar` keeps them.
 #[derive(Clone, Debug, Default)]
@@ -37,6 +40,10 @@ pub struct Sar {
     dynamic: Option<(Vec<u8>, u8)>,
     /// MTGS and its layout version.
     geographic: Option<(Vec<u8>, u8)>,
+    /// Whether the tables were read from ACPI at all: `phy->acpisar`.
+    acpi: bool,
+    /// MTFG, when long enough.
+    flags: Option<Vec<u8>>,
 }
 
 /// `mt792x_asar_fits`: `table` holds a header of `header` bytes and its
@@ -82,7 +89,38 @@ impl Sar {
             }),
             geographic: mtgs
                 .and_then(|t| layout(&t, (6, 5), (7, 7), (3, 8)).map(|version| (t, version))),
+            acpi: false,
+            flags: None,
         }
+    }
+
+    /// The tables as `mt792x_init_acpi_sar` keeps them on an ACPI platform,
+    /// with its optional MTFG.
+    pub fn on_acpi(mut self, mtfg: Option<Vec<u8>>) -> Self {
+        self.acpi = true;
+        self.flags = mtfg.filter(|t| t.len() >= MTFG_MIN_BYTES);
+        self
+    }
+
+    /// `mt792x_acpi_get_flags`: bit 0 on an ACPI platform, and MTFG's flags
+    /// 1 and 4 as the CLC's bits 1 and 2.
+    pub fn flags(&self) -> u8 {
+        if !self.acpi {
+            return 0;
+        }
+        let Some(table) = self.flags.as_deref() else {
+            return 1;
+        };
+        // nr_flag at 6, the flags from 8, bounded by what was read.
+        let count = usize::from(table[6]);
+        table[8..]
+            .iter()
+            .take(count)
+            .fold(1, |flags, &flag| match flag {
+                1 => flags | 1 << 1,
+                4 => flags | 1 << 2,
+                _ => flags,
+            })
     }
 
     /// `mt792x_acpi_get_mtcl_conf`: bits 0-1 enable 5.9 GHz, bits 2-3 6 GHz
@@ -215,7 +253,7 @@ pub fn read(companion: Option<stela_driver_base::platform::acpi::Handle<'static>
             })
             .collect()
     };
-    Sar::new(table("MTCL"), table("MTDS"), table("MTGS"))
+    Sar::new(table("MTCL"), table("MTDS"), table("MTGS")).on_acpi(table("MTFG"))
 }
 
 #[cfg(test)]

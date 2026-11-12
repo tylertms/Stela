@@ -294,10 +294,14 @@ impl<C: 'static> Hardware<C> {
                 .capabilities()
                 .and_then(|report| report.observed().chip_flags())
                 .unwrap_or(0);
-            // SAFETY: `resource` keeps the function's policy ownership.
             // Connac3's request carries none of Connac2's ACPI, power-node or
-            // MTCL fields, and the CLC's environment is the OS's
+            // MTCL fields. `__mt7921_mcu_set_clc` sends the platform's flags
+            // and each country's MTCL configuration, MT792X_ACPI_MTCL_INVALID
+            // without one; no device tree power node exists, so its 6 GHz
+            // power type stays zero. The CLC's environment is the OS's
             // `country_ie_env`, ENVIRON_ANY.
+            let mtcl = |alpha2| self.sar.mtcl_configuration(alpha2).unwrap_or(u32::MAX);
+            // SAFETY: `resource` keeps the function's policy ownership.
             unsafe {
                 controller.execute_clc(ClcInputs {
                     alpha2: self.alpha2,
@@ -305,9 +309,9 @@ impl<C: 'static> Hardware<C> {
                     chip_capabilities,
                     power_limits_node: false,
                     power_type: 0,
-                    acpi_flags: 0,
-                    mtcl_configuration: 0,
-                    world_mtcl_configuration: 0,
+                    acpi_flags: self.sar.flags(),
+                    mtcl_configuration: mtcl(self.alpha2),
+                    world_mtcl_configuration: mtcl(*b"00"),
                 })
             }
             .await?;
