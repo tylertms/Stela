@@ -127,7 +127,7 @@ pub trait Link {
     }
     /// How long after its start the link may take to report carrier before
     /// a missing one means no cable or no network. The default is a wired
-    /// PHY's, and every link here keeps it.
+    /// PHY's; a Wi-Fi station waits for its scan, join and handshake.
     fn carrier_wait_us(&self) -> u64 {
         WIRED_CARRIER_WAIT_US
     }

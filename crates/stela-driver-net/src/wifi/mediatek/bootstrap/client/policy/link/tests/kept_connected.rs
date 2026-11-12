@@ -661,6 +661,12 @@ fn an_attached_mt7925_carries_dhcp_under_the_handshake_keys_through_the_link() {
     association.extend_from_slice(&bss.elements);
     incoming(&model, &response(0x10, &association), None, false);
     assert!(!station.carrier());
+    // The stack waits for a station's scan, join and handshake.
+    assert_eq!(
+        station.carrier_wait_us(),
+        crate::wifi::connection::keeper::CARRIER_WAIT_US
+    );
+    assert_eq!(station.carrier_wait_us(), 45_000_000);
     // Before the handshake the port is closed to data.
     let discover = dhcp_datagram([0; 4], [255; 4], 1);
     let mut ethernet = Vec::new();

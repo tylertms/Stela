@@ -260,6 +260,10 @@ const SCAN_INTERVAL_US: u64 = 5_000_000;
 const RECONNECT_US: u64 = 100_000;
 /// wpa_supplicant's 10 s authentication timeout around the handshake.
 const HANDSHAKE_TIMEOUT_US: u64 = 10_000_000;
+/// How long a station may take from its start to carrier: one whole scan,
+/// then authentication and association, then the 4-way handshake within
+/// its timeout. A wired PHY's wait would end before the scan does.
+pub const CARRIER_WAIT_US: u64 = SCAN_BUDGET_US + 5_000_000 + HANDSHAKE_TIMEOUT_US;
 /// The longest an SAE exchange may take, its commits, anti-clogging retry
 /// and confirms included: the same 10 s wpa_supplicant allows.
 const SAE_BUDGET_US: u64 = 10_000_000;
@@ -1546,6 +1550,9 @@ impl<R: Radio> Link for Keeper<R> {
     fn carrier(&mut self) -> bool {
         self.poll();
         self.lost.is_none() && self.link.carrier()
+    }
+    fn carrier_wait_us(&self) -> u64 {
+        CARRIER_WAIT_US
     }
     fn signals(&self) -> bool {
         self.lost.is_none() && self.link.signals()
