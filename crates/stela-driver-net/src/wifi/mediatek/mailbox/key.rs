@@ -148,7 +148,11 @@ impl<C: 'static> HardwareKey<C> {
     /// The old key and peer generation are removed and all RX/TX,
     /// firmware, IRQ/deferred users drained. The same physical slot remains
     /// exclusively owned; the new scope/context belongs to its real acknowledged
-    /// peer. Preserve this owner and all material history across rebinding.
+    /// peer. Preserve this owner across rebinding.
+    ///
+    /// The new association starts its own IGTK history: its handshake gives
+    /// each IGTK's IPN, so an AP's unchanged IGTK installs again with the
+    /// AP's replay floor, as mac80211 installs it on every association.
     pub(in crate::wifi::mediatek) unsafe fn rebind(
         &mut self,
         context: Context,
@@ -164,6 +168,7 @@ impl<C: 'static> HardwareKey<C> {
         let s = self.owned_mut();
         s.context = context;
         s.scope = scope;
+        s.igtk_history = [None; bip::HISTORY_CAPACITY];
         Ok(())
     }
     /// Apply canonical replay checks to a normalized vendor RX frame.

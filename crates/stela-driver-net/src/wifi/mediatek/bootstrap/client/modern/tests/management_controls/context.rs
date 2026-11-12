@@ -117,44 +117,18 @@ fn reconnect_rejects_stale_context_and_keys() {
         .unwrap();
     }
     let epoch = driver.station().association_epoch().unwrap();
-    let before = model.response.lock().unwrap().client_commands.len();
-    let log = model.bar.0.lock().unwrap().log.len();
-    let head = model.queues[&0xd4300].lock().unwrap().head;
-    let permit = admit(&mut owner, &driver, AssociationUse::Management);
-    // SAFETY: model old users were drained above. Even this fresh GTK
-    // namespace cannot revive the original IGTK with a reset replay floor.
-    assert!(matches!(
-        // SAFETY: Old peer users were drained and the new context remains held.
-        // The retired IGTK material must still be rejected before it can
-        // enter the fresh group-key namespace.
-        unsafe {
-            driver.install_management_key_modern(
-                &mut owner,
-                permit,
-                epoch,
-                4,
-                &[0x55; 16],
-                PacketNumber::new(100).unwrap(),
-            )
-        },
-        Err(ClientError::Key(mailbox::key::Error::Bip(
-            mailbox::key::bip::Error::RetiredMaterial
-        )))
-    ));
-    assert_eq!(model.response.lock().unwrap().client_commands.len(), before);
-    assert_eq!(model.bar.0.lock().unwrap().log.len(), log);
-    assert_eq!(model.queues[&0xd4300].lock().unwrap().head, head);
-    assert!(driver.state().management.is_none());
     let permit = admit(&mut owner, &driver, AssociationUse::Management);
     // SAFETY: same drained requester and authenticated model OS exchange
-    // as attach(), now supplying fresh temporal material for this association.
+    // as attach(). The AP kept its IGTK: the new association's handshake
+    // gives it again with the AP's IPN, and it installs as mac80211 installs
+    // it on every association.
     let session = unsafe {
         driver.install_management_key_modern(
             &mut owner,
             permit,
             epoch,
             4,
-            &[0x77; 16],
+            &[0x55; 16],
             PacketNumber::new(100).unwrap(),
         )
     }
