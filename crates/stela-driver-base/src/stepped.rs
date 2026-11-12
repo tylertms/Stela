@@ -52,13 +52,15 @@ pub fn poll_once<F: Future + ?Sized>(future: Pin<&mut F>) -> Poll<F::Output> {
 }
 
 /// Run `future` to completion on this CPU, stepping it until it is ready;
-/// the attach-time driver of the same work [`Stepped`] runs per poll.
+/// the attach-time driver of the same work [`Stepped`] runs per poll. Each
+/// pending step is a wait, so the [`crate::on_wait`] hook runs between steps.
 pub fn block_on<F: Future>(future: F) -> F::Output {
     let mut future = core::pin::pin!(future);
     loop {
         if let Poll::Ready(output) = poll_once(future.as_mut()) {
             return output;
         }
+        crate::waiting();
         core::hint::spin_loop();
     }
 }
