@@ -496,6 +496,12 @@ pub struct Board {
     pub clusters: Vec<CpuCluster>,
     /// The always-on eFuse block, under the same conditions.
     pub aon_fuses: Option<(u64, u64)>,
+    /// The T6020 PMGR voltage-rail leakage calibration words.
+    pub rail_calibration: Option<u64>,
+    /// Source-checked T6020 complex status and DVMR boot reads.
+    pub t6020_perf_boot: Vec<u64>,
+    /// T6020 PMGR physical ranges with unsupported register effects.
+    pub t6020_unmodeled_pmgr: Vec<(u64, u64)>,
     /// CPU/CPM energy banks selected by `hw-dpe-reg`, in absolute guest PA.
     pub energy: Vec<EnergyBank>,
     /// SOC configuration banks, bound to translated PMGR `reg` entries.
@@ -917,6 +923,9 @@ pub fn board(tree: &[u8]) -> Result<Board> {
         energy,
         clusters,
         aon_fuses,
+        rail_calibration,
+        t6020_perf_boot,
+        t6020_unmodeled_pmgr,
     } = pmgr_registers(&io, &extent, chip_id)?;
     // The native T8112 PMP image names three independent DVFS controllers.
     // Their source-checked protocol does not establish a backend.
@@ -976,6 +985,9 @@ pub fn board(tree: &[u8]) -> Result<Board> {
         t6020_memory,
         clusters,
         aon_fuses,
+        rail_calibration,
+        t6020_perf_boot,
+        t6020_unmodeled_pmgr,
         cpu_start,
         aic: InterruptController {
             physical,
