@@ -182,7 +182,12 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> Radio for Mt7925
             capabilities: local.capabilities().clone(),
             elements: local.elements().to_vec(),
             he_source_maps: *local.he_source_maps(),
-            multi_link: local.mlo().reported_supported(),
+            // Single-link: an AP MLD is joined as a legacy station on one
+            // link, with no Multi-Link element, so the firmware keeps a
+            // non-MLD BSS (group 0xff) and a single-link STA_REC, as mt7925
+            // does for a vif that is not an MLD. The two-link path stays in
+            // the client until it is proven on hardware.
+            multi_link: Some(false),
         })
     }
 
