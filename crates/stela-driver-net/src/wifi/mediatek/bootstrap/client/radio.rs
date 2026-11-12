@@ -360,6 +360,7 @@ mod tests {
     use crate::wifi::mediatek::mailbox::clc::remaining::tests::caps;
     use crate::wifi::mediatek::ring::rx::tests::device_receive;
     use crate::wifi::mediatek::ring::tests::Source;
+    use crate::wifi::stepped::block_on;
     use crate::wifi::{Band, Channel};
 
     const SIX: Channel = Channel {
@@ -466,12 +467,13 @@ mod tests {
         f.policy_bands(Chip::Mt7925, [true; 3]);
         // SAFETY: this fixture owns the real modeled controller, programmed
         // policy and firmware. No unrelated/caller-copied receipt enables it.
-        unsafe { f.controller.initialize_mac() }.unwrap();
+        unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
         // SAFETY: source-checked modeled 5GHz initial radio ownership; the
         // hardware scan command will select the independently programmed 6GHz.
-        unsafe { f.controller.start(Band::Ghz5, 36, 5180) }.unwrap();
+        unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
         // SAFETY: exact fixture-owned interface and controller resource.
-        let interface = unsafe { f.controller.register_interface(profile().interface) }.unwrap();
+        let interface =
+            unsafe { block_on(f.controller.register_interface(profile().interface)) }.unwrap();
         f.model.lock().unwrap().client_execution = true;
         let NativeFixture {
             controller,

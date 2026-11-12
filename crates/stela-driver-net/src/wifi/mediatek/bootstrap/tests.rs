@@ -14,6 +14,7 @@ use crate::wifi::mediatek::{
         tests::{Domain, Io, Memory, Source, State},
     },
 };
+use crate::wifi::stepped::block_on;
 use crate::wifi::{
     Band,
     mediatek::{
@@ -251,11 +252,13 @@ impl NativeFixture {
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
         unsafe {
-            self.controller
-                .install_with(&Source, domain, false, move |offset| {
-                    let state = states.get(&offset).unwrap().clone();
-                    let inner =
-                        if offset == 0xd4400 || offset == if is_c3 { 0xd43f0 } else { 0xd4410 } {
+            block_on(
+                self.controller
+                    .install_with(&Source, domain, false, move |offset| {
+                        let state = states.get(&offset).unwrap().clone();
+                        let inner = if offset == 0xd4400
+                            || offset == if is_c3 { 0xd43f0 } else { 0xd4410 }
+                        {
                             Inner::Tx(DeviceIo {
                                 io: Io(state),
                                 rx: states[&0xd4500].clone(),
@@ -271,21 +274,22 @@ impl NativeFixture {
                         } else {
                             Inner::Rx(Io(state))
                         };
-                    Ok(Q {
-                        inner,
-                        bar: bar.clone(),
-                        offset,
-                        runtime: states[&0xd4540].clone(),
-                        response: response.clone(),
-                    })
-                })
+                        Ok(Q {
+                            inner,
+                            bar: bar.clone(),
+                            offset,
+                            runtime: states[&0xd4540].clone(),
+                            response: response.clone(),
+                        })
+                    }),
+            )
         }
     }
     pub(crate) fn boot(&mut self, chip: Chip) {
         let requests = Requests::new(&identity(chip));
         let provider = catalog(&requests, patch_bytes(), ram(&clc_bytes(chip)));
         let prepared = requests.load(&provider).unwrap();
-        self.controller.boot(&prepared).unwrap();
+        block_on(self.controller.boot(&prepared)).unwrap();
     }
     pub(crate) fn policy(&mut self, chip: Chip) {
         self.policy_bands(chip, [true, true, false]);
@@ -323,7 +327,7 @@ impl NativeFixture {
             .chip_flags();
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        unsafe { self.controller.execute_clc(inputs(flags)) }.unwrap();
+        unsafe { block_on(self.controller.execute_clc(inputs(flags))) }.unwrap();
         let bands: [Vec<power::Channel>; 3] = core::array::from_fn(|i| {
             if enabled[i] {
                 let band = [Band::Ghz2, Band::Ghz5, Band::Ghz6][i];
@@ -365,7 +369,7 @@ impl NativeFixture {
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
         unsafe {
-            self.controller.execute_remaining(
+            block_on(self.controller.execute_remaining(
                 crate::wifi::mediatek::mailbox::clc::remaining::Inputs {
                     channel_configuration,
                     domain: domain::Inputs {
@@ -381,7 +385,7 @@ impl NativeFixture {
                         ghz6: enabled[2].then_some(&bands[2]),
                     },
                 },
-            )
+            ))
         }
         .unwrap();
     }
@@ -544,7 +548,7 @@ fn complete_source_bootstrap_owns_all_queues_and_real_runtime_transition() {
         assert_eq!(f.controller.phase(), Phase::Policy);
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        unsafe { f.controller.initialize_mac() }.unwrap();
+        unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
         let mac = f.controller.mac_observations().unwrap();
         assert_eq!(mac.wtbl.len(), 20);
         assert_eq!(mac.global_format.value & (1 << 19), 0);
@@ -555,7 +559,7 @@ fn complete_source_bootstrap_owns_all_queues_and_real_runtime_transition() {
         let n = f.model.lock().unwrap().clc_commands.len();
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        unsafe { f.controller.start(Band::Ghz5, 36, 5180) }.unwrap();
+        unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
         assert_eq!(f.controller.phase(), Phase::StartFacts);
         assert_eq!(f.model.lock().unwrap().clc_commands.len(), n);
         assert_eq!(
@@ -624,7 +628,7 @@ fn complete_source_bootstrap_owns_all_queues_and_real_runtime_transition() {
         }
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        assert!(unsafe { f.controller.start(Band::Ghz5, 36, 5180) }.is_err());
+        assert!(unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.is_err());
         f.retire();
         let drops = f.drops.clone();
         drop(f);
@@ -650,7 +654,7 @@ fn publication_failures_keep_guard_and_context() {
             }
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            assert!(unsafe { f.controller.initialize_mac() }.is_err());
+            assert!(unsafe { block_on(f.controller.initialize_mac()) }.is_err());
             assert_eq!(f.controller.phase(), Phase::Quarantined);
             let drops = f.drops.clone();
             drop(f);
@@ -704,7 +708,7 @@ fn global_and_source_per_wcid_controls_match_receive_format() {
         f.policy(chip);
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        unsafe { f.controller.initialize_mac() }.unwrap();
+        unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
         let context = Context {
             bss_index: 0,
             omac_index: 0,
@@ -723,7 +727,7 @@ fn global_and_source_per_wcid_controls_match_receive_format() {
         }
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        let interface = unsafe { f.controller.register_interface(context) }.unwrap();
+        let interface = unsafe { block_on(f.controller.register_interface(context)) }.unwrap();
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
         let disabled = unsafe { f.controller.disable_peer_translation(&interface, 1, true) };
@@ -841,7 +845,7 @@ fn composed_bootstrap_matches_source_mac_effects_and_all_initial_packet_bytes() 
             }
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            unsafe { f.controller.initialize_mac() }.unwrap();
+            unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
             let mut native = f.bar.0.lock().unwrap().log.clone();
             let global = if chip == Chip::Mt7925 { 0xe800 } else { 0xf000 };
             let with_deagg = initial(global) | (1 << 15);
@@ -864,7 +868,7 @@ fn composed_bootstrap_matches_source_mac_effects_and_all_initial_packet_bytes() 
             f.bar.0.lock().unwrap().log.clear();
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            unsafe { f.controller.start(Band::Ghz5, 36, 5180) }.unwrap();
+            unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
             assert_eq!(f.bar.0.lock().unwrap().log, counters);
             let trace = std::fs::read(root.join(alloc::format!("{id}-commands.trace"))).unwrap();
             let mut at = 0;
@@ -909,7 +913,7 @@ fn all_images_boot_the_full_native_layout_before_source_initialization() {
             std::fs::read(images.join(chip.ram_name())).unwrap(),
         );
         let prepared = requests.load(&provider).unwrap();
-        f.controller.boot(&prepared).unwrap();
+        block_on(f.controller.boot(&prepared)).unwrap();
         drop(prepared);
         drop(provider);
         assert!(
@@ -924,10 +928,10 @@ fn all_images_boot_the_full_native_layout_before_source_initialization() {
         f.policy(chip);
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        unsafe { f.controller.initialize_mac() }.unwrap();
+        unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        unsafe { f.controller.start(Band::Ghz5, 36, 5180) }.unwrap();
+        unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
         f.retire();
     }
 }
@@ -967,13 +971,13 @@ fn missing_live_rfkill_service_refuses_start_before_any_radio_command() {
         f.policy(chip);
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
-        unsafe { f.controller.initialize_mac() }.unwrap();
+        unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
         let count = f.model.lock().unwrap().initial_commands.len();
         let reg = f.model.lock().unwrap().regulatory_commands.len();
         assert!(matches!(
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            unsafe { f.controller.start(Band::Ghz5, 36, 5180) },
+            unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) },
             Err(BootError::RequiredRfkill)
         ));
         assert_eq!(f.controller.phase(), Phase::Mac);
@@ -993,7 +997,7 @@ fn wrong_prepared_input_refuses_before_restart_or_firmware_mutation() {
     let provider = catalog(&r, patch_bytes(), ram(&clc_bytes(Chip::Mt7925)));
     let p = r.load(&provider).unwrap();
     assert!(matches!(
-        f.controller.boot(&p),
+        block_on(f.controller.boot(&p)),
         Err(BootError::WrongFirmware)
     ));
     assert_eq!(f.controller.phase(), Phase::Queues);
@@ -1014,5 +1018,36 @@ fn a_late_power_on_report_still_downloads_as_linux_does() {
     f.boot(Chip::Mt7925);
     assert!(f.controller.firmware_power_late());
     assert_eq!(f.controller.phase(), Phase::Firmware);
+    f.retire();
+}
+
+/// The whole bring-up, firmware download included, runs in steps of one
+/// register read or one command, each within a recovery step's bound on
+/// the model's clock.
+#[test]
+fn every_bring_up_step_fits_a_recovery_step() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let mut f = NativeFixture::new(Chip::Mt7925);
+    crate::wifi::stepped::longest::take();
+    f.install().unwrap();
+    f.boot(Chip::Mt7925);
+    f.policy(Chip::Mt7925);
+    // SAFETY: the model device, its pages and its domain belong to this test alone; no other
+    // driver, worker or DMA touches them.
+    unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
+    // SAFETY: as above.
+    unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
+    let context = crate::wifi::mediatek::bootstrap::client::tests::profile().interface;
+    // SAFETY: as above.
+    let interface = unsafe { block_on(f.controller.register_interface(context)) }.unwrap();
+    let longest = crate::wifi::stepped::longest::take();
+    assert!(longest > 0);
+    assert!(
+        longest <= crate::wifi::connection::keeper::RECOVERY_STEP_US,
+        "{longest} us"
+    );
+    drop(interface);
     f.retire();
 }

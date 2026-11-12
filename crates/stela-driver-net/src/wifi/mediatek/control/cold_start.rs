@@ -4,7 +4,7 @@
 //! Initial MT7925 WLAN reset from Linux mt792x_wfsys_reset_default. This private
 //! install step provides neither runtime recovery nor shared reset permission.
 use super::{BarIo, Control, Error, Observation};
-use crate::wifi::mediatek::identity::Chip;
+use crate::wifi::{mediatek::identity::Chip, stepped::until};
 
 const WFSYS: u32 = 0x7c000140;
 const RESET_B: u32 = 1;
@@ -16,7 +16,7 @@ impl<I: BarIo> Control<I> {
     /// any rings/engine publication, with no old WLAN firmware/DMA/IRQ users.
     /// External shared power/reset operations still require retirement of all
     /// affected functions; this WLAN observation grants no such permission.
-    pub(in crate::wifi::mediatek) unsafe fn initial_wfsys_reset(
+    pub(in crate::wifi::mediatek) async unsafe fn initial_wfsys_reset(
         &mut self,
     ) -> Result<Observation, Error> {
         self.guard(true)?;
@@ -27,9 +27,9 @@ impl<I: BarIo> Control<I> {
         // also enters terminal quarantine before the first ownership request.
         self.initial_reset_attempted = true;
         self.dma_stopped = false;
-        let result = (|| {
+        let result = async {
             self.modify(WFSYS, RESET_B, 0)?;
-            self.clock.delay(50_000);
+            until(self.clock.deadline(50_000)).await;
             self.modify(WFSYS, 0, RESET_B)?;
             // __mt76_poll_msec(..., 500) uses tick=10. The donor's do/while
             // performs 51 reads and sleeps after every failed read, including
@@ -43,7 +43,7 @@ impl<I: BarIo> Control<I> {
                         reads,
                     });
                 }
-                self.clock.delay(10_000);
+                until(self.clock.deadline(10_000)).await;
                 if reads == 51 {
                     return Err(Error::Timeout {
                         address: WFSYS,
@@ -54,7 +54,8 @@ impl<I: BarIo> Control<I> {
                 }
             }
             unreachable!("the final failed observation returns above")
-        })();
+        }
+        .await;
         self.finish(result)
     }
 }
@@ -64,6 +65,7 @@ mod tests {
     extern crate std;
     use super::*;
     use crate::wifi::mediatek::registers::{self, Registers};
+    use crate::wifi::stepped::block_on;
     use alloc::vec::Vec;
 
     struct Model {
@@ -142,13 +144,13 @@ mod tests {
     fn run(c: &mut Control<Model>) -> Result<Observation, Error> {
         // SAFETY: the model device, its pages and its domain belong to this test alone; no other
         // driver, worker or DMA touches them.
-        unsafe { c.initial_wfsys_reset() }
+        unsafe { block_on(c.initial_wfsys_reset()) }
     }
     #[test]
     fn initial_reset_ack_boundaries_preserve_bits_and_real_clock_delays() {
         for ack in [Some(1), Some(2), Some(50), Some(51), Some(52), None] {
             let mut c = setup(Chip::Mt7925, 0xa5a50011, ack);
-            c.driver_own(false).unwrap();
+            block_on(c.driver_own(false)).unwrap();
             let start = c.clock.now_us();
             let result = run(&mut c);
             let end = c.clock.now_us();
@@ -212,7 +214,7 @@ mod tests {
             assert_eq!(run(&mut c), Err(Error::NotDriverOwned));
             assert!(c.registers.test_io().log.is_empty());
             if chip != Chip::Mt7925 {
-                c.driver_own(false).unwrap();
+                block_on(c.driver_own(false)).unwrap();
                 assert_eq!(run(&mut c), Err(Error::InitialResetRefused));
                 assert!(c.registers.test_io().log.iter().all(|v| v.1 != 0xf0140));
             }
@@ -220,18 +222,18 @@ mod tests {
         // Two RMWs and the first poll: fail every MMIO boundary.
         for fail in 1..=5 {
             let mut c = setup(Chip::Mt7925, 0, Some(1));
-            c.driver_own(false).unwrap();
+            block_on(c.driver_own(false)).unwrap();
             let io = c.registers.test_io();
             io.fail_at = Some(io.log.len() + fail);
             assert!(matches!(run(&mut c), Err(Error::Register(_))));
             assert!(c.is_poisoned());
             let n = c.registers.test_io().log.len();
             assert_eq!(run(&mut c), Err(Error::Poisoned));
-            assert_eq!(c.stop_dma(true), Err(Error::Poisoned));
+            assert_eq!(block_on(c.stop_dma(true)), Err(Error::Poisoned));
             assert_eq!(c.registers.test_io().log.len(), n);
         }
         let mut c = setup(Chip::Mt7925, 0, Some(1));
-        c.driver_own(false).unwrap();
+        block_on(c.driver_own(false)).unwrap();
         c.registers.test_io().unavailable = true;
         assert_eq!(run(&mut c), Err(Error::Unavailable { address: WFSYS }));
         assert!(c.is_poisoned());
@@ -254,7 +256,7 @@ mod tests {
             let polls: u32 = fields[3].parse().unwrap();
             let wait: u64 = fields[4].parse().unwrap();
             let mut c = setup(Chip::Mt7925, initial, (ack != 0).then_some(ack));
-            c.driver_own(false).unwrap();
+            block_on(c.driver_own(false)).unwrap();
             let start = c.clock.now_us();
             let result = run(&mut c);
             assert!(c.clock.now_us() - start >= wait);

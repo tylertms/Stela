@@ -10,6 +10,7 @@ use crate::wifi::mediatek::ring::tests::Source;
 use crate::wifi::regulatory as reg;
 use crate::wifi::station::phy::{Mode, Width};
 use crate::wifi::station::wire::{AssociationRequest, six_ghz::tests::selected};
+use crate::wifi::stepped::block_on;
 use crate::wifi::{Band, Channel};
 use alloc::rc::Rc;
 use core::cell::Cell;
@@ -116,11 +117,12 @@ fn six_setup() -> (Client<Bar, Q, NativeGuard>, Model) {
     f.boot(Chip::Mt7925);
     f.policy_bands(Chip::Mt7925, [true; 3]);
     // SAFETY: this fixture owns the modeled controller, policy and firmware.
-    unsafe { f.controller.initialize_mac() }.unwrap();
+    unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
     // SAFETY: modeled initial radio ownership, as the 6 GHz scan test uses.
-    unsafe { f.controller.start(Band::Ghz5, 36, 5180) }.unwrap();
+    unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
     // SAFETY: exact fixture-owned interface and controller resource.
-    let interface = unsafe { f.controller.register_interface(profile().interface) }.unwrap();
+    let interface =
+        unsafe { block_on(f.controller.register_interface(profile().interface)) }.unwrap();
     f.model.lock().unwrap().client_execution = true;
     let NativeFixture {
         controller,

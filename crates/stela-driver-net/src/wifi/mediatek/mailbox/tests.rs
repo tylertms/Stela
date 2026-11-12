@@ -7,6 +7,7 @@ use super::super::{
     },
 };
 use super::*;
+use crate::wifi::stepped::block_on;
 extern crate std;
 use alloc::sync::Arc;
 use std::sync::Mutex;
@@ -743,7 +744,7 @@ fn full_prepared_download_uses_real_tx_and_rx_iova_memory_for_every_chip() {
         let provider = catalog(&requests, patch_bytes(), ram_bytes());
         let prepared = requests.load(&provider).unwrap();
         let mut engine = Downloader::new(mailbox);
-        let report = engine.download(&prepared).unwrap();
+        let report = block_on(engine.download(&prepared)).unwrap();
         assert_eq!(report.patch, PatchState::Uploaded);
         assert_eq!(report.release, ReleaseState::Released);
         assert!(report.firmware_start_acknowledged);
@@ -880,7 +881,7 @@ fn boot_and_runtime_share_one_dma_sequence() {
         let provider = catalog(&requests, patch_bytes(), ram_bytes());
         let prepared = requests.load(&provider).unwrap();
         let mut downloader = Downloader::new(mailbox);
-        downloader.download(&prepared).unwrap();
+        block_on(downloader.download(&prepared)).unwrap();
         let mut mailbox = downloader.into_transport();
         let mut sequence = wm.lock().unwrap().completed.last().unwrap()[39];
         assert_eq!(mailbox.replies().len(), 6);
@@ -1100,7 +1101,7 @@ fn exact_firmware_target_is_checked_before_the_first_mcu_command() {
     let provider = catalog(&wrong, patch_bytes(), ram_bytes());
     let prepared = wrong.load(&provider).unwrap();
     let mut downloader = Downloader::new(m);
-    let error = downloader.download(&prepared).unwrap_err();
+    let error = block_on(downloader.download(&prepared)).unwrap_err();
     assert_eq!(error.stage, Stage::FirmwareTarget);
     assert_eq!(error.failure.kind, FailureKind::FirmwareTarget);
     assert_eq!(error.failure.port, PortState::Usable);
@@ -1168,8 +1169,7 @@ fn pinned_download_crosses_owned_dma_and_mcu_event_path() {
         let prepared = requests.load(&provider).unwrap();
         let mut downloader = Downloader::new(m);
         assert!(
-            downloader
-                .download(&prepared)
+            block_on(downloader.download(&prepared))
                 .unwrap()
                 .firmware_start_acknowledged
         );
@@ -1621,7 +1621,7 @@ fn an_interface_rebinds_its_slots_to_a_station_mld_link_address() {
     let context = initial_context(Chip::Mt7925, 0);
     // SAFETY: modeled exclusive interface resources with no earlier users.
     let mut interface = unsafe { Interface::claim(&mailbox, context, ()) }.unwrap();
-    interface.activate(&mut mailbox).unwrap();
+    block_on(interface.activate(&mut mailbox)).unwrap();
     let link = super::super::mcu::device::Context {
         address: crate::Mac([2, 0xa, 0, 0, 0, 1]),
         ..context
@@ -1677,7 +1677,7 @@ fn native_initial_interface_requires_both_real_commands_and_later_user_drain() {
         let mut interface =
             unsafe { Interface::claim(&mailbox, context, KeyResource(drops.clone())) }.unwrap();
         assert!(interface.registered_context().is_none());
-        interface.activate(&mut mailbox).unwrap();
+        block_on(interface.activate(&mut mailbox)).unwrap();
         assert_eq!(interface.registered_context(), Some(context));
         assert!(response.lock().unwrap().device_active);
         assert!(response.lock().unwrap().bss_active);
@@ -1689,7 +1689,7 @@ fn native_initial_interface_requires_both_real_commands_and_later_user_drain() {
                 .collect::<Vec<_>>(),
             vec![Step::ActivateDevice, Step::ActivateBss]
         );
-        assert!(interface.activate(&mut mailbox).is_err());
+        assert!(block_on(interface.activate(&mut mailbox)).is_err());
         let receipt = interface.deactivate(&mut mailbox).unwrap();
         assert!(interface.registered_context().is_none());
         assert!(interface.needs_drain());
@@ -1773,7 +1773,7 @@ fn partial_initial_registration_or_uncertain_publication_keeps_contexts() {
             if case == 6 {
                 wm.lock().unwrap().fail_publish = true;
             }
-            assert!(interface.activate(&mut mailbox).is_err());
+            assert!(block_on(interface.activate(&mut mailbox)).is_err());
             assert!(interface.registered_context().is_none());
             assert!(interface.is_quarantined());
             if case < 6 {
@@ -1783,7 +1783,7 @@ fn partial_initial_registration_or_uncertain_publication_keeps_contexts() {
                 assert!(response.lock().unwrap().bss_active);
             }
             let published = wm.lock().unwrap().completed.len();
-            assert!(interface.activate(&mut mailbox).is_err());
+            assert!(block_on(interface.activate(&mut mailbox)).is_err());
             assert_eq!(wm.lock().unwrap().completed.len(), published);
             if case < 2 {
                 assert_eq!(
@@ -1831,14 +1831,14 @@ fn source_already_inactive_applies_only_to_bss_deactivation() {
                 response.lock().unwrap().bss_status = 0xc0000001;
             }
             assert!(matches!(
-                interface.activate(&mut mailbox),
+                block_on(interface.activate(&mut mailbox)),
                 Err(Dev::Firmware {
                     status: 0xc0000001,
                     ..
                 })
             ));
         } else {
-            interface.activate(&mut mailbox).unwrap();
+            block_on(interface.activate(&mut mailbox)).unwrap();
             if case == 2 {
                 response.lock().unwrap().bss_status = 0xc0000001;
             } else {
@@ -1908,11 +1908,11 @@ fn owner_receipt_survives_wrong_controller() {
         )
     }
     .unwrap();
-    assert_eq!(first.activate(&mut b), Err(Dev::WrongMailbox));
+    assert_eq!(block_on(first.activate(&mut b)), Err(Dev::WrongMailbox));
     assert!(awm.lock().unwrap().completed.is_empty());
     assert!(bwm.lock().unwrap().completed.is_empty());
-    first.activate(&mut a).unwrap();
-    second.activate(&mut b).unwrap();
+    block_on(first.activate(&mut a)).unwrap();
+    block_on(second.activate(&mut b)).unwrap();
     let own = first.deactivate(&mut a).unwrap();
     let other = second.deactivate(&mut b).unwrap();
     assert_eq!(
@@ -2118,8 +2118,7 @@ fn pinned_firmware_and_linux_capability_reports_cross_native_dma_query() {
         let prepared = requests.load(&provider).unwrap();
         let mut downloader = Downloader::new(mailbox);
         assert!(
-            downloader
-                .download(&prepared)
+            block_on(downloader.download(&prepared))
                 .unwrap()
                 .firmware_start_acknowledged
         );
@@ -2386,8 +2385,7 @@ fn images_and_eeprom_source_reports_cross_native_dma_with_kept_clc_owner() {
         let auxiliary = prepared.retain_auxiliary();
         let mut downloader = Downloader::new(mailbox);
         assert!(
-            downloader
-                .download(&prepared)
+            block_on(downloader.download(&prepared))
                 .unwrap()
                 .firmware_start_acknowledged
         );
@@ -2444,7 +2442,7 @@ fn native_download_binding_keeps_inputs_and_separate_skipped_patch_outcome() {
             let prepared = requests.load(&provider).unwrap();
             let auxiliary = prepared.retain_auxiliary();
             let patch_hash = prepared.patch_image().sha256();
-            mailbox.download_with_binding(&prepared).unwrap();
+            block_on(mailbox.download_with_binding(&prepared)).unwrap();
             drop(prepared);
             drop(provider);
             let binding = mailbox.download_binding().unwrap();
@@ -2513,7 +2511,8 @@ fn failed_native_bound_download_keeps_uncertain_owner_without_any_binding() {
     let requests = Requests::new(&identity(Chip::Mt7922));
     let provider = catalog(&requests, patch_bytes(), ram_bytes());
     let prepared = requests.load(&provider).unwrap();
-    let firmware::Error::Protocol(error) = mailbox.download_with_binding(&prepared).unwrap_err()
+    let firmware::Error::Protocol(error) =
+        block_on(mailbox.download_with_binding(&prepared)).unwrap_err()
     else {
         panic!("actual protocol failure")
     };
@@ -2525,7 +2524,7 @@ fn failed_native_bound_download_keeps_uncertain_owner_without_any_binding() {
     assert!(mailbox.is_poisoned());
     let count = wm.lock().unwrap().completed.len();
     assert_eq!(
-        mailbox.download_with_binding(&prepared).unwrap_err(),
+        block_on(mailbox.download_with_binding(&prepared)).unwrap_err(),
         firmware::Error::NotFresh
     );
     assert_eq!(wm.lock().unwrap().completed.len(), count);
@@ -2546,7 +2545,8 @@ fn bound_download_checks_native_identity_before_commands_and_raw_boot_invalidate
     let provider = catalog(&requests, patch_bytes(), ram_bytes());
     let prepared = requests.load(&provider).unwrap();
     let (mut wrong, wm, fwdl, _) = setup(Chip::Mt7922, true, false, 0);
-    let firmware::Error::Protocol(error) = wrong.download_with_binding(&prepared).unwrap_err()
+    let firmware::Error::Protocol(error) =
+        block_on(wrong.download_with_binding(&prepared)).unwrap_err()
     else {
         panic!("actual native target check")
     };
@@ -2558,14 +2558,14 @@ fn bound_download_checks_native_identity_before_commands_and_raw_boot_invalidate
     // SAFETY: modeled requester stopped despite no submitted command.
     unsafe { wrong.release_after_quiesce() }.unwrap();
     let (mut mailbox, _, _, _) = setup(chip, true, false, 0);
-    mailbox.download_with_binding(&prepared).unwrap();
+    block_on(mailbox.download_with_binding(&prepared)).unwrap();
     assert!(mailbox.download_binding().is_some());
     mailbox
         .command(Command::PatchSemaphore as u8, &0u32.to_le_bytes())
         .unwrap();
     assert!(mailbox.download_binding().is_none());
     assert_eq!(
-        mailbox.download_with_binding(&prepared).unwrap_err(),
+        block_on(mailbox.download_with_binding(&prepared)).unwrap_err(),
         firmware::Error::NotFresh
     );
     assert!(mailbox.download_binding().is_none());
@@ -2589,7 +2589,7 @@ fn pinned_downloads_bind_same_owned_clc_input_past_provider_lifetime() {
         );
         let prepared = requests.load(&provider).unwrap();
         let auxiliary = prepared.retain_auxiliary();
-        mailbox.download_with_binding(&prepared).unwrap();
+        block_on(mailbox.download_with_binding(&prepared)).unwrap();
         drop(prepared);
         drop(provider);
         let binding = mailbox.download_binding().unwrap();

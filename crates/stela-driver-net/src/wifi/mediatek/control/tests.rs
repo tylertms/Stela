@@ -1,5 +1,6 @@
 use super::*;
 use crate::wifi::mediatek::identity::Chip;
+use crate::wifi::stepped::block_on;
 use alloc::{collections::BTreeMap, vec::Vec};
 extern crate std;
 
@@ -101,7 +102,7 @@ fn a_captured_interrupt_is_acknowledged_with_the_vector_quiet() {
         .insert(MT_WFDMA0_HOST_INT_STA, 1 << 29 | 1 << 2 | 1 << 31);
     m.registers.insert(MT_MCU_CMD, 1);
     let mut c = setup(Chip::Mt7925, m);
-    c.driver_own(false).unwrap();
+    block_on(c.driver_own(false)).unwrap();
     c.open_interrupts().unwrap();
     let start = c.registers.test_io().operations.len();
     c.capture_interrupts().unwrap();
@@ -134,12 +135,12 @@ fn ownership_ack_and_dma_idle_precede_scheduler_reset_writes() {
             m.registers.insert(MT_WFDMA0_GLO_CFG, 0x5a228055 | BUSY);
             m.busy_reads = Some(2);
             let mut c = setup(chip, m);
-            assert_eq!(c.stop_dma(force), Err(Error::NotDriverOwned));
+            assert_eq!(block_on(c.stop_dma(force)), Err(Error::NotDriverOwned));
             assert!(c.registers.test_io().operations.is_empty());
-            let own = c.driver_own(false).unwrap();
+            let own = block_on(c.driver_own(false)).unwrap();
             assert_eq!(own.attempts, 1);
             assert_eq!(own.status.value & 4, 0);
-            let stopped = c.stop_dma(force).unwrap();
+            let stopped = block_on(c.stop_dma(force)).unwrap();
             assert!(stopped.status.reads >= 3);
             assert_eq!(stopped.status.value & (DISABLE | BUSY), 0);
             let io = &c.registers.test_io();
@@ -176,7 +177,7 @@ fn ownership_retries_bound_attempts_and_never_proceed_on_timeout() {
                 ..Model::default()
             },
         );
-        let result = c.driver_own(true);
+        let result = block_on(c.driver_own(true));
         if accept.is_some() {
             assert_eq!(result.unwrap().attempts, 3);
         } else {
@@ -191,8 +192,8 @@ fn ownership_retries_bound_attempts_and_never_proceed_on_timeout() {
             ));
             assert_eq!(c.registers.test_io().attempts, 10);
             let count = c.registers.test_io().operations.len();
-            assert_eq!(c.stop_dma(true), Err(Error::Poisoned));
-            assert_eq!(c.driver_own(false), Err(Error::Poisoned));
+            assert_eq!(block_on(c.stop_dma(true)), Err(Error::Poisoned));
+            assert_eq!(block_on(c.driver_own(false)), Err(Error::Poisoned));
             assert_eq!(c.registers.test_io().operations.len(), count);
         }
     }
@@ -200,8 +201,8 @@ fn ownership_retries_bound_attempts_and_never_proceed_on_timeout() {
 #[test]
 fn firmware_ownership_precedes_the_driver_s_and_bounds_its_attempts() {
     let mut c = setup(Chip::Mt7925, Model::default());
-    assert_eq!(c.firmware_own().unwrap().value & 4, 4);
-    assert_eq!(c.driver_own(false).unwrap().attempts, 1);
+    assert_eq!(block_on(c.firmware_own()).unwrap().value & 4, 4);
+    assert_eq!(block_on(c.driver_own(false)).unwrap().attempts, 1);
     let mut m = Model {
         ignore_write: Some(0xe0010),
         ..Model::default()
@@ -209,7 +210,7 @@ fn firmware_ownership_precedes_the_driver_s_and_bounds_its_attempts() {
     m.registers.insert(0xe0010, 0);
     let mut c = setup(Chip::Mt7925, m);
     assert!(matches!(
-        c.firmware_own(),
+        block_on(c.firmware_own()),
         Err(Error::Timeout {
             address: MT_CONN_ON_LPCTL,
             mask: 4,
@@ -219,7 +220,7 @@ fn firmware_ownership_precedes_the_driver_s_and_bounds_its_attempts() {
     ));
     let requests = c.registers.test_io().operations.iter();
     assert_eq!(requests.filter(|&&op| op == (1, 0xe0010, 1)).count(), 10);
-    assert_eq!(c.driver_own(false), Err(Error::Poisoned));
+    assert_eq!(block_on(c.driver_own(false)), Err(Error::Poisoned));
 }
 #[test]
 fn identity_registers_read_through_the_remap_and_restore_it() {
@@ -237,8 +238,8 @@ fn identity_registers_read_through_the_remap_and_restore_it() {
         ]);
         let mut c = setup(chip, m);
         assert_eq!(c.identity_registers(), Err(Error::NotDriverOwned));
-        c.firmware_own().unwrap();
-        c.driver_own(false).unwrap();
+        block_on(c.firmware_own()).unwrap();
+        block_on(c.driver_own(false)).unwrap();
         let bound = (chip == Chip::Mt7921).then_some(0x7f);
         assert_eq!(c.identity_registers(), Ok((0x0001_7961, 0x8a10, bound)));
         let io = c.registers.test_io();
@@ -259,9 +260,9 @@ fn stuck_dma_never_resets_or_releases_unknown_owned_resources() {
     };
     m.registers.insert(MT_WFDMA0_GLO_CFG, 0x5a228055 | BUSY);
     let mut c = setup(Chip::Mt7925, m);
-    c.driver_own(false).unwrap();
+    block_on(c.driver_own(false)).unwrap();
     assert!(matches!(
-        c.stop_dma(true),
+        block_on(c.stop_dma(true)),
         Err(Error::Timeout {
             address: MT_WFDMA0_GLO_CFG,
             mask: BUSY,
@@ -281,8 +282,8 @@ fn stuck_dma_never_resets_or_releases_unknown_owned_resources() {
 #[test]
 fn every_ownership_and_stop_io_failure_poison_the_control_epoch() {
     let mut good = setup(Chip::Mt7921, Model::default());
-    good.driver_own(false).unwrap();
-    good.stop_dma(true).unwrap();
+    block_on(good.driver_own(false)).unwrap();
+    block_on(good.stop_dma(true)).unwrap();
     let accesses = good.registers.test_io().operations.len();
     for fail_at in 1..=accesses {
         let mut c = setup(
@@ -292,7 +293,7 @@ fn every_ownership_and_stop_io_failure_poison_the_control_epoch() {
                 ..Model::default()
             },
         );
-        let result = c.driver_own(false).and_then(|_| c.stop_dma(true));
+        let result = block_on(c.driver_own(false)).and_then(|_| block_on(c.stop_dma(true)));
         assert_eq!(
             result,
             Err(Error::Register(registers::Error::AccessFailed)),
@@ -300,7 +301,7 @@ fn every_ownership_and_stop_io_failure_poison_the_control_epoch() {
         );
         assert!(c.is_poisoned());
         let count = c.registers.test_io().operations.len();
-        assert_eq!(c.poll_n9_ready(), Err(Error::Poisoned));
+        assert_eq!(block_on(c.poll_n9_ready()), Err(Error::Poisoned));
         assert_eq!(c.registers.test_io().operations.len(), count);
     }
 }
@@ -310,8 +311,8 @@ fn power_and_n9_observations_do_not_synthesize_ready_from_all_ones_or_elapsed_ti
         let mut m = Model::default();
         m.registers.insert(0xe00f0, state);
         let mut c = setup(Chip::Mt7925, m);
-        c.driver_own(false).unwrap();
-        let ready = c.poll_n9_ready();
+        block_on(c.driver_own(false)).unwrap();
+        let ready = block_on(c.poll_n9_ready());
         if state == 3 {
             assert_eq!(ready.unwrap().value, 3);
         } else if state == u32::MAX {
@@ -333,14 +334,17 @@ fn power_and_n9_observations_do_not_synthesize_ready_from_all_ones_or_elapsed_ti
         }
     }
     let mut c = setup(Chip::Mt7922, Model::default());
-    c.driver_own(false).unwrap();
-    assert_eq!(c.poll_firmware_power_on().unwrap().unwrap().value, 1);
+    block_on(c.driver_own(false)).unwrap();
+    assert_eq!(
+        block_on(c.poll_firmware_power_on()).unwrap().unwrap().value,
+        1
+    );
     // mt792x_load_firmware warns and downloads anyway: a late MCU is no
     // failure, and the control stays driver-owned and usable.
     c.registers.test_io().registers.insert(0xe00f0, 3);
-    assert_eq!(c.poll_firmware_power_on(), Ok(None));
+    assert_eq!(block_on(c.poll_firmware_power_on()), Ok(None));
     assert!(!c.is_poisoned());
-    assert_eq!(c.poll_n9_ready().unwrap().value, 3);
+    assert_eq!(block_on(c.poll_n9_ready()).unwrap().value, 3);
 }
 #[test]
 fn unavailable_control_and_zero_clock_fail_before_fabricating_ownership() {
@@ -349,7 +353,7 @@ fn unavailable_control_and_zero_clock_fail_before_fabricating_ownership() {
     m.own_at_attempt = None;
     let mut c = setup(Chip::Mt7921, m);
     assert_eq!(
-        c.driver_own(false),
+        block_on(c.driver_own(false)),
         Err(Error::Unavailable {
             address: MT_CONN_ON_LPCTL
         })
@@ -407,8 +411,8 @@ fn unchanged_pinned_ownership_and_disable_helpers_match_register_effects() {
         assert_eq!(at, bytes.len());
         for chip in [Chip::Mt7921, Chip::Mt7922, Chip::Mt7925] {
             let mut c = setup(chip, Model::default());
-            c.driver_own(false).unwrap();
-            c.stop_dma(force).unwrap();
+            block_on(c.driver_own(false)).unwrap();
+            block_on(c.stop_dma(force)).unwrap();
             assert_eq!(c.polls, polls);
             let mut actual = core::mem::take(&mut c.registers.test_io().operations);
             // Stela additionally flushes the final posted write; this is
@@ -424,11 +428,11 @@ fn polling_start_uses_chip_prefetch_and_index_reset_with_all_irq_sources_masked(
         let mut c = setup(chip, Model::default());
         // SAFETY: isolated register-algorithm fixture, no DMA hardware.
         assert_eq!(unsafe { c.start_dma_polling() }, Err(Error::NotDriverOwned));
-        c.driver_own(false).unwrap();
+        block_on(c.driver_own(false)).unwrap();
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
         assert_eq!(unsafe { c.start_dma_polling() }, Err(Error::DmaNotStopped));
-        c.stop_dma(true).unwrap();
+        block_on(c.stop_dma(true)).unwrap();
         let start = c.registers.test_io().operations.len();
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
@@ -474,8 +478,8 @@ fn unsupported_dma_mode_and_ignored_control_stores_never_check_start() {
         (0xd4204, 1),
     ] {
         let mut c = setup(Chip::Mt7925, Model::default());
-        c.driver_own(false).unwrap();
-        c.stop_dma(true).unwrap();
+        block_on(c.driver_own(false)).unwrap();
+        block_on(c.stop_dma(true)).unwrap();
         let old = c
             .registers
             .test_io()
@@ -512,9 +516,9 @@ fn unsupported_dma_mode_and_ignored_control_stores_never_check_start() {
             ..Model::default()
         },
     );
-    c.driver_own(false).unwrap();
+    block_on(c.driver_own(false)).unwrap();
     assert!(matches!(
-        c.stop_dma(true),
+        block_on(c.stop_dma(true)),
         Err(Error::Readback {
             address: MT_WFDMA0_GLO_CFG,
             expected: 0,
@@ -523,8 +527,8 @@ fn unsupported_dma_mode_and_ignored_control_stores_never_check_start() {
     ));
     assert!(!c.dma_stopped);
     let mut c = setup(Chip::Mt7921, Model::default());
-    c.driver_own(false).unwrap();
-    c.stop_dma(true).unwrap();
+    block_on(c.driver_own(false)).unwrap();
+    block_on(c.stop_dma(true)).unwrap();
     c.registers.test_io().ignore_write = Some(MT_WFDMA0_GLO_CFG);
     assert!(matches!(
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
@@ -541,8 +545,8 @@ fn unsupported_dma_mode_and_ignored_control_stores_never_check_start() {
 fn every_dma_start_publication_failure_poison_context_without_retry() {
     for chip in [Chip::Mt7921, Chip::Mt7925] {
         let mut c = setup(chip, Model::default());
-        c.driver_own(false).unwrap();
-        c.stop_dma(true).unwrap();
+        block_on(c.driver_own(false)).unwrap();
+        block_on(c.stop_dma(true)).unwrap();
         let initial = c.registers.test_io().operations.len();
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
@@ -550,8 +554,8 @@ fn every_dma_start_publication_failure_poison_context_without_retry() {
         let end = c.registers.test_io().operations.len();
         for fail_at in initial + 1..=end {
             let mut c = setup(chip, Model::default());
-            c.driver_own(false).unwrap();
-            c.stop_dma(true).unwrap();
+            block_on(c.driver_own(false)).unwrap();
+            block_on(c.stop_dma(true)).unwrap();
             c.registers.test_io().fail_at = Some(fail_at);
             assert_eq!(
                 // SAFETY: the model device, its pages and its domain belong to this test alone;
@@ -565,7 +569,7 @@ fn every_dma_start_publication_failure_poison_context_without_retry() {
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
             assert_eq!(unsafe { c.start_dma_polling() }, Err(Error::Poisoned));
-            assert_eq!(c.stop_dma(true), Err(Error::Poisoned));
+            assert_eq!(block_on(c.stop_dma(true)), Err(Error::Poisoned));
             assert_eq!(c.registers.test_io().operations.len(), count);
         }
     }
@@ -604,8 +608,8 @@ fn unchanged_pinned_prefetch_and_enable_match_except_explicit_polling_irq_policy
         );
         expected.truncate(count - 3);
         let mut c = setup(chip, Model::default());
-        c.driver_own(false).unwrap();
-        c.stop_dma(true).unwrap();
+        block_on(c.driver_own(false)).unwrap();
+        block_on(c.stop_dma(true)).unwrap();
         let initial = c.registers.test_io().operations.len();
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.

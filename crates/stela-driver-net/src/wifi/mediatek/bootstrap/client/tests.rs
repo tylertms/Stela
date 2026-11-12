@@ -13,6 +13,7 @@ use crate::wifi::mediatek::{
         tests::{Memory, Source},
     },
 };
+use crate::wifi::stepped::block_on;
 use crate::wifi::{Band, mediatek::bootstrap::Error as BootError};
 use crate::{
     Mac,
@@ -133,13 +134,14 @@ pub(crate) fn setup() -> (Client<Bar, Q, NativeGuard>, Model) {
     f.policy(Chip::Mt7925);
     // SAFETY: the model device, its pages and its domain belong to this test alone; no other
     // driver, worker or DMA touches them.
-    unsafe { f.controller.initialize_mac() }.unwrap();
+    unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
     // SAFETY: the model device, its pages and its domain belong to this test alone; no other
     // driver, worker or DMA touches them.
-    unsafe { f.controller.start(Band::Ghz5, 36, 5180) }.unwrap();
+    unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
     // SAFETY: the model device, its pages and its domain belong to this test alone; no other
     // driver, worker or DMA touches them.
-    let interface = unsafe { f.controller.register_interface(profile().interface) }.unwrap();
+    let interface =
+        unsafe { block_on(f.controller.register_interface(profile().interface)) }.unwrap();
     f.model.lock().unwrap().client_execution = true;
     f.model.lock().unwrap().key_execution = true;
     let NativeFixture {
@@ -613,11 +615,11 @@ fn combo_initial_boot_is_consumed_once_on_success_or_uncertainty() {
         let requests = Requests::new(&identity(Chip::Mt7925));
         let provider = catalog(&requests, patch_bytes(), ram(&clc_bytes(Chip::Mt7925)));
         let prepared = requests.load(&provider).unwrap();
-        assert_eq!(f.controller.boot(&prepared).is_err(), failed);
+        assert_eq!(block_on(f.controller.boot(&prepared)).is_err(), failed);
         let count = f.model.lock().unwrap().initial_commands.len();
         assert_eq!(count, 1);
         assert!(matches!(
-            f.controller.boot(&prepared),
+            block_on(f.controller.boot(&prepared)),
             Err(BootError::WrongPhase)
         ));
         assert_eq!(f.model.lock().unwrap().initial_commands.len(), count);

@@ -166,18 +166,21 @@ impl<W: QueueIo, F: QueueIo, R: QueueIo> Mailbox<W, F, R> {
     /// On any failure the owned mailbox remains here, terminally poisoned with
     /// no old input permission; independent quiescence is still required
     /// before its owned queues/context can be released. No reset is invented.
-    pub fn download_with_binding(&mut self, prepared: &Prepared<'_>) -> Result<&Binding, Error> {
+    pub async fn download_with_binding(
+        &mut self,
+        prepared: &Prepared<'_>,
+    ) -> Result<&Binding, Error> {
         self.download_binding = None;
         if self.poisoned || self.cookie != 0 {
             self.poisoned = true;
             return Err(Error::NotFresh);
         }
-        self.download_bound_input(prepared)
+        self.download_bound_input(prepared).await
     }
     /// Only the private NIC_POWER_CTRL one-way completion on this
     /// otherwise unused owner permits source sequence continuation. This is
     /// no reset/fresh-epoch proof and is invalidated by any intervening command.
-    pub(in crate::wifi::mediatek) fn download_after_source_restart(
+    pub(in crate::wifi::mediatek) async fn download_after_source_restart(
         &mut self,
         prepared: &Prepared<'_>,
     ) -> Result<&Binding, Error> {
@@ -187,9 +190,9 @@ impl<W: QueueIo, F: QueueIo, R: QueueIo> Mailbox<W, F, R> {
             return Err(Error::NotFresh);
         }
         self.source_restart_cookie = None;
-        self.download_bound_input(prepared)
+        self.download_bound_input(prepared).await
     }
-    fn download_bound_input(&mut self, prepared: &Prepared<'_>) -> Result<&Binding, Error> {
+    async fn download_bound_input(&mut self, prepared: &Prepared<'_>) -> Result<&Binding, Error> {
         // Own the exact canonical Prepared identity/provenance before any
         // device mutation. Canonical Requests::load checked returned Images.
         let requests = prepared.requests().clone();
@@ -197,7 +200,7 @@ impl<W: QueueIo, F: QueueIo, R: QueueIo> Mailbox<W, F, R> {
         let ram = Input::copy(prepared.ram_image());
         let outcome = {
             let mut downloader = Downloader::new(Borrowed(self));
-            downloader.download(prepared).map(Outcome::copy)
+            downloader.download(prepared).await.map(Outcome::copy)
         };
         let outcome = match outcome {
             Ok(outcome) => outcome,

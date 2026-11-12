@@ -294,9 +294,12 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
             .control
             .clear_peer_admission(interface.broadcast_wcid)
             .map_err(|e| Error::Bootstrap(super::super::Error::Control(e)))?;
-        link.interface
-            .activate(roc.controller.state_mut().mailbox.as_mut().unwrap())
-            .map_err(|e| Error::Bootstrap(super::super::Error::Interface(e)))?;
+        // A link's registration while associating: both commands now.
+        crate::wifi::stepped::block_on(
+            link.interface
+                .activate(roc.controller.state_mut().mailbox.as_mut().unwrap()),
+        )
+        .map_err(|e| Error::Bootstrap(super::super::Error::Interface(e)))?;
         // mt7925_set_mlo_roc takes the channels while no other request holds
         // them: the association's own request ends first.
         if roc.roc_deadline.take().is_some() {

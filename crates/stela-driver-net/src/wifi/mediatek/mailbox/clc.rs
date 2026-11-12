@@ -11,6 +11,7 @@ use crate::wifi::mediatek::{
     mcu::{Event, clc as codec},
     ring::rx::Frame,
 };
+use crate::wifi::stepped::yield_now;
 use alloc::{alloc::alloc, boxed::Box, vec::Vec};
 use core::alloc::Layout;
 
@@ -246,14 +247,15 @@ impl<C: 'static> Execution<C> {
     /// Publish each source request once through the existing
     /// mailbox/DMA/sequence owner. Successful return is raw protocol completion
     /// only; keep the stopped radio and policy resources kept afterward.
-    pub fn execute<W: QueueIo, F: QueueIo, R: QueueIo>(
+    pub async fn execute<W: QueueIo, F: QueueIo, R: QueueIo>(
         &mut self,
         mailbox: &mut Mailbox<W, F, R>,
     ) -> Result<(), Error> {
-        self.execute_timed(mailbox, PCI_TIMEOUT_US)
+        self.execute_timed(mailbox, PCI_TIMEOUT_US).await
     }
 
-    pub(super) fn execute_timed<W: QueueIo, F: QueueIo, R: QueueIo>(
+    /// A step per request.
+    pub(super) async fn execute_timed<W: QueueIo, F: QueueIo, R: QueueIo>(
         &mut self,
         mailbox: &mut Mailbox<W, F, R>,
         timeout_us: u64,
@@ -277,7 +279,9 @@ impl<C: 'static> Execution<C> {
         for (request, body) in state.plan.requests().iter().enumerate() {
             debug_assert_eq!(body.chip(), mailbox.identity.chip);
             let packet = Packet::Clc(mailbox.encoder.encode_clc(body));
-            if let Err(failure) = mailbox.execute(&packet, timeout_us) {
+            let executed = mailbox.execute(&packet, timeout_us);
+            yield_now().await;
+            if let Err(failure) = executed {
                 state.interrupted = mailbox.interrupted_clc_reply.take();
                 return Err(Error::Transport { request, failure });
             }

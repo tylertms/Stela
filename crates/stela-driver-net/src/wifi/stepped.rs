@@ -46,7 +46,33 @@ pub fn until(deadline: Deadline) -> impl Future<Output = ()> {
 
 /// One poll of `future`, as one step of its work.
 pub fn poll_once<F: Future + ?Sized>(future: Pin<&mut F>) -> Poll<F::Output> {
-    future.poll(&mut Context::from_waker(Waker::noop()))
+    #[cfg(test)]
+    let start = crate::Clock::ticks();
+    let poll = future.poll(&mut Context::from_waker(Waker::noop()));
+    #[cfg(test)]
+    longest::record(crate::Clock::ticks().wrapping_sub(start));
+    poll
+}
+
+/// The longest step this test thread ran, in counter ticks, which the
+/// device models' virtual clock counts in microseconds.
+#[cfg(test)]
+pub(crate) mod longest {
+    extern crate std;
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static LONGEST: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record(ticks: u64) {
+        LONGEST.with(|longest| longest.set(longest.get().max(ticks)));
+    }
+
+    /// The longest step since the last call.
+    pub(crate) fn take() -> u64 {
+        LONGEST.with(|longest| longest.replace(0))
+    }
 }
 
 /// Run `future` to completion on this CPU, stepping it until it is ready;

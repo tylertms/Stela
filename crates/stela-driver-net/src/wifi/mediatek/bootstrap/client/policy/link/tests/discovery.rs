@@ -9,6 +9,7 @@ use crate::wifi::mediatek::{
     mcu::domain,
     ring::{rx::tests::device_receive, tests::Source},
 };
+use crate::wifi::stepped::block_on;
 use core::sync::atomic::Ordering;
 
 mod custom_probe;
@@ -50,13 +51,14 @@ fn setup(six_capability: bool, six_programmed: bool, flags: u32) -> (TestLink, M
         ],
     );
     // SAFETY: model bootstrap and source policy programming completed.
-    unsafe { f.controller.initialize_mac() }.unwrap();
+    unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
     // SAFETY: the model device, its pages and its domain belong to this test alone; no other
     // driver, worker or DMA touches them.
-    unsafe { f.controller.start(Band::Ghz5, 36, 5180) }.unwrap();
+    unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
     // SAFETY: the model device, its pages and its domain belong to this test alone; no other
     // driver, worker or DMA touches them.
-    let interface = unsafe { f.controller.register_interface(profile().interface) }.unwrap();
+    let interface =
+        unsafe { block_on(f.controller.register_interface(profile().interface)) }.unwrap();
     f.model.lock().unwrap().client_execution = true;
     let NativeFixture {
         controller,

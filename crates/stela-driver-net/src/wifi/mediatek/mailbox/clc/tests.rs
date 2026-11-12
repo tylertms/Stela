@@ -16,6 +16,7 @@ use crate::wifi::mediatek::{
     },
     mailbox::clc::{Error, Execution, Fact},
 };
+use crate::wifi::stepped::block_on;
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -159,7 +160,7 @@ impl Fixture {
         let provider = catalog(&requests, patch, ram);
         let prepared = requests.load(&provider).unwrap();
         let auxiliary = prepared.retain_auxiliary();
-        mailbox.download_with_binding(&prepared).unwrap();
+        block_on(mailbox.download_with_binding(&prepared)).unwrap();
         drop(prepared);
         drop(provider);
         let capabilities = mailbox.query_capabilities().unwrap();
@@ -220,7 +221,7 @@ fn clc_preserves_absent_and_zero_values() {
             assert_eq!(owner.capabilities().observed().chip_flags(), flags);
             assert_eq!(owner.eeprom().observed().byte(), 0);
             assert_eq!(owner.plan().requests().len(), 2);
-            owner.execute(&mut fixture.mailbox).unwrap();
+            block_on(owner.execute(&mut fixture.mailbox)).unwrap();
             assert!(owner.completed_facts() && !owner.is_quarantined());
             assert_eq!(owner.facts().len(), 2);
             assert!(owner.interrupted_reply().is_none());
@@ -267,7 +268,7 @@ fn clc_preserves_absent_and_zero_values() {
             }
             drop(model);
             assert_eq!(
-                owner.execute(&mut fixture.mailbox),
+                block_on(owner.execute(&mut fixture.mailbox)),
                 Err(Error::AlreadyAttempted)
             );
             if flags == Some(0) {
@@ -350,14 +351,17 @@ fn native_clc_checks_image_reports_flags_and_live_binding_before_publication() {
         let mut owner = fixture.claim(inputs(Some(1)), &drops).unwrap();
         let mut other = Fixture::new(Chip::Mt7921, Some(1));
         if mode == 0 {
-            assert_eq!(owner.execute(&mut other.mailbox), Err(Error::WrongMailbox));
+            assert_eq!(
+                block_on(owner.execute(&mut other.mailbox)),
+                Err(Error::WrongMailbox)
+            );
         } else {
             fixture
                 .mailbox
                 .command(Command::PatchSemaphore as u8, &0u32.to_le_bytes())
                 .unwrap();
             assert_eq!(
-                owner.execute(&mut fixture.mailbox),
+                block_on(owner.execute(&mut fixture.mailbox)),
                 Err(Error::MissingImageBinding)
             );
         }
@@ -394,9 +398,7 @@ fn native_clc_partial_uncertain_and_malformed_execution_keeps_guard_on_drop() {
                     _ => unreachable!(),
                 }
             }
-            let result = owner
-                .execute_timed(&mut fixture.mailbox, 1_000)
-                .unwrap_err();
+            let result = block_on(owner.execute_timed(&mut fixture.mailbox, 1_000)).unwrap_err();
             assert!(owner.is_quarantined() && !owner.completed_facts());
             let completed = if mode < 2 { 1 } else { 0 };
             assert_eq!(owner.facts().len(), completed);
@@ -429,7 +431,7 @@ fn native_clc_partial_uncertain_and_malformed_execution_keeps_guard_on_drop() {
             }
             let count = fixture.model.lock().unwrap().clc_commands.len();
             assert_eq!(
-                owner.execute(&mut fixture.mailbox),
+                block_on(owner.execute(&mut fixture.mailbox)),
                 Err(Error::AlreadyAttempted)
             );
             assert_eq!(fixture.model.lock().unwrap().clc_commands.len(), count);
@@ -487,7 +489,7 @@ fn full_source_clc_plans_execute_through_one_native_requester_and_exact_wire_byt
             let drops = Arc::new(AtomicUsize::new(0));
             let mut owner = fixture.claim(input, &drops).unwrap();
             assert_eq!(owner.plan().requests().len(), count);
-            owner.execute(&mut fixture.mailbox).unwrap();
+            block_on(owner.execute(&mut fixture.mailbox)).unwrap();
             assert_eq!(owner.facts().len(), count);
             assert_eq!(fixture.model.lock().unwrap().clc_commands.len(), count);
             for (index, (request, fact)) in owner
@@ -563,7 +565,7 @@ fn downloaded_images_and_owned_reports_execute_clc_past_provider_lifetime() {
             let mut owner = fixture.claim(inputs(flags), &drops).unwrap();
             assert!(!owner.auxiliary().release_information().is_empty());
             assert!(!owner.plan().requests().is_empty());
-            owner.execute(&mut fixture.mailbox).unwrap();
+            block_on(owner.execute(&mut fixture.mailbox)).unwrap();
             assert!(owner.completed_facts());
             assert_eq!(owner.facts().len(), owner.plan().requests().len());
             assert_eq!(owner.capabilities().observed().chip_flags(), flags);

@@ -31,6 +31,7 @@ use crate::{
     wifi::{
         network::Network,
         regulatory::database::{self, Country, Database},
+        stepped::block_on,
     },
 };
 use alloc::{sync::Arc, vec::Vec};
@@ -145,11 +146,13 @@ fn retryable(error: &AttachError) -> bool {
 
 /// Run `attempt` until it succeeds, at most [`BRING_UP_ATTEMPTS`] times,
 /// while its failure is [`retryable`].
-fn with_retries<T>(mut attempt: impl FnMut() -> Result<T, AttachError>) -> Result<T, AttachError> {
+async fn with_retries<T>(
+    mut attempt: impl AsyncFnMut() -> Result<T, AttachError>,
+) -> Result<T, AttachError> {
     let mut tries = 0;
     loop {
         tries += 1;
-        match attempt() {
+        match attempt().await {
             Err(error) if tries < BRING_UP_ATTEMPTS && retryable(&error) => {}
             outcome => return outcome,
         }
@@ -197,8 +200,8 @@ impl<C: 'static> Hardware<C> {
     /// Bring the function up, retried after a WLAN subsystem reset as
     /// `mt7925_init_hardware` does. `address` keeps a station address over
     /// a chip reset; `None` takes the firmware's.
-    pub fn bring_up(&mut self, address: Option<Mac>) -> Result<BroughtUp<C>, AttachError> {
-        with_retries(|| self.attempt(address))
+    pub async fn bring_up(&mut self, address: Option<Mac>) -> Result<BroughtUp<C>, AttachError> {
+        with_retries(async || self.attempt(address).await).await
     }
 
     /// Release the controllers of failed attempts after a WLAN subsystem
@@ -215,7 +218,7 @@ impl<C: 'static> Hardware<C> {
         }
     }
 
-    fn attempt(&mut self, address: Option<Mac>) -> Result<BroughtUp<C>, AttachError> {
+    async fn attempt(&mut self, address: Option<Mac>) -> Result<BroughtUp<C>, AttachError> {
         let owner: Arc<dyn Any> = self.resource.clone();
         // SAFETY: `attach`'s contract holds for the kept window and owner.
         let identity = unsafe {
@@ -227,7 +230,8 @@ impl<C: 'static> Hardware<C> {
                 self.clock,
                 self.aspm,
             )
-        }?;
+        }
+        .await?;
         // Both images load before the controller claims the function.
         let prepared = Requests::new(&identity)
             .load(self.firmware)
@@ -244,12 +248,16 @@ impl<C: 'static> Hardware<C> {
             )
         }?;
         // SAFETY: as above, with the kept domain and page source.
-        let installed = unsafe { controller.install(self.pages, self.domain.clone(), self.aspm) };
+        let installed =
+            unsafe { controller.install(self.pages, self.domain.clone(), self.aspm) }.await;
         if controller.phase() != bootstrap::Phase::Fresh {
             // The install reset the WLAN subsystem before any ring.
             self.release_failed();
         }
-        match self.program(controller, installed, &prepared, address) {
+        match self
+            .program(controller, installed, &prepared, address)
+            .await
+        {
             Ok(up) => Ok(up),
             Err((error, controller)) => {
                 if let Some(controller) = controller {
@@ -264,16 +272,16 @@ impl<C: 'static> Hardware<C> {
         clippy::result_large_err,
         reason = "a failed bring-up hands back its controller for release after the next reset"
     )]
-    fn program(
+    async fn program(
         &self,
         mut controller: Native<C>,
         installed: Result<(), bootstrap::Error>,
         prepared: &firmware::Prepared<'_>,
         address: Option<Mac>,
     ) -> Result<BroughtUp<C>, Failed<C>> {
-        let steps = (|| -> Result<_, AttachError> {
+        let steps: Result<_, AttachError> = async {
             installed?;
-            controller.boot(prepared)?;
+            controller.boot(prepared).await?;
             let chip_capabilities = controller
                 .capabilities()
                 .and_then(|report| report.observed().chip_flags())
@@ -293,17 +301,19 @@ impl<C: 'static> Hardware<C> {
                     mtcl_configuration: 0,
                     world_mtcl_configuration: 0,
                 })
-            }?;
+            }
+            .await?;
             let plan = controller.regulatory_plan(&self.country, &self.sar)?;
             let firmware_domain_unused = controller.firmware_regulatory_domain();
             // SAFETY: the plan resolves the CLC's restrictions, the country
             // and the platform's SAR, and `resource` keeps them.
-            unsafe { controller.execute_remaining(plan.inputs()) }?;
+            unsafe { controller.execute_remaining(plan.inputs()) }.await?;
             // SAFETY: no peer, WTBL or key user exists yet.
-            unsafe { controller.initialize_mac() }?;
+            unsafe { controller.initialize_mac() }.await?;
             let channel = plan.default_channel().ok_or(AttachError::NoChannel)?;
             // SAFETY: the programmed domain holds `channel`.
-            unsafe { controller.start(channel.band, channel.number as u8, channel.frequency_mhz) }?;
+            unsafe { controller.start(channel.band, channel.number as u8, channel.frequency_mhz) }
+                .await?;
             let (address, random_address) = match address {
                 Some(address) => (address, false),
                 None => station_address(
@@ -326,9 +336,10 @@ impl<C: 'static> Hardware<C> {
                 address,
             };
             // SAFETY: the first interface of a fresh controller.
-            let interface = unsafe { controller.register_interface(context) }?;
+            let interface = unsafe { controller.register_interface(context) }.await?;
             Ok((interface, context, firmware_domain_unused, random_address))
-        })();
+        }
+        .await;
         let (interface, context, firmware_domain_unused, random_address) = match steps {
             Ok(done) => done,
             Err(error) => return Err((error, Some(controller))),
@@ -400,7 +411,9 @@ pub unsafe fn attach<C: 'static>(
         entropy: inputs.entropy.clone(),
         failed: Vec::new(),
     };
-    let up = hardware.bring_up(None)?;
+    // The attach runs the same stepped bring-up a recovery steps through,
+    // to completion.
+    let up = block_on(hardware.bring_up(None))?;
     Ok(Attached {
         station: Station::new(
             up.link,
@@ -461,24 +474,24 @@ mod tests {
         // Always failing: ten attempts, as MT792x_MCU_INIT_RETRY_COUNT.
         let mut tries = 0;
         assert!(
-            with_retries(|| -> Result<(), _> {
+            block_on(with_retries(async || -> Result<(), _> {
                 tries += 1;
                 Err(firmware())
-            })
+            }))
             .is_err()
         );
         assert_eq!(tries, BRING_UP_ATTEMPTS);
         // A later attempt succeeds.
         let mut tries = 0;
         assert_eq!(
-            with_retries(|| {
+            block_on(with_retries(async || {
                 tries += 1;
                 if tries < 4 {
                     Err(firmware())
                 } else {
                     Ok(tries)
                 }
-            })
+            }))
             .unwrap(),
             4
         );
@@ -487,10 +500,10 @@ mod tests {
             let mut error = Some(error);
             let mut tries = 0;
             assert!(
-                with_retries(|| -> Result<(), _> {
+                block_on(with_retries(async || -> Result<(), _> {
                     tries += 1;
                     Err(error.take().unwrap_or_else(firmware))
-                })
+                }))
                 .is_err()
             );
             assert_eq!(tries, 1);

@@ -199,10 +199,9 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
                 .deactivate(s.controller.state_mut().mailbox.as_mut().unwrap())
                 .map_err(|e| Error::Bootstrap(super::super::Error::Interface(e)))?,
         );
-        s.controller
-            .state_mut()
-            .control
-            .stop_dma(false)
+        // The same stop as the bring-up's, run to completion: one 100 ms
+        // poll at most.
+        crate::wifi::stepped::block_on(s.controller.state_mut().control.stop_dma(false))
             .map_err(|e| Error::Bootstrap(super::super::Error::Control(e)))?;
         s.phase = Phase::ControllerDrain;
         Ok(())

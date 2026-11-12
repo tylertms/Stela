@@ -7,7 +7,10 @@ use super::{
     BarIo, Control, Error, MT_CONN_ON_LPCTL, MT_WFDMA0_TX_RING0_EXT_CTRL, Observation, rx_ring,
     tx_ring,
 };
-use crate::wifi::mediatek::identity::Chip;
+use crate::wifi::{
+    mediatek::identity::Chip,
+    stepped::{block_on, until},
+};
 
 #[derive(Debug)]
 pub struct MacInitialized {
@@ -22,9 +25,9 @@ impl<I: BarIo> Control<I> {
     /// C2 normal-mode write precedes the source PCI MCU driver-own
     /// handshake. C3 first performs its source FW-own→driver-own sequence.
     /// All operations keep the existing exclusive controller and real clock.
-    pub fn prepare_firmware(&mut self, aspm_supported: bool) -> Result<(), Error> {
+    pub async fn prepare_firmware(&mut self, aspm_supported: bool) -> Result<(), Error> {
         self.guard(false)?;
-        let result = (|| {
+        let result = async {
             if self.registers.chip() != Chip::Mt7925 {
                 self.registers.write32(0x41f23c, 0)?;
                 let actual = self.read_control(0x41f23c)?;
@@ -40,19 +43,19 @@ impl<I: BarIo> Control<I> {
                 // mt7921e_driver_own uses the TOP LPCR FW-own bit, rather
                 // than substituting the common driver's bit2 sync poll.
                 self.registers.write32(0x18060010, 2)?;
-                self.poll(0x18060010, 1, 0, 500_000)?;
+                self.poll(0x18060010, 1, 0, 500_000).await?;
                 self.driver_owned = true;
             } else {
                 self.driver_owned = false;
                 for attempt in 0..10 {
                     self.registers.write32(MT_CONN_ON_LPCTL, 1)?;
-                    match self.poll(MT_CONN_ON_LPCTL, 4, 4, 50_000) {
+                    match self.poll(MT_CONN_ON_LPCTL, 4, 4, 50_000).await {
                         Ok(_) => break,
                         Err(Error::Timeout { .. }) if attempt < 9 => {}
                         Err(e) => return Err(e),
                     }
                 }
-                self.driver_own(aspm_supported)?;
+                self.driver_own(aspm_supported).await?;
             }
             self.modify(0x10194, 0, 1 << 8)?;
             let actual = self.read_control(0x10194)?;
@@ -65,7 +68,8 @@ impl<I: BarIo> Control<I> {
                 });
             }
             Ok(())
-        })();
+        }
+        .await;
         self.finish(result)
     }
     fn mac_modify(&mut self, address: u32, mask: u32, set: u32) -> Result<(), Error> {
@@ -85,7 +89,7 @@ impl<I: BarIo> Control<I> {
         self.mac_modify(0x820e9008 + stride, (3 << 30) | (3 << 24), 3 << 24)?;
         Ok(())
     }
-    fn wtbl_clear_admission(&mut self, index: u32) -> Result<Observation, Error> {
+    async fn wtbl_clear_admission(&mut self, index: u32) -> Result<Observation, Error> {
         let c3 = self.registers.chip() == Chip::Mt7925;
         let address = if c3 { 0x820d4380 } else { 0x820d4230 };
         self.mac_modify(
@@ -106,7 +110,7 @@ impl<I: BarIo> Control<I> {
                     reads,
                 });
             }
-            self.clock.delay(10);
+            until(self.clock.deadline(10)).await;
         }
         Err(Error::Timeout {
             address,
@@ -120,7 +124,9 @@ impl<I: BarIo> Control<I> {
         index: u16,
     ) -> Result<Observation, Error> {
         self.guard(true)?;
-        let result = self.wtbl_clear_admission(u32::from(index));
+        // A connected peer's clear: the same poll, at most 501 reads 10 us
+        // apart, run to completion within the caller's step.
+        let result = block_on(self.wtbl_clear_admission(u32::from(index)));
         self.finish(result)
     }
     /// # Safety
@@ -131,9 +137,9 @@ impl<I: BarIo> Control<I> {
     /// Both later firmware/per-WCID translation controls must also be disabled
     /// before claiming that a peer's payload is raw80211. This method itself
     /// establishes only the global bit and source initialization effects.
-    pub unsafe fn initialize_mac_raw(&mut self) -> Result<MacInitialized, Error> {
+    pub async unsafe fn initialize_mac_raw(&mut self) -> Result<MacInitialized, Error> {
         self.guard(true)?;
-        let result = (|| {
+        let result = async {
             let c3 = self.registers.chip() == Chip::Mt7925;
             let mdp = if c3 { 0x820cc800 } else { 0x820cd000 };
             self.mac_modify(mdp + 4, 0xfff8, 1536 << 3)?;
@@ -148,7 +154,7 @@ impl<I: BarIo> Control<I> {
                 reads: 0,
             }; 20];
             for (index, receipt) in wtbl.iter_mut().enumerate() {
-                *receipt = self.wtbl_clear_admission(index as u32)?;
+                *receipt = self.wtbl_clear_admission(index as u32).await?;
             }
             for band in 0..2 {
                 self.mac_band(band)?;
@@ -182,7 +188,8 @@ impl<I: BarIo> Control<I> {
                 wtbl,
                 fixed_rate_entries: if c3 { 12 } else { 0 },
             })
-        })();
+        }
+        .await;
         self.finish(result)
     }
 }

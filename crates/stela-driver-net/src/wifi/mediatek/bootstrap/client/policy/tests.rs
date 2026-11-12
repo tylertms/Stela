@@ -6,6 +6,7 @@ use crate::wifi::mediatek::{
     mcu::domain,
     ring::{rx::tests::device_receive, tests::Source},
 };
+use crate::wifi::stepped::block_on;
 use core::sync::atomic::Ordering;
 use reg::database::{
     Database,
@@ -92,20 +93,21 @@ fn setup_modern_bands(
         },
     );
     // SAFETY: modeled completed bootstrap, source policy and owner.
-    unsafe { f.controller.initialize_mac() }.unwrap();
+    unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
     // SAFETY: the model device, its pages and its domain belong to this test alone; no other
     // driver, worker or DMA touches them.
     unsafe {
-        f.controller.start(
+        block_on(f.controller.start(
             channel.band,
             u8::try_from(channel.number).unwrap(),
             channel.frequency_mhz,
-        )
+        ))
     }
     .unwrap();
     // SAFETY: the model device, its pages and its domain belong to this test alone; no other
     // driver, worker or DMA touches them.
-    let interface = unsafe { f.controller.register_interface(profile().interface) }.unwrap();
+    let interface =
+        unsafe { block_on(f.controller.register_interface(profile().interface)) }.unwrap();
     f.model.lock().unwrap().client_execution = true;
     f.model.lock().unwrap().key_execution = true;
     let NativeFixture {
@@ -511,13 +513,14 @@ fn active_six_ghz_rnr_requires_programmed_probe_policy_and_reuses_refused_owner(
     );
     // SAFETY: the model device, its pages and its domain belong to this test alone; no other
     // driver, worker or DMA touches them.
-    unsafe { f.controller.initialize_mac() }.unwrap();
+    unsafe { block_on(f.controller.initialize_mac()) }.unwrap();
     // SAFETY: the model device, its pages and its domain belong to this test alone; no other
     // driver, worker or DMA touches them.
-    unsafe { f.controller.start(Band::Ghz5, 36, 5180) }.unwrap();
+    unsafe { block_on(f.controller.start(Band::Ghz5, 36, 5180)) }.unwrap();
     // SAFETY: the model device, its pages and its domain belong to this test alone; no other
     // driver, worker or DMA touches them.
-    let interface = unsafe { f.controller.register_interface(profile().interface) }.unwrap();
+    let interface =
+        unsafe { block_on(f.controller.register_interface(profile().interface)) }.unwrap();
     f.model.lock().unwrap().client_execution = true;
     let NativeFixture {
         controller,

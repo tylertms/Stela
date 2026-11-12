@@ -8,6 +8,7 @@ use super::{
     firmware::{Patch, Prepared, Ram},
     identity::Chip,
 };
+use crate::wifi::stepped::yield_now;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -183,13 +184,15 @@ impl<T: Transport> Downloader<T> {
         self.transport
     }
 
-    pub fn download(&mut self, prepared: &Prepared<'_>) -> Result<&Report, Error> {
-        if self.state == State::Fresh {
-            self.transport
-                .validate_firmware(prepared)
-                .map_err(|failure| self.fail(Stage::FirmwareTarget, failure))?;
+    /// The whole download, a step per command or scatter transfer.
+    pub async fn download(&mut self, prepared: &Prepared<'_>) -> Result<&Report, Error> {
+        if self.state == State::Fresh
+            && let Err(failure) = self.transport.validate_firmware(prepared)
+        {
+            return Err(self.fail(Stage::FirmwareTarget, failure).await);
         }
         self.download_parts(prepared.requests.chip, &prepared.patch, &prepared.ram)
+            .await
     }
 
     fn command(&mut self, command: u8, payload: &[u8]) -> Result<u32, TransportFailure> {
@@ -198,23 +201,26 @@ impl<T: Transport> Downloader<T> {
         Ok(result)
     }
 
-    fn acknowledged(&mut self, command: u8, payload: &[u8]) -> Result<(), TransportFailure> {
-        let status = self.command(command, payload)?;
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(TransportFailure {
+    /// One command whose status must be 0, ending its step.
+    async fn acknowledged(&mut self, command: u8, payload: &[u8]) -> Result<(), TransportFailure> {
+        let status = self.command(command, payload);
+        yield_now().await;
+        match status? {
+            0 => Ok(()),
+            status => Err(TransportFailure {
                 kind: FailureKind::Device(status),
                 port: PortState::Usable,
-            })
+            }),
         }
     }
 
-    fn fail(&mut self, stage: Stage, failure: TransportFailure) -> Error {
+    async fn fail(&mut self, stage: Stage, failure: TransportFailure) -> Error {
         self.state = State::Poisoned;
         if self.report.release == ReleaseState::Held {
             self.report.release = if failure.port == PortState::Usable {
-                match self.command(COMMAND_PATCH_SEMAPHORE, &0u32.to_le_bytes()) {
+                let released = self.command(COMMAND_PATCH_SEMAPHORE, &0u32.to_le_bytes());
+                yield_now().await;
+                match released {
                     Ok(PATCH_SEMAPHORE_RELEASED) => ReleaseState::Released,
                     Ok(status) => ReleaseState::Failed(TransportFailure {
                         kind: FailureKind::Device(status),
@@ -233,7 +239,7 @@ impl<T: Transport> Downloader<T> {
         }
     }
 
-    fn region(
+    async fn region(
         &mut self,
         chip: Chip,
         stage: Stage,
@@ -250,8 +256,9 @@ impl<T: Transport> Downloader<T> {
         request[..4].copy_from_slice(&address.to_le_bytes());
         request[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         request[8..].copy_from_slice(&mode.to_le_bytes());
-        self.acknowledged(command, &request)
-            .map_err(|failure| self.fail(stage, failure))?;
+        if let Err(failure) = self.acknowledged(command, &request).await {
+            return Err(self.fail(stage, failure).await);
+        }
         let data_stage = match stage {
             Stage::PatchStart(i) => Stage::PatchData(i),
             Stage::RamStart(i) => Stage::RamData(i),
@@ -265,16 +272,18 @@ impl<T: Transport> Downloader<T> {
             completed_bytes: 0,
         });
         for chunk in payload.chunks(SCATTER_BYTES) {
-            self.transport
-                .scatter(chunk)
-                .map_err(|failure| self.fail(data_stage, failure))?;
+            let scattered = self.transport.scatter(chunk);
+            yield_now().await;
+            if let Err(failure) = scattered {
+                return Err(self.fail(data_stage, failure).await);
+            }
             self.report.scatter_transfers_completed += 1;
             self.report.regions.last_mut().unwrap().completed_bytes += chunk.len();
         }
         Ok(())
     }
 
-    fn download_parts(
+    async fn download_parts(
         &mut self,
         chip: Chip,
         patch: &Patch<'_>,
@@ -296,9 +305,12 @@ impl<T: Transport> Downloader<T> {
         }
         // The one-attempt gate closes before the first hardware side effect.
         self.state = State::Poisoned;
-        let semaphore = self
-            .command(COMMAND_PATCH_SEMAPHORE, &1u32.to_le_bytes())
-            .map_err(|failure| self.fail(Stage::AcquirePatch, failure))?;
+        let semaphore = self.command(COMMAND_PATCH_SEMAPHORE, &1u32.to_le_bytes());
+        yield_now().await;
+        let semaphore = match semaphore {
+            Ok(semaphore) => semaphore,
+            Err(failure) => return Err(self.fail(Stage::AcquirePatch, failure).await),
+        };
         match semaphore {
             PATCH_ALREADY_APPLIED => self.report.patch = PatchState::AlreadyApplied,
             PATCH_SEMAPHORE_ACQUIRED => {
@@ -310,12 +322,15 @@ impl<T: Transport> Downloader<T> {
                         region.address,
                         region.mode,
                         region.payload,
-                    )?;
+                    )
+                    .await?;
                 }
-                self.acknowledged(COMMAND_PATCH_FINISH, &[0; 4])
-                    .map_err(|failure| self.fail(Stage::PatchFinish, failure))?;
+                if let Err(failure) = self.acknowledged(COMMAND_PATCH_FINISH, &[0; 4]).await {
+                    return Err(self.fail(Stage::PatchFinish, failure).await);
+                }
                 self.report.patch = PatchState::Uploaded;
                 let released = self.command(COMMAND_PATCH_SEMAPHORE, &0u32.to_le_bytes());
+                yield_now().await;
                 match released {
                     Ok(PATCH_SEMAPHORE_RELEASED) => self.report.release = ReleaseState::Released,
                     Ok(status) => {
@@ -324,22 +339,24 @@ impl<T: Transport> Downloader<T> {
                             port: PortState::Usable,
                         };
                         self.report.release = ReleaseState::Failed(failure);
-                        return Err(self.fail(Stage::ReleasePatch, failure));
+                        return Err(self.fail(Stage::ReleasePatch, failure).await);
                     }
                     Err(failure) => {
                         self.report.release = ReleaseState::Failed(failure);
-                        return Err(self.fail(Stage::ReleasePatch, failure));
+                        return Err(self.fail(Stage::ReleasePatch, failure).await);
                     }
                 }
             }
             status => {
-                return Err(self.fail(
-                    Stage::AcquirePatch,
-                    TransportFailure {
-                        kind: FailureKind::Device(status),
-                        port: PortState::Usable,
-                    },
-                ));
+                return Err(self
+                    .fail(
+                        Stage::AcquirePatch,
+                        TransportFailure {
+                            kind: FailureKind::Device(status),
+                            port: PortState::Usable,
+                        },
+                    )
+                    .await);
             }
         }
         let mut start = 0u32;
@@ -357,13 +374,15 @@ impl<T: Transport> Downloader<T> {
                 region.address,
                 region.mode(),
                 region.payload,
-            )?;
+            )
+            .await?;
         }
         let mut request = [0u8; 8];
         request[..4].copy_from_slice(&u32::from(start != 0).to_le_bytes());
         request[4..].copy_from_slice(&start.to_le_bytes());
-        self.acknowledged(COMMAND_START_FIRMWARE, &request)
-            .map_err(|failure| self.fail(Stage::FirmwareStart, failure))?;
+        if let Err(failure) = self.acknowledged(COMMAND_START_FIRMWARE, &request).await {
+            return Err(self.fail(Stage::FirmwareStart, failure).await);
+        }
         self.report.start_address = Some(start);
         self.report.firmware_start_acknowledged = true;
         self.state = State::Complete;
@@ -374,6 +393,7 @@ impl<T: Transport> Downloader<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wifi::stepped::block_on;
     use alloc::rc::Rc;
     use core::cell::RefCell;
     #[derive(Default)]
@@ -445,7 +465,7 @@ mod tests {
         let (p, r) = (Patch::parse(&p).unwrap(), Ram::parse(&r).unwrap());
         let model = Rc::new(RefCell::new(Model::default()));
         let mut engine = Downloader::new(model.clone());
-        let report = engine.download_parts(Chip::Mt7922, &p, &r).unwrap();
+        let report = block_on(engine.download_parts(Chip::Mt7922, &p, &r)).unwrap();
         assert_eq!(report.patch, PatchState::Uploaded);
         assert_eq!(report.release, ReleaseState::Released);
         assert_eq!(report.scatter_transfers_completed, 5);
@@ -462,8 +482,7 @@ mod tests {
         drop(m);
         let count = model.borrow().operations.len();
         assert_eq!(
-            engine
-                .download_parts(Chip::Mt7922, &p, &r)
+            block_on(engine.download_parts(Chip::Mt7922, &p, &r))
                 .unwrap_err()
                 .stage,
             Stage::AlreadyAttempted
@@ -484,15 +503,14 @@ mod tests {
                 ..Model::default()
             }));
             let mut engine = Downloader::new(model.clone());
-            let error = engine.download_parts(Chip::Mt7922, &p, &r).unwrap_err();
+            let error = block_on(engine.download_parts(Chip::Mt7922, &p, &r)).unwrap_err();
             assert_eq!(error.failure.kind, FailureKind::Timeout);
             assert_eq!(model.borrow().operations.len(), fail_at);
             if (2..=6).contains(&fail_at) {
                 assert_eq!(error.report.release, ReleaseState::UnsafeToAttempt);
             }
             assert_eq!(
-                engine
-                    .download_parts(Chip::Mt7922, &p, &r)
+                block_on(engine.download_parts(Chip::Mt7922, &p, &r))
                     .unwrap_err()
                     .stage,
                 Stage::AlreadyAttempted
@@ -515,7 +533,7 @@ mod tests {
                 ..Model::default()
             }));
             let mut engine = Downloader::new(model.clone());
-            let error = engine.download_parts(Chip::Mt7921, &p, &r).unwrap_err();
+            let error = block_on(engine.download_parts(Chip::Mt7921, &p, &r)).unwrap_err();
             assert_eq!(error.stage, Stage::PatchData(0));
             assert_eq!(error.failure.kind, FailureKind::Device(7));
             assert_eq!(model.borrow().operations.len(), 4);
@@ -543,7 +561,7 @@ mod tests {
             ..Model::default()
         }));
         let mut engine = Downloader::new(model.clone());
-        let report = engine.download_parts(Chip::Mt7925, &p, &r).unwrap();
+        let report = block_on(engine.download_parts(Chip::Mt7925, &p, &r)).unwrap();
         assert_eq!(report.patch, PatchState::AlreadyApplied);
         assert_eq!(report.release, ReleaseState::NotHeld);
         assert_eq!(
@@ -596,7 +614,7 @@ mod tests {
             let prepared = requests.load(&provider).unwrap();
             let model = Rc::new(RefCell::new(Model::default()));
             let mut engine = Downloader::new(model.clone());
-            let report = engine.download(&prepared).unwrap();
+            let report = block_on(engine.download(&prepared)).unwrap();
             assert!(report.firmware_start_acknowledged);
             assert_eq!(report.release, ReleaseState::Released);
             let operations = &model.borrow().operations;

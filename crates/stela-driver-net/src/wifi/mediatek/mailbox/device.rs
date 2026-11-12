@@ -10,6 +10,7 @@ use crate::wifi::mediatek::{
         runtime::Command,
     },
 };
+use crate::wifi::stepped::yield_now;
 use alloc::{boxed::Box, vec::Vec};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,7 +209,8 @@ impl<C: 'static> Interface<C> {
             }
         }
     }
-    pub fn activate<W: QueueIo, F: QueueIo, R: QueueIo>(
+    /// The two registration commands, a step each.
+    pub async fn activate<W: QueueIo, F: QueueIo, R: QueueIo>(
         &mut self,
         mailbox: &mut Mailbox<W, F, R>,
     ) -> Result<(), Error> {
@@ -221,9 +223,13 @@ impl<C: 'static> Interface<C> {
         // Publication may partially install real resources even without ACK.
         state.phase = Phase::Quarantined;
         let (command, body) = request.first();
-        Self::send(state, mailbox, Step::ActivateDevice, command, body)?;
+        let sent = Self::send(state, mailbox, Step::ActivateDevice, command, body);
+        yield_now().await;
+        sent?;
         let (command, body) = request.second();
-        Self::send(state, mailbox, Step::ActivateBss, command, body)?;
+        let sent = Self::send(state, mailbox, Step::ActivateBss, command, body);
+        yield_now().await;
+        sent?;
         state.phase = Phase::Registered;
         Ok(())
     }

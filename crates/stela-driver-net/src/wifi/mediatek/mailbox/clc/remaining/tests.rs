@@ -6,6 +6,7 @@ use crate::wifi::mediatek::{
     identity::Chip,
     mcu::Event,
 };
+use crate::wifi::stepped::block_on;
 use crate::wifi::{
     Band,
     mediatek::{
@@ -151,17 +152,17 @@ fn coherent_clc_domain_power_dma_response_and_pse_facts_keep_owner() {
             let drops = Arc::new(AtomicUsize::new(0));
             let mut owner = fixture.claim(inputs(Some(1)), &drops).unwrap();
             assert_eq!(
-                owner.execute_all(&mut fixture.mailbox),
+                block_on(owner.execute_all(&mut fixture.mailbox)),
                 Err(RemainingError::NotPrepared)
             );
             let bands = [rates(chip, Band::Ghz2), rates(chip, Band::Ghz5), Vec::new()];
-            owner.execute(&mut fixture.mailbox).unwrap();
+            block_on(owner.execute(&mut fixture.mailbox)).unwrap();
             prepare(&mut owner, &fixture, *b"US", &bands).unwrap();
             assert_eq!(
                 prepare(&mut owner, &fixture, *b"US", &bands),
                 Err(RemainingError::AlreadyPrepared)
             );
-            owner.execute_all(&mut fixture.mailbox).unwrap();
+            block_on(owner.execute_all(&mut fixture.mailbox)).unwrap();
             assert!(owner.remaining_completed() && !owner.is_quarantined());
             let model = fixture.model.lock().unwrap();
             assert!(model.regulatory_domain && model.clc_guard && model.clc_processing);
@@ -212,7 +213,7 @@ fn coherent_clc_domain_power_dma_response_and_pse_facts_keep_owner() {
             }
             drop(model);
             assert_eq!(
-                owner.execute_all(&mut fixture.mailbox),
+                block_on(owner.execute_all(&mut fixture.mailbox)),
                 Err(RemainingError::WrongPhase)
             );
             if retain {
@@ -244,7 +245,7 @@ fn remaining_refusal_keeps_completed_clc_before_any_domain_or_power_publication(
         }
         let drops = Arc::new(AtomicUsize::new(0));
         let mut owner = fixture.claim(inputs(Some(1)), &drops).unwrap();
-        owner.execute(&mut fixture.mailbox).unwrap();
+        block_on(owner.execute(&mut fixture.mailbox)).unwrap();
         let mut bands = [rates(chip, Band::Ghz2), rates(chip, Band::Ghz5), Vec::new()];
         let expected = match mode {
             0 => RemainingError::CapabilitiesIncomplete,
@@ -298,7 +299,7 @@ fn partial_domain_power_failure_early_reply_and_bad_pse_never_release_policy_gua
             let drops = Arc::new(AtomicUsize::new(0));
             let mut owner = fixture.claim(inputs(Some(1)), &drops).unwrap();
             let bands = [rates(chip, Band::Ghz2), rates(chip, Band::Ghz5), Vec::new()];
-            owner.execute(&mut fixture.mailbox).unwrap();
+            block_on(owner.execute(&mut fixture.mailbox)).unwrap();
             prepare(&mut owner, &fixture, *b"US", &bands).unwrap();
             {
                 let mut model = fixture.model.lock().unwrap();
@@ -317,9 +318,8 @@ fn partial_domain_power_failure_early_reply_and_bad_pse_never_release_policy_gua
                     _ => unreachable!(),
                 }
             }
-            let failure = owner
-                .execute_all_timed(&mut fixture.mailbox, 1000)
-                .unwrap_err();
+            let failure =
+                block_on(owner.execute_all_timed(&mut fixture.mailbox, 1000)).unwrap_err();
             assert!(owner.is_quarantined() && !owner.remaining_completed());
             assert!(fixture.model.lock().unwrap().regulatory_domain);
             assert_eq!(drops.load(Ordering::Relaxed), 0);
@@ -351,7 +351,7 @@ fn partial_domain_power_failure_early_reply_and_bad_pse_never_release_policy_gua
             }
             let count = fixture.model.lock().unwrap().regulatory_commands.len();
             assert_eq!(
-                owner.execute_all(&mut fixture.mailbox),
+                block_on(owner.execute_all(&mut fixture.mailbox)),
                 Err(RemainingError::WrongPhase)
             );
             assert_eq!(
@@ -390,9 +390,9 @@ fn all_source_rate_plans_cross_coherent_native_clc_domain_power_and_pse_dma() {
             let mut input = inputs(Some(1));
             input.alpha2 = source.alpha2;
             let mut owner = fixture.claim(input, &drops).unwrap();
-            owner.execute(&mut fixture.mailbox).unwrap();
+            block_on(owner.execute(&mut fixture.mailbox)).unwrap();
             prepare(&mut owner, &fixture, source.alpha2, &source.bands).unwrap();
-            owner.execute_all(&mut fixture.mailbox).unwrap();
+            block_on(owner.execute_all(&mut fixture.mailbox)).unwrap();
             assert!(owner.remaining_completed());
             let model = fixture.model.lock().unwrap();
             assert_eq!(model.regulatory_commands.len(), source.wire.len() + 1);
@@ -434,9 +434,9 @@ fn images_execute_kept_clc_domain_power_chain_past_provider_lifetime() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut owner = fixture.claim(inputs(Some(1)), &drops).unwrap();
         let bands = [rates(chip, Band::Ghz2), rates(chip, Band::Ghz5), Vec::new()];
-        owner.execute(&mut fixture.mailbox).unwrap();
+        block_on(owner.execute(&mut fixture.mailbox)).unwrap();
         prepare(&mut owner, &fixture, *b"US", &bands).unwrap();
-        owner.execute_all(&mut fixture.mailbox).unwrap();
+        block_on(owner.execute_all(&mut fixture.mailbox)).unwrap();
         assert!(owner.remaining_completed());
         assert!(!owner.auxiliary().release_information().is_empty());
         fixture.drain();
@@ -463,7 +463,7 @@ fn clc_reply_resolves_domain_and_power_once() {
                 let drops = Arc::new(AtomicUsize::new(0));
                 let mut owner = fixture.claim(inputs(Some(1)), &drops).unwrap();
                 assert_eq!(owner.facts().len(), 0);
-                owner.execute(&mut fixture.mailbox).unwrap();
+                block_on(owner.execute(&mut fixture.mailbox)).unwrap();
                 let flags = owner
                     .facts()
                     .iter()
@@ -533,7 +533,7 @@ fn clc_reply_resolves_domain_and_power_once() {
                     continue;
                 }
                 result.unwrap();
-                owner.execute_all(&mut fixture.mailbox).unwrap();
+                block_on(owner.execute_all(&mut fixture.mailbox)).unwrap();
                 let model = fixture.model.lock().unwrap();
                 assert_eq!(model.clc_commands.len(), 2, "never replay completed CLC");
                 assert_eq!(

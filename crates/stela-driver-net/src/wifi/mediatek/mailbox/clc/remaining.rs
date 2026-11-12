@@ -7,6 +7,7 @@ use crate::wifi::mediatek::{
     identity::Chip,
     mcu::{Event, domain, power},
 };
+use crate::wifi::stepped::yield_now;
 use alloc::vec::Vec;
 
 pub struct Inputs<'a> {
@@ -181,13 +182,14 @@ impl<C: 'static> Execution<C> {
     /// power/PSE exactly once under the same permission. CLC is never
     /// restarted/replayed. Return means raw protocol facts, including source
     /// one-way boundaries, never an admitted radio or policy.
-    pub fn execute_all<W: QueueIo, F: QueueIo, R: QueueIo>(
+    pub async fn execute_all<W: QueueIo, F: QueueIo, R: QueueIo>(
         &mut self,
         mailbox: &mut Mailbox<W, F, R>,
     ) -> Result<(), Error> {
-        self.execute_all_timed(mailbox, PCI_TIMEOUT_US)
+        self.execute_all_timed(mailbox, PCI_TIMEOUT_US).await
     }
-    pub(in super::super) fn execute_all_timed<W: QueueIo, F: QueueIo, R: QueueIo>(
+    /// A step per request.
+    pub(in super::super) async fn execute_all_timed<W: QueueIo, F: QueueIo, R: QueueIo>(
         &mut self,
         mailbox: &mut Mailbox<W, F, R>,
         timeout_us: u64,
@@ -229,7 +231,9 @@ impl<C: 'static> Execution<C> {
                 )
             };
             let sequence = packet.sequence();
-            if let Err(failure) = mailbox.execute(&packet, timeout_us) {
+            let executed = mailbox.execute(&packet, timeout_us);
+            yield_now().await;
+            if let Err(failure) = executed {
                 chain.interrupted = mailbox.interrupted_regulatory_reply.take();
                 return Err(Error::Transport { step, failure });
             }
@@ -284,7 +288,7 @@ impl<C: 'static> Execution<C> {
     }
     /// Vendor initial lifecycle only: source repeats the same resolved domain
     /// at first start. This does not replay CLC or manufacture new permission.
-    pub(in crate::wifi::mediatek) fn start_domain<W: QueueIo, F: QueueIo, R: QueueIo>(
+    pub(in crate::wifi::mediatek) async fn start_domain<W: QueueIo, F: QueueIo, R: QueueIo>(
         &mut self,
         mailbox: &mut Mailbox<W, F, R>,
     ) -> Result<(), Error> {
@@ -304,11 +308,13 @@ impl<C: 'static> Execution<C> {
             .map_err(|_| Error::NoMemory)?;
         s.phase = Phase::StartUncertain;
         let packet = Packet::Domain(mailbox.encoder.encode_domain(&chain.domain));
-        Self::start_exchange(mailbox, chain, Step::Domain, packet)?;
+        let exchanged = Self::start_exchange(mailbox, chain, Step::Domain, packet);
+        yield_now().await;
+        exchanged?;
         s.phase = Phase::StartDomainFacts;
         Ok(())
     }
-    pub(in crate::wifi::mediatek) fn start_power<W: QueueIo, F: QueueIo, R: QueueIo>(
+    pub(in crate::wifi::mediatek) async fn start_power<W: QueueIo, F: QueueIo, R: QueueIo>(
         &mut self,
         mailbox: &mut Mailbox<W, F, R>,
     ) -> Result<(), Error> {
@@ -330,7 +336,9 @@ impl<C: 'static> Execution<C> {
                 kind: body.kind(),
             };
             let packet = Packet::Power(mailbox.encoder.encode_power(body));
-            Self::start_exchange(mailbox, chain, step, packet)?;
+            let exchanged = Self::start_exchange(mailbox, chain, step, packet);
+            yield_now().await;
+            exchanged?;
         }
         s.phase = Phase::StartPowerFacts;
         Ok(())

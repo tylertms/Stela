@@ -6,6 +6,7 @@ use super::{
     identity::Chip,
     registers::{self, BarIo, Registers},
 };
+use crate::wifi::stepped::until;
 
 mod cold_start;
 pub mod dma;
@@ -176,7 +177,9 @@ impl<I: BarIo> Control<I> {
         self.registers.write32(address, (old & !mask) | value)?;
         Ok(())
     }
-    fn poll(
+    /// One register read a step until `address` reads `expected` under
+    /// `mask` or `timeout_us` passes.
+    async fn poll(
         &mut self,
         address: u32,
         mask: u32,
@@ -207,26 +210,27 @@ impl<I: BarIo> Control<I> {
             }
             // mt76_poll_msec_tick(..., tick=1). State transitions are read
             // from the device after each delay, never inferred by time.
-            self.clock.delay(1000);
+            until(self.clock.deadline(1000)).await;
         }
     }
     /// `mt792xe_mcu_fw_pmctrl`: hand the function to its firmware, retrying
     /// the MT_CONN_ON_LPCTL request through at most ten 50 ms polls.
-    pub fn firmware_own(&mut self) -> Result<Observation, Error> {
+    pub async fn firmware_own(&mut self) -> Result<Observation, Error> {
         self.guard(false)?;
         self.driver_owned = false;
         self.dma_stopped = false;
-        let result = (|| {
+        let result = async {
             for attempts in 1..=10 {
                 self.registers.write32(MT_CONN_ON_LPCTL, 1 << 0)?;
-                match self.poll(MT_CONN_ON_LPCTL, 1 << 2, 1 << 2, 50_000) {
+                match self.poll(MT_CONN_ON_LPCTL, 1 << 2, 1 << 2, 50_000).await {
                     Ok(status) => return Ok(status),
                     Err(Error::Timeout { .. }) if attempts < 10 => {}
                     Err(error) => return Err(error),
                 }
             }
             unreachable!("the final ownership timeout returns above")
-        })();
+        }
+        .await;
         self.finish(result)
     }
     /// The registers `mt7925_pci_probe` identifies the chip by once the
@@ -249,24 +253,25 @@ impl<I: BarIo> Control<I> {
     }
     /// The common MT792xe MT_CONN_ON_LPCTL request retries at most ten 50ms polls. ASPM
     /// requires a minimum 2ms wake delay before each status read.
-    pub fn driver_own(&mut self, aspm_supported: bool) -> Result<DriverOwned, Error> {
+    pub async fn driver_own(&mut self, aspm_supported: bool) -> Result<DriverOwned, Error> {
         self.guard(false)?;
         self.driver_owned = false;
         self.dma_stopped = false;
-        let result = (|| {
+        let result = async {
             for attempts in 1..=10 {
                 self.registers.write32(MT_CONN_ON_LPCTL, 1 << 1)?;
                 if aspm_supported {
-                    self.clock.delay(2000);
+                    until(self.clock.deadline(2000)).await;
                 }
-                match self.poll(MT_CONN_ON_LPCTL, 1 << 2, 0, 50_000) {
+                match self.poll(MT_CONN_ON_LPCTL, 1 << 2, 0, 50_000).await {
                     Ok(status) => return Ok(DriverOwned { attempts, status }),
                     Err(Error::Timeout { .. }) if attempts < 10 => {}
                     Err(error) => return Err(error),
                 }
             }
             unreachable!("the final ownership timeout returns above")
-        })();
+        }
+        .await;
         let receipt = self.finish(result)?;
         self.driver_owned = true;
         Ok(receipt)
@@ -274,12 +279,12 @@ impl<I: BarIo> Control<I> {
     /// Stop WLAN WFDMA0 and optionally toggle only its DMASHDL/logic reset.
     /// This does not issue a WLAN subsystem/combo reset, reset Bluetooth,
     /// release any mapping, or claim a fresh MCU response-sequencing epoch.
-    pub fn stop_dma(&mut self, force: bool) -> Result<DmaStopped, Error> {
+    pub async fn stop_dma(&mut self, force: bool) -> Result<DmaStopped, Error> {
         self.guard(true)?;
         self.dma_stopped = false;
-        let result = (|| {
+        let result = async {
             self.modify(MT_WFDMA0_GLO_CFG, DISABLE, 0)?;
-            let status = self.poll(MT_WFDMA0_GLO_CFG, BUSY, 0, 100_000)?;
+            let status = self.poll(MT_WFDMA0_GLO_CFG, BUSY, 0, 100_000).await?;
             if status.value & DISABLE != 0 {
                 return Err(Error::Readback {
                     address: MT_WFDMA0_GLO_CFG,
@@ -301,7 +306,8 @@ impl<I: BarIo> Control<I> {
                 status,
                 reset_applied: force,
             })
-        })();
+        }
+        .await;
         let receipt = self.finish(result)?;
         self.dma_stopped = true;
         Ok(receipt)
@@ -316,9 +322,9 @@ impl<I: BarIo> Control<I> {
     /// Poll the pre-download power state for 1 s. Linux warns on a timeout
     /// and downloads anyway, so a timeout is `None`, not a failure, and
     /// leaves the control usable. This does not itself restart the MCU.
-    pub fn poll_firmware_power_on(&mut self) -> Result<Option<Observation>, Error> {
+    pub async fn poll_firmware_power_on(&mut self) -> Result<Option<Observation>, Error> {
         self.guard(true)?;
-        match self.poll(MT_CONN_ON_MISC, 7, 1, 1_000_000) {
+        match self.poll(MT_CONN_ON_MISC, 7, 1, 1_000_000).await {
             Ok(observation) => Ok(Some(observation)),
             Err(Error::Timeout { .. }) => Ok(None),
             Err(error) => self.finish(Err(error)),
@@ -327,9 +333,9 @@ impl<I: BarIo> Control<I> {
     /// Observe N9-ready bits after the caller's download/start exchange.
     /// Even success proves only this register state, not which firmware was
     /// loaded, a new command epoch, calibration, regulatory setup or association.
-    pub fn poll_n9_ready(&mut self) -> Result<Observation, Error> {
+    pub async fn poll_n9_ready(&mut self) -> Result<Observation, Error> {
         self.guard(true)?;
-        let result = self.poll(MT_CONN_ON_MISC, 3, 3, 1_500_000);
+        let result = self.poll(MT_CONN_ON_MISC, 3, 3, 1_500_000).await;
         self.finish(result)
     }
 }
