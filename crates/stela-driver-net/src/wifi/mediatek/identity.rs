@@ -73,12 +73,15 @@ pub struct PciIdentity {
 }
 
 impl PciIdentity {
-    /// The chip the function's IDs name, before its registers confirm it.
+    /// The chip the function's IDs name, before its registers confirm it:
+    /// MediaTek's IDs, and ITTIM's MT7922 (vendor 0b48), as Linux's
+    /// `mt7921_pci_device_table` lists it.
     pub fn chip(self) -> Option<Chip> {
-        if self.vendor != 0x14c3 {
-            return None;
+        match (self.vendor, self.device) {
+            (0x14c3, device) => Chip::of_pci(device),
+            (0x0b48, 0x7922) => Some(Chip::Mt7922),
+            _ => None,
         }
-        Chip::of_pci(self.device)
     }
 }
 
@@ -224,5 +227,19 @@ mod tests {
                 .unwrap()
                 .hardware_key()
         );
+    }
+    #[test]
+    fn ittims_mt7922_is_an_mt7922_and_no_other_of_its_ids_is_a_chip() {
+        let ittim = |device| PciIdentity {
+            vendor: 0x0b48,
+            ..pci(device)
+        };
+        assert_eq!(ittim(0x7922).chip(), Some(Chip::Mt7922));
+        let identity = Identity::observed(ittim(0x7922), 0x7922, 1, None).unwrap();
+        assert_eq!(identity.chip, Chip::Mt7922);
+        assert!(identity.hardware_key().starts_with("pci:0b48:7922:"));
+        for device in [0x7961, 0x7925, 0x0616] {
+            assert_eq!(ittim(device).chip(), None);
+        }
     }
 }

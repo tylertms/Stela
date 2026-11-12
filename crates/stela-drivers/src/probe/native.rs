@@ -105,7 +105,11 @@ impl Kind {
             Some(Self::Ish)
         } else if function.vendor == 0x8086 && function.class[..2] == [2, 0x80] {
             Some(Self::IntelWifi)
-        } else if function.vendor == 0x14c3 && function.class[..2] == [2, 0x80] {
+        } else if matches!(
+            (function.vendor, function.device),
+            (0x14c3, _) | (0x0b48, 0x7922)
+        ) && function.class[..2] == [2, 0x80]
+        {
             Some(Self::MediatekWifi)
         } else if function.vendor == 0x10ec
             && function.class[..2] == [2, 0x80]

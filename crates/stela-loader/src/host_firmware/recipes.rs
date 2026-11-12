@@ -976,7 +976,7 @@ pub fn require_wifi(inventory: &mut Inventory, vendor: u16, device: u16) -> Resu
                 "mediatek/WIFI_RAM_CODE_MT7961_1.bin",
             ],
         ),
-        (0x14c3, 0x7922 | 0x0616) => (
+        (0x14c3, 0x7922 | 0x0616) | (0x0b48, 0x7922) => (
             "wifi-mt792x",
             "pci:14c3:7922",
             &[

@@ -177,17 +177,19 @@ fn approved_downloads_match_recipe_and_license_content_pins() {
 
 #[test]
 fn a_wifi_network_requires_the_database_and_a_mediatek_chips_two_images() {
-    for (device, chip) in [
-        (0x7961, "7961"),
-        (0x0608, "7961"),
-        (0x7922, "7922"),
-        (0x0616, "7922"),
-        (0x7925, "7925"),
-        (0x0717, "7925"),
+    for (vendor, device, chip) in [
+        (0x14c3, 0x7961, "7961"),
+        (0x14c3, 0x0608, "7961"),
+        (0x14c3, 0x7922, "7922"),
+        (0x14c3, 0x0616, "7922"),
+        // ITTIM's MT7922 takes MediaTek's MT7922 images.
+        (0x0b48, 0x7922, "7922"),
+        (0x14c3, 0x7925, "7925"),
+        (0x14c3, 0x0717, "7925"),
     ] {
         let mut inventory = Inventory::default();
         require_regulatory(&mut inventory).unwrap();
-        assert!(require_wifi(&mut inventory, 0x14c3, device).unwrap());
+        assert!(require_wifi(&mut inventory, vendor, device).unwrap());
         let plan = Plan::select(&inventory).unwrap();
         assert_eq!(plan.selections().len(), 3, "{device:#x}");
         for selection in &plan.selections()[1..] {
