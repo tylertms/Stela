@@ -445,6 +445,14 @@ unsafe impl QueueIo for DeviceIo {
                 );
                 return Ok(());
             }
+            {
+                // A connac2 client's CE commands, which no event answers.
+                let mut model = self.response.lock().unwrap();
+                if !unified && model.client_execution && self.chip != Chip::Mt7925 {
+                    model.client_commands.push(packet.clone());
+                    return Ok(());
+                }
+            }
             let mut response = vec![0u8; base + 12 + if unified { 8 } else { 0 }];
             response[..4].copy_from_slice(&(7u32 << 27).to_le_bytes());
             response[base..base + 2].copy_from_slice(&12u16.to_le_bytes());

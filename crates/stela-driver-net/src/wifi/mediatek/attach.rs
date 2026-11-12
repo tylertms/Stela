@@ -18,7 +18,7 @@ use super::{
         self, LoadError, Requests,
         clc::{Environment as ClcEnvironment, Inputs as ClcInputs},
     },
-    identity::{Chip, PciIdentity},
+    identity::PciIdentity,
     mcu::device::Context,
     registers::MmioBar,
     ring::MmioQueue,
@@ -450,7 +450,8 @@ pub unsafe fn attach<C: 'static>(
     domain: Arc<dyn DmaDomain>,
     inputs: Inputs,
 ) -> Result<Attached<C>, AttachError> {
-    if pci.chip() != Some(Chip::Mt7925) {
+    // MT7920 (0x7920) has no Chip and stays refused.
+    if pci.chip().is_none() {
         return Err(AttachError::UnsupportedChip(pci));
     }
     let alpha2 = inputs.network.country.unwrap_or(*b"00");
@@ -497,6 +498,7 @@ pub unsafe fn attach<C: 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wifi::mediatek::identity::Chip;
     extern crate std;
     use stela_driver_base::entropy::EntropyError;
 

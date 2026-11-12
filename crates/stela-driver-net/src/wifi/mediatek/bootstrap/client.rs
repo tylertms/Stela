@@ -320,9 +320,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         mut controller: Controller<I, Q, C>,
         interface: Interface<Arc<C>>,
     ) -> Result<Self, Error> {
-        if controller.phase() != ControllerPhase::StartFacts
-            || controller.state().identity.chip != Chip::Mt7925
-        {
+        if controller.phase() != ControllerPhase::StartFacts {
             return Err(Error::WrongDevice);
         }
         let m = controller.state().mailbox.as_ref().unwrap();

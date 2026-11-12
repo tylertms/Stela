@@ -34,12 +34,16 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Client<I, Q, C> {
         // request. A refused RNR list must leave this same owner reusable.
         let mut elements = [Vec::new(), Vec::new(), Vec::new()];
         // A 6 GHz probe carries the HE 6 GHz capability, as mac80211 builds it.
+        // mt76_connac_mcu_hw_scan copies mac80211's elements into every
+        // active connac2 scan.
+        let connac2 = s.controller.state().identity.chip != Chip::Mt7925;
         let prepared = !request.extra_elements().is_empty()
             || (request.active()
-                && request
-                    .channels()
-                    .iter()
-                    .any(|ch| ch.band == wifi::Band::Ghz6));
+                && (connac2
+                    || request
+                        .channels()
+                        .iter()
+                        .any(|ch| ch.band == wifi::Band::Ghz6)));
         if prepared {
             let he6 = if actual_policy.capabilities().observed().six_ghz() == Some(true) {
                 local::current(s, wifi::Band::Ghz6)

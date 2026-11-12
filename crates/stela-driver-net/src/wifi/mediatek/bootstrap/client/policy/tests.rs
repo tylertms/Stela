@@ -24,15 +24,15 @@ pub(super) fn setup_modern_radio(
     split: bool,
     channel: Channel,
 ) -> (Client<Bar, Q, NativeGuard>, Model) {
-    setup_modern_bands(split, channel, 0, None)
+    setup_modern_bands(Chip::Mt7925, split, channel, 0, None)
 }
 /// A modern client whose board also programs 6 GHz channel 1 with `flags`.
 pub(crate) fn setup_six(flags: u32) -> (Client<Bar, Q, NativeGuard>, Model) {
-    setup_modern_bands(false, CHANNEL, 0, Some(flags))
+    setup_modern_bands(Chip::Mt7925, false, CHANNEL, 0, Some(flags))
 }
 /// A modern client whose 5 GHz channels bar probes, under `passive_country`.
 pub(crate) fn setup_passive_five() -> (Client<Bar, Q, NativeGuard>, Model) {
-    setup_modern_bands(false, CHANNEL, channel::NO_IR, None)
+    setup_modern_bands(Chip::Mt7925, false, CHANNEL, channel::NO_IR, None)
 }
 /// The rules of `country()` with its 5 GHz band NO-IR.
 pub(crate) fn passive_country() -> Country {
@@ -50,21 +50,22 @@ pub(crate) fn six_country() -> Country {
     ])
 }
 fn setup_modern_bands(
+    chip: Chip,
     split: bool,
     channel: Channel,
     five: u32,
     six: Option<u32>,
 ) -> (Client<Bar, Q, NativeGuard>, Model) {
-    let mut f = NativeFixture::new(Chip::Mt7925);
+    let mut f = NativeFixture::new(chip);
     if six.is_some() {
         f.model.lock().unwrap().capability_payload = Some(
-            crate::wifi::mediatek::mailbox::clc::remaining::tests::caps(Chip::Mt7925, [true; 3]),
+            crate::wifi::mediatek::mailbox::clc::remaining::tests::caps(chip, [true; 3]),
         );
     }
     f.install().unwrap();
-    f.boot(Chip::Mt7925);
+    f.boot(chip);
     f.policy_channel_power(
-        Chip::Mt7925,
+        chip,
         [true, true, six.is_some()],
         [
             vec![domain::Channel {
@@ -140,6 +141,79 @@ pub(super) fn done(model: &Model) {
     done[38] = 6;
     done[50] = 4;
     device_receive(&model.queues[&0xd4500], &done, true, 0);
+}
+/// A connac2 client of `chip` on the modern client's board.
+pub(crate) fn setup_connac2(chip: Chip) -> (Client<Bar, Q, NativeGuard>, Model) {
+    setup_modern_bands(chip, false, CHANNEL, 0, None)
+}
+/// connac2's unsolicited SCAN_DONE event, 0x0d, after its 24-byte RXD.
+pub(crate) fn connac2_done(model: &Model) {
+    let mut done = vec![0; 52];
+    done[..4].copy_from_slice(&(7u32 << 27).to_le_bytes());
+    done[28] = 0x0d;
+    done[30] = 4;
+    device_receive(&model.queues[&0xd4500], &done, true, 0);
+}
+#[test]
+fn connac2_clients_admit_their_policy_and_scan_with_their_probe_elements() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    for chip in [Chip::Mt7921, Chip::Mt7922] {
+        let (client, model) = setup_connac2(chip);
+        // mt7921_register_device: 160 MHz VHT only on MT7922.
+        let local = client.local_advertisement(Band::Ghz5).unwrap();
+        let vht = local.capabilities().vht().unwrap().capability;
+        assert_eq!(vht & 0x44 != 0, chip == Chip::Mt7922);
+        assert!(local.capabilities().eht().is_none());
+        // The admitted policy reads connac2's domain rows and rate power.
+        let mut driver = ManagedClient::new(client, country(), Environment::Indoor).unwrap();
+        let count = model.response.lock().unwrap().client_commands.len();
+        driver
+            .begin_scan(
+                scan::Request::new(vec![CHANNEL], vec![vec![]], vec![]).unwrap(),
+                0,
+                1000,
+            )
+            .unwrap();
+        let commands = model.response.lock().unwrap().client_commands.clone();
+        assert_eq!(commands.len(), count + 1);
+        // MCU_CE_CMD(START_HW_SCAN) with one all-band element list.
+        let scan = &commands[count];
+        assert_eq!(scan[36], 3);
+        let body = &scan[64..];
+        assert_eq!(body.len(), 1186);
+        let elements = super::super::local::scan::elements(
+            &local,
+            super::super::local::scan::Selection::programmed(
+                driver
+                    .client
+                    .state()
+                    .controller
+                    .state()
+                    .policy
+                    .as_ref()
+                    .unwrap()
+                    .programmed()
+                    .unwrap()
+                    .0,
+                Band::Ghz5,
+                0,
+            ),
+        )
+        .unwrap();
+        // Only the 5 GHz channel is scanned, so the list is its elements.
+        let length = usize::from(u16::from_le_bytes([body[224], body[225]]));
+        assert_eq!(&body[226..226 + length], &elements[..]);
+        connac2_done(&model);
+        driver.poll(2, &Source).unwrap();
+        assert_eq!(driver.phase(), Phase::ScanCompleted);
+        // SAFETY: modeled terminal/notifications/DMA drained.
+        unsafe { driver.retire_scan_after_drain() }.unwrap();
+        driver.stop().unwrap();
+        assert_eq!(driver.phase(), Phase::ControllerDrain);
+        finish_stop(&mut driver, &model);
+    }
 }
 fn finish_stop(driver: &mut ManagedClient<Bar, Q, NativeGuard>, model: &Model) {
     model.response.lock().unwrap().clc_processing = false;
