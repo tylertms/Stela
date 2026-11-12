@@ -64,6 +64,9 @@ fn poisoned_output_refuses_to_rewrite_the_active_dma_buffer() {
             send,
             status: dma.allocate(64, 64).unwrap(),
             queued: None,
+            sending: None,
+            resetting: None,
+            sent_error: None,
             notify_queued: None,
             connected: None,
             rx_dropped: 0,
@@ -617,6 +620,99 @@ fn malformed_parameters_and_short_size_commands_abort_before_ncm_data_activation
         );
         assert!(model.borrow().outgoing.is_empty());
     }
+}
+
+/// An ECM link sending frames, one of whole packets with the zero-length
+/// packet after it, and recovering a STALLed IN transfer, a STALLed OUT
+/// transfer and one past its deadline, its calls bounded by
+/// [`crate::usb::ethernet::tests::stepped::Calls`]; what the device saw and
+/// the transfers dropped.
+fn ecm_link_through_failures(late: bool) -> (crate::usb::ethernet::tests::stepped::Effects, u64) {
+    use crate::net::{Link, LinkError};
+    use crate::usb::ethernet::tests::stepped::{Calls, effects};
+    let mut dma = TestRegion::new(128 * 1024 * 8);
+    let (controller, model) = unconfigured_cancellation_controller_with_configurations(
+        &mut dma,
+        &[vec![9, 2, 9, 0, 0, 42, 0, 0x80, 50]],
+    );
+    model.borrow_mut().descriptors = vec![(STRING_DESCRIPTOR, 1, cdc_mac_descriptor())];
+    let shared = Rc::new(RefCell::new(controller));
+    let mut found = Found::default();
+    bind(&shared, cdc_device(&shared, None), &mut dma, &mut found);
+    assert!(found.failures.is_empty(), "{:?}", found.failures);
+    let link = &mut found.links[0];
+    let clock = shared.borrow().clock;
+    let mut calls = Calls::new(model.clone(), clock, late);
+    let not_busy = |result: &Result<(), LinkError>| result != &Err(LinkError::Busy);
+
+    calls
+        .until(|| link.transmit(&[0x5a; 60]), not_busy)
+        .unwrap();
+    // A frame of whole packets, then its zero-length packet.
+    calls
+        .until(|| link.transmit(&[0x6a; 64]), not_busy)
+        .unwrap();
+    calls
+        .until(|| link.transmit(&[0x7a; 60]), not_busy)
+        .unwrap();
+
+    // usbnet's rx_complete: a STALLed IN transfer is dropped once its
+    // endpoint is reset, a command or poll per call.
+    model.borrow_mut().halt_transfer = Some(5);
+    calls.call(|| link.receive().unwrap());
+    model.borrow_mut().halt_transfer = None;
+    calls.until(
+        || (link.receive().unwrap(), link.rx_dropped()),
+        |(_, dropped)| *dropped == 1,
+    );
+    model.borrow_mut().push_acl(vec![0x8a; 60]);
+    let frame = calls.until(|| link.receive().unwrap(), Option::is_some);
+    assert_eq!(frame, Some(vec![0x8a; 60]));
+
+    // A STALLed OUT transfer is reported once its TDs are cancelled.
+    model.borrow_mut().halt_transfer = Some(4);
+    let failed = calls.until(
+        || link.transmit(&[0x9a; 60]),
+        |result| result.is_err() && not_busy(result),
+    );
+    assert!(matches!(failed, Err(LinkError::Adapter(_))));
+    model.borrow_mut().halt_transfer = None;
+    calls
+        .until(|| link.transmit(&[0xaa; 60]), not_busy)
+        .unwrap();
+
+    // So is one past its deadline.
+    model.borrow_mut().silence_transfer = Some(4);
+    calls
+        .until(|| link.transmit(&[0xba; 60]), not_busy)
+        .unwrap();
+    calls.wait(SEND_US);
+    let failed = calls.until(|| link.transmit(&[0xca; 60]), not_busy);
+    assert!(matches!(
+        failed,
+        Err(LinkError::Adapter(message)) if message.ends_with("device timeout")
+    ));
+    model.borrow_mut().silence_transfer = None;
+    calls
+        .until(|| link.transmit(&[0xda; 60]), not_busy)
+        .unwrap();
+    assert_eq!(calls.answered_late > 0, late);
+    let seen = (effects(&model.borrow(), |_| false), link.rx_dropped());
+    calls.answer_at_once();
+    seen
+}
+
+/// A device that answers each transfer and command only after the link
+/// call that asked returned: no transmit waits for its OUT transfer, a
+/// frame sent while one is in flight is busy, and endpoint resets run a
+/// command or poll per call, no call holding the processor beyond its
+/// bound; the device sees what one that answers at once sees.
+#[test]
+fn ecm_link_calls_never_wait_when_the_device_answers_late() {
+    assert_eq!(
+        ecm_link_through_failures(true),
+        ecm_link_through_failures(false)
+    );
 }
 
 pub(crate) mod generation;

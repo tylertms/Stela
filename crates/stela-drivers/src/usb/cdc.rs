@@ -27,13 +27,19 @@
 //! NetworkConnection notifications on the interrupt endpoint set the
 //! carrier (ECM 6.3.1, and alike in NCM); until one arrives the link is
 //! taken to be up. Frames above the 1514-byte Ethernet maximum are refused.
+//!
+//! As usbnet keeps its URBs, one OUT transfer and one IN transfer stay in
+//! flight across link calls, and no call waits for the device: a frame
+//! sent while the last is in flight is refused as busy, and a failed
+//! transfer's endpoint reset runs a command or poll per call.
 mod ntb;
 
 use super::descriptor::{
     DEVICE_TO_HOST, Endpoint, Interface, RECIPIENT_INTERFACE, SET_INTERFACE, TYPE_CLASS, setup,
 };
-use super::xhci::{Device, Plan, Shared, SlotId, TransferTicket};
+use super::xhci::{Device, Operation, Plan, Shared, SlotId, TransferTicket};
 use crate::{
+    Deadline,
     block::BlockError,
     bus::dma::{DmaAllocator, DmaBuffer},
     net::{Link, LinkError, MAX_FRAME, Mac},
@@ -74,7 +80,10 @@ const NETWORK_CONNECTION: u8 = 0x00;
 const FRAME_BYTES: usize = 2048;
 /// The largest NCM IN block this driver takes: room for ten full frames.
 pub const NCM_IN_BLOCK: usize = 16 * 1024;
+/// How long one OUT transfer may stay outstanding before it is cancelled.
 const SEND_US: u64 = 1_000_000;
+/// xHCI's Incompatible Device Error, which only retiring the slot ends.
+const INCOMPATIBLE_DEVICE: u32 = 22;
 
 /// The CDC Ethernet model an adapter speaks.
 #[derive(Clone, Copy, Debug)]
@@ -178,6 +187,23 @@ fn parse_mac(text: &str) -> Option<Mac> {
     Some(Mac(mac))
 }
 
+/// The OUT transfer the controller still owns: its ticket, its length, when
+/// it times out, and whether a zero-length packet follows it.
+struct Sending {
+    ticket: TransferTicket,
+    bytes: usize,
+    deadline: Deadline,
+    zero_length: bool,
+}
+
+/// What an endpoint reset under way is for.
+enum Reset {
+    /// A failed IN transfer, dropped once its endpoint is reset.
+    Input,
+    /// A failed or timed-out OUT transfer, reported once it is cancelled.
+    Output(BlockError),
+}
+
 pub struct UsbNet {
     controller: Shared,
     id: SlotId,
@@ -190,6 +216,14 @@ pub struct UsbNet {
     send: DmaBuffer,
     status: DmaBuffer,
     queued: Option<TransferTicket>,
+    /// The send buffer is the controller's until this ends or its
+    /// cancellation is acknowledged.
+    sending: Option<Sending>,
+    /// An endpoint reset, a command or poll per link call.
+    resetting: Option<(Operation, Reset)>,
+    /// A failed OUT transfer's error, once its endpoint is reset, for the
+    /// next transmit to report.
+    sent_error: Option<BlockError>,
     notify_queued: Option<TransferTicket>,
     connected: Option<bool>,
     /// Receive transfers that failed, blocks that did not decode and frames
@@ -333,6 +367,9 @@ impl UsbNet {
             send,
             status,
             queued: None,
+            sending: None,
+            resetting: None,
+            sent_error: None,
             notify_queued: None,
             connected: None,
             rx_dropped: 0,
@@ -375,26 +412,130 @@ fn link_error(error: BlockError) -> LinkError {
     LinkError::Adapter(format!("USB Ethernet: {error}"))
 }
 
+impl UsbNet {
+    /// One look at the endpoint reset under way: whether none runs any more.
+    /// A reset that fails leaves its endpoint refusing every transfer.
+    fn advance(&mut self) -> Result<bool, BlockError> {
+        let Some((operation, _)) = &mut self.resetting else {
+            return Ok(true);
+        };
+        let result = {
+            let mut host = self.controller.borrow_mut();
+            host.device(self.id)?.poll(operation)
+        };
+        let Some(result) = result else {
+            return Ok(false);
+        };
+        let (_, reset) = self.resetting.take().unwrap();
+        result?;
+        match reset {
+            Reset::Input => self.rx_dropped = self.rx_dropped.saturating_add(1),
+            Reset::Output(error) => {
+                self.sending = None;
+                self.sent_error = Some(error);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether the send buffer is free: no OUT transfer in flight, or the
+    /// one in flight completed, after which a due zero-length packet is
+    /// sent. A failed transfer is reported once its endpoint's TDs are
+    /// cancelled, and one past its deadline once its cancellation is
+    /// acknowledged; until then the buffer stays the controller's.
+    fn sent(&mut self) -> Result<bool, LinkError> {
+        if let Some(error) = self.sent_error.take() {
+            return Err(link_error(error));
+        }
+        let output = self.binding.output;
+        loop {
+            let Some(sending) = &self.sending else {
+                return Ok(true);
+            };
+            let mut host = self.controller.borrow_mut();
+            let clock = host.clock;
+            let mut c = host.device(self.id).map_err(link_error)?;
+            let error = match c.completed_ticket(&sending.ticket) {
+                Some(Ok(actual)) if actual != sending.bytes => {
+                    self.sending = None;
+                    return Err(LinkError::Adapter(String::from(
+                        "short USB Ethernet OUT transfer",
+                    )));
+                }
+                Some(Ok(_)) if sending.zero_length => {
+                    let deadline = clock.try_deadline(SEND_US).map_err(|_| {
+                        LinkError::Adapter(String::from("USB Ethernet send clock unavailable"))
+                    })?;
+                    let ticket = c
+                        .submit_ticket(output.dci(), self.send.physical(), 0)
+                        .map_err(link_error)?;
+                    self.sending = Some(Sending {
+                        ticket,
+                        bytes: 0,
+                        deadline,
+                        zero_length: false,
+                    });
+                    continue;
+                }
+                Some(Ok(_)) => {
+                    self.sending = None;
+                    return Ok(true);
+                }
+                // Only retiring the slot ends this; no cancellation can.
+                Some(Err(
+                    error @ BlockError::Device {
+                        status: INCOMPATIBLE_DEVICE,
+                    },
+                )) => {
+                    self.sending = None;
+                    return Err(link_error(error));
+                }
+                Some(Err(error)) => error,
+                None if sending.deadline.passed() => BlockError::Timeout,
+                None => return Ok(false),
+            };
+            let operation = c.start_cancel(output.dci()).map_err(link_error)?;
+            drop(host);
+            self.resetting = Some((operation, Reset::Output(error)));
+            self.advance().map_err(link_error)?;
+            return match self.sent_error.take() {
+                Some(error) => Err(link_error(error)),
+                None => Ok(false),
+            };
+        }
+    }
+}
+
 impl Link for UsbNet {
     fn mac(&self) -> Mac {
         self.mac
     }
 
     fn carrier(&mut self) -> bool {
-        self.notifications().is_ok() && self.connected.unwrap_or(true)
+        self.advance().is_ok() && self.notifications().is_ok() && self.connected.unwrap_or(true)
     }
 
+    /// Queue `frame` and return without waiting for the controller, as
+    /// usbnet_start_xmit submits its URB. While the previous frame, or an
+    /// endpoint reset, is still under way the frame is refused as busy.
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
-        // A previous failed cancellation may still own this OUT buffer.
-        let mut host = self.controller.borrow_mut();
-        let mut c = host.device(self.id).map_err(link_error)?;
-        c.endpoint_ready(self.binding.output.dci())
-            .map_err(link_error)?;
+        let idle = self.advance().map_err(link_error)?;
         if frame.len() > MAX_FRAME {
             return Err(LinkError::Adapter(String::from(
                 "frame above the Ethernet maximum",
             )));
         }
+        if !idle || !self.sent()? {
+            return Err(LinkError::Busy);
+        }
+        let mut host = self.controller.borrow_mut();
+        let clock = host.clock;
+        let mut c = host.device(self.id).map_err(link_error)?;
+        c.endpoint_ready(self.binding.output.dci())
+            .map_err(link_error)?;
+        let deadline = clock
+            .try_deadline(SEND_US)
+            .map_err(|_| LinkError::Adapter(String::from("USB Ethernet send clock unavailable")))?;
         // The length of the one OUT transfer, and the NCM block size that
         // needs no zero-length packet after it.
         let (length, whole) = match &mut self.framing {
@@ -415,24 +556,25 @@ impl Link for UsbNet {
             }
         };
         let output = self.binding.output;
-        let physical = self.send.physical();
-        let sent = c
-            .transfer(output.dci(), physical, length, SEND_US)
-            .map_err(link_error)?;
-        if sent != length {
-            return Err(LinkError::Adapter(String::from(
-                "short USB Ethernet OUT transfer",
-            )));
-        }
         let packet = usize::from(output.max_packet & 0x7ff).max(1);
-        if length.is_multiple_of(packet) && whole != Some(length) {
-            c.transfer(output.dci(), physical, 0, SEND_US)
-                .map_err(link_error)?;
-        }
-        Ok(())
+        let ticket = c
+            .submit_ticket(output.dci(), self.send.physical(), length)
+            .map_err(link_error)?;
+        drop(host);
+        self.sending = Some(Sending {
+            ticket,
+            bytes: length,
+            deadline,
+            zero_length: length.is_multiple_of(packet) && whole != Some(length),
+        });
+        // A controller that already finished reports the outcome now.
+        self.sent().map(|_| ())
     }
 
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
+        if !self.advance().map_err(link_error)? {
+            return Ok(None);
+        }
         let mut host = self.controller.borrow_mut();
         let mut c = host.device(self.id).map_err(link_error)?;
         if let Some(frame) = self.pending.pop_front() {
@@ -456,8 +598,10 @@ impl Link for UsbNet {
                 // usbnet's rx_complete: a failed transfer is counted and
                 // dropped once its endpoint is reset; an endpoint that
                 // cannot be reset is a dead device.
-                c.clear(&input).map_err(link_error)?;
-                self.rx_dropped = self.rx_dropped.saturating_add(1);
+                let operation = c.start_clear(&input).map_err(link_error)?;
+                drop(host);
+                self.resetting = Some((operation, Reset::Input));
+                self.advance().map_err(link_error)?;
                 return Ok(None);
             }
         };
