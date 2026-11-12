@@ -217,6 +217,13 @@ fn a_passphrase_network_offering_sae_authenticates_by_it_before_the_handshake() 
     // authentication.
     done(&model);
     assert!(!station.carrier());
+    // Hunting and pecking runs hostapd's 40 rounds, a bounded share a
+    // poll; the poll that finds the element sends the commit.
+    for _ in 1..40 / crate::wifi::sae::ROUNDS_PER_STEP {
+        assert!(!station.carrier());
+        assert!(finish_tx(&model).is_empty());
+    }
+    assert!(!station.carrier());
     let (transaction, status, commit) = sent_sae(&model);
     assert_eq!((transaction, status), (1, 0));
     let mut random = 7u8;
@@ -484,7 +491,9 @@ fn a_reported_six_ghz_ap_is_scanned_and_joined_by_sae_hash_to_element() {
     assert!(!station.carrier());
     done(&model);
     assert!(!station.carrier());
-    // The station commits by hash-to-element on the AP's channel.
+    // The station commits by hash-to-element on the AP's channel, the poll
+    // after it began the exchange.
+    assert!(!station.carrier());
     let sent = |model: &Model| {
         let frame = finish_tx_on(model, 1).pop().unwrap();
         assert_eq!(frame[..2], [0xb0, 0]);

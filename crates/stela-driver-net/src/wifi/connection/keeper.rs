@@ -456,7 +456,10 @@ struct Authenticating<H> {
     bss: Bss,
     security: Security,
     session: Arc<external::Session>,
-    exchange: Exchange,
+    /// The password element's derivation, a bounded share per poll, until
+    /// the exchange's first commit goes out.
+    deriving: Option<sae::Deriving>,
+    exchange: Option<Exchange>,
     /// Whether the exchange derives its element by hash-to-element.
     h2e: bool,
     /// The AP MLD links the association requests.
@@ -741,8 +744,14 @@ impl<R: Radio> Keeper<R> {
         match &self.state {
             State::Waiting { at } if now >= *at && stage == Stage::Idle => self.scan(now),
             State::Scanning(_) if stage == Stage::Scanned => self.scanned(now),
+            State::Authenticating(authenticating) if authenticating.deriving.is_some() => {
+                self.derive(now)
+            }
             State::Authenticating(authenticating)
-                if authenticating.exchange.accepted()
+                if authenticating
+                    .exchange
+                    .as_ref()
+                    .is_some_and(Exchange::accepted)
                     && self.link.station().external_authenticated() =>
             {
                 self.associate(now)
@@ -980,35 +989,55 @@ impl<R: Radio> Keeper<R> {
         }
         .map_err(|error| format!("{error}"))?;
         let derivation = Derivation::for_rsnxe(connection::find(&bss.elements, 244));
-        let mut unavailable = None;
-        let mut random = || {
-            let mut bytes = [0; 32];
-            if let Err(error) = self.entropy.fill(&mut bytes) {
-                unavailable = Some(error);
-            }
-            bytes
-        };
-        let exchange = Exchange::for_session(
-            &session,
-            derivation,
-            passphrase.as_bytes(),
-            None,
-            &mut random,
-        );
-        if let Some(error) = unavailable {
-            return Err(format!("{} SAE: {error}", R::NAME));
-        }
-        let exchange = exchange.map_err(|error| format!("{} SAE: {error:?}", R::NAME))?;
-        self.send_sae(&session, exchange.commit())?;
+        let deriving =
+            sae::Deriving::for_session(&session, derivation, passphrase.as_bytes(), None)
+                .map_err(|error| format!("{} SAE: {error:?}", R::NAME))?;
         Ok(Box::new(Authenticating {
             handle,
             bss,
             security,
             session,
-            exchange,
+            deriving: Some(deriving),
+            exchange: None,
             h2e: derivation == Derivation::HashToElement,
             links,
         }))
+    }
+
+    /// One bounded share of the password element's derivation; the step
+    /// that finds it sends the exchange's first commit.
+    fn derive(&mut self, now: u64) {
+        let State::Authenticating(authenticating) = &mut self.state else {
+            return;
+        };
+        let Some(deriving) = authenticating.deriving.as_mut() else {
+            return;
+        };
+        let entropy = &self.entropy;
+        let mut unavailable = None;
+        let mut random = || {
+            let mut bytes = [0; 32];
+            if let Err(error) = entropy.fill(&mut bytes) {
+                unavailable = Some(error);
+            }
+            bytes
+        };
+        let stepped = deriving.step(&mut random);
+        if let Some(error) = unavailable {
+            return self.failed(now, format!("{} SAE: {error}", R::NAME));
+        }
+        let exchange = match stepped {
+            Ok(Some(exchange)) => exchange,
+            Ok(None) => return,
+            Err(error) => return self.failed(now, format!("{} SAE: {error:?}", R::NAME)),
+        };
+        let commit = exchange.commit();
+        authenticating.deriving = None;
+        authenticating.exchange = Some(exchange);
+        let session = authenticating.session.clone();
+        if let Err(message) = self.send_sae(&session, commit) {
+            self.failed(now, message);
+        }
     }
 
     /// `ieee80211_mgd_assoc` for an AP MLD: when the NIC reports MLO and
@@ -1146,7 +1175,11 @@ impl<R: Radio> Keeper<R> {
         if !Arc::ptr_eq(received.session(), &authenticating.session) {
             return;
         }
-        let reply = match authenticating.exchange.receive_from(received) {
+        // Nothing the AP sends precedes the station's first commit.
+        let Some(exchange) = authenticating.exchange.as_mut() else {
+            return;
+        };
+        let reply = match exchange.receive_from(received) {
             Ok(reply) => reply,
             Err(sae::Error::Confirm) => {
                 return self.failed(
@@ -1183,8 +1216,9 @@ impl<R: Radio> Keeper<R> {
             exchange,
             h2e,
             links,
+            ..
         } = *authenticating;
-        let Some(pmk) = exchange.pmk() else {
+        let Some(pmk) = exchange.as_ref().and_then(Exchange::pmk) else {
             return self.failed(now, format!("{}: SAE gave no PMK", R::NAME));
         };
         let rsnxe = h2e.then_some(&sae::H2E_RSNXE[..]);

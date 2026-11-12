@@ -50,6 +50,9 @@ const CONFIRM: u16 = 2;
 /// whichever round finds the element, so its time does not reveal which.
 const ROUNDS: u8 = 40;
 const MAX_ROUNDS: u8 = 200;
+/// Hunting-and-pecking rounds one [`Deriving::step`] runs, so that a
+/// station poll derives the element over several polls, never in one.
+pub const ROUNDS_PER_STEP: u8 = 4;
 const ELEMENT_BYTES: usize = 64;
 const SCALAR_BYTES: usize = 32;
 /// Element ID Extension and its password identifier and anti-clogging token
@@ -129,32 +132,189 @@ fn addresses(a: Mac, b: Mac) -> [u8; 12] {
     out
 }
 
-/// The password element by hunting and pecking: the first `pwd-value` below
-/// p that is the x of a curve point, with the y whose parity is the
-/// `pwd-seed`'s (12.4.4.2.2).
-fn hunt_and_peck(password: &[u8], a: Mac, b: Mac) -> Result<ProjectivePoint, Error> {
-    let base = addresses(a, b);
-    let mut found = Choice::from(0);
-    let mut element = AffinePoint::IDENTITY;
-    let mut counter = 1u8;
-    while counter <= ROUNDS || !bool::from(found) {
-        if counter > MAX_ROUNDS {
-            return Err(Error::Exhausted);
-        }
-        let seed = Zeroizing::new(hmac_sha256(&base, &[password, &[counter]]));
-        let value = kdf_sha256(&seed[..], b"SAE Hunting and Pecking", &PRIME, 32);
-        let candidate =
-            AffinePoint::decompress(FieldBytes::from_slice(&value), Choice::from(seed[31] & 1));
-        let take = candidate.is_some() & !found;
-        element = AffinePoint::conditional_select(
-            &element,
-            &candidate.unwrap_or(AffinePoint::IDENTITY),
-            take,
-        );
-        found |= take;
-        counter += 1;
+/// The password element by hunting and pecking, a few rounds at a time: the
+/// first `pwd-value` below p that is the x of a curve point, with the y whose
+/// parity is the `pwd-seed`'s (12.4.4.2.2).
+struct Hunt {
+    base: [u8; 12],
+    password: Zeroizing<Vec<u8>>,
+    counter: u8,
+    found: Choice,
+    element: AffinePoint,
+}
+
+impl Drop for Hunt {
+    fn drop(&mut self) {
+        self.element.zeroize();
     }
-    Ok(element.into())
+}
+
+impl Hunt {
+    fn new(password: &[u8], a: Mac, b: Mac) -> Self {
+        Self {
+            base: addresses(a, b),
+            password: Zeroizing::new(password.to_vec()),
+            counter: 1,
+            found: Choice::from(0),
+            element: AffinePoint::IDENTITY,
+        }
+    }
+
+    /// Up to `rounds` more rounds: the element once every round hostapd
+    /// runs has run and one found it.
+    fn step(&mut self, rounds: u8) -> Result<Option<ProjectivePoint>, Error> {
+        for _ in 0..rounds {
+            if self.counter > ROUNDS && bool::from(self.found) {
+                break;
+            }
+            if self.counter > MAX_ROUNDS {
+                return Err(Error::Exhausted);
+            }
+            let seed = Zeroizing::new(hmac_sha256(
+                &self.base,
+                &[&self.password[..], &[self.counter]],
+            ));
+            let value = kdf_sha256(&seed[..], b"SAE Hunting and Pecking", &PRIME, 32);
+            let candidate =
+                AffinePoint::decompress(FieldBytes::from_slice(&value), Choice::from(seed[31] & 1));
+            let take = candidate.is_some() & !self.found;
+            self.element = AffinePoint::conditional_select(
+                &self.element,
+                &candidate.unwrap_or(AffinePoint::IDENTITY),
+                take,
+            );
+            self.found |= take;
+            self.counter += 1;
+        }
+        if self.counter > ROUNDS && bool::from(self.found) {
+            Ok(Some(self.element.into()))
+        } else if self.counter > MAX_ROUNDS {
+            Err(Error::Exhausted)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// The whole hunt in one call, for the tests' known answers.
+#[cfg(test)]
+fn hunt_and_peck(password: &[u8], a: Mac, b: Mac) -> Result<ProjectivePoint, Error> {
+    let mut hunt = Hunt::new(password, a, b);
+    loop {
+        if let Some(element) = hunt.step(MAX_ROUNDS)? {
+            return Ok(element);
+        }
+    }
+}
+
+/// Where a [`Deriving`] exchange's password element stands.
+enum Work {
+    Hunt(Hunt),
+    Element(ProjectivePoint),
+}
+
+/// An exchange whose password element is still being derived. Each
+/// [`Self::step`] does a bounded share of the work, at most
+/// [`ROUNDS_PER_STEP`] rounds of hunting and pecking, so that a station
+/// derives across its polls; the step that finds the element also draws the
+/// commit's secrets and gives the [`Exchange`].
+pub struct Deriving {
+    derivation: Derivation,
+    identifier: Option<Vec<u8>>,
+    work: Work,
+}
+
+impl core::fmt::Debug for Deriving {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Deriving")
+            .field("derivation", &self.derivation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Deriving {
+    fn drop(&mut self) {
+        if let Work::Element(element) = &mut self.work {
+            element.zeroize();
+        }
+    }
+}
+
+impl Deriving {
+    /// Begin the exchange of `own` with `peer`. `template` serves
+    /// [`Derivation::HashToElement`]; hunting and pecking derives the element
+    /// from `password` over the steps.
+    pub fn new(
+        derivation: Derivation,
+        password: &[u8],
+        template: Option<&Template>,
+        identifier: Option<&[u8]>,
+        own: Mac,
+        peer: Mac,
+    ) -> Result<Self, Error> {
+        let work = match (derivation, template) {
+            (Derivation::HashToElement, Some(template)) => {
+                Work::Element(template.element(own, peer))
+            }
+            (Derivation::HashToElement, None) => return Err(Error::Sequence),
+            (Derivation::HuntingAndPecking, _) => Work::Hunt(Hunt::new(password, own, peer)),
+        };
+        Ok(Self {
+            derivation,
+            identifier: identifier.map(<[u8]>::to_vec),
+            work,
+        })
+    }
+
+    /// Begin the exchange of an external authentication session: its
+    /// station, AP and, for hash-to-element, SSID; an MLD session's
+    /// exchange runs between the two MLDs' addresses, as wpa_supplicant
+    /// gives SAE its own and the AP MLD's, by hash-to-element, whose token
+    /// container leaves the AP's multi-link element apart. The frames go out
+    /// through [`Station::external_authentication_transmit`] under the same
+    /// session.
+    ///
+    /// [`Station::external_authentication_transmit`]: super::station::Station::external_authentication_transmit
+    pub fn for_session(
+        session: &Session,
+        derivation: Derivation,
+        password: &[u8],
+        identifier: Option<&[u8]>,
+    ) -> Result<Self, Error> {
+        let (own, peer) = match session.multi_link() {
+            Some(_) if derivation != Derivation::HashToElement => return Err(Error::MultiLink),
+            Some(affiliation) => (affiliation.mld.local, affiliation.mld.ap),
+            None => (session.local(), session.peer()),
+        };
+        let template = (derivation == Derivation::HashToElement)
+            .then(|| Template::derive(session.ssid(), password, identifier));
+        Self::new(
+            derivation,
+            password,
+            template.as_ref(),
+            identifier,
+            own,
+            peer,
+        )
+    }
+
+    /// One bounded share of the derivation: the exchange, its first commit
+    /// ready, once the element is found.
+    pub fn step(
+        &mut self,
+        random: &mut dyn FnMut() -> [u8; 32],
+    ) -> Result<Option<Exchange>, Error> {
+        let element = match &mut self.work {
+            Work::Hunt(hunt) => match hunt.step(ROUNDS_PER_STEP)? {
+                Some(element) => element,
+                None => return Ok(None),
+            },
+            Work::Element(element) => *element,
+        };
+        let mut exchange = Exchange::commit_to(self.derivation, element, random)?;
+        exchange.identifier = self.identifier.take();
+        Ok(Some(exchange))
+    }
 }
 
 /// The password element template of hash-to-element (12.4.4.2.3): the sum
@@ -302,9 +462,9 @@ fn encode(scalar: &Scalar, element: &AffinePoint, out: &mut Vec<u8>) {
 }
 
 impl Exchange {
-    /// Begin the exchange of `own` with `peer` and write its first commit.
-    /// `template` serves [`Derivation::HashToElement`]; hunting and pecking
-    /// derives the element from `password`.
+    /// Begin the exchange of `own` with `peer` and write its first commit,
+    /// running every step of its [`Deriving`] at once, as a peer that is not
+    /// polled may.
     pub fn new(
         derivation: Derivation,
         password: &[u8],
@@ -314,11 +474,20 @@ impl Exchange {
         peer: Mac,
         random: &mut dyn FnMut() -> [u8; 32],
     ) -> Result<Self, Error> {
-        let element = match (derivation, template) {
-            (Derivation::HashToElement, Some(template)) => template.element(own, peer),
-            (Derivation::HashToElement, None) => return Err(Error::Sequence),
-            (Derivation::HuntingAndPecking, _) => hunt_and_peck(password, own, peer)?,
-        };
+        let mut deriving = Deriving::new(derivation, password, template, identifier, own, peer)?;
+        loop {
+            if let Some(exchange) = deriving.step(random)? {
+                return Ok(exchange);
+            }
+        }
+    }
+
+    /// The commit's secrets for the password element.
+    fn commit_to(
+        derivation: Derivation,
+        element: ProjectivePoint,
+        random: &mut dyn FnMut() -> [u8; 32],
+    ) -> Result<Self, Error> {
         let random_value = random_scalar(random)?;
         let mut mask = random_scalar(random)?;
         let mut exchange = Self::with_secrets(derivation, element, random_value, &mask);
@@ -328,42 +497,7 @@ impl Exchange {
             exchange = Self::with_secrets(derivation, element, random_scalar(random)?, &mask);
         }
         mask.zeroize();
-        exchange.identifier = identifier.map(<[u8]>::to_vec);
         Ok(exchange)
-    }
-
-    /// Begin the exchange of an external authentication session: its
-    /// station, AP and, for hash-to-element, SSID; an MLD session's
-    /// exchange runs between the two MLDs' addresses, as wpa_supplicant
-    /// gives SAE its own and the AP MLD's, by hash-to-element, whose token
-    /// container leaves the AP's multi-link element apart. The frames go out
-    /// through [`Station::external_authentication_transmit`] under the same
-    /// session.
-    ///
-    /// [`Station::external_authentication_transmit`]: super::station::Station::external_authentication_transmit
-    pub fn for_session(
-        session: &Session,
-        derivation: Derivation,
-        password: &[u8],
-        identifier: Option<&[u8]>,
-        random: &mut dyn FnMut() -> [u8; 32],
-    ) -> Result<Self, Error> {
-        let (own, peer) = match session.multi_link() {
-            Some(_) if derivation != Derivation::HashToElement => return Err(Error::MultiLink),
-            Some(affiliation) => (affiliation.mld.local, affiliation.mld.ap),
-            None => (session.local(), session.peer()),
-        };
-        let template = (derivation == Derivation::HashToElement)
-            .then(|| Template::derive(session.ssid(), password, identifier));
-        Self::new(
-            derivation,
-            password,
-            template.as_ref(),
-            identifier,
-            own,
-            peer,
-            random,
-        )
     }
 
     /// Take the AP's frame of the session, as

@@ -28,6 +28,52 @@ fn counter() -> impl FnMut() -> [u8; 32] {
     }
 }
 
+/// Each step runs a bounded share of hostapd's 40 rounds and the stepped
+/// hunt finds the element the whole one does.
+#[test]
+fn hunting_and_pecking_runs_a_bounded_share_of_its_rounds_a_step() {
+    let mut hunt = Hunt::new(PASSWORD, OWN, PEER);
+    let mut steps = 0;
+    let element = loop {
+        let before = hunt.counter;
+        let found = hunt.step(ROUNDS_PER_STEP).unwrap();
+        assert!(hunt.counter - before <= ROUNDS_PER_STEP);
+        steps += 1;
+        if let Some(element) = found {
+            break element;
+        }
+    };
+    assert_eq!(steps, ROUNDS / ROUNDS_PER_STEP);
+    assert_eq!(element, hunt_and_peck(PASSWORD, OWN, PEER).unwrap());
+    // The stepped exchange commits exactly as the one built at once.
+    let mut deriving = Deriving::new(
+        Derivation::HuntingAndPecking,
+        PASSWORD,
+        None,
+        None,
+        OWN,
+        PEER,
+    )
+    .unwrap();
+    let mut random = counter();
+    let stepped = loop {
+        if let Some(exchange) = deriving.step(&mut random).unwrap() {
+            break exchange;
+        }
+    };
+    let whole = Exchange::new(
+        Derivation::HuntingAndPecking,
+        PASSWORD,
+        None,
+        None,
+        OWN,
+        PEER,
+        &mut counter(),
+    )
+    .unwrap();
+    assert_eq!(stepped.commit(), whole.commit());
+}
+
 #[test]
 fn hunting_and_pecking_derives_the_annex_j_keys() {
     let element = hunt_and_peck(PASSWORD, OWN, PEER).unwrap();
