@@ -261,7 +261,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
             return Err(Error::WrongPhase);
         }
         let mut facts = Vec::new();
-        facts.try_reserve_exact(12).map_err(|_| Error::NoMemory)?;
+        facts.try_reserve_exact(14).map_err(|_| Error::NoMemory)?;
         // SAFETY: `Owned` is not zero-sized.
         let p = unsafe { alloc(Layout::new::<Owned<I, Q, C>>()) }.cast::<Owned<I, Q, C>>();
         if p.is_null() {
@@ -620,6 +620,19 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
         // SAFETY: `initialize_mac`'s contract: the EEPROM override is resolved
         // and no peer, WTBL or key user exists on the freshly booted firmware.
         s.mac = Some(unsafe { s.control.initialize_mac_raw() }.map_err(Error::Control)?);
+        // mt7925_init_work: thermal protection once the MAC is up.
+        for request in Request::thermal_protection(s.identity.chip)
+            .into_iter()
+            .flatten()
+        {
+            let fact = s
+                .mailbox
+                .as_mut()
+                .unwrap()
+                .initial(&request)
+                .map_err(Error::Transport)?;
+            s.facts.push(fact);
+        }
         if s.identity.chip != Chip::Mt7925 {
             let fact = s
                 .mailbox

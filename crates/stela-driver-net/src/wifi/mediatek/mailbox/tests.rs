@@ -362,6 +362,12 @@ unsafe impl QueueIo for DeviceIo {
                 }
                 return Ok(());
             }
+            // UNI_CHIP_CONFIG_CHIP_CFG settings such as thermal protection,
+            // sent without a wait, which firmware does not answer.
+            if unified && command == 14 && packet[52..54] == [2, 0] {
+                assert_eq!(packet[43], 6);
+                return Ok(());
+            }
             let capability = (unified && command == 14) || (!unified && command == 0x8a);
             let encapsulation = (unified && command == 0x2d && packet[43] == 3)
                 || (!unified && command == 0xed && packet[41] == 1);
