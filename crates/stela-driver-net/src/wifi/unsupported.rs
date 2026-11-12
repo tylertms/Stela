@@ -21,13 +21,7 @@ pub fn reason(vendor: u16, device: u16) -> Option<&'static str> {
         (0x8086, 0x0082..=0x0091 | 0x0885..=0x0897 | 0x08ae | 0x08af | 0x422b..=0x423d) => {
             "Intel WiFi Link or Centrino 1000-6000 series (Linux iwlwifi): no driver here"
         }
-        // mt7921e. Only MT7925 runs a station here.
-        (0x14c3, 0x7961 | 0x0608) => {
-            "MediaTek MT7921 (Linux mt7921e): no station driver here, only MT7925's"
-        }
-        (0x14c3 | 0x0b48, 0x7922) | (0x14c3, 0x0616) => {
-            "MediaTek MT7922 (Linux mt7921e): no station driver here, only MT7925's"
-        }
+        // mt7921e. MT7921 and MT7922 run a station here.
         (0x14c3, 0x7920) => "MediaTek MT7920 (Linux mt7921e): no driver here",
         (0x14c3, 0x7906 | 0x790a | 0x7915 | 0x7916) => {
             "MediaTek MT7915 or MT7916 (Linux mt7915e): no driver here"
@@ -156,9 +150,14 @@ mod tests {
 
     #[test]
     fn chips_a_driver_here_runs_have_no_reason_and_others_name_the_linux_driver() {
-        // MT7925, RTL8822CE, and an Intel device the Intel driver lists,
-        // which reports its own radio and step.
+        // MT7921, MT7922, MT7925, RTL8822CE, and an Intel device the Intel
+        // driver lists, which reports its own radio and step.
         for (vendor, device) in [
+            (0x14c3, 0x7961),
+            (0x14c3, 0x0608),
+            (0x14c3, 0x7922),
+            (0x14c3, 0x0616),
+            (0x0b48, 0x7922),
             (0x14c3, 0x7925),
             (0x14c3, 0x0717),
             (0x10ec, 0xc822),
@@ -177,8 +176,7 @@ mod tests {
         for (vendor, device, driver) in [
             (0x8086, 0x9df0, "iwlwifi"),
             (0x8086, 0x24fd, "iwlwifi"),
-            (0x14c3, 0x7961, "mt7921e"),
-            (0x0b48, 0x7922, "mt7921e"),
+            (0x14c3, 0x7920, "mt7921e"),
             (0x14c3, 0x7990, "mt7996e"),
             (0x10ec, 0xb852, "rtw89_8852be"),
             (0x10ec, 0xc821, "rtw88_8821ce"),
