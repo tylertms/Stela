@@ -517,3 +517,22 @@ fn a_cached_pmksa_lasts_its_lifetime_and_goes_when_its_resumption_fails() {
     assert!(keeper.cached(Mac([2, 1, 0, 0, 0, 0]), 0).is_none());
     assert!(keeper.cached(Mac([2, 1, 0, 0, 0, 1]), 0).is_some());
 }
+
+/// key_mgmt=NONE matches a BSS without privacy, RSN or WPA; a WMM element
+/// is no WPA element.
+#[test]
+fn an_open_network_takes_only_a_bss_without_privacy_rsn_or_wpa() {
+    let mut bss = ap(1, 2, CHANNEL_1, AP_MLD, &[]);
+    bss.elements.clear();
+    bss.capabilities = 0x01;
+    assert!(!protected(&bss));
+    bss.capabilities |= 0x10;
+    assert!(protected(&bss));
+    bss.capabilities = 0x01;
+    bss.elements = vec![48, 2, 1, 0];
+    assert!(protected(&bss));
+    bss.elements = vec![221, 4, 0, 0x50, 0xf2, 1];
+    assert!(protected(&bss));
+    bss.elements = vec![221, 4, 0, 0x50, 0xf2, 2];
+    assert!(!protected(&bss));
+}

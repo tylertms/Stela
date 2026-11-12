@@ -340,6 +340,26 @@ fn failure_delay_us(failures: u32) -> u64 {
     seconds * 1_000_000
 }
 
+/// Whether `bss` protects its frames: privacy, an RSN element or a WPA
+/// element, any of which keeps an open network's station out.
+fn protected(bss: &Bss) -> bool {
+    let wpa = {
+        let mut rest = &bss.elements[..];
+        let mut found = false;
+        while let [id, length, tail @ ..] = rest {
+            let Some((body, next)) = tail.split_at_checked(usize::from(*length)) else {
+                break;
+            };
+            found |= *id == 221 && body.starts_with(&[0x00, 0x50, 0xf2, 1]);
+            rest = next;
+        }
+        found
+    };
+    bss.capabilities & connection::PRIVACY != 0
+        || security::rsn_element(&bss.elements).is_some()
+        || wpa
+}
+
 /// `cfg80211_6ghz_power_type_valid`: whether a client may use the 6 GHz
 /// `bss` under the flags its channel has among `channels`.
 fn power_type_usable(bss: &Bss, channels: &[(Channel, u32)]) -> bool {
@@ -412,6 +432,18 @@ fn candidate(bss: &Bss, security: Security, pmk: Zeroizing<[u8; 32]>) -> Candida
     cached_candidate(bss, security, pmk, None)
 }
 
+/// The candidate of an open network's BSS: no keys and no handshake.
+fn open_candidate(bss: &Bss) -> Candidate {
+    Candidate {
+        bssid: bss.bssid,
+        security: None,
+        pmk: Zeroizing::new([0; 32]),
+        own_rsn: Vec::new(),
+        peer_rsn: Vec::new(),
+        links: None,
+    }
+}
+
 /// The candidate of an association that names `pmkid`, whose 4-way
 /// handshake repeats the request's RSN element.
 fn cached_candidate(
@@ -422,7 +454,7 @@ fn cached_candidate(
 ) -> Candidate {
     Candidate {
         bssid: bss.bssid,
-        security,
+        security: Some(security),
         pmk,
         own_rsn: security.element_with(pmkid),
         peer_rsn: element(48, security::rsn_element(&bss.elements).unwrap_or_default()),
@@ -447,7 +479,8 @@ struct Candidate {
     /// The authenticator: the BSS, or the AP MLD of a multi-link
     /// association.
     bssid: Mac,
-    security: Security,
+    /// The association's suites; none for an open network.
+    security: Option<Security>,
     /// The PMK the 4-way handshake proves: the passphrase's or the PSK, or
     /// the SAE exchange's.
     pmk: Zeroizing<[u8; 32]>,
@@ -527,6 +560,8 @@ enum State<H, M> {
         /// Secondary-link IGTKs waiting for earlier frames and key users.
         link_integrity: Vec<(u8, IntegrityKey)>,
     },
+    /// Associated with an open network's BSS: its port is open with no keys.
+    Open,
     /// Leave the association, then scan once `at` passes.
     Leaving {
         at: u64,
@@ -830,6 +865,7 @@ impl<R: Radio> Keeper<R> {
             | State::Joining(_)
             | State::Handshake { .. }
             | State::Connected { .. }
+            | State::Open
                 if matches!(stage, Stage::Idle | Stage::NeedsDrain) =>
             {
                 self.failed(
@@ -953,9 +989,11 @@ impl<R: Radio> Keeper<R> {
     /// supports, after an SAE exchange when that is the security. A 6 GHz
     /// BSS whose power type its channel bars is not one cfg80211 connects to.
     fn choose(&mut self, now: u64) {
-        let mut best: Option<(R::Handle, &Bss, Security)> = None;
+        let mut best: Option<(R::Handle, &Bss, Option<Security>)> = None;
         let mut refusal = None;
         let passphrase = matches!(self.network.secret, Secret::Passphrase(_));
+        let open = matches!(self.network.secret, Secret::Open);
+        let signal = |bss: &Bss| bss.signal_dbm.unwrap_or(i8::MIN);
         let six = self.link.channels(Band::Ghz6);
         let observed = self.link.bss();
         for &(handle, bss) in &observed {
@@ -969,14 +1007,25 @@ impl<R: Radio> Keeper<R> {
                 ));
                 continue;
             }
+            if open {
+                // key_mgmt=NONE: a BSS without privacy, RSN or WPA alone.
+                if protected(bss) {
+                    refusal = Some(String::from("is protected, and the network has no key"));
+                } else if best
+                    .as_ref()
+                    .is_none_or(|(_, b, _)| signal(bss) > signal(b))
+                {
+                    best = Some((handle, bss, None));
+                }
+                continue;
+            }
             match Security::select_on(bss.channel.band, &bss.elements, passphrase) {
                 Ok(security) => {
-                    let signal = |bss: &Bss| bss.signal_dbm.unwrap_or(i8::MIN);
                     if best
                         .as_ref()
                         .is_none_or(|(_, b, _)| signal(bss) > signal(b))
                     {
-                        best = Some((handle, bss, security));
+                        best = Some((handle, bss, Some(security)));
                     }
                 }
                 Err(reason) => {
@@ -998,6 +1047,20 @@ impl<R: Radio> Keeper<R> {
         };
         let bss = bss.clone();
         drop(observed);
+        let Some(security) = security else {
+            let started =
+                self.association_for(&bss, None, None, None)
+                    .and_then(|(join, profile)| {
+                        self.link
+                            .join(handle, join, profile)
+                            .map_err(|error| format!("{error}"))
+                    });
+            match started {
+                Ok(()) => self.state = State::Joining(Box::new(open_candidate(&bss))),
+                Err(message) => self.failed(now, message),
+            }
+            return;
+        };
         let cached = (security.akm == Akm::Sae)
             .then(|| self.cached(bss.bssid, now))
             .flatten();
@@ -1360,6 +1423,18 @@ impl<R: Radio> Keeper<R> {
         rsnxe: Option<&[u8]>,
         pmkid: Option<[u8; 16]>,
     ) -> Result<(Join, R::Profile), String> {
+        self.association_for(bss, Some(security), rsnxe, pmkid)
+    }
+
+    /// The association under `security`, or an open network's without
+    /// privacy or RSN element and with an open port.
+    fn association_for(
+        &self,
+        bss: &Bss,
+        security: Option<Security>,
+        rsnxe: Option<&[u8]>,
+        pmkid: Option<[u8; 16]>,
+    ) -> Result<(Join, R::Profile), String> {
         let band = bss.channel.band;
         let advertisement = self
             .link
@@ -1385,7 +1460,9 @@ impl<R: Radio> Keeper<R> {
                 self.link.supported_channels(band),
             )
         });
-        let own_rsn = security.element_with(pmkid);
+        let own_rsn = security
+            .map(|security| security.element_with(pmkid))
+            .unwrap_or_default();
         let elements = connection::request_elements(
             &Request {
                 ssid: &self.network.ssid,
@@ -1405,9 +1482,12 @@ impl<R: Radio> Keeper<R> {
                 .map_err(|error| format!("{} request capabilities: {error:?}", R::NAME))?;
         }
         let rates = local.rates().supported & peer.rates().supported;
-        let capability = connection::capability(band, chosen.mode, spectrum.is_some());
+        let mut capability = connection::capability(band, chosen.mode, spectrum.is_some());
+        if security.is_none() {
+            capability &= !connection::PRIVACY;
+        }
         let width = chosen.definition.width;
-        let request = if security.management.is_some() {
+        let request = if security.is_some_and(|security| security.management.is_some()) {
             AssociationRequest::new_modern_with_local_pmf(
                 capability,
                 R::LISTEN_INTERVAL,
@@ -1452,7 +1532,11 @@ impl<R: Radio> Keeper<R> {
         let join = Join {
             bssid: bss.bssid,
             channel: bss.channel,
-            policy: PortPolicy::Controlled,
+            policy: if security.is_some() {
+                PortPolicy::Controlled
+            } else {
+                PortPolicy::Open
+            },
             request,
         };
         Ok((join, profile))
@@ -1484,8 +1568,14 @@ impl<R: Radio> Keeper<R> {
                 link.accepted = accepted.contains(&link.link_id);
             }
         }
+        let Some(security) = candidate.security else {
+            // key_mgmt=NONE: the association opens the port.
+            self.state = State::Open;
+            self.failures = 0;
+            return;
+        };
         match Supplicant::new(
-            candidate.security.suites(),
+            security.suites(),
             candidate.pmk,
             self.link.mac(),
             candidate.bssid,

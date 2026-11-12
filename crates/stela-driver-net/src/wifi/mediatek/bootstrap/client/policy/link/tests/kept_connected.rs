@@ -154,6 +154,84 @@ fn the_station_scans_joins_and_opens_the_port_after_the_4_way_handshake() {
     assert!(station.due_us().unwrap() <= clock.now_us());
 }
 
+/// key_mgmt=NONE: an open network's station joins a BSS without privacy or
+/// RSN by open-system authentication, and its port opens with the
+/// association, no handshake or key behind it; a protected BSS of the same
+/// name is never chosen.
+#[test]
+fn an_open_network_joins_its_unprotected_ap_and_opens_the_port_at_association() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let (link, model) = managed_link();
+    let (_, bss) = {
+        let (client, _model) = setup_modern();
+        modern_inputs(&client)
+    };
+    let network = Network {
+        ssid: b"x".to_vec(),
+        secret: Secret::Open,
+        country: None,
+    };
+    let mut station = Station::new(
+        link,
+        profile().interface,
+        country(),
+        network,
+        Arc::new(Fixed),
+        crate::Clock {
+            ticks_per_microsecond: 1,
+        },
+    );
+    // The AP's elements without its RSN element, and no privacy.
+    let mut open = Vec::new();
+    let mut rest = &bss.elements[..];
+    while let [id, length, tail @ ..] = rest {
+        let (body, next) = tail.split_at(usize::from(*length));
+        if *id != 48 {
+            open.extend_from_slice(&[*id, *length]);
+            open.extend_from_slice(body);
+        }
+        rest = next;
+    }
+    let capabilities = bss.capabilities & !0x10;
+    assert!(!station.carrier());
+    let mut body = vec![0; 8];
+    body.extend_from_slice(&100u16.to_le_bytes());
+    body.extend_from_slice(&capabilities.to_le_bytes());
+    body.extend_from_slice(&open);
+    let mut beacon = response(0x80, &body);
+    beacon[4..10].copy_from_slice(&Mac::BROADCAST.0);
+    incoming(&model, &beacon, None, false);
+    assert!(!station.carrier());
+    done(&model);
+    assert!(!station.carrier());
+    // Open-system authentication, then an association request with neither
+    // privacy nor an RSN element.
+    assert_eq!(finish_tx(&model)[0][..2], [0xb0, 0]);
+    station.carrier();
+    incoming(&model, &response(0xb0, &[0, 0, 2, 0, 0, 0]), None, false);
+    station.carrier();
+    let request = finish_tx(&model).pop().unwrap();
+    assert_eq!(request[..2], [0, 0]);
+    assert_eq!(u16::from_le_bytes([request[24], request[25]]) & 0x10, 0);
+    assert!(crate::wifi::connection::find(&request[28..], 48).is_none());
+    station.carrier();
+    let mut association = Vec::new();
+    association.extend_from_slice(&(capabilities | 1).to_le_bytes());
+    association.extend_from_slice(&[0, 0, 1, 0xc0]);
+    association.extend_from_slice(&open);
+    incoming(&model, &response(0x10, &association), None, false);
+    // The association opens the port.
+    let mut carrier = false;
+    for _ in 0..4 {
+        carrier |= station.carrier();
+    }
+    assert!(carrier);
+    let reported: Vec<_> = core::iter::from_fn(|| station.take_diagnostic()).collect();
+    assert!(reported.is_empty(), "{reported:?}");
+}
+
 /// The station's last transmitted SAE frame: its transaction, status and
 /// data.
 fn sent_sae(model: &Model) -> (u16, u16, Vec<u8>) {

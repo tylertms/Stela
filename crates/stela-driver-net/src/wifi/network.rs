@@ -32,13 +32,16 @@ impl fmt::Debug for Network {
     }
 }
 
-/// A WPA2-PSK or WPA3-SAE credential.
+/// A WPA2-PSK or WPA3-SAE credential, or none for an open network.
 #[derive(Clone)]
 pub enum Secret {
     /// Eight to 63 printable ASCII characters.
     Passphrase(Passphrase),
     /// The 256-bit pre-shared key, from 64 hex digits.
     Psk(Zeroizing<[u8; 32]>),
+    /// No credential: the network is open, wpa_supplicant's `key_mgmt=NONE`.
+    /// Only a BSS without privacy, RSN or WPA matches it.
+    Open,
 }
 
 impl fmt::Debug for Secret {
@@ -46,6 +49,7 @@ impl fmt::Debug for Secret {
         f.write_str(match self {
             Self::Passphrase(_) => "Passphrase(..)",
             Self::Psk(_) => "Psk(..)",
+            Self::Open => "Open",
         })
     }
 }
@@ -122,13 +126,15 @@ impl Secret {
 
 impl Secret {
     /// The pairwise master key for `ssid`: the PSK itself, or the
-    /// passphrase's PBKDF2 derivation (IEEE 802.11-2020 J.4.1).
+    /// passphrase's PBKDF2 derivation (IEEE 802.11-2020 J.4.1). An open
+    /// network has none and keys nothing; its value is zero.
     pub fn pmk(&self, ssid: &[u8]) -> Zeroizing<[u8; 32]> {
         match self {
             Self::Passphrase(passphrase) => {
                 super::supplicant::passphrase_psk(passphrase.as_bytes(), ssid)
             }
             Self::Psk(psk) => psk.clone(),
+            Self::Open => Zeroizing::new([0; 32]),
         }
     }
 }

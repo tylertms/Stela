@@ -17,7 +17,7 @@ pub mod security;
 /// WLAN_CAPABILITY_ESS, _PRIVACY, _SHORT_PREAMBLE, _SPECTRUM_MGMT and
 /// _SHORT_SLOT_TIME.
 const ESS: u16 = 1 << 0;
-const PRIVACY: u16 = 1 << 4;
+pub(crate) const PRIVACY: u16 = 1 << 4;
 const SHORT_PREAMBLE: u16 = 1 << 5;
 const SPECTRUM_MANAGEMENT: u16 = 1 << 8;
 const SHORT_SLOT_TIME: u16 = 1 << 10;
