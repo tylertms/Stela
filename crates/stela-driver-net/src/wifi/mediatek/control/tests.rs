@@ -334,16 +334,13 @@ fn power_and_n9_observations_do_not_synthesize_ready_from_all_ones_or_elapsed_ti
     }
     let mut c = setup(Chip::Mt7922, Model::default());
     c.driver_own(false).unwrap();
-    assert_eq!(c.poll_firmware_power_on().unwrap().value, 1);
+    assert_eq!(c.poll_firmware_power_on().unwrap().unwrap().value, 1);
+    // mt792x_load_firmware warns and downloads anyway: a late MCU is no
+    // failure, and the control stays driver-owned and usable.
     c.registers.test_io().registers.insert(0xe00f0, 3);
-    assert!(matches!(
-        c.poll_firmware_power_on(),
-        Err(Error::Timeout {
-            mask: 7,
-            expected: 1,
-            ..
-        })
-    ));
+    assert_eq!(c.poll_firmware_power_on(), Ok(None));
+    assert!(!c.is_poisoned());
+    assert_eq!(c.poll_n9_ready().unwrap().value, 3);
 }
 #[test]
 fn unavailable_control_and_zero_clock_fail_before_fabricating_ownership() {

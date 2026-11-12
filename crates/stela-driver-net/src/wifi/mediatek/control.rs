@@ -304,13 +304,16 @@ impl<I: BarIo> Control<I> {
         self.dma_stopped = true;
         Ok(receipt)
     }
-    /// Poll the pre-download power state. Linux warns and continues on this
-    /// timeout; Stela reports the unmet requirement rather than downloading
-    /// through an unready MCU. This does not itself restart the MCU.
-    pub fn poll_firmware_power_on(&mut self) -> Result<Observation, Error> {
+    /// Poll the pre-download power state for 1 s. Linux warns on a timeout
+    /// and downloads anyway, so a timeout is `None`, not a failure, and
+    /// leaves the control usable. This does not itself restart the MCU.
+    pub fn poll_firmware_power_on(&mut self) -> Result<Option<Observation>, Error> {
         self.guard(true)?;
-        let result = self.poll(MT_CONN_ON_MISC, 7, 1, 1_000_000);
-        self.finish(result)
+        match self.poll(MT_CONN_ON_MISC, 7, 1, 1_000_000) {
+            Ok(observation) => Ok(Some(observation)),
+            Err(Error::Timeout { .. }) => Ok(None),
+            Err(error) => self.finish(Err(error)),
+        }
     }
     /// Observe N9-ready bits after the caller's download/start exchange.
     /// Even success proves only this register state, not which firmware was

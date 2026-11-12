@@ -987,3 +987,19 @@ fn wrong_prepared_input_refuses_before_restart_or_firmware_mutation() {
     assert!(f.model.lock().unwrap().initial_commands.is_empty());
     f.retire();
 }
+
+#[test]
+fn a_late_power_on_report_still_downloads_as_linux_does() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let mut f = NativeFixture::new(Chip::Mt7925);
+    // The MCU never reports FW_PWR_ON: mt792x_load_firmware warns, then
+    // downloads, and the download's own replies decide.
+    f.bar.0.lock().unwrap().values.insert(0xe00f0, 0);
+    f.install().unwrap();
+    f.boot(Chip::Mt7925);
+    assert!(f.controller.firmware_power_late());
+    assert_eq!(f.controller.phase(), Phase::Firmware);
+    f.retire();
+}

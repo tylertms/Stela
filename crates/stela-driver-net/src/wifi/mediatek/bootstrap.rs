@@ -146,6 +146,9 @@ struct Owned<I: BarIo, Q: QueueIo, C: 'static> {
     counter_reset_ticks: Option<u64>,
     /// Rings outside the layout another owner left counted, emptied at install.
     cleared_rings: u8,
+    /// The MCU did not report power-on for download in time; Linux warns
+    /// and downloads anyway, and so does this controller.
+    firmware_power_late: bool,
 }
 /// Drop after the first mutation keeps the entire real context,
 /// including fully completed facts. Independent quiescence is required
@@ -290,6 +293,7 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
                 counters: None,
                 counter_reset_ticks: None,
                 cleared_rings: 0,
+                firmware_power_late: false,
             });
             Ok(Self {
                 owned: Some(Box::from_raw(p)),
@@ -321,6 +325,11 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
     /// emptied.
     pub fn cleared_rings(&self) -> u8 {
         self.state().cleared_rings
+    }
+    /// Whether boot downloaded firmware after the MCU's power-on report
+    /// timed out, as Linux does after its warning.
+    pub fn firmware_power_late(&self) -> bool {
+        self.state().firmware_power_late
     }
     fn require(&self, phase: Phase) -> Result<(), Error> {
         if self.phase() == phase {
@@ -464,7 +473,13 @@ impl<I: BarIo, Q: QueueIo, C: 'static> Controller<I, Q, C> {
             .initial(&Request::restart(s.identity.chip))
             .map_err(Error::Transport)?;
         s.facts.push(fact);
-        s.control.poll_firmware_power_on().map_err(Error::Control)?;
+        // mt792x_load_firmware warns "MCU is not ready for firmware
+        // download" and goes on; the download's own replies then decide.
+        s.firmware_power_late = s
+            .control
+            .poll_firmware_power_on()
+            .map_err(Error::Control)?
+            .is_none();
         m.download_after_source_restart(prepared)
             .map_err(Error::Download)?;
         s.control.poll_n9_ready().map_err(Error::Control)?;
