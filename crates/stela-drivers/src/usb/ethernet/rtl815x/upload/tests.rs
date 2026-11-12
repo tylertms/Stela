@@ -2,6 +2,7 @@ use super::*;
 use crate::usb::ethernet::{firmware::tests::synthetic_upload, rtl815x::tests::Model};
 use alloc::{collections::BTreeMap, rc::Rc};
 use core::cell::RefCell;
+use stela_driver_base::stepped::block_on;
 
 /// Stateful PHY/MCU model independent of the uploader: SRAM auto-increment,
 /// asynchronous patch-ready, staged 2 KiB USB RAM download ownership and
@@ -260,13 +261,13 @@ impl Hardware {
 }
 pub(crate) struct Io(pub(crate) Rc<RefCell<Hardware>>);
 impl Control for Io {
-    fn control(&mut self, request: [u8; 8], output: &[u8]) -> Result<Vec<u8>, BlockError> {
+    async fn control(&mut self, request: [u8; 8], output: &[u8]) -> Result<Vec<u8>, BlockError> {
         self.0.borrow_mut().request(request, output)
     }
-    fn delay_us(&mut self, us: u64) {
+    async fn delay_us(&mut self, us: u64) {
         self.0.borrow_mut().core.delays.push(us);
     }
-    fn minimum_wait(&mut self, us: u64) -> Result<(), BlockError> {
+    async fn minimum_wait(&mut self, us: u64) -> Result<(), BlockError> {
         let mut state = self.0.borrow_mut();
         state.core.minimum_elapsed = state
             .core
@@ -280,11 +281,11 @@ impl Control for Io {
 
 fn execute(bytes: &[u8], revision: u16) -> (Chip<Io>, Rc<RefCell<Hardware>>) {
     let model = Rc::new(RefCell::new(Hardware::new(revision, bytes)));
-    let mut chip = Chip::probe(Io(model.clone()), Revision(revision)).unwrap();
-    chip.upload_firmware(&Firmware::parse(bytes, Revision(revision)).unwrap(), false)
+    let mut chip = block_on(Chip::probe(Io(model.clone()), Revision(revision))).unwrap();
+    block_on(chip.upload_firmware(&Firmware::parse(bytes, Revision(revision)).unwrap(), false))
         .unwrap();
     assert!(!chip.initialized);
-    assert!(chip.carrier().is_err());
+    assert!(block_on(chip.carrier()).is_err());
     assert_eq!(chip.base, None);
     (chip, model)
 }
@@ -308,8 +309,10 @@ fn link_effects_require_completion_before_carrier() {
             }
         }
         let before = model.borrow().core.trace.len();
-        chip.upload_firmware(&Firmware::parse(&bytes, Revision(revision)).unwrap(), false)
-            .unwrap();
+        block_on(
+            chip.upload_firmware(&Firmware::parse(&bytes, Revision(revision)).unwrap(), false),
+        )
+        .unwrap();
         let model = model.borrow();
         assert!(
             !model.core.trace[before..]
@@ -328,13 +331,13 @@ fn failures_at_every_mac_upload_request_poison_and_forbid_retries() {
     let count = model.borrow().core.trace.len();
     for at in 1..count {
         let model = Rc::new(RefCell::new(Hardware::new(0x6010, &bytes)));
-        let mut chip = Chip::probe(Io(model.clone()), Revision(0x6010)).unwrap();
+        let mut chip = block_on(Chip::probe(Io(model.clone()), Revision(0x6010))).unwrap();
         model.borrow_mut().core.fail_at = Some(at);
         let firmware = Firmware::parse(&bytes, Revision(0x6010)).unwrap();
-        assert!(chip.upload_firmware(&firmware, false).is_err());
+        assert!(block_on(chip.upload_firmware(&firmware, false)).is_err());
         assert!(!chip.accessible);
         assert_eq!(model.borrow().core.trace.len(), at + 1);
-        assert!(chip.upload_firmware(&firmware, false).is_err());
+        assert!(block_on(chip.upload_firmware(&firmware, false)).is_err());
         assert_eq!(model.borrow().core.trace.len(), at + 1);
     }
 }
@@ -350,9 +353,9 @@ fn patch_ready_speedup_and_final_version_failures_remain_explicit() {
             1 => model.borrow_mut().stuck_speed = true,
             _ => model.borrow_mut().wrong_version = true,
         }
-        let mut chip = Chip::probe(Io(model.clone()), Revision(revision)).unwrap();
+        let mut chip = block_on(Chip::probe(Io(model.clone()), Revision(revision))).unwrap();
         let firmware = Firmware::parse(&bytes, Revision(revision)).unwrap();
-        assert!(chip.upload_firmware(&firmware, false).is_err());
+        assert!(block_on(chip.upload_firmware(&firmware, false)).is_err());
         assert!(!chip.accessible);
         assert!(!chip.initialized);
         if case == 1 {
@@ -362,7 +365,7 @@ fn patch_ready_speedup_and_final_version_failures_remain_explicit() {
             );
         }
         let count = model.borrow().core.trace.len();
-        assert!(chip.upload_firmware(&firmware, false).is_err());
+        assert!(block_on(chip.upload_firmware(&firmware, false)).is_err());
         assert_eq!(model.borrow().core.trace.len(), count);
     }
 }

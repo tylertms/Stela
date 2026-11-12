@@ -5,6 +5,7 @@ use crate::usb::xhci::{model, model::*, *};
 use alloc::string::String;
 use alloc::{collections::BTreeMap, rc::Rc};
 use core::cell::RefCell;
+use stela_driver_base::stepped::block_on;
 
 /// Independent byte-lane/OCP model. The window maps through the hardware
 /// base register, partial writes preserve disabled lanes, and reset/LL
@@ -172,13 +173,13 @@ impl Model {
 
 pub(crate) struct Io(pub Rc<RefCell<Model>>);
 impl Control for Io {
-    fn control(&mut self, setup: [u8; 8], output: &[u8]) -> Result<Vec<u8>, BlockError> {
+    async fn control(&mut self, setup: [u8; 8], output: &[u8]) -> Result<Vec<u8>, BlockError> {
         self.0.borrow_mut().request(setup, output)
     }
-    fn delay_us(&mut self, us: u64) {
+    async fn delay_us(&mut self, us: u64) {
         self.0.borrow_mut().delays.push(us);
     }
-    fn minimum_wait(&mut self, us: u64) -> Result<(), BlockError> {
+    async fn minimum_wait(&mut self, us: u64) -> Result<(), BlockError> {
         let mut state = self.0.borrow_mut();
         state.delays.push(us);
         if state.refuse_minimum {
@@ -199,8 +200,12 @@ fn rtl8152_revisions_initialize_both_usb_fifo_modes_and_follow_carrier() {
     for revision in [0x4c00, 0x4c10, 0x4800] {
         for full_speed in [false, true] {
             let model = Rc::new(RefCell::new(Model::new(revision)));
-            let (mut chip, mac) =
-                Chip::attach(Io(model.clone()), Revision(revision), full_speed).unwrap();
+            let (mut chip, mac) = block_on(Chip::attach(
+                Io(model.clone()),
+                Revision(revision),
+                full_speed,
+            ))
+            .unwrap();
             assert_eq!(mac, Mac([2, 0x11, 0x22, 0x33, 0x44, 0x55]));
             assert_eq!(
                 model.borrow().get(PLA, PLA_RXFIFO_CTRL1, 4),
@@ -211,15 +216,15 @@ fn rtl8152_revisions_initialize_both_usb_fifo_modes_and_follow_carrier() {
                 if full_speed { 0x78 } else { 0x48 }
             );
             assert_eq!(model.borrow().get(PLA, PLA_CR, 1), 0);
-            assert!(chip.carrier().unwrap());
+            assert!(block_on(chip.carrier()).unwrap());
             assert_eq!(model.borrow().get(PLA, PLA_CR, 1), 12);
             assert_eq!(model.borrow().get(PLA, PLA_RCR, 4) & 15, 14);
             model.borrow_mut().link = false;
-            assert!(!chip.carrier().unwrap());
-            chip.stop().unwrap();
+            assert!(!block_on(chip.carrier()).unwrap());
+            block_on(chip.stop()).unwrap();
             assert_eq!(model.borrow().get(PLA, PLA_CR, 1), 0);
             model.borrow_mut().link = true;
-            assert!(chip.carrier().unwrap());
+            assert!(block_on(chip.carrier()).unwrap());
         }
     }
 }
@@ -228,22 +233,22 @@ fn rtl8152_revisions_initialize_both_usb_fifo_modes_and_follow_carrier() {
 fn no_further_register_access_after_any_failed_initialization_transaction() {
     for revision in [0x4c00, 0x4c10, 0x4800] {
         let model = Rc::new(RefCell::new(Model::new(revision)));
-        Chip::attach(Io(model.clone()), Revision(revision), false).unwrap();
+        block_on(Chip::attach(Io(model.clone()), Revision(revision), false)).unwrap();
         let operations = model.borrow().trace.len();
         assert!(operations > 80);
         for fail_at in 0..operations {
             let model = Rc::new(RefCell::new(Model::new(revision)));
             model.borrow_mut().fail_at = Some(fail_at);
-            assert!(Chip::attach(Io(model.clone()), Revision(revision), false).is_err());
+            assert!(block_on(Chip::attach(Io(model.clone()), Revision(revision), false)).is_err());
             assert_eq!(model.borrow().trace.len(), fail_at + 1);
         }
     }
     let model = Rc::new(RefCell::new(Model::new(0x4c10)));
-    let (mut chip, _) = Chip::attach(Io(model.clone()), Revision(0x4c10), false).unwrap();
+    let (mut chip, _) = block_on(Chip::attach(Io(model.clone()), Revision(0x4c10), false)).unwrap();
     let next = model.borrow().trace.len();
     model.borrow_mut().short_at = Some(next);
-    assert!(chip.carrier().is_err());
-    assert!(chip.carrier().is_err());
+    assert!(block_on(chip.carrier()).is_err());
+    assert!(block_on(chip.carrier()).is_err());
     assert_eq!(model.borrow().trace.len(), next + 1);
 }
 
@@ -256,8 +261,12 @@ fn revision01_reads_idr_preserves_station_and_masks_only_led_mode() {
         model.borrow_mut().set(PLA, PLA_BACKUP, 4, 0);
         model.borrow_mut().set(PLA, PLA_BACKUP + 4, 4, 0);
         model.borrow_mut().set(PLA, PLA_LED_FEATURE, 2, 0xa75a);
-        let (mut chip, mac) =
-            Chip::attach(Io(model.clone()), Revision(0x4c00), full_speed).unwrap();
+        let (mut chip, mac) = block_on(Chip::attach(
+            Io(model.clone()),
+            Revision(0x4c00),
+            full_speed,
+        ))
+        .unwrap();
         assert_eq!(mac.0, [2, 3, 4, 5, 6, 7]);
         assert_eq!(model.borrow().get(PLA, PLA_LED_FEATURE, 2), 0xa05a);
         assert_eq!(model.borrow().get(PLA, PLA_IDR + 4, 4), 0x88770706);
@@ -268,8 +277,8 @@ fn revision01_reads_idr_preserves_station_and_masks_only_led_mode() {
                     0xc000 | 0xc004
                 )
         }));
-        assert!(chip.carrier().unwrap());
-        chip.stop().unwrap();
+        assert!(block_on(chip.carrier()).unwrap());
+        block_on(chip.stop()).unwrap();
     }
     for case in 0..3 {
         let model = Rc::new(RefCell::new(Model::new(0x4c00)));
@@ -278,7 +287,7 @@ fn revision01_reads_idr_preserves_station_and_masks_only_led_mode() {
             1 => model.borrow_mut().stuck_phy = true,
             _ => model.borrow_mut().stuck_list = true,
         }
-        assert!(Chip::attach(Io(model), Revision(0x4c00), false).is_err());
+        assert!(block_on(Chip::attach(Io(model), Revision(0x4c00), false)).is_err());
     }
 }
 
@@ -288,12 +297,12 @@ fn an_invalid_station_address_is_replaced_by_a_programmed_random_one() {
     // set_ethernet_addr writes it to IDR on every revision but 01.
     let model = Rc::new(RefCell::new(Model::new(0x4c00)));
     model.borrow_mut().set(PLA, PLA_IDR, 4, 0x05040303);
-    let (_, mac) = Chip::attach(Io(model), Revision(0x4c00), false).unwrap();
+    let (_, mac) = block_on(Chip::attach(Io(model), Revision(0x4c00), false)).unwrap();
     assert!(mac.is_valid() && mac.0[0] & 2 != 0, "{mac}");
     let model = Rc::new(RefCell::new(Model::new(0x4c10)));
     model.borrow_mut().set(PLA, PLA_BACKUP, 4, 0);
     model.borrow_mut().set(PLA, PLA_BACKUP + 4, 4, 0);
-    let (_, mac) = Chip::attach(Io(model.clone()), Revision(0x4c10), false).unwrap();
+    let (_, mac) = block_on(Chip::attach(Io(model.clone()), Revision(0x4c10), false)).unwrap();
     assert!(mac.is_valid() && mac.0[0] & 2 != 0, "{mac}");
     let [a, b, c, d, e, f] = mac.0;
     assert_eq!(
@@ -348,7 +357,8 @@ fn unchanged_linux_rtl8152_revision_init_and_station_effects() {
         }
         model.borrow_mut().set(PLA, PLA_IDR, 4, 0x05040302);
         model.borrow_mut().set(PLA, PLA_IDR + 4, 4, 0x0706);
-        let (_, mac) = Chip::attach(Io(model.clone()), Revision(revision), false).unwrap();
+        let (_, mac) =
+            block_on(Chip::attach(Io(model.clone()), Revision(revision), false)).unwrap();
         for (actual, expected) in mac.0.into_iter().zip(&values[3..9]) {
             assert_eq!(
                 u32::from(actual),
@@ -388,7 +398,7 @@ fn timeout_unknown_revision_and_alignment_are_explicit() {
             _ => model.borrow_mut().stuck_list = true,
         }
         assert!(matches!(
-            Chip::attach(Io(model), Revision(0x4c10), false),
+            block_on(Chip::attach(Io(model), Revision(0x4c10), false)),
             Err(BlockError::Timeout)
         ));
     }
@@ -396,15 +406,15 @@ fn timeout_unknown_revision_and_alignment_are_explicit() {
     // revisions start without their file (every_patched_revision_...).
     for revision in [0x4c20, 0xffff] {
         let model = Rc::new(RefCell::new(Model::new(revision)));
-        assert!(Chip::attach(Io(model.clone()), Revision(revision), false).is_err());
+        assert!(block_on(Chip::attach(Io(model.clone()), Revision(revision), false)).is_err());
         assert_eq!(model.borrow().trace.len(), 1);
     }
     let model = Rc::new(RefCell::new(Model::new(0x4c10)));
-    let (mut chip, _) = Chip::attach(Io(model.clone()), Revision(0x4c10), false).unwrap();
+    let (mut chip, _) = block_on(Chip::attach(Io(model.clone()), Revision(0x4c10), false)).unwrap();
     let before = model.borrow().trace.len();
     for (address, width) in [(0xe813, 2), (0xe812, 4), (0x10000, 1), (0xe810, 3)] {
-        assert!(chip.read(PLA, address, width).is_err());
-        assert!(chip.write(PLA, address, width, 0).is_err());
+        assert!(block_on(chip.read(PLA, address, width)).is_err());
+        assert!(block_on(chip.write(PLA, address, width, 0)).is_err());
     }
     assert_eq!(model.borrow().trace.len(), before);
 }
@@ -412,7 +422,7 @@ fn timeout_unknown_revision_and_alignment_are_explicit() {
 #[test]
 fn backup_station_address_is_validated_then_restored_with_write_gate() {
     let model = Rc::new(RefCell::new(Model::new(0x4c10)));
-    let (_chip, mac) = Chip::attach(Io(model.clone()), Revision(0x4c10), false).unwrap();
+    let (_chip, mac) = block_on(Chip::attach(Io(model.clone()), Revision(0x4c10), false)).unwrap();
     assert_eq!(mac.0, [2, 0x11, 0x22, 0x33, 0x44, 0x55]);
     assert_eq!(model.borrow().get(PLA, PLA_IDR, 4), 0x33221102);
     assert_eq!(model.borrow().get(PLA, PLA_IDR + 4, 2), 0x5544);
@@ -422,7 +432,8 @@ fn backup_station_address_is_validated_then_restored_with_write_gate() {
         model.borrow_mut().set(PLA, PLA_BACKUP, 4, first);
         model.borrow_mut().set(PLA, PLA_BACKUP + 4, 4, 0);
         // Invalid (zero, multicast, all ones): a random address instead.
-        let (_chip, mac) = Chip::attach(Io(model.clone()), Revision(0x4c10), false).unwrap();
+        let (_chip, mac) =
+            block_on(Chip::attach(Io(model.clone()), Revision(0x4c10), false)).unwrap();
         assert!(mac.is_valid() && mac.0[0] & 2 != 0, "{mac}");
         assert_ne!(model.borrow().get(PLA, PLA_IDR, 4), first);
     }
@@ -446,22 +457,22 @@ fn unchanged_linux_ocp_request_trace_matches_native_helpers() {
     };
     for bank in [USB, PLA] {
         for address in 0xc000..0xc020 {
-            chip.write(bank, address, 1, address * 7).unwrap();
-            chip.read(bank, address, 1).unwrap();
+            block_on(chip.write(bank, address, 1, address * 7)).unwrap();
+            block_on(chip.read(bank, address, 1)).unwrap();
         }
         for address in (0xe000..0xe020).step_by(2) {
-            chip.write(bank, address, 2, address * 11).unwrap();
-            chip.read(bank, address, 2).unwrap();
+            block_on(chip.write(bank, address, 2, address * 11)).unwrap();
+            block_on(chip.read(bank, address, 2)).unwrap();
         }
         for address in (0xd000..0xd020).step_by(4) {
-            chip.write(bank, address, 4, address * 0x1234).unwrap();
-            chip.read(bank, address, 4).unwrap();
+            block_on(chip.write(bank, address, 4, address * 0x1234)).unwrap();
+            block_on(chip.read(bank, address, 4)).unwrap();
         }
     }
     for address in (0x2010..0xf000).step_by(0x102) {
-        chip.phy_write(address, address * 7).unwrap();
-        let mapped = chip.phy_address(address).unwrap();
-        chip.read(PLA, mapped, 2).unwrap();
+        block_on(chip.phy_write(address, address * 7)).unwrap();
+        let mapped = block_on(chip.phy_address(address)).unwrap();
+        block_on(chip.read(PLA, mapped, 2)).unwrap();
     }
     let mut actual = alloc::string::String::new();
     for (request, bytes) in &model.borrow().trace {
@@ -684,20 +695,20 @@ fn rtl815x_firmware_uses_ep0_dma_wrapping_and_poison_guards() {
                 controller: shared.clone(),
                 id: shared.borrow().test_device_id(1).unwrap(),
             };
-            let mut chip = Chip::probe(io, Revision(revision)).unwrap();
+            let mut chip = block_on(Chip::probe(io, Revision(revision))).unwrap();
             if fail {
                 model.borrow_mut().silence_transfer = Some(1);
                 model.borrow_mut().fail = Some((STOP_ENDPOINT, CONTEXT_STATE_ERROR));
-                assert!(chip.upload_firmware(&firmware, false).is_err());
+                assert!(block_on(chip.upload_firmware(&firmware, false)).is_err());
                 assert!(shared.borrow_mut().endpoint_ready(1, 1).is_err());
                 let control = shared.borrow().control_bytes(1);
                 let requests = model.borrow().setup.len();
-                assert!(chip.upload_firmware(&firmware, false).is_err());
+                assert!(block_on(chip.upload_firmware(&firmware, false)).is_err());
                 assert_eq!(model.borrow().setup.len(), requests);
                 assert_eq!(shared.borrow().control_bytes(1), control);
             } else {
-                chip.upload_firmware(&firmware, false).unwrap();
-                assert!(chip.carrier().is_err()); // Upload alone is not initialized PHY/MAC.
+                block_on(chip.upload_firmware(&firmware, false)).unwrap();
+                assert!(block_on(chip.carrier()).is_err()); // Upload alone is not initialized PHY/MAC.
                 let state = model.borrow();
                 assert_eq!(state.configuration_value, 7);
                 assert!(state.configuration_seen_before_endpoints.is_empty());
@@ -1045,9 +1056,13 @@ fn every_patched_revision_starts_without_its_firmware_file() {
     ] {
         assert!(Revision(revision).firmware().is_some());
         let model = Rc::new(RefCell::new(FirmwareModel::new(revision, &[])));
-        let (chip, mac) =
-            Chip::attach_with_firmware(FirmwareIo(model), Revision(revision), 4, None)
-                .unwrap_or_else(|error| panic!("{revision:04x}: {error:?}"));
+        let (chip, mac) = block_on(Chip::attach_with_firmware(
+            FirmwareIo(model),
+            Revision(revision),
+            4,
+            None,
+        ))
+        .unwrap_or_else(|error| panic!("{revision:04x}: {error:?}"));
         assert!(chip.initialized, "{revision:04x}");
         assert!(!mac.is_multicast() && mac.0 != [0; 6]);
     }

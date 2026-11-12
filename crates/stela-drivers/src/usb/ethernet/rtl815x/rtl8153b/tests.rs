@@ -5,6 +5,7 @@ use crate::usb::ethernet::{
 };
 use alloc::rc::Rc;
 use core::cell::RefCell;
+use stela_driver_base::stepped::block_on;
 
 #[test]
 fn rtl8153b_calibration_power_phy_and_receive_paths() {
@@ -36,12 +37,12 @@ fn rtl8153b_calibration_power_phy_and_receive_paths() {
                     hw.core
                         .set(PLA, 0xdc00, 1, if test_io { 1 << 5 } else { 0 });
                 }
-                let (mut chip, _) = Chip::attach_with_firmware(
+                let (mut chip, _) = block_on(Chip::attach_with_firmware(
                     FirmwareIo(model.clone()),
                     Revision(revision),
                     speed,
                     firmware.as_ref(),
-                )
+                ))
                 .unwrap();
                 assert!(chip.initialized);
                 assert_eq!(chip.receive_bytes(), 32768);
@@ -92,7 +93,7 @@ fn rtl8153b_calibration_power_phy_and_receive_paths() {
                     assert_eq!(hw.core.get(USB, USB_RX_BUF_TH, 4), RX_THR_B);
                     assert_eq!(hw.core.get(PLA, OCP_PHY_PATCH_CMD, 2) & PATCH_REQUEST, 0);
                 }
-                assert!(chip.carrier().unwrap());
+                assert!(block_on(chip.carrier()).unwrap());
                 {
                     let hw = model.borrow();
                     assert_eq!(hw.core.get(USB, USB_RX_EARLY_TIMEOUT, 2), 16);
@@ -107,7 +108,7 @@ fn rtl8153b_calibration_power_phy_and_receive_paths() {
                         if revision == 0x6010 { FC_PATCH_TASK } else { 0 }
                     );
                 }
-                chip.stop().unwrap();
+                block_on(chip.stop()).unwrap();
                 assert_eq!(model.borrow().core.get(PLA, PLA_CR, 1), 0);
             }
         }
@@ -129,12 +130,12 @@ fn rtl8153b_clears_w1c_teredo_events_with_one_byte_and_preserves_neighbors() {
             .borrow_mut()
             .core
             .set(PLA, PLA_TEREDO_CFG, 4, 0x1234_abff);
-        Chip::attach_with_firmware(
+        block_on(Chip::attach_with_firmware(
             FirmwareIo(model.clone()),
             Revision(revision),
             4,
             firmware.as_ref(),
-        )
+        ))
         .unwrap();
         assert_eq!(model.borrow().core.get(PLA, PLA_TEREDO_CFG, 4), 0x1234_ab00);
         let hw = model.borrow();
@@ -154,8 +155,13 @@ fn rtl8153b_clears_w1c_teredo_events_with_one_byte_and_preserves_neighbors() {
 fn rtl8153b_power_cut_during_ups_exit_requires_an_extra_phy_reload() {
     let model = Rc::new(RefCell::new(FirmwareModel::new(0x6000, &[])));
     model.borrow_mut().ups_exit_power_cut = true;
-    let (chip, _) =
-        Chip::attach_with_firmware(FirmwareIo(model.clone()), Revision(0x6000), 4, None).unwrap();
+    let (chip, _) = block_on(Chip::attach_with_firmware(
+        FirmwareIo(model.clone()),
+        Revision(0x6000),
+        4,
+        None,
+    ))
+    .unwrap();
     assert!(chip.initialized);
     assert!(!model.borrow().ups_exit_power_cut);
     let resets = model
@@ -184,12 +190,12 @@ fn rtl8153b_reloads_observed_power_cut_phy_and_refuses_all_deadlines() {
             .borrow_mut()
             .phy_states
             .extend([PHY_STAT_LAN_ON, PHY_STAT_LAN_ON, state]);
-        let (chip, _) = Chip::attach_with_firmware(
+        let (chip, _) = block_on(Chip::attach_with_firmware(
             FirmwareIo(model.clone()),
             Revision(0x6010),
             4,
             Some(&firmware),
-        )
+        ))
         .unwrap();
         assert!(chip.initialized);
         assert!(model.borrow().phy_states.is_empty());
@@ -209,7 +215,12 @@ fn rtl8153b_reloads_observed_power_cut_phy_and_refuses_all_deadlines() {
             }
         }
         assert!(matches!(
-            Chip::attach_with_firmware(FirmwareIo(model), Revision(0x6000), 4, None),
+            block_on(Chip::attach_with_firmware(
+                FirmwareIo(model),
+                Revision(0x6000),
+                4,
+                None
+            )),
             Err(BlockError::Timeout)
         ));
     }
@@ -238,10 +249,11 @@ fn unchanged_linux_8153b_link_register_effects() {
             .borrow_mut()
             .core
             .set(PLA, PLA_MAC_PWR_CTRL4, 2, 0xa55a);
-        let mut chip = Chip::probe(FirmwareIo(model.clone()), Revision(revision)).unwrap();
+        let mut chip =
+            block_on(Chip::probe(FirmwareIo(model.clone()), Revision(revision))).unwrap();
         model.borrow_mut().core.set(PLA, PLA_TCR1, 2, 0xa55a);
         chip.usb_speed = speed;
-        chip.enable_8153b(status).unwrap();
+        block_on(chip.enable_8153b(status)).unwrap();
         for ((bank, address), expected) in [
             (USB, USB_RX_EARLY_TIMEOUT),
             (USB, USB_RX_EARLY_SIZE),
@@ -278,15 +290,15 @@ fn real_firmware_8153b_full_startup_and_link() {
     let firmware = Firmware::parse(&bytes, Revision(revision)).unwrap();
     for speed in [1, 3, 4, 5] {
         let model = Rc::new(RefCell::new(FirmwareModel::new(revision, &bytes)));
-        let (mut chip, _) = Chip::attach_with_firmware(
+        let (mut chip, _) = block_on(Chip::attach_with_firmware(
             FirmwareIo(model.clone()),
             Revision(revision),
             speed,
             Some(&firmware),
-        )
+        ))
         .unwrap();
-        assert!(chip.initialized && chip.carrier().unwrap());
-        chip.stop().unwrap();
+        assert!(chip.initialized && block_on(chip.carrier()).unwrap());
+        block_on(chip.stop()).unwrap();
         assert_eq!(model.borrow().core.get(PLA, PLA_CR, 1), 0);
     }
 }
@@ -296,24 +308,24 @@ fn every_rtl8153b_startup_transfer_failure_prevents_ready_state() {
     let bytes = synthetic_upload(0x6010);
     let firmware = Firmware::parse(&bytes, Revision(0x6010)).unwrap();
     let model = Rc::new(RefCell::new(FirmwareModel::new(0x6010, &bytes)));
-    Chip::attach_with_firmware(
+    block_on(Chip::attach_with_firmware(
         FirmwareIo(model.clone()),
         Revision(0x6010),
         4,
         Some(&firmware),
-    )
+    ))
     .unwrap();
     let count = model.borrow().core.trace.len();
     for at in 0..count {
         let model = Rc::new(RefCell::new(FirmwareModel::new(0x6010, &bytes)));
         model.borrow_mut().core.fail_at = Some(at);
         assert!(
-            Chip::attach_with_firmware(
+            block_on(Chip::attach_with_firmware(
                 FirmwareIo(model.clone()),
                 Revision(0x6010),
                 4,
                 Some(&firmware)
-            )
+            ))
             .is_err()
         );
         assert_eq!(model.borrow().core.trace.len(), at + 1);

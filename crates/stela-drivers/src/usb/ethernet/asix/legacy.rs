@@ -30,7 +30,7 @@ pub(in crate::usb::ethernet) struct Chip<C> {
     decoder: framing::Decoder,
 }
 impl<C: Control> Chip<C> {
-    fn read(
+    async fn read(
         &mut self,
         command: u8,
         value: u16,
@@ -47,8 +47,9 @@ impl<C: Control> Chip<C> {
                 data: RegisterData::Read(n),
             },
         )
+        .await
     }
-    fn write(
+    async fn write(
         &mut self,
         command: u8,
         value: u16,
@@ -65,17 +66,19 @@ impl<C: Control> Chip<C> {
                 data: RegisterData::Write(data),
             },
         )
+        .await
         .map(|_| ())
     }
-    fn word(&mut self, command: u8) -> Result<u16, BlockError> {
+    async fn word(&mut self, command: u8) -> Result<u16, BlockError> {
         self.read(command, 0, 0, 2)
+            .await
             .map(|v| u16::from_le_bytes(v.try_into().unwrap()))
     }
-    fn command(&mut self, command: u8, value: u16) -> Result<(), BlockError> {
-        self.write(command, value, 0, &[])
+    async fn command(&mut self, command: u8, value: u16) -> Result<(), BlockError> {
+        self.write(command, value, 0, &[]).await
     }
-    fn minimum_wait(&mut self, us: u64) -> Result<(), BlockError> {
-        let result = self.io.minimum_wait(us);
+    async fn minimum_wait(&mut self, us: u64) -> Result<(), BlockError> {
+        let result = self.io.minimum_wait(us).await;
         if result.is_err() {
             self.initialized = false;
         }
@@ -86,28 +89,29 @@ impl<C: Control> Chip<C> {
         self.initialized = false;
         BlockError::Timeout
     }
-    fn own_mii(&mut self) -> Result<(), BlockError> {
+    async fn own_mii(&mut self) -> Result<(), BlockError> {
         for _ in 0..30 {
-            self.command(SET_SW_MII, 0)?;
-            self.minimum_wait(1000)?;
-            if self.read(STATUS, 0, 0, 1)?[0] & HOST_EN != 0 {
+            self.command(SET_SW_MII, 0).await?;
+            self.minimum_wait(1000).await?;
+            if self.read(STATUS, 0, 0, 1).await?[0] & HOST_EN != 0 {
                 return Ok(());
             }
         }
         Err(self.timeout())
     }
-    fn phy_read(&mut self, address: u16) -> Result<u16, BlockError> {
-        self.own_mii()?;
-        let bytes = self.read(READ_MII, self.phy, address, 2)?;
-        self.command(SET_HW_MII, 0)?;
+    async fn phy_read(&mut self, address: u16) -> Result<u16, BlockError> {
+        self.own_mii().await?;
+        let bytes = self.read(READ_MII, self.phy, address, 2).await?;
+        self.command(SET_HW_MII, 0).await?;
         Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
     }
-    fn phy_write(&mut self, address: u16, value: u16) -> Result<(), BlockError> {
-        self.own_mii()?;
-        self.write(WRITE_MII, self.phy, address, &value.to_le_bytes())?;
-        self.command(SET_HW_MII, 0)
+    async fn phy_write(&mut self, address: u16, value: u16) -> Result<(), BlockError> {
+        self.own_mii().await?;
+        self.write(WRITE_MII, self.phy, address, &value.to_le_bytes())
+            .await?;
+        self.command(SET_HW_MII, 0).await
     }
-    pub(super) fn attach(io: C, eeprom_mac: bool) -> Result<(Self, Mac), BlockError> {
+    pub(super) async fn attach(io: C, eeprom_mac: bool) -> Result<(Self, Mac), BlockError> {
         let mut c = Self {
             io: super::super::MinimumControl::new(io),
             accessible: true,
@@ -123,10 +127,11 @@ impl<C: Control> Chip<C> {
         let mut address = [0; 6];
         if eeprom_mac {
             for i in 0..3 {
-                address[i * 2..i * 2 + 2].copy_from_slice(&c.read(EEPROM, 4 + i as u16, 0, 2)?);
+                address[i * 2..i * 2 + 2]
+                    .copy_from_slice(&c.read(EEPROM, 4 + i as u16, 0, 2).await?);
             }
         } else {
-            address.copy_from_slice(&c.read(READ_MAC, 0, 0, 6)?);
+            address.copy_from_slice(&c.read(READ_MAC, 0, 0, 6).await?);
         }
         let mac = Mac(address);
         if address[0] & 1 != 0 || address.iter().all(|b| *b == 0) {
@@ -134,99 +139,102 @@ impl<C: Control> Chip<C> {
                 "AX88772 invalid permanent station address",
             ));
         }
-        let phy = c.read(READ_PHY, 0, 0, 2)?;
+        let phy = c.read(READ_PHY, 0, 0, 2).await?;
         c.phy = u16::from(phy[1]);
         if c.phy != INTERNAL_PHY {
             return Err(BlockError::Unsupported(
                 "AX88772 external/unknown PHY requires its own initialization",
             ));
         }
-        c.raw_status = c.read(STATUS, 0, 0, 1)?[0];
+        c.raw_status = c.read(STATUS, 0, 0, 1).await?[0];
         if !matches!(c.raw_status & CHIP_MASK, ORIGINAL | A | B) {
             return Err(BlockError::Unsupported("AX88772 unimplemented chip code"));
         }
-        c.reset(&mac)?;
-        c.phy_id = (u32::from(c.phy_read(PHY_ID1)?) << 16) | u32::from(c.phy_read(PHY_ID2)?);
+        c.reset(&mac).await?;
+        c.phy_id =
+            (u32::from(c.phy_read(PHY_ID1).await?) << 16) | u32::from(c.phy_read(PHY_ID2).await?);
         if c.phy_id != PHY_A && c.phy_id != PHY_C && c.phy_id & !0xf != PHY_96B {
             return Err(BlockError::Unsupported(
                 "AX88772 unimplemented embedded PHY identity",
             ));
         }
-        c.phy_start()?;
+        c.phy_start().await?;
         // Driver reset/open follows bind in usbnet; preserve this order after
         // physical reset and PHY attach, then let polling resolve the medium.
-        c.write(WRITE_MAC, 0, 0, &mac.0)?;
-        c.command(WRITE_RX, RX_DEFAULT)?;
-        c.command(WRITE_MEDIUM, MEDIUM_DEFAULT)?;
+        c.write(WRITE_MAC, 0, 0, &mac.0).await?;
+        c.command(WRITE_RX, RX_DEFAULT).await?;
+        c.command(WRITE_MEDIUM, MEDIUM_DEFAULT).await?;
         // Native Link has no multicast filter programming API. Source
         // asix_set_multicast's all-multicast mode preserves guest IPv6/etc.
-        c.command(WRITE_RX, RX_DEFAULT | RX_ALL_MULTICAST)?;
-        c.command(WRITE_MEDIUM, 0)?; // phylink begins with carrier down.
+        c.command(WRITE_RX, RX_DEFAULT | RX_ALL_MULTICAST).await?;
+        c.command(WRITE_MEDIUM, 0).await?; // phylink begins with carrier down.
         c.initialized = true;
         Ok((c, mac))
     }
-    fn reset(&mut self, mac: &Mac) -> Result<(), BlockError> {
+    async fn reset(&mut self, mac: &Mac) -> Result<(), BlockError> {
         let code = self.raw_status & CHIP_MASK;
         let gpio = if code == ORIGINAL {
             GPIO_RELOAD | GPIO_2 | GPIO_2_ENABLE
         } else {
             GPIO_RELOAD
         };
-        self.command(WRITE_GPIO, gpio)?;
-        self.minimum_wait(5000)?;
-        self.command(PHY_SELECT, 1 | if code == ORIGINAL { 0 } else { SSEN })?;
+        self.command(WRITE_GPIO, gpio).await?;
+        self.minimum_wait(5000).await?;
+        self.command(PHY_SELECT, 1 | if code == ORIGINAL { 0 } else { SSEN })
+            .await?;
         if code == ORIGINAL {
-            self.command(SW_RESET, RESET_IPPD)?;
-            self.minimum_wait(10_000)?;
-            self.command(SW_RESET, 0)?;
-            self.minimum_wait(60_000)?;
-            self.command(SW_RESET, RESET_IPRL | RESET_PRL)?;
-            self.minimum_wait(150_000)?;
-            self.command(WRITE_RX, RX_DEFAULT)?;
-            self.command(WRITE_MEDIUM, MEDIUM_DEFAULT)?;
+            self.command(SW_RESET, RESET_IPPD).await?;
+            self.minimum_wait(10_000).await?;
+            self.command(SW_RESET, 0).await?;
+            self.minimum_wait(60_000).await?;
+            self.command(SW_RESET, RESET_IPRL | RESET_PRL).await?;
+            self.minimum_wait(150_000).await?;
+            self.command(WRITE_RX, RX_DEFAULT).await?;
+            self.command(WRITE_MEDIUM, MEDIUM_DEFAULT).await?;
         } else {
-            self.minimum_wait(10_000)?;
-            self.command(SW_RESET, RESET_IPPD | RESET_IPRL)?;
-            self.minimum_wait(10_000)?;
-            self.command(SW_RESET, RESET_IPRL)?;
-            self.minimum_wait(160_000)?;
-            self.command(SW_RESET, 0)?;
-            self.command(SW_RESET, RESET_IPRL)?;
-            self.minimum_wait(200_000)?;
+            self.minimum_wait(10_000).await?;
+            self.command(SW_RESET, RESET_IPPD | RESET_IPRL).await?;
+            self.minimum_wait(10_000).await?;
+            self.command(SW_RESET, RESET_IPRL).await?;
+            self.minimum_wait(160_000).await?;
+            self.command(SW_RESET, 0).await?;
+            self.command(SW_RESET, RESET_IPRL).await?;
+            self.minimum_wait(200_000).await?;
             if code == B {
-                self.write(QUEUE, 0x8000, 0x8001, &[])?;
+                self.write(QUEUE, 0x8000, 0x8001, &[]).await?;
             } else {
                 let mut observed = [0; 3];
                 for (i, (register, _)) in A_DEFAULTS.iter().enumerate() {
-                    observed[i] = self.phy_read(*register)?;
+                    observed[i] = self.phy_read(*register).await?;
                 }
                 for ((register, value), actual) in A_DEFAULTS.iter().zip(observed) {
                     if *value != actual {
-                        self.phy_write(*register, *value)?;
+                        self.phy_write(*register, *value).await?;
                     }
                 }
             }
         }
-        self.write(WRITE_IPG, IPG0 | IPG1, IPG2, &[])?;
-        self.write(WRITE_MAC, 0, 0, &mac.0)?;
-        self.command(WRITE_RX, RX_DEFAULT)?;
+        self.write(WRITE_IPG, IPG0 | IPG1, IPG2, &[]).await?;
+        self.write(WRITE_MAC, 0, 0, &mac.0).await?;
+        self.command(WRITE_RX, RX_DEFAULT).await?;
         if code != ORIGINAL {
-            self.command(WRITE_MEDIUM, MEDIUM_DEFAULT)?;
-            self.command(WRITE_RX, RX_DEFAULT)?;
+            self.command(WRITE_MEDIUM, MEDIUM_DEFAULT).await?;
+            self.command(WRITE_RX, RX_DEFAULT).await?;
         }
-        self.word(READ_RX)?;
-        self.word(READ_MEDIUM)?;
+        self.word(READ_RX).await?;
+        self.word(READ_MEDIUM).await?;
         Ok(())
     }
-    fn phy_start(&mut self) -> Result<(), BlockError> {
+    async fn phy_start(&mut self) -> Result<(), BlockError> {
         // ax88796b.c asix_soft_reset must toggle RESET low first.
-        self.phy_write(BMCR, 0)?;
-        let old = self.phy_read(BMCR)?;
-        self.phy_write(BMCR, (old & !ISOLATE) | RESET | AN_RESTART)?;
+        self.phy_write(BMCR, 0).await?;
+        let old = self.phy_read(BMCR).await?;
+        self.phy_write(BMCR, (old & !ISOLATE) | RESET | AN_RESTART)
+            .await?;
         let mut done = false;
         for _ in 0..12 {
-            self.minimum_wait(50_000)?;
-            if self.phy_read(BMCR)? & RESET == 0 {
+            self.minimum_wait(50_000).await?;
+            if self.phy_read(BMCR).await? & RESET == 0 {
                 done = true;
                 break;
             }
@@ -234,8 +242,8 @@ impl<C: Control> Chip<C> {
         if !done {
             return Err(self.timeout());
         }
-        self.minimum_wait(1000)?;
-        let capabilities = self.phy_read(BMSR)?;
+        self.minimum_wait(1000).await?;
+        let capabilities = self.phy_read(BMSR).await?;
         if capabilities & AN_CAPABLE == 0 {
             return Err(BlockError::Unsupported("AX88772 PHY lacks autonegotiation"));
         }
@@ -255,25 +263,26 @@ impl<C: Control> Chip<C> {
                 "AX88772 PHY lacks 10/100 capability",
             ));
         }
-        let old = self.phy_read(ADVERTISE)?;
+        let old = self.phy_read(ADVERTISE).await?;
         self.advertised = (old & !ADV_MASK) | adv;
         if old != self.advertised {
-            self.phy_write(ADVERTISE, self.advertised)?;
+            self.phy_write(ADVERTISE, self.advertised).await?;
         }
-        let control = self.phy_read(BMCR)?;
+        let control = self.phy_read(BMCR).await?;
         self.phy_write(
             BMCR,
             (control & !(ISOLATE | POWER_DOWN)) | AN_ENABLE | AN_RESTART,
         )
+        .await
     }
-    pub(super) fn carrier(&mut self) -> Result<bool, BlockError> {
+    pub(super) async fn carrier(&mut self) -> Result<bool, BlockError> {
         if let Some(error) = self.io.error() {
             return Err(error.clone());
         }
         if !self.initialized {
             return Err(BlockError::Unsupported("AX88772 not initialized"));
         }
-        let control = self.phy_read(BMCR)?;
+        let control = self.phy_read(BMCR).await?;
         if control & AN_ENABLE == 0 {
             return Err(BlockError::Unsupported(
                 "AX88772 autonegotiation unexpectedly disabled",
@@ -284,31 +293,31 @@ impl<C: Control> Chip<C> {
         } else if self.was_link {
             // Poll once while up so the latched-low indication of a brief
             // disconnect is observed instead of cleared by a second read.
-            self.phy_read(BMSR)?
+            self.phy_read(BMSR).await?
         } else {
-            let first = self.phy_read(BMSR)?;
+            let first = self.phy_read(BMSR).await?;
             if first & LINK != 0 {
                 first
             } else {
-                self.phy_read(BMSR)?
+                self.phy_read(BMSR).await?
             }
         };
         let up = status & (LINK | AN_COMPLETE) == LINK | AN_COMPLETE;
         if !up {
             if self.medium != 0 {
-                self.command(WRITE_MEDIUM, 0)?;
+                self.command(WRITE_MEDIUM, 0).await?;
                 self.medium = 0;
             }
             self.decoder.reset();
             // AX88772A's PHY_NOLINK callback reinitializes the PHY to clear
             // stale partner advertisement. Bound this to a down transition.
             if self.was_link && self.phy_id == PHY_A {
-                self.phy_start()?;
+                self.phy_start().await?;
             }
             self.was_link = false;
             return Ok(false);
         }
-        let partner = self.phy_read(LPA)?;
+        let partner = self.phy_read(LPA).await?;
         let common = partner & self.advertised;
         let (hundred, full) = if common & ADV_100_FULL != 0 {
             (true, true)
@@ -344,28 +353,28 @@ impl<C: Control> Chip<C> {
             }
         }
         if self.medium != medium {
-            self.command(WRITE_MEDIUM, medium)?;
+            self.command(WRITE_MEDIUM, medium).await?;
             self.medium = medium;
         }
         self.was_link = true;
         Ok(true)
     }
-    pub(super) fn link_down(&mut self) -> Result<(), BlockError> {
+    pub(super) async fn link_down(&mut self) -> Result<(), BlockError> {
         self.decoder.reset();
         if self.medium != 0 {
-            self.command(WRITE_MEDIUM, 0)?;
+            self.command(WRITE_MEDIUM, 0).await?;
             self.medium = 0;
         }
         Ok(())
     }
-    pub(super) fn stop(&mut self) -> Result<(), BlockError> {
+    pub(super) async fn stop(&mut self) -> Result<(), BlockError> {
         self.initialized = false;
         self.was_link = false;
         self.decoder.reset();
-        self.command(WRITE_MEDIUM, 0)?;
-        self.command(WRITE_RX, 0)?;
-        let old = self.phy_read(BMCR)?;
-        self.phy_write(BMCR, old | POWER_DOWN)
+        self.command(WRITE_MEDIUM, 0).await?;
+        self.command(WRITE_RX, 0).await?;
+        let old = self.phy_read(BMCR).await?;
+        self.phy_write(BMCR, old | POWER_DOWN).await
     }
     pub(super) fn decode(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
         self.decoder.decode(bytes)
@@ -378,13 +387,14 @@ mod tests {
     use super::*;
     use alloc::rc::Rc;
     use core::cell::RefCell;
+    use stela_driver_base::stepped::block_on;
     fn attached(
         code: u8,
         id: u32,
         eeprom: bool,
     ) -> (Chip<model::Io>, Rc<RefCell<model::Hardware>>) {
         let hw = Rc::new(RefCell::new(model::Hardware::new(code, id)));
-        let (chip, mac) = Chip::attach(model::Io(hw.clone()), eeprom).unwrap();
+        let (chip, mac) = block_on(Chip::attach(model::Io(hw.clone()), eeprom)).unwrap();
         assert_eq!(mac.0, hw.borrow().mac);
         (chip, hw)
     }
@@ -400,28 +410,28 @@ mod tests {
                     assert_eq!(hw.borrow().phy[4] & 0xfe0, 0xde0);
                     // Grant delays advance the separate autonegotiation clock.
                     for _ in 0..4 {
-                        if c.carrier().unwrap() {
+                        if block_on(c.carrier()).unwrap() {
                             break;
                         }
                     }
-                    assert!(c.carrier().unwrap());
+                    assert!(block_on(c.carrier()).unwrap());
                     assert_eq!(hw.borrow().medium, 0x336);
                     hw.borrow_mut().link = false;
-                    assert!(!c.carrier().unwrap());
+                    assert!(!block_on(c.carrier()).unwrap());
                     assert_eq!(hw.borrow().medium, 0);
                     assert_eq!(hw.borrow().resets, if id == PHY_A { 2 } else { 1 });
                     hw.borrow_mut().link = true;
                     for _ in 0..4 {
-                        if c.carrier().unwrap() {
+                        if block_on(c.carrier()).unwrap() {
                             break;
                         }
                     }
-                    assert!(c.carrier().unwrap());
-                    c.stop().unwrap();
+                    assert!(block_on(c.carrier()).unwrap());
+                    block_on(c.stop()).unwrap();
                     assert_eq!(hw.borrow().medium, 0);
                     assert_eq!(hw.borrow().rx, 0);
                     assert_ne!(hw.borrow().phy[0] & 0x800, 0);
-                    assert!(c.carrier().is_err());
+                    assert!(block_on(c.carrier()).is_err());
                 }
             }
         }
@@ -443,7 +453,7 @@ mod tests {
                             hw.borrow_mut().fail_at = Some(at);
                         }
                         assert!(
-                            Chip::attach(model::Io(hw.clone()), eeprom).is_err(),
+                            block_on(Chip::attach(model::Io(hw.clone()), eeprom)).is_err(),
                             "code {code} at {at}"
                         );
                         assert_eq!(hw.borrow().trace.len(), at + 1);
@@ -454,10 +464,10 @@ mod tests {
         let (mut c, hw) = attached(0x20, PHY_C, true);
         let at = hw.borrow().trace.len();
         hw.borrow_mut().fail_at = Some(at + 2);
-        assert!(c.carrier().is_err());
+        assert!(block_on(c.carrier()).is_err());
         let count = hw.borrow().trace.len();
-        assert!(c.carrier().is_err());
-        assert!(c.stop().is_err());
+        assert!(block_on(c.carrier()).is_err());
+        assert!(block_on(c.stop()).is_err());
         assert_eq!(hw.borrow().trace.len(), count);
     }
     #[test]
@@ -473,7 +483,7 @@ mod tests {
                 5 => hw.borrow_mut().mac = [0; 6],
                 _ => hw.borrow_mut().phy[1] = 0,
             }
-            assert!(Chip::attach(model::Io(hw.clone()), false).is_err());
+            assert!(block_on(Chip::attach(model::Io(hw.clone()), false)).is_err());
             assert_eq!(hw.borrow().rx & !0x88, 0);
         }
     }
@@ -485,10 +495,10 @@ mod tests {
                 hw.borrow_mut().delay(100_000);
                 hw.borrow_mut().phy[5] = partner;
                 if partner == 0 && id != PHY_A {
-                    assert!(c.carrier().is_err());
+                    assert!(block_on(c.carrier()).is_err());
                     continue;
                 }
-                assert!(c.carrier().unwrap());
+                assert!(block_on(c.carrier()).unwrap());
                 let expected = match partner {
                     0 => 0x104,
                     0x21 => 0x104,
@@ -529,7 +539,7 @@ mod tests {
                 was_link: false,
                 decoder: framing::Decoder::default(),
             };
-            chip.reset(&Mac([2, 0x27, 0x72, 0x43, 0x54, 0x65])).unwrap();
+            block_on(chip.reset(&Mac([2, 0x27, 0x72, 0x43, 0x54, 0x65]))).unwrap();
             let hw = hw.borrow();
             let mut trace = alloc::string::String::new();
             use core::fmt::Write;
@@ -593,20 +603,20 @@ mod tests {
     fn polling_observes_latched_loss_and_reassembles_only_current_link_frames() {
         let (mut c, hw) = attached(0x20, PHY_C, true);
         hw.borrow_mut().delay(100_000);
-        assert!(c.carrier().unwrap());
+        assert!(block_on(c.carrier()).unwrap());
         let n = 60u32;
         let header = (n | ((!n & 0xffff) << 16)).to_le_bytes();
         let mut part = header.to_vec();
         part.extend_from_slice(&[0x93; 20]);
         assert!(c.decode(&part).unwrap().is_empty());
         hw.borrow_mut().latched_low = true;
-        assert!(!c.carrier().unwrap());
-        assert!(c.carrier().unwrap());
+        assert!(!block_on(c.carrier()).unwrap());
+        assert!(block_on(c.carrier()).unwrap());
         let mut frame = header.to_vec();
         frame.extend_from_slice(&[0x65; 60]);
         assert_eq!(c.decode(&frame).unwrap(), alloc::vec![alloc::vec![0x65;60]]);
         hw.borrow_mut().phy[0] &= !0x1000;
-        assert!(c.carrier().is_err());
+        assert!(block_on(c.carrier()).is_err());
     }
     #[test]
     fn phy_advertisement_is_intersected_with_basic_capabilities() {
@@ -614,7 +624,7 @@ mod tests {
             let hw = Rc::new(RefCell::new(model::Hardware::new(0x20, PHY_C)));
             hw.borrow_mut().phy[1] = AN_CAPABLE | (mask << 11);
             hw.borrow_mut().phy[4] = 0xa201;
-            let result = Chip::attach(model::Io(hw.clone()), false);
+            let result = block_on(Chip::attach(model::Io(hw.clone()), false));
             if mask == 0 {
                 assert!(result.is_err());
                 continue;
@@ -627,19 +637,19 @@ mod tests {
             let mut failures = 0;
             // Fault every operation of final PHY stop after a ready link.
             hw.borrow_mut().delay(100_000);
-            c.carrier().unwrap();
+            block_on(c.carrier()).unwrap();
             let start = hw.borrow().trace.len();
-            c.stop().unwrap();
+            block_on(c.stop()).unwrap();
             let n = hw.borrow().trace.len() - start;
             for at in 0..n {
                 let (mut other, other_hw) = attached(0x20, PHY_C, false);
                 other_hw.borrow_mut().delay(100_000);
-                assert!(other.carrier().unwrap());
+                assert!(block_on(other.carrier()).unwrap());
                 let begin = other_hw.borrow().trace.len();
                 other_hw.borrow_mut().fail_at = Some(begin + at);
-                assert!(other.stop().is_err());
+                assert!(block_on(other.stop()).is_err());
                 let end = other_hw.borrow().trace.len();
-                assert!(other.stop().is_err());
+                assert!(block_on(other.stop()).is_err());
                 assert_eq!(other_hw.borrow().trace.len(), end);
                 failures += 1;
             }

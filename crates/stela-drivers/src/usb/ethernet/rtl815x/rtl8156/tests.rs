@@ -5,6 +5,7 @@ use crate::usb::ethernet::{
 };
 use alloc::rc::Rc;
 use core::cell::RefCell;
+use stela_driver_base::stepped::block_on;
 
 fn seed(model: &mut FirmwareModel, mdi: bool) {
     model
@@ -38,12 +39,12 @@ fn rtl8156a_exact_revision_phy_sram2_mdi_and_48k_receive() {
             for mdi in [false, true] {
                 let model = Rc::new(RefCell::new(FirmwareModel::new(revision, &bytes)));
                 seed(&mut model.borrow_mut(), mdi);
-                let (mut chip, _) = Chip::attach_with_firmware(
+                let (mut chip, _) = block_on(Chip::attach_with_firmware(
                     FirmwareIo(model.clone()),
                     Revision(revision),
                     speed,
                     firmware.as_ref(),
-                )
+                ))
                 .unwrap();
                 assert!(chip.initialized);
                 assert_eq!(chip.receive_bytes(), 49152);
@@ -86,7 +87,7 @@ fn rtl8156a_exact_revision_phy_sram2_mdi_and_48k_receive() {
                 for status in [0x06, 0x07, 0x0a, 0x0b, 0x13, 0x113, 0x403, 0x473] {
                     model.borrow_mut().core.phy_status = status;
                     let before = model.borrow().core.trace.len();
-                    assert!(chip.carrier().unwrap());
+                    assert!(block_on(chip.carrier()).unwrap());
                     {
                         let hw = model.borrow();
                         let writes = &hw.core.trace[before..];
@@ -129,7 +130,7 @@ fn rtl8156a_exact_revision_phy_sram2_mdi_and_48k_receive() {
                             );
                         }
                     }
-                    chip.stop().unwrap();
+                    block_on(chip.stop()).unwrap();
                     assert_eq!(model.borrow().core.get(PLA, PLA_RX_FIFO_FULL, 2), 0);
                     assert_eq!(model.borrow().core.get(PLA, PLA_RX_FIFO_EMPTY, 2), 0);
                 }
@@ -150,12 +151,12 @@ fn rtl8156a_observed_phy_upload_modes_and_ups_reload_are_distinct() {
             state,
             PHY_STAT_LAN_ON,
         ]);
-        let (chip, _) = Chip::attach_with_firmware(
+        let (chip, _) = block_on(Chip::attach_with_firmware(
             FirmwareIo(model.clone()),
             Revision(0x7030),
             4,
             Some(&firmware),
-        )
+        ))
         .unwrap();
         assert!(chip.initialized);
         assert!(model.borrow().phy_states.is_empty());
@@ -166,8 +167,13 @@ fn rtl8156a_observed_phy_upload_modes_and_ups_reload_are_distinct() {
     }
     let model = Rc::new(RefCell::new(FirmwareModel::new(0x7020, &[])));
     model.borrow_mut().ups_exit_power_cut = true;
-    let (chip, _) =
-        Chip::attach_with_firmware(FirmwareIo(model.clone()), Revision(0x7020), 4, None).unwrap();
+    let (chip, _) = block_on(Chip::attach_with_firmware(
+        FirmwareIo(model.clone()),
+        Revision(0x7020),
+        4,
+        None,
+    ))
+    .unwrap();
     assert!(chip.initialized);
     assert!(!model.borrow().ups_exit_power_cut);
     let resets = model
@@ -191,12 +197,12 @@ fn rtl8156a_every_mdi_startup_transfer_failure_and_deadline_refuses_ready() {
     let firmware = Firmware::parse(&bytes, Revision(0x7030)).unwrap();
     let model = Rc::new(RefCell::new(FirmwareModel::new(0x7030, &bytes)));
     seed(&mut model.borrow_mut(), true);
-    Chip::attach_with_firmware(
+    block_on(Chip::attach_with_firmware(
         FirmwareIo(model.clone()),
         Revision(0x7030),
         4,
         Some(&firmware),
-    )
+    ))
     .unwrap();
     let count = model.borrow().core.trace.len();
     for at in 0..count {
@@ -204,12 +210,12 @@ fn rtl8156a_every_mdi_startup_transfer_failure_and_deadline_refuses_ready() {
         seed(&mut model.borrow_mut(), true);
         model.borrow_mut().core.fail_at = Some(at);
         assert!(
-            Chip::attach_with_firmware(
+            block_on(Chip::attach_with_firmware(
                 FirmwareIo(model.clone()),
                 Revision(0x7030),
                 4,
                 Some(&firmware)
-            )
+            ))
             .is_err()
         );
         assert_eq!(model.borrow().core.trace.len(), at + 1);
@@ -228,7 +234,12 @@ fn rtl8156a_every_mdi_startup_transfer_failure_and_deadline_refuses_ready() {
             }
         }
         assert!(matches!(
-            Chip::attach_with_firmware(FirmwareIo(model), Revision(0x7030), 4, Some(&firmware)),
+            block_on(Chip::attach_with_firmware(
+                FirmwareIo(model),
+                Revision(0x7030),
+                4,
+                Some(&firmware)
+            )),
             Err(BlockError::Timeout)
         ));
     }
@@ -272,18 +283,18 @@ fn unchanged_linux_rtl8156a_enable_register_effects() {
         let firmware =
             (!bytes.is_empty()).then(|| Firmware::parse(&bytes, Revision(revision)).unwrap());
         let model = Rc::new(RefCell::new(FirmwareModel::new(revision, &bytes)));
-        let (mut chip, _) = Chip::attach_with_firmware(
+        let (mut chip, _) = block_on(Chip::attach_with_firmware(
             FirmwareIo(model.clone()),
             Revision(revision),
             speed,
             firmware.as_ref(),
-        )
+        ))
         .unwrap();
         for (bank, address) in fields {
             model.borrow_mut().core.set(bank, address, 2, 0xa55a);
         }
         model.borrow_mut().core.phy_status = status;
-        assert!(chip.carrier().unwrap());
+        assert!(block_on(chip.carrier()).unwrap());
         for ((bank, address), expected) in fields.into_iter().zip(&v[3..]) {
             assert_eq!(
                 model.borrow().core.get(bank, address, 2),
@@ -313,15 +324,15 @@ fn real_firmware_8156a_full_startup_link_and_stop() {
     for speed in [1, 3, 4, 5] {
         let model = Rc::new(RefCell::new(FirmwareModel::new(revision, &bytes)));
         seed(&mut model.borrow_mut(), true);
-        let (mut chip, _) = Chip::attach_with_firmware(
+        let (mut chip, _) = block_on(Chip::attach_with_firmware(
             FirmwareIo(model.clone()),
             Revision(revision),
             speed,
             Some(&firmware),
-        )
+        ))
         .unwrap();
-        assert!(chip.initialized && chip.carrier().unwrap());
-        chip.stop().unwrap();
+        assert!(chip.initialized && block_on(chip.carrier()).unwrap());
+        block_on(chip.stop()).unwrap();
         assert_eq!(model.borrow().core.get(PLA, PLA_CR, 1), 0);
     }
 }

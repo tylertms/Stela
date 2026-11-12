@@ -14,7 +14,7 @@ use minimum::MinimumControl;
 pub mod rtl815x;
 
 use super::descriptor::{Endpoint, Interface};
-use super::xhci::{Device, Shared, SlotId, TransferTicket};
+use super::xhci::{Device, DeviceAccess, Operation, Shared, SlotId, TransferTicket};
 use crate::{
     Deadline,
     block::BlockError,
@@ -26,6 +26,8 @@ use alloc::{collections::VecDeque, format, string::String, vec::Vec};
 pub(crate) use asix::LegacyModel;
 #[cfg(test)]
 pub(crate) use asix::model::Hardware as AsixModel;
+use core::future::Future;
+use stela_driver_base::stepped::{block_on, yield_now};
 #[cfg(test)]
 pub(crate) fn asix_legacy_ids() -> Vec<(u16, u16)> {
     asix::legacy_ids()
@@ -53,14 +55,20 @@ pub(crate) fn asix_ids() -> Vec<(u16, u16)> {
     asix::ids().iter().map(|entry| (entry.0, entry.1)).collect()
 }
 
-/// Synchronous endpoint-zero requests. Success includes the exact transferred
-/// byte count; short replies/writes are errors, never invented register values.
+/// Endpoint-zero requests and the waits between them, as futures: the chip
+/// code written once over them runs to completion at attach ([`block_on`])
+/// or a step per runtime call. Success includes the exact transferred byte
+/// count; short replies/writes are errors, never invented register values.
 pub trait Control {
-    fn control(&mut self, request: [u8; 8], output: &[u8]) -> Result<Vec<u8>, BlockError>;
+    fn control(
+        &mut self,
+        request: [u8; 8],
+        output: &[u8],
+    ) -> impl Future<Output = Result<Vec<u8>, BlockError>>;
     /// Nominal polling cadence only; never authorizes a hardware minimum.
-    fn delay_us(&mut self, microseconds: u64);
+    fn delay_us(&mut self, microseconds: u64) -> impl Future<Output = ()>;
     /// Required physical quiet interval from this actual device's owner.
-    fn minimum_wait(&mut self, microseconds: u64) -> Result<(), BlockError>;
+    fn minimum_wait(&mut self, microseconds: u64) -> impl Future<Output = Result<(), BlockError>>;
 }
 
 #[derive(Clone, Debug)]
@@ -154,21 +162,38 @@ pub(super) struct HostControl {
 }
 
 impl Control for HostControl {
-    fn control(&mut self, request: [u8; 8], output: &[u8]) -> Result<Vec<u8>, BlockError> {
-        let mut controller = self.controller.borrow_mut();
-        let mut c = controller.device(self.id)?;
-        if !c.connected()? {
-            return Err(BlockError::Unsupported("USB Ethernet disconnected"));
-        }
-        c.control(request, output)
+    async fn control(&mut self, request: [u8; 8], output: &[u8]) -> Result<Vec<u8>, BlockError> {
+        operation(&self.controller, self.id, |c| {
+            if !c.connected()? {
+                return Err(BlockError::Unsupported("USB Ethernet disconnected"));
+            }
+            c.start_control(request, output)
+        })
+        .await
     }
-    fn delay_us(&mut self, microseconds: u64) {
+    async fn delay_us(&mut self, microseconds: u64) {
         self.controller.borrow().clock.delay(microseconds);
     }
-    fn minimum_wait(&mut self, microseconds: u64) -> Result<(), BlockError> {
+    async fn minimum_wait(&mut self, microseconds: u64) -> Result<(), BlockError> {
         let mut controller = self.controller.borrow_mut();
         controller.device(self.id)?.connected()?;
         controller.minimum_wait(microseconds)
+    }
+}
+
+/// An endpoint operation `start` begins on the device, looked at once per
+/// step until it ends; the controller is borrowed only within a step.
+pub(super) async fn operation(
+    controller: &Shared,
+    id: SlotId,
+    start: impl FnOnce(&mut DeviceAccess<'_>) -> Result<Operation, BlockError>,
+) -> Result<Vec<u8>, BlockError> {
+    let mut operation = start(&mut controller.borrow_mut().device(id)?)?;
+    loop {
+        if let Some(result) = controller.borrow_mut().device(id)?.poll(&mut operation) {
+            return result;
+        }
+        yield_now().await;
     }
 }
 
@@ -185,20 +210,20 @@ impl Backend {
     }
     fn carrier(&mut self) -> Result<bool, BlockError> {
         match self {
-            Self::Realtek(chip) => chip.carrier(),
-            Self::Asix(chip) => chip.carrier(),
+            Self::Realtek(chip) => block_on(chip.carrier()),
+            Self::Asix(chip) => block_on(chip.carrier()),
         }
     }
     fn link_down(&mut self) -> Result<(), BlockError> {
         match self {
-            Self::Realtek(c) => c.stop(),
-            Self::Asix(c) => c.link_down(),
+            Self::Realtek(c) => block_on(c.stop()),
+            Self::Asix(c) => block_on(c.link_down()),
         }
     }
     fn stop(&mut self) -> Result<(), BlockError> {
         match self {
-            Self::Realtek(chip) => chip.stop(),
-            Self::Asix(chip) => chip.stop(),
+            Self::Realtek(chip) => block_on(chip.stop()),
+            Self::Asix(chip) => block_on(chip.stop()),
         }
     }
     fn encode(&self, frame: &[u8], output: &mut [u8], packet: u16) -> Result<usize, &'static str> {
@@ -300,13 +325,13 @@ impl UsbEthernet {
                         Ok(firmware) => (firmware, None),
                         Err(error) => (None, Some(error)),
                     };
-                let (chip, mac) = Chip::attach_with_policy(
+                let (chip, mac) = block_on(Chip::attach_with_policy(
                     io,
                     revision,
                     device.speed,
                     firmware.as_ref().map(|(_, parsed)| parsed),
                     policy(device),
-                )?;
+                ))?;
                 let family = if revision.is_8153a() {
                     "RTL8153A"
                 } else if revision.is_8153b() {
@@ -330,7 +355,7 @@ impl UsbEthernet {
                 (Backend::Realtek(chip), mac, receipt, family, skipped)
             }
             Kind::Asix(identity) => {
-                let (chip, mac) = asix::Device::attach(io, identity)?;
+                let (chip, mac) = block_on(asix::Device::attach(io, identity))?;
                 let family = match identity {
                     asix::Identity::Ax88179 => "AX88179",
                     asix::Identity::Ax88178a => "AX88178A",

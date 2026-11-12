@@ -51,7 +51,9 @@ pub(crate) fn refuse(peer: &mut UsbEthernet, target: &Shared) {
     let before_pending = peer.pending.clone();
     let before_send = peer.send.bytes().to_vec();
     let before_receive = peer.receive.bytes().to_vec();
-    assert!(io.control(setup(0xc0, 5, 0, 0, 4), &[]).is_err());
+    assert!(
+        stela_driver_base::stepped::block_on(io.control(setup(0xc0, 5, 0, 0, 4), &[])).is_err()
+    );
     assert!(!peer.carrier());
     assert!(peer.transmit(&[0x88; 60]).is_err());
     assert!(peer.receive().is_err());

@@ -4,6 +4,7 @@ use super::*;
 use crate::bus::pci::power::Error;
 use alloc::rc::Rc;
 use core::cell::{Cell, RefCell};
+use stela_driver_base::stepped::block_on;
 #[derive(Default)]
 struct Effects {
     controls: RefCell<Vec<[u8; 8]>>,
@@ -19,14 +20,14 @@ impl Drop for Owner {
     }
 }
 impl Control for Owner {
-    fn control(&mut self, request: [u8; 8], _: &[u8]) -> Result<Vec<u8>, BlockError> {
+    async fn control(&mut self, request: [u8; 8], _: &[u8]) -> Result<Vec<u8>, BlockError> {
         self.0.controls.borrow_mut().push(request);
         Ok(Vec::new())
     }
-    fn delay_us(&mut self, _: u64) {
+    async fn delay_us(&mut self, _: u64) {
         panic!("physical sequence used nominal bridge");
     }
-    fn minimum_wait(&mut self, us: u64) -> Result<(), BlockError> {
+    async fn minimum_wait(&mut self, us: u64) -> Result<(), BlockError> {
         self.0.waits.borrow_mut().push(us);
         if self.0.refuse.get() {
             return Err(BlockError::PciPower(Error::Interrupted));
@@ -39,20 +40,20 @@ impl Control for Owner {
 fn minimum_failure_is_sticky_before_control_effects_and_owner_destruction() {
     let effects = Rc::new(Effects::default());
     let mut owner = MinimumControl::new(Owner(effects.clone()));
-    owner.minimum_wait(73).unwrap();
+    block_on(owner.minimum_wait(73)).unwrap();
     assert_eq!(effects.elapsed.get(), 73);
     effects.refuse.set(true);
     assert_eq!(
-        owner.minimum_wait(500),
+        block_on(owner.minimum_wait(500)),
         Err(BlockError::PciPower(Error::Interrupted))
     );
     effects.refuse.set(false);
     assert_eq!(
-        owner.minimum_wait(800),
+        block_on(owner.minimum_wait(800)),
         Err(BlockError::PciPower(Error::Interrupted))
     );
     assert_eq!(
-        owner.control([0; 8], &[]),
+        block_on(owner.control([0; 8], &[])),
         Err(BlockError::PciPower(Error::Interrupted))
     );
     assert_eq!(*effects.waits.borrow(), [73, 500]);
@@ -65,7 +66,7 @@ fn ax88179_power_reset_failure_stops_before_clock_select_and_retains_partial_own
     let effects = Rc::new(Effects::default());
     effects.refuse.set(true);
     assert!(matches!(
-        super::super::asix::Chip::attach(Owner(effects.clone())),
+        block_on(super::super::asix::Chip::attach(Owner(effects.clone()))),
         Err(BlockError::PciPower(Error::Interrupted))
     ));
     assert_eq!(effects.controls.borrow().len(), 2);
@@ -82,12 +83,12 @@ fn actual_host_bridge_reports_retained_model_timer_failure_without_later_device_
         id: device.id,
     });
     assert_eq!(
-        control.minimum_wait(u64::MAX),
+        block_on(control.minimum_wait(u64::MAX)),
         Err(BlockError::PciPower(Error::Clock))
     );
     let accesses = hardware.borrow().accesses;
     assert_eq!(
-        control.control([0; 8], &[]),
+        block_on(control.control([0; 8], &[])),
         Err(BlockError::PciPower(Error::Clock))
     );
     assert_eq!(hardware.borrow().accesses, accesses);

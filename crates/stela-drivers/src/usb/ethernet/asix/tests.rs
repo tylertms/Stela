@@ -7,6 +7,7 @@ use crate::usb::ethernet;
 use crate::usb::xhci::{model, model::*, *};
 use alloc::rc::Rc;
 use core::cell::RefCell;
+use stela_driver_base::stepped::block_on;
 
 #[test]
 fn ax179_real_power_eeprom_efuse_old_led_phy_and_link_states() {
@@ -30,7 +31,7 @@ fn ax179_real_power_eeprom_efuse_old_led_phy_and_link_states() {
                     }
                     h.eeprom[0x43] = 0x100;
                 }
-                let (mut chip, mac) = Chip::attach(Io(hw.clone())).unwrap();
+                let (mut chip, mac) = block_on(Chip::attach(Io(hw.clone()))).unwrap();
                 assert_eq!(mac.0, [2, 0x34, 0x56, 0x78, 0x9a, 0xbc]);
                 assert_eq!(chip.general_status, if ua2 { 4 } else { 0 });
                 assert_eq!(chip.phy_id, 0x0007_c001);
@@ -73,19 +74,19 @@ fn ax179_real_power_eeprom_efuse_old_led_phy_and_link_states() {
                         hw.borrow_mut()
                             .phy
                             .insert((0, 0, 0x11), speed | duplex | 0x400);
-                        assert!(chip.carrier().unwrap());
+                        assert!(block_on(chip.carrier()).unwrap());
                         assert_eq!(&hw.borrow().mac[0x2e..0x33], &BULKIN[expected_queue]);
                         assert_eq!(
                             hw.borrow().word(0x22),
                             medium | if duplex != 0 { 2 } else { 0 }
                         );
-                        chip.stop().unwrap();
+                        block_on(chip.stop()).unwrap();
                         assert_eq!(hw.borrow().word(0x22) & 0x100, 0);
                         assert_eq!(hw.borrow().word(0x0b), 0);
                     }
                 }
                 hw.borrow_mut().phy.insert((0, 0, 0x11), 0);
-                assert!(!chip.carrier().unwrap());
+                assert!(!block_on(chip.carrier()).unwrap());
             }
         }
     }
@@ -112,7 +113,7 @@ fn ax179_all_startup_transfer_faults_and_short_reads_poison_access() {
     for source in 0..3 {
         for ua2 in [false, true] {
             let hw = Rc::new(RefCell::new(model(source, ua2)));
-            Chip::attach(Io(hw.clone())).unwrap();
+            block_on(Chip::attach(Io(hw.clone()))).unwrap();
             let count = hw.borrow().trace.len();
             for at in 0..count {
                 let read = hw.borrow().trace[at].0[0] == 0xc0;
@@ -127,7 +128,7 @@ fn ax179_all_startup_transfer_faults_and_short_reads_poison_access() {
                         hw.borrow_mut().fail_at = Some(at);
                     }
                     assert!(
-                        Chip::attach(Io(hw.clone())).is_err(),
+                        block_on(Chip::attach(Io(hw.clone()))).is_err(),
                         "{source}/{ua2}/{at}/{short}"
                     );
                     assert_eq!(hw.borrow().trace.len(), at + 1);
@@ -136,11 +137,11 @@ fn ax179_all_startup_transfer_faults_and_short_reads_poison_access() {
         }
     }
     let hw = Rc::new(RefCell::new(Hardware::new(4, true)));
-    let (mut chip, _) = Chip::attach(Io(hw.clone())).unwrap();
+    let (mut chip, _) = block_on(Chip::attach(Io(hw.clone()))).unwrap();
     let at = hw.borrow().trace.len();
     hw.borrow_mut().fail_at = Some(at);
-    assert!(chip.carrier().is_err());
-    assert!(chip.carrier().is_err());
+    assert!(block_on(chip.carrier()).is_err());
+    assert!(block_on(chip.carrier()).is_err());
     assert_eq!(hw.borrow().trace.len(), at + 1);
 }
 
@@ -160,14 +161,14 @@ fn ax179_hardware_deadlines_and_invalid_identity_refuse_success() {
             }
             _ => hw.borrow_mut().mac[0x10..0x16].fill(0),
         }
-        assert!(Chip::attach(Io(hw)).is_err(), "{case}");
+        assert!(block_on(Chip::attach(Io(hw))).is_err(), "{case}");
     }
     let hw = Rc::new(RefCell::new(Hardware::new(4, true)));
-    let (mut chip, _) = Chip::attach(Io(hw.clone())).unwrap();
+    let (mut chip, _) = block_on(Chip::attach(Io(hw.clone()))).unwrap();
     hw.borrow_mut().stuck_fifo = true;
-    assert!(matches!(chip.carrier(), Err(BlockError::Timeout)));
+    assert!(matches!(block_on(chip.carrier()), Err(BlockError::Timeout)));
     let at = hw.borrow().trace.len();
-    assert!(chip.carrier().is_err());
+    assert!(block_on(chip.carrier()).is_err());
     assert_eq!(hw.borrow().trace.len(), at);
 }
 
@@ -232,7 +233,7 @@ fn unchanged_linux_asix_led_eeprom_mmd_fields() {
                 }
                 h.eeprom[0x43] = if detach { 0x100 } else { 0xffff };
             }
-            Chip::attach(Io(hw.clone())).unwrap();
+            block_on(Chip::attach(Io(hw.clone()))).unwrap();
             let h = hw.borrow();
             assert_eq!(
                 (
@@ -272,9 +273,9 @@ fn unchanged_linux_asix_negotiated_queue_and_medium_fields() {
             .collect();
         assert_eq!(v.len(), 9);
         let hw = Rc::new(RefCell::new(Hardware::new(v[0] as u8, true)));
-        let (mut chip, _) = Chip::attach(Io(hw.clone())).unwrap();
+        let (mut chip, _) = block_on(Chip::attach(Io(hw.clone()))).unwrap();
         hw.borrow_mut().phy.insert((0, 0, 0x11), v[1] as u16);
-        assert!(chip.carrier().unwrap());
+        assert!(block_on(chip.carrier()).unwrap());
         assert_eq!(u32::from(hw.borrow().word(0x22)), v[2], "{line}");
         for (actual, expected) in hw.borrow().mac[0x2e..0x33].iter().zip(&v[3..8]) {
             assert_eq!(u32::from(*actual), *expected, "{line}");
@@ -306,17 +307,17 @@ fn unchanged_linux_asix_eeprom_and_efuse_checksum_mutations() {
             .map(|at| u8::from_str_radix(&v[1][at..at + 2], 16).unwrap())
             .collect();
         let hw = Rc::new(RefCell::new(Hardware::new(4, true)));
-        let (mut chip, _) = Chip::attach(Io(hw.clone())).unwrap();
+        let (mut chip, _) = block_on(Chip::attach(Io(hw.clone()))).unwrap();
         let valid = if v[0] == "0" {
             assert_eq!(bytes.len(), 12);
             for (i, word) in bytes.as_chunks::<2>().0.iter().enumerate() {
                 hw.borrow_mut().eeprom[i] = u16::from_le_bytes(*word);
             }
-            chip.eeprom_valid().unwrap()
+            block_on(chip.eeprom_valid()).unwrap()
         } else {
             assert_eq!(bytes.len(), 64);
             hw.borrow_mut().efuse.copy_from_slice(&bytes);
-            chip.efuse_led().unwrap().is_some()
+            block_on(chip.efuse_led()).unwrap().is_some()
         };
         assert_eq!(valid, v[2] == "1", "{line}");
         count += 1;

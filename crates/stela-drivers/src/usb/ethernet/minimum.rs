@@ -24,26 +24,26 @@ impl<C> MinimumControl<C> {
     }
 }
 impl<C: Control> Control for MinimumControl<C> {
-    fn control(&mut self, request: [u8; 8], output: &[u8]) -> Result<Vec<u8>, BlockError> {
+    async fn control(&mut self, request: [u8; 8], output: &[u8]) -> Result<Vec<u8>, BlockError> {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
-        let result = self.source.control(request, output);
+        let result = self.source.control(request, output).await;
         if let Err(error @ BlockError::PciPower(_)) = &result {
             self.failure = Some(error.clone());
         }
         result
     }
-    fn delay_us(&mut self, us: u64) {
+    async fn delay_us(&mut self, us: u64) {
         if self.failure.is_none() {
-            self.source.delay_us(us);
+            self.source.delay_us(us).await;
         }
     }
-    fn minimum_wait(&mut self, us: u64) -> Result<(), BlockError> {
+    async fn minimum_wait(&mut self, us: u64) -> Result<(), BlockError> {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
-        let result = self.source.minimum_wait(us);
+        let result = self.source.minimum_wait(us).await;
         if let Err(error) = &result {
             self.failure = Some(error.clone());
         }

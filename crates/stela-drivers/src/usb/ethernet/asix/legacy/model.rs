@@ -221,13 +221,13 @@ impl Hardware {
 }
 pub(super) struct Io(pub Rc<RefCell<Hardware>>);
 impl Control for Io {
-    fn control(&mut self, q: [u8; 8], data: &[u8]) -> Result<Vec<u8>, BlockError> {
+    async fn control(&mut self, q: [u8; 8], data: &[u8]) -> Result<Vec<u8>, BlockError> {
         self.0.borrow_mut().request(q, data)
     }
-    fn delay_us(&mut self, us: u64) {
+    async fn delay_us(&mut self, us: u64) {
         self.0.borrow_mut().delay(us);
     }
-    fn minimum_wait(&mut self, us: u64) -> Result<(), BlockError> {
+    async fn minimum_wait(&mut self, us: u64) -> Result<(), BlockError> {
         let mut state = self.0.borrow_mut();
         state.minimum_attempts.push(us);
         if state.minimum_failure {

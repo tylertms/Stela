@@ -201,13 +201,13 @@ impl Hardware {
 
 pub(super) struct Io(pub Rc<RefCell<Hardware>>);
 impl Control for Io {
-    fn control(&mut self, request: [u8; 8], output: &[u8]) -> Result<Vec<u8>, BlockError> {
+    async fn control(&mut self, request: [u8; 8], output: &[u8]) -> Result<Vec<u8>, BlockError> {
         self.0.borrow_mut().request(request, output)
     }
-    fn delay_us(&mut self, microseconds: u64) {
+    async fn delay_us(&mut self, microseconds: u64) {
         self.0.borrow_mut().delays.push(microseconds);
     }
-    fn minimum_wait(&mut self, microseconds: u64) -> Result<(), BlockError> {
+    async fn minimum_wait(&mut self, microseconds: u64) -> Result<(), BlockError> {
         let mut state = self.0.borrow_mut();
         state.minimum_elapsed = state
             .minimum_elapsed
