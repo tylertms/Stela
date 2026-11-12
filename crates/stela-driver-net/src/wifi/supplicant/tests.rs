@@ -610,3 +610,49 @@ fn a_multi_link_message_3_misnaming_or_missing_a_link_installs_nothing() {
         Some(Error::MultiLink)
     );
 }
+
+#[test]
+fn a_repeated_message_3_after_a_lost_message_4_answers_again_without_reinstalling() {
+    for akm in [Akm::Psk, Akm::Sae] {
+        let (mut ap, mut station) = begun(suites(akm));
+        let step = station.receive(&ap.message_3(&RSN), &mut random).unwrap();
+        assert!(step.pairwise.is_some() && step.group.is_some());
+        // Message 4 is lost: the authenticator sends message 3 again with a
+        // higher replay counter, as wpa_supplicant expects.
+        let step = station.receive(&ap.message_3(&RSN), &mut random).unwrap();
+        ap.signed_reply(&step.reply.unwrap(), PAIRWISE | MIC | SECURE);
+        assert!(step.pairwise.is_none() && step.group.is_none() && step.integrity.is_none());
+        // A forged repeat changes nothing.
+        let mut forged = ap.message_3(&RSN);
+        forged[MIC_OFFSET] ^= 1;
+        assert_eq!(
+            station.receive(&forged, &mut random).unwrap_err(),
+            Error::Mic
+        );
+        // A new 4-way handshake (PTK rekey) still installs its keys.
+        ap.anonce = [0xb2; 32];
+        let step = station.receive(&ap.message_1(), &mut random).unwrap();
+        ap.message_2(&step.reply.unwrap());
+        let step = station.receive(&ap.message_3(&RSN), &mut random).unwrap();
+        ap.signed_reply(&step.reply.unwrap(), PAIRWISE | MIC | SECURE);
+        assert_eq!(
+            step.pairwise.unwrap().material[..],
+            ap.ptk.as_ref().unwrap().tk()[..]
+        );
+        // The GTK did not change: it stays installed, its counter untouched.
+        assert!(step.group.is_none());
+    }
+}
+
+#[test]
+fn a_repeated_group_message_answers_without_reinstalling_its_key() {
+    let (mut ap, mut station) = begun(suites(Akm::Psk));
+    station.receive(&ap.message_3(&RSN), &mut random).unwrap();
+    let step = station.receive(&ap.group_message_1(), &mut random).unwrap();
+    assert_eq!(step.group.unwrap().index, 2);
+    // The authenticator repeats group message 1 after a lost reply: the
+    // same GTK is answered, not reinstalled (wpa_supplicant_install_gtk).
+    let step = station.receive(&ap.group_message_1(), &mut random).unwrap();
+    ap.signed_reply(&step.reply.unwrap(), MIC | SECURE);
+    assert!(step.group.is_none());
+}

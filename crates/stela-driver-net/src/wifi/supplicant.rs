@@ -705,6 +705,13 @@ pub struct Supplicant {
     tentative: Option<(Ptk, [u8; 32])>,
     /// The PTK message 3 confirmed.
     ptk: Option<Ptk>,
+    /// The ANonce of the 4-way handshake that confirmed `ptk`, which a
+    /// retransmitted message 3 repeats.
+    anonce: Option<[u8; 32]>,
+    /// The group key and IGTK last installed, as index and material, which
+    /// wpa_supplicant never reinstalls (`wpa_supplicant_install_gtk`).
+    installed_group: Option<(u8, Zeroizing<Vec<u8>>)>,
+    installed_integrity: Option<(u8, Zeroizing<Vec<u8>>)>,
     /// The links of a multi-link association.
     multi_link: Option<MultiLink>,
     /// The Key Replay Counter of the next EAPOL-Key request.
@@ -742,6 +749,9 @@ impl Supplicant {
             snonce: None,
             tentative: None,
             ptk: None,
+            anonce: None,
+            installed_group: None,
+            installed_integrity: None,
             multi_link: None,
             request_counter: 0,
         })
@@ -953,10 +963,13 @@ impl Supplicant {
     }
 
     fn message_3(&mut self, key: &Frame<'_>) -> Result<Step, Error> {
-        let (ptk, anonce) = self.tentative.as_ref().ok_or(Error::Sequence)?;
         if key.info & (INSTALL | ENCRYPTED) != INSTALL | ENCRYPTED {
             return Err(Error::Sequence);
         }
+        if self.tentative.is_none() {
+            return self.repeated_message_3(key);
+        }
+        let (ptk, anonce) = self.tentative.as_ref().ok_or(Error::Sequence)?;
         key.verify(self.suites.akm, ptk.kck())?;
         if *anonce != key.nonce {
             return Err(Error::Nonce);
@@ -983,16 +996,80 @@ impl Supplicant {
             scope: KeyScope::Pairwise(self.authenticator),
         };
         self.replay = Some(key.replay);
-        self.ptk = self.tentative.take().map(|(ptk, _)| ptk);
+        let (ptk, anonce) = self.tentative.take().ok_or(Error::Sequence)?;
+        self.ptk = Some(ptk);
+        self.anonce = Some(anonce);
         // A later 4-way handshake takes a fresh SNonce.
         self.snonce = None;
+        let (group, integrity) = self.fresh_group_keys(group, integrity);
         Ok(Step {
             reply: Some(reply),
             pairwise: Some(pairwise),
-            group: Some(group),
+            group,
             integrity,
             links,
         })
+    }
+
+    /// `wpa_supplicant_process_3_of_4` for a message 3 the authenticator
+    /// sent again after message 4 was lost: under the PTK and ANonce it
+    /// confirmed, message 4 goes again and no key is reinstalled.
+    fn repeated_message_3(&mut self, key: &Frame<'_>) -> Result<Step, Error> {
+        let (Some(ptk), Some(anonce)) = (self.ptk.as_ref(), self.anonce) else {
+            return Err(Error::Sequence);
+        };
+        key.verify(self.suites.akm, ptk.kck())?;
+        if anonce != key.nonce {
+            return Err(Error::Nonce);
+        }
+        let data = unwrap(ptk.kek(), key.data)?;
+        if rsn_element(&data) != Some(&self.peer_rsn[..]) {
+            return Err(Error::RsnElement);
+        }
+        let reply = build(
+            self.suites.akm,
+            PAIRWISE | MIC | SECURE,
+            key.replay,
+            &[0; NONCE],
+            &self.own_address(),
+            Some(ptk.kck()),
+        );
+        self.replay = Some(key.replay);
+        Ok(Step {
+            reply: Some(reply),
+            ..Step::default()
+        })
+    }
+
+    /// The group key and IGTK of a handshake, each left out when it is the
+    /// one already installed, as `wpa_supplicant_install_gtk` and
+    /// `wpa_supplicant_install_igtk` leave an in-use key alone so that a
+    /// repeated message cannot reset its receive counter.
+    fn fresh_group_keys(
+        &mut self,
+        group: TemporalKey,
+        integrity: Option<IntegrityKey>,
+    ) -> (Option<TemporalKey>, Option<IntegrityKey>) {
+        let same = |installed: &Option<(u8, Zeroizing<Vec<u8>>)>, index: u8, material: &[u8]| {
+            installed
+                .as_ref()
+                .is_some_and(|(i, m)| *i == index && m[..] == *material)
+        };
+        let group = if same(&self.installed_group, group.index, &group.material) {
+            None
+        } else {
+            self.installed_group = Some((group.index, group.material.clone()));
+            Some(group)
+        };
+        let integrity = match integrity {
+            Some(key) if same(&self.installed_integrity, key.index, &key.material) => None,
+            Some(key) => {
+                self.installed_integrity = Some((key.index, key.material.clone()));
+                Some(key)
+            }
+            None => None,
+        };
+        (group, integrity)
     }
 
     fn group_message_1(&mut self, key: &Frame<'_>) -> Result<Step, Error> {
@@ -1012,9 +1089,10 @@ impl Supplicant {
             Some(ptk.kck()),
         );
         self.replay = Some(key.replay);
+        let (group, integrity) = self.fresh_group_keys(group, integrity);
         Ok(Step {
             reply: Some(reply),
-            group: Some(group),
+            group,
             integrity,
             links,
             ..Step::default()
