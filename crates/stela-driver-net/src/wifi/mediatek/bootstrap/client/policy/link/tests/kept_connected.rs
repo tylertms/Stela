@@ -371,6 +371,215 @@ fn a_passphrase_network_offering_sae_authenticates_by_it_before_the_handshake() 
     assert!(station.carrier());
 }
 
+/// The firmware's unsolicited BSS-lost event for the station's BSS.
+fn bss_lost(model: &Model) {
+    let mut lost = vec![0; 32 + 12 + 12];
+    lost[..4].copy_from_slice(&(7u32 << 27).to_le_bytes());
+    lost[36] = 12;
+    lost[38] = 4;
+    device_receive(&model.queues[&0xd4500], &lost, true, 0);
+}
+
+/// Leave the lost association, wait `wait_us`, and answer the scan that
+/// follows with the AP's `beacon`: the station's first frame after it.
+fn rescan(
+    station: &mut TestStation,
+    model: &Model,
+    beacon: &[u8],
+    wait_us: u64,
+) -> Option<Vec<u8>> {
+    // The departure ends well before the wait does.
+    for _ in 0..4 {
+        assert!(!station.carrier());
+        finish_tx(model);
+    }
+    crate::test_clock::advance(
+        crate::Clock {
+            ticks_per_microsecond: 1,
+        },
+        wait_us,
+    );
+    // The poll past the wait scans; the beacon answers the scan.
+    assert!(!station.carrier());
+    incoming(model, beacon, None, false);
+    assert!(!station.carrier());
+    done(model);
+    assert!(!station.carrier());
+    finish_tx(model).pop()
+}
+
+type TestStation = Station<Bar, Q, NativeGuard, Provider>;
+
+/// pmksa_cache_get: a station that lost its SAE association resumes the
+/// AP's PMKSA by open-system authentication and the PMKID in its RSN
+/// element, and the handshake proves the cached PMK; an AP that refuses
+/// the PMKID with status 53 drops the entry and the next attempt runs full
+/// SAE, as wpa_sm_aborted_cached leaves.
+#[test]
+fn a_lost_sae_association_resumes_its_pmksa_and_runs_sae_again_once_refused() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let _clock = crate::test_clock::virtualize();
+    let (client, model) = setup_modern();
+    let (_, bss) = inputs_akm(&client, 8);
+    let client = ManagedClient::new(client, country(), Environment::Indoor).unwrap();
+    let link = ManagedLink::new(
+        client,
+        Provider(
+            Arc::new(AtomicUsize::new(0)),
+            core::sync::atomic::AtomicBool::new(false),
+        ),
+    )
+    .unwrap();
+    let password = b"correct horse battery";
+    let network = Network {
+        ssid: b"x".to_vec(),
+        secret: Secret::parse(password).unwrap(),
+        country: None,
+    };
+    let mut station = Station::new(
+        link,
+        profile().interface,
+        country(),
+        network,
+        Arc::new(Fixed),
+        crate::Clock {
+            ticks_per_microsecond: 1,
+        },
+    );
+    assert!(!station.carrier());
+    let mut body = vec![0; 8];
+    body.extend_from_slice(&100u16.to_le_bytes());
+    body.extend_from_slice(&0x11u16.to_le_bytes());
+    body.extend_from_slice(&bss.elements);
+    let mut beacon = response(0x80, &body);
+    beacon[4..10].copy_from_slice(&Mac::BROADCAST.0);
+    incoming(&model, &beacon, None, false);
+    assert!(!station.carrier());
+    done(&model);
+    assert!(!station.carrier());
+    for _ in 0..40 / crate::wifi::sae::ROUNDS_PER_STEP {
+        assert!(!station.carrier());
+    }
+    let (transaction, status, commit) = sent_sae(&model);
+    assert_eq!((transaction, status), (1, 0));
+    let mut random = 7u8;
+    let mut next = || {
+        random = random.wrapping_add(1);
+        [random; 32]
+    };
+    let mut sae = Exchange::new(
+        Derivation::HuntingAndPecking,
+        password,
+        None,
+        None,
+        AP,
+        LOCAL,
+        &mut next,
+    )
+    .unwrap();
+    let confirm = sae.receive(1, 0, &commit).unwrap().unwrap();
+    station.carrier();
+    sae_from_ap(&model, &sae.commit());
+    assert!(!station.carrier());
+    let (_, _, own_confirm) = sent_sae(&model);
+    assert_eq!(sae.receive(2, 0, &own_confirm).unwrap(), None);
+    station.carrier();
+    sae_from_ap(&model, &confirm);
+    assert!(!station.carrier());
+    let security = Security::select(&bss.elements, true).unwrap();
+    let own_rsn = security.element();
+    let request = finish_tx(&model).pop().unwrap();
+    assert!(request.windows(own_rsn.len()).any(|w| w == own_rsn));
+    station.carrier();
+    let mut association = vec![0x11, 0, 0, 0, 1, 0xc0];
+    let mut rest = &bss.elements[..];
+    while let [id, length, tail @ ..] = rest {
+        let (body, next) = tail.split_at(usize::from(*length));
+        if *id != 48 {
+            association.extend_from_slice(&[*id, *length]);
+            association.extend_from_slice(body);
+        }
+        rest = next;
+    }
+    let rsn = crate::wifi::connection::find(&bss.elements, 48).unwrap();
+    let mut whole = vec![48, rsn.len() as u8];
+    whole.extend_from_slice(rsn);
+    let mut igtk = vec![0xdd, 4 + 8 + 16, 0x00, 0x0f, 0xac, 9, 4, 0];
+    igtk.extend_from_slice(&[0; 6]);
+    igtk.extend_from_slice(&[0x77; 16]);
+    let pmk = sae.pmk().unwrap();
+    let handshake = |station: &mut TestStation, own_rsn: &[u8]| {
+        incoming(&model, &response(0x10, &association), None, false);
+        assert!(!station.carrier());
+        let mut ap =
+            Authenticator::between(security.suites(), pmk.clone(), AP, LOCAL, own_rsn.to_vec());
+        eapol(&model, &ap.message_1());
+        assert!(!station.carrier());
+        ap.message_2(&sent_eapol(&model));
+        eapol(&model, &ap.message_3_with(&whole, &igtk));
+        assert!(!station.carrier());
+        ap.signed_reply(&sent_eapol(&model), 0x308);
+        let carrier = station.carrier();
+        let reported: Vec<_> = core::iter::from_fn(|| station.take_diagnostic()).collect();
+        assert!(carrier, "{reported:?}");
+    };
+    handshake(&mut station, &own_rsn);
+
+    // The firmware loses the BSS: the station leaves and scans again after
+    // its reconnect delay, then resumes the PMKSA by open-system
+    // authentication instead of a commit.
+    bss_lost(&model);
+    let auth = rescan(&mut station, &model, &beacon, 200_000).expect("a rejoin");
+    assert_eq!(auth[..2], [0xb0, 0]);
+    assert_eq!(auth[24..28], [0, 0, 1, 0], "open system, transaction 1");
+    station.carrier();
+    incoming(&model, &response(0xb0, &[0, 0, 2, 0, 0, 0]), None, false);
+    assert!(!station.carrier());
+    let request = finish_tx(&model).pop().unwrap();
+    assert_eq!(request[..2], [0, 0]);
+    let resumed_rsn = security.element_with(sae.pmkid());
+    assert!(
+        request.windows(resumed_rsn.len()).any(|w| w == resumed_rsn),
+        "the RSN element names the PMKID"
+    );
+    station.carrier();
+    // The handshake under the cached PMK opens the port.
+    handshake(&mut station, &resumed_rsn);
+
+    // Lost again, the AP has forgotten the PMKSA: its association response
+    // refuses the PMKID with status 53.
+    bss_lost(&model);
+    let auth = rescan(&mut station, &model, &beacon, 200_000).expect("a rejoin");
+    assert_eq!(auth[24..28], [0, 0, 1, 0]);
+    station.carrier();
+    incoming(&model, &response(0xb0, &[0, 0, 2, 0, 0, 0]), None, false);
+    assert!(!station.carrier());
+    let request = finish_tx(&model).pop().unwrap();
+    assert!(request.windows(resumed_rsn.len()).any(|w| w == resumed_rsn));
+    station.carrier();
+    incoming(
+        &model,
+        &response(0x10, &[0x11, 0, 53, 0, 0, 0]),
+        None,
+        false,
+    );
+    assert!(!station.carrier());
+    // After the failure's 10 s, the station commits to full SAE.
+    let mut commit = rescan(&mut station, &model, &beacon, 10_100_000);
+    for _ in 0..40 / crate::wifi::sae::ROUNDS_PER_STEP {
+        if commit.is_some() {
+            break;
+        }
+        assert!(!station.carrier());
+        commit = finish_tx(&model).pop();
+    }
+    let commit = commit.expect("a commit");
+    assert_eq!(commit[..2], [0xb0, 0]);
+    assert_eq!(commit[24..30], [3, 0, 1, 0, 0, 0], "SAE commit");
+}
+
 #[test]
 fn a_protected_psk_association_opens_its_port_once_the_igtk_installs() {
     if crate::test_process::isolate_model() {

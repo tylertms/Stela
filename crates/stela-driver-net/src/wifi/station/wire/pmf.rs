@@ -25,6 +25,7 @@ pub struct Selection {
     pairwise: Cipher,
     group: Cipher,
     management: ManagementCipher,
+    pmkid: bool,
 }
 impl Selection {
     pub fn rsn(&self) -> &[u8] {
@@ -50,6 +51,12 @@ impl Selection {
     pub const fn sae(&self) -> bool {
         matches!(self.akm, SAE | SAE_EXT_KEY)
     }
+    /// Whether the RSNE names a PMKID: a cached PMKSA the association
+    /// resumes after open-system authentication, as wpa_supplicant's SME
+    /// does for SAE.
+    pub const fn pmkid(&self) -> bool {
+        self.pmkid
+    }
     pub(super) fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let profile = Profile::parse(bytes)?;
         if profile.pairwise.len() != 1 || profile.akms.len() != 1 {
@@ -73,6 +80,7 @@ impl Selection {
             pairwise,
             group: profile.group,
             management: profile.management,
+            pmkid: profile.pmkids != 0,
         })
     }
     /// Bind to the BSS. A response may omit RSNE, as in Linux;
@@ -132,6 +140,7 @@ struct Profile {
     akms: Vec<[u8; 4]>,
     capabilities: u16,
     management: ManagementCipher,
+    pmkids: usize,
 }
 fn suites(bytes: &mut &[u8]) -> Result<Vec<[u8; 4]>, Error> {
     let count = usize::from(word(bytes)?);
@@ -153,9 +162,10 @@ impl Profile {
         if capabilities & MFPC == 0 || capabilities & EXTENDED_KEY_ID != 0 {
             return Err(Error::Unsupported("PMF capability/extended key ID"));
         }
+        let mut pmkids = 0;
         if !bytes.is_empty() {
-            let count = usize::from(word(&mut bytes)?);
-            take(&mut bytes, count.checked_mul(16).ok_or(Error::Truncated)?)?;
+            pmkids = usize::from(word(&mut bytes)?);
+            take(&mut bytes, pmkids.checked_mul(16).ok_or(Error::Truncated)?)?;
         }
         // IEEE RSN default management-group suite is BIP-CMAC128 when omitted.
         let management = if bytes.is_empty() {
@@ -176,6 +186,7 @@ impl Profile {
             akms,
             capabilities,
             management,
+            pmkids,
         })
     }
 }
@@ -220,6 +231,26 @@ mod tests {
                 (!ft).then_some(false)
             );
         }
+    }
+
+    /// An SAE selection naming a PMKID resumes a cached PMKSA; one without
+    /// runs SAE first.
+    #[test]
+    fn an_sae_selection_names_the_pmkid_it_resumes() {
+        // CCMP, SAE, MFPC|MFPR, then no PMKID, then one, then BIP-CMAC-128.
+        let mut bytes = vec![
+            1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 8, 0xc0, 0,
+        ];
+        let fresh = Selection::parse(&bytes).unwrap();
+        assert!(fresh.sae() && !fresh.pmkid());
+        bytes.extend_from_slice(&[0, 0]);
+        assert!(!Selection::parse(&bytes).unwrap().pmkid());
+        bytes[20] = 1;
+        bytes.extend_from_slice(&[0x5a; 16]);
+        bytes.extend_from_slice(&[0, 15, 172, 6]);
+        let resumed = Selection::parse(&bytes).unwrap();
+        assert!(resumed.sae() && resumed.pmkid());
+        assert_eq!(resumed.management(), ManagementCipher::Cmac128);
     }
 
     #[test]

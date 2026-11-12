@@ -399,8 +399,9 @@ impl Station {
     ) -> Result<Action, Error> {
         match join.request.pmf() {
             None => return Err(Error::Unsupported("selected PMF request required")),
-            // The OS runs SAE before associate_external_pmf.
-            Some(pmf) if pmf.sae() => {
+            // The OS runs SAE before associate_external_pmf; a cached
+            // PMKSA resumes by open-system authentication and its PMKID.
+            Some(pmf) if pmf.sae() && !pmf.pmkid() => {
                 return Err(Error::Unsupported("SAE authenticates through the OS"));
             }
             Some(_) => {}
