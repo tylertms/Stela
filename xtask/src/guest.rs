@@ -89,7 +89,7 @@ fn build_bundle(component: &Path, output: &Path, include: &Path) -> Result<PathB
             fs::remove_dir_all(directory)?;
         }
     }
-    let clang = &crate::clang::toolset()?.clang;
+    let clang = &crate::clang::target_toolset()?.clang;
     let resources = Command::new(clang).arg("-print-resource-dir").output()?;
     ensure!(
         resources.status.success(),
@@ -175,7 +175,7 @@ fn build_kext(component: &Path, output: &Path, xnu: &Path, include: &Path) -> Re
     let info = fs::read_to_string(source.join("Info.plist"))?;
     let (identifier, version) = identity(&info)?;
     fs::write(bundle.join("Info.plist"), &info)?;
-    let clang = &crate::clang::toolset()?.clangxx;
+    let clang = &crate::clang::target_toolset()?.clangxx;
     for entry in fs::read_dir(&source)? {
         let path = entry?.path();
         if path.extension().is_none_or(|extension| extension != "cpp") {

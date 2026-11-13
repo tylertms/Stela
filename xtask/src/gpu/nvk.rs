@@ -147,14 +147,16 @@ pub(super) const REGEX: [&str; 5] = ["regcomp", "regexec", "regfree", "regerror"
 
 /// What Meson's probes find that names a path the image does not take. SSE4.1
 /// and BLAKE3's assembly are host features; the image runs on any x86-64.
-pub(super) const HOST_DEFINES: [&str; 8] = [
+pub(super) const HOST_DEFINES: [&str; 10] = [
     "ALLOW_KCMP",
+    "HAS_SCHED_GETAFFINITY",
     "HAVE_CET_H",
     "HAVE_DIRENT_D_TYPE",
     "HAVE_DLADDR",
     "HAVE_DRI2",
     "HAVE_FLOCK",
     "HAVE_FUNC_ATTRIBUTE_VISIBILITY",
+    "HAVE_MKOSTEMP",
     "HAVE_RENDERDOC_INTEGRATION=1",
 ];
 pub(super) const LATE_DEFINES: [&str; 3] = [
@@ -208,7 +210,8 @@ pub(super) const TARGET_FLAGS: [&str; 17] = [
     "-femulated-tls",
 ];
 /// The C library's own test, on the build host.
-pub(super) const LIBC_TEST_FLAGS: [&str; 15] = [
+pub(super) const LIBC_TEST_FLAGS: [&str; 16] = [
+    "-Qunused-arguments",
     "--target=x86_64-unknown-linux-gnu",
     "-O1",
     "-msse2",

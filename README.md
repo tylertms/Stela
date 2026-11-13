@@ -92,6 +92,13 @@ cargo xtask dist
 This writes `target/release/stela`. The first build fetches and compiles
 Linux, Mesa and LLVM sources and takes a long time.
 
+Set `CLANG` to choose the host compiler. If cross-compilation needs a different
+Clang, set `STELA_TARGET_CLANG` to its executable (for example, an unwrapped
+Nix Clang); it defaults to the host compiler. xtask finds the target C++ driver
+and LLVM tools alongside that compiler or via its usual fallbacks. Both
+compilers must be supported, and `LIBCLANG_PATH`, when set, must match their
+LLVM major version.
+
 ## Legal
 
 Stela contains no Apple software. You are responsible for following Apple's

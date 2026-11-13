@@ -479,7 +479,7 @@ pub(super) fn build(toolchain: &Toolchain, jobs: u16, test: bool) -> Result<()> 
         llvm.display()
     );
     let generated = directory.join("generated");
-    let tool = build_tool(toolchain, &llvm, &directory, jobs)?;
+    let tool = build_tool(crate::clang::toolset()?, &llvm, &directory, jobs)?;
     tablegen(&tool, &llvm, &generated)?;
 
     let target = format!("--target={NATIVE_TARGET}");

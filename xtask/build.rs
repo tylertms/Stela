@@ -9,7 +9,12 @@ const FIXTURES: [(&str, &str, &str); 1] = [("src/boot/kernel.S", "kernel.bin", "
 
 fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
-    let clang = env::var_os("CLANG").unwrap_or_else(|| "clang".into());
+    println!("cargo:rerun-if-env-changed=STELA_TARGET_CLANG");
+    println!("cargo:rerun-if-env-changed=CLANG");
+    let clang = env::var_os("STELA_TARGET_CLANG")
+        .filter(|value| !value.is_empty())
+        .or_else(|| env::var_os("CLANG").filter(|value| !value.is_empty()))
+        .unwrap_or_else(|| "clang".into());
     for (source, image, architecture) in FIXTURES {
         println!("cargo:rerun-if-changed={source}");
         let object_path = out.join(image).with_extension("o");

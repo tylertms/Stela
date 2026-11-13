@@ -9,6 +9,14 @@ pub fn run() -> Result<()> {
     if let Err(error) = crate::clang::toolset() {
         problems.extend(error.to_string().lines().map(str::to_owned));
     }
+    if let Err(error) = crate::clang::target_toolset() {
+        let text = error.to_string();
+        for line in text.lines() {
+            if !problems.iter().any(|problem| problem == line) {
+                problems.push(line.to_owned());
+            }
+        }
+    }
     if tools::which("git").is_none() {
         problems.push("install git, which checks out the pinned sources".into());
     }

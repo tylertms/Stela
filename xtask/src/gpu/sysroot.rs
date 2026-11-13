@@ -28,8 +28,9 @@ pub(super) const POSITION_INDEPENDENT: &str = "-fPIC";
 /// probes, CET branch markers, `_FORTIFY_SOURCE` or libstdc++ assertions),
 /// and configuration files can add anything, which `--no-default-config`
 /// drops.
-pub(super) const FREESTANDING: [&str; 6] = [
+pub(super) const FREESTANDING: [&str; 7] = [
     "--no-default-config",
+    "-Qunused-arguments",
     "-fno-stack-protector",
     "-fno-stack-clash-protection",
     "-fcf-protection=none",

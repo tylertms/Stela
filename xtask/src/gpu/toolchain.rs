@@ -224,8 +224,12 @@ pub(super) type Toolchain = crate::clang::Toolset;
 /// The chosen tools, with the GPU build trees that other tools or flags
 /// left removed.
 pub(super) fn discover() -> Result<Toolchain> {
-    let toolchain = crate::clang::toolset()?.clone();
-    rebuild_if_changed(&toolchain, &super::support::build_root())?;
+    let toolchain = crate::clang::target_toolset()?.clone();
+    rebuild_if_changed(
+        &toolchain,
+        crate::clang::toolset()?,
+        &super::support::build_root(),
+    )?;
     Ok(toolchain)
 }
 
@@ -263,8 +267,15 @@ fn flags() -> String {
 /// with differ from these: their objects, Meson's configuration and the probe
 /// results it recorded all depend on them, and only the sources' times are
 /// watched otherwise.
-fn rebuild_if_changed(toolchain: &Toolchain, root: &Path) -> Result<()> {
-    let identity = format!("{}flags {}\n", toolchain.identity(), flags());
+fn rebuild_if_changed(toolchain: &Toolchain, host: &Toolchain, root: &Path) -> Result<()> {
+    let identity = format!(
+        "target:
+{}host:
+{}flags {}\n",
+        toolchain.identity(),
+        host.identity(),
+        flags()
+    );
     let record = root.join(IDENTITY);
     let recorded = fs::read_to_string(&record).ok();
     if recorded.as_deref() == Some(identity.as_str()) {
@@ -329,12 +340,35 @@ mod tests {
         let tree = root.path().join("nvk/sysroot");
         fs::create_dir_all(&tree).unwrap();
         // A tree from before the record existed.
-        rebuild_if_changed(&toolset("/llvm/bin/clang"), root.path()).unwrap();
+        rebuild_if_changed(
+            &toolset("/llvm/bin/clang"),
+            &toolset("/llvm/bin/clang"),
+            root.path(),
+        )
+        .unwrap();
         assert!(!tree.exists());
         fs::create_dir_all(&tree).unwrap();
-        rebuild_if_changed(&toolset("/llvm/bin/clang"), root.path()).unwrap();
+        rebuild_if_changed(
+            &toolset("/llvm/bin/clang"),
+            &toolset("/llvm/bin/clang"),
+            root.path(),
+        )
+        .unwrap();
         assert!(tree.exists());
-        rebuild_if_changed(&toolset("/home/me/wrapper/clang"), root.path()).unwrap();
+        rebuild_if_changed(
+            &toolset("/home/me/wrapper/clang"),
+            &toolset("/llvm/bin/clang"),
+            root.path(),
+        )
+        .unwrap();
+        assert!(!tree.exists());
+        fs::create_dir_all(&tree).unwrap();
+        rebuild_if_changed(
+            &toolset("/home/me/wrapper/clang"),
+            &toolset("/new/host/clang"),
+            root.path(),
+        )
+        .unwrap();
         assert!(!tree.exists());
         let record = fs::read_to_string(root.path().join(IDENTITY)).unwrap();
         assert!(record.contains("/home/me/wrapper/clang"), "{record}");

@@ -48,12 +48,19 @@ pub const UNHARDENED: [&str; 4] = [
     "-U_FORTIFY_SOURCE",
 ];
 
-/// The Clang to compile with when the caller chose no compiler: `CLANG`,
-/// which `cargo xtask` sets to the one it chose, else `clang` on PATH. The
+/// The Clang to compile with when the caller chose no compiler: for cross
+/// builds, `STELA_TARGET_CLANG` if set; otherwise `CLANG`, which xtask sets
+/// to its host choice, or `clang` on PATH. The
 /// build reruns when either changes, so objects never mix compilers.
 pub fn clang() -> std::ffi::OsString {
     println!("cargo:rerun-if-env-changed=CLANG");
-    env::var_os("CLANG")
+    println!("cargo:rerun-if-env-changed=STELA_TARGET_CLANG");
+    let target_clang = (env::var_os("TARGET") != env::var_os("HOST"))
+        .then(|| env::var_os("STELA_TARGET_CLANG"))
+        .flatten()
+        .filter(|clang| !clang.is_empty());
+    target_clang
+        .or_else(|| env::var_os("CLANG"))
         .filter(|clang| !clang.is_empty())
         .unwrap_or_else(|| {
             println!("cargo:rerun-if-env-changed=PATH");

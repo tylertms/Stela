@@ -529,3 +529,25 @@ fn a_ccache_wrapper_stays_in_front_of_the_real_install() {
     let found = candidates(&host);
     assert_eq!(found.len(), 1, "{found:?}");
 }
+
+#[test]
+fn host_and_target_compilers_are_selected_independently() {
+    let host = Fake::new(&["/host/bin", "/target/bin"])
+        .llvm("/host/bin", 21)
+        .llvm("/target/bin", 21)
+        .file("/host/lib/libclang.so.21.1")
+        .file("/target/lib/libclang.so.21.1")
+        .var("CLANG", "/host/bin/clang")
+        .var("STELA_TARGET_CLANG", "/target/bin/clang");
+    assert_eq!(select(&host).unwrap().clang, path("/host/bin/clang"));
+    let target = select_for(&host, TARGET_VARIABLE).unwrap();
+    assert_eq!(target.clang, path("/target/bin/clang"));
+    assert_eq!(target.clangxx, path("/target/bin/clang++"));
+    assert_eq!(target.archiver, path("/target/bin/llvm-ar"));
+    let missing = host.var("STELA_TARGET_CLANG", "/missing/clang");
+    let error = select_for(&missing, TARGET_VARIABLE)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("STELA_TARGET_CLANG"), "{error}");
+    assert!(error.contains("/missing/clang"), "{error}");
+}

@@ -1,4 +1,4 @@
-//! The host LLVM every C and C++ compile of the build uses, chosen in one
+//! The host and optional target LLVM toolsets, each chosen in one
 //! place as one set: Clang and its C++ driver, libclang for bindgen (whose
 //! built-in headers must be the compiler's), and a linker, archiver and
 //! symbol lister at least as new.
@@ -11,7 +11,7 @@
 //! symbol lister come from the same install when it has them, else from the
 //! active Rust toolchain's `llvm-tools`, else from PATH; each must be at
 //! least the compiler's version. The nested Cargo builds get the choice through `CLANG`, so every
-//! build script compiles with the same Clang.
+//! build script uses the host Clang, or `STELA_TARGET_CLANG` for cross builds.
 use anyhow::{Result, bail};
 use std::{
     cmp::Ordering,
@@ -29,6 +29,8 @@ use std::{
 pub const SUPPORTED: RangeInclusive<u32> = 21..=23;
 /// The environment variable that names the compiler.
 pub const VARIABLE: &str = "CLANG";
+/// Optional compiler for cross-compiled code.
+pub const TARGET_VARIABLE: &str = "STELA_TARGET_CLANG";
 /// Where versioned LLVM installs live, and the prefixes their directories'
 /// names start with: Debian's `llvm-NN`, Arch's, Fedora's and openSUSE's
 /// `llvmNN`, Homebrew's `llvm@NN`.
@@ -196,8 +198,12 @@ fn real_compiler(host: &dyn Host, clang: &Path) -> PathBuf {
 /// Every Clang this computer has: `CLANG` alone when it is set, else the
 /// versioned installs' and PATH's, each once by the compiler it runs.
 pub fn candidates(host: &dyn Host) -> Vec<Found> {
+    candidates_for(host, VARIABLE)
+}
+
+fn candidates_for(host: &dyn Host, variable: &str) -> Vec<Found> {
     let mut paths = Vec::new();
-    let explicit = host.var(VARIABLE).filter(|value| !value.is_empty());
+    let explicit = host.var(variable).filter(|value| !value.is_empty());
     let named = explicit.is_some();
     if let Some(clang) = explicit {
         let clang = PathBuf::from(clang);
@@ -306,10 +312,14 @@ fn newest(found: &[Found]) -> Option<&Found> {
 
 /// Chooses the toolset, or says everything that is missing.
 pub fn select(host: &dyn Host) -> Result<Toolset, Problems> {
-    let found = candidates(host);
-    let explicit = host.var(VARIABLE).is_some_and(|value| !value.is_empty());
+    select_for(host, VARIABLE)
+}
+
+fn select_for(host: &dyn Host, variable: &str) -> Result<Toolset, Problems> {
+    let found = candidates_for(host, variable);
+    let explicit = host.var(variable).is_some_and(|value| !value.is_empty());
     let Some(chosen) = newest(&found) else {
-        return Err(Problems(vec![no_compiler(&found, explicit)]));
+        return Err(Problems(vec![no_compiler(&found, explicit, variable)]));
     };
     let version = chosen.version.expect("a supported compiler has a version");
     let mut problems = Vec::new();
@@ -416,7 +426,7 @@ pub fn select(host: &dyn Host) -> Result<Toolset, Problems> {
     }
 }
 
-fn no_compiler(found: &[Found], explicit: bool) -> String {
+fn no_compiler(found: &[Found], explicit: bool, variable: &str) -> String {
     let listed: Vec<String> = found
         .iter()
         .map(|f| match f.version {
@@ -435,8 +445,8 @@ fn no_compiler(found: &[Found], explicit: bool) -> String {
     };
     if explicit {
         format!(
-            "{VARIABLE} names no supported compiler: {found}. Stela builds with Clang {}: \
-             install one and name it with {VARIABLE}, or unset {VARIABLE}",
+            "{variable} names no supported compiler: {found}. Stela builds with Clang {}: \
+             install one and name it with {variable}, or unset {variable}",
             range()
         )
     } else {
@@ -623,6 +633,21 @@ impl Host for System {
 pub fn toolset() -> Result<&'static Toolset> {
     static CHOSEN: OnceLock<Result<Toolset, String>> = OnceLock::new();
     match CHOSEN.get_or_init(|| select(&System).map_err(|problems| problems.to_string())) {
+        Ok(toolset) => Ok(toolset),
+        Err(problems) => bail!("{problems}"),
+    }
+}
+
+/// The cross compiler, or the host toolset when no override was provided.
+pub fn target_toolset() -> Result<&'static Toolset> {
+    static CHOSEN: OnceLock<Result<Toolset, String>> = OnceLock::new();
+    match CHOSEN.get_or_init(|| {
+        if env::var_os(TARGET_VARIABLE).is_some_and(|value| !value.is_empty()) {
+            select_for(&System, TARGET_VARIABLE).map_err(|problems| problems.to_string())
+        } else {
+            toolset().cloned().map_err(|error| error.to_string())
+        }
+    }) {
         Ok(toolset) => Ok(toolset),
         Err(problems) => bail!("{problems}"),
     }
