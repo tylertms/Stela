@@ -6422,3 +6422,25 @@ fn journey_several_sticks_are_chosen_from_and_quit_changes_nothing() {
     assert!(stela < other, "{shown}");
     assert_eq!(stick_files(&f), before);
 }
+
+#[test]
+fn home_create_dispatches_create_after_wizard_confirmation() {
+    let f = fixture(64 * GIB, false);
+    let before = stick_files(&f);
+    let person = ui::tests::Scripted::new(&["Offline", "Erase and create"]);
+    let environment = Environment {
+        ui: &person,
+        builds: builds::SUPPORTED,
+        ..environment(&f.host)
+    };
+    let request = Request {
+        efi: Some(f.efi.clone()),
+        dry_run: true,
+        ..Request::home(command::Global::default())
+    };
+    let result = home::run(&environment, request);
+    assert!(result.is_ok(), "{result:?}");
+    assert!(person.done(), "{}", person.transcript());
+    assert_eq!(stick_files(&f), before);
+    assert!(f.host.unmounted.borrow().is_empty());
+}

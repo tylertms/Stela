@@ -675,6 +675,7 @@ fn create(environment: &Environment<'_>, mut request: Request, stick: &Stick) ->
     if !wizard::configure(environment, &mut request, stick)? {
         return Ok(());
     }
+    request.action = Action::Create;
     super::create_installer(environment, request)
 }
 
