@@ -169,9 +169,6 @@ impl State {
             return Err(refuse!("unsupported AMD top-of-memory geometry"));
         }
         for (base, mask) in state.iorr {
-            if mask & (1 << 11) != 0 {
-                super::ranges::range(base, mask, physical_bits)?;
-            }
             if base & !(address | 0x18) != 0 || mask & !(address | (1 << 11)) != 0 {
                 return Err(refuse!("unsupported AMD IORR fields"));
             }
@@ -364,13 +361,7 @@ mod tests {
         changed = baseline;
         changed.top_mem = 8 << 23;
         assert!(baseline.compatible(changed).is_err());
-        for (slot, value) in [
-            (5, 1),
-            (5, (1 << 32) + (1 << 23)),
-            (6, 1 << 48),
-            (1, 0x20),
-            (2, 0xffff_ffff_a800),
-        ] {
+        for (slot, value) in [(5, 1), (5, (1 << 32) + (1 << 23)), (6, 1 << 48), (1, 0x20)] {
             let mut changed = source;
             changed.msrs[0].value = VARIABLE_DRAM | TOM2_ENABLE;
             assert!(State::from_snapshot(&changed, 48).is_ok());

@@ -7,6 +7,11 @@ pub mod amd;
 mod ranges;
 
 pub const CAP: u32 = 0xfe;
+/// The MTRRCAP fields the image uses and every processor must share: the
+/// variable range count, fixed ranges and write combining. SMRR, PRMRR and
+/// the rest may differ between core types and are not compared, as Linux
+/// does not compare them.
+pub const CAP_COMPARED: u64 = 0x5ff;
 pub const DEFAULT: u32 = 0x2ff;
 pub const VARIABLE_BASE: u32 = 0x200;
 pub const MAX_VARIABLE: usize = 16;
@@ -70,7 +75,7 @@ impl Image {
                 "native initial MTRR recipe has no qualified vendor/capability controls"
             ));
         }
-        let cap = register(snapshot, CAP)?;
+        let cap = register(snapshot, CAP)? & CAP_COMPARED;
         let variables = (cap & 0xff) as usize;
         if variables > MAX_VARIABLE {
             return Err(refuse!("native MTRR capacity exceeds captured image"));
@@ -130,10 +135,6 @@ impl Image {
             if !supported {
                 return Err(refuse!("unsupported BSP memory-type register fields"));
             }
-            if !FIXED.contains(&index) && (index - VARIABLE_BASE) % 2 == 1 && value & (1 << 11) != 0
-            {
-                ranges::range(register(snapshot, index - 1)?, value, physical_bits)?;
-            }
             image.writes[image.count] = Write {
                 index,
                 low: value as u32,
@@ -145,7 +146,8 @@ impl Image {
     }
 
     /// Old contents may be uninitialized on a never-admitted AP. Hardware
-    /// capacity/physical-width differences may not be normalized away.
+    /// capacity ([`CAP_COMPARED`]) and physical-width differences may not
+    /// be normalized away.
     pub fn compatible(&self, snapshot: &Snapshot) -> Result<()> {
         match self.amd {
             Some(source) => {
@@ -171,7 +173,7 @@ impl Image {
             }
             None => {}
         }
-        if register(snapshot, CAP)? != self.cap
+        if register(snapshot, CAP)? & CAP_COMPARED != self.cap
             || snapshot.get(0x8000_0008, 0).map(|leaf| leaf.eax as u8) != Some(self.physical_bits)
         {
             return Err(refuse!(
@@ -250,6 +252,9 @@ mod tests {
         for msr in &mut ap.msrs[1..ap.msr_count as usize] {
             msr.value = 0;
         }
+        assert_eq!(image.compatible(&ap), Ok(()));
+        // SMRR and PRMRR, which hybrid core types may report differently.
+        ap.msrs[0].value ^= (1 << 11) | (1 << 12);
         assert_eq!(image.compatible(&ap), Ok(()));
         ap.msrs[0].value += 1;
         assert!(image.compatible(&ap).is_err());

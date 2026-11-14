@@ -3,19 +3,32 @@
 //! exclusion of incompatible aliases; this image does not grant RAM ownership.
 use super::{Image, VARIABLE_BASE, amd};
 use crate::Result;
-use core::ops::Range;
 use stela_contracts::refuse;
 
-pub fn range(base: u64, mask: u64, bits: u8) -> Result<Range<u64>> {
+/// Whether variable range `(base, mask)` matches `cursor`, and the next
+/// address above it where that may change. An address matches when its
+/// masked bits equal the base's (Intel SDM Vol. 3A 12.11.2.3; AMD APM
+/// Vol. 2 7.7.1), so a base not aligned to the range's size starts at
+/// `base & mask`, and a mask with holes matches a set of aligned blocks the
+/// size of its lowest set bit. Linux runs on both shapes.
+pub fn variable(base: u64, mask: u64, bits: u8, cursor: u64) -> (bool, u64) {
     let address = ((1u64 << bits) - 1) & !4095;
+    let mask = mask & address;
+    let matches = (cursor ^ base) & mask == 0;
     let size = (!mask & address) + 4096;
-    let start = base & address;
-    if !size.is_power_of_two() || !start.is_multiple_of(size) {
-        return Err(refuse!(
-            "noncontiguous or misaligned native memory-type range"
-        ));
+    if size.is_power_of_two() {
+        let start = base & mask;
+        let end = start.saturating_add(size);
+        return match (cursor < start, matches) {
+            (true, _) => (false, start),
+            (false, true) => (true, end),
+            (false, false) => (false, u64::MAX),
+        };
     }
-    Ok(start..start + size)
+    // Bits below the lowest set one never take part, so the answer holds
+    // to the end of the block of that size holding `cursor`.
+    let block = 1u64 << mask.trailing_zeros().max(12);
+    (matches, (cursor | (block - 1)).saturating_add(1))
 }
 
 impl Image {
@@ -79,12 +92,9 @@ impl Image {
                     if mask & (1 << 11) == 0 {
                         continue;
                     }
-                    let span = range(base, mask, self.physical_bits)?;
-                    if span.start > cursor {
-                        next = next.min(span.start);
-                    }
-                    if span.contains(&cursor) {
-                        next = next.min(span.end);
+                    let (inside, change) = variable(base, mask, self.physical_bits, cursor);
+                    next = next.min(change);
+                    if inside {
                         // Every matched type must be WB. UC/WT precedence and
                         // undefined mixed overlaps therefore cannot admit RAM.
                         if base as u8 != 6 {
@@ -114,17 +124,12 @@ impl Image {
                             if mask & (1 << 11) == 0 {
                                 continue;
                             }
-                            let span = range(base, mask, self.physical_bits)?;
-                            if span.start > cursor {
-                                next = next.min(span.start);
-                            }
-                            if span.contains(&cursor) {
-                                next = next.min(span.end);
-                                if base & 0x18 != 0x18 {
-                                    return Err(refuse!(
-                                        "AMD IORR does not route both directions to DRAM"
-                                    ));
-                                }
+                            let (inside, change) = variable(base, mask, self.physical_bits, cursor);
+                            next = next.min(change);
+                            if inside && base & 0x18 != 0x18 {
+                                return Err(refuse!(
+                                    "AMD IORR does not route both directions to DRAM"
+                                ));
                             }
                         }
                     }
@@ -304,14 +309,35 @@ mod tests {
         assert!(image.writeback_ram(0x8000, 4096).is_err());
     }
     #[test]
-    fn every_non_wb_overlap_and_malformed_range_refuses() {
+    fn every_non_wb_overlap_refuses() {
         let mut image = image();
         for kind in [0, 1, 4, 5] {
             span(&mut image, 2 << 20, 2 << 20, kind);
             assert!(image.writeback_ram((2 << 20) - 1, 2).is_err());
         }
-        assert!(range(4096, 0xffff_ffff_e800, 48).is_err()); // nonaligned base
-        assert!(range(0, 0xffff_ffff_a800, 48).is_err()); // mask hole
+    }
+    #[test]
+    fn a_misaligned_base_and_a_mask_with_holes_match_as_the_hardware_does() {
+        const MIB: u64 = 1 << 20;
+        // A 32 MiB range whose base has a low bit set starts at 32 MiB.
+        let mask = 0xffff_fe00_0000;
+        assert_eq!(variable(0x200_1000, mask, 48, 16 * MIB), (false, 32 * MIB));
+        assert_eq!(variable(0x200_1000, mask, 48, 32 * MIB), (true, 64 * MIB));
+        assert_eq!(variable(0x200_1000, mask, 48, 64 * MIB), (false, u64::MAX));
+        // A 2 MiB mask with bit 30 clear matches 2 MiB at 0 and at 1 GiB.
+        let holed = 0xffff_bfe0_0000;
+        assert_eq!(variable(0, holed, 48, 0), (true, 2 * MIB));
+        assert_eq!(variable(0, holed, 48, 2 * MIB), (false, 4 * MIB));
+        assert_eq!(variable(0, holed, 48, 1 << 30), (true, (1 << 30) + 2 * MIB));
+        let mut image = image();
+        set(&mut image, VARIABLE_BASE, 0x200_1000);
+        set(&mut image, VARIABLE_BASE + 1, mask | 1 << 11);
+        assert!(image.writeback_ram(16 * MIB, 4096).is_ok());
+        assert!(image.writeback_ram(33 * MIB, 4096).is_err());
+        set(&mut image, VARIABLE_BASE, 0);
+        set(&mut image, VARIABLE_BASE + 1, holed | 1 << 11);
+        assert!(image.writeback_ram(4 * MIB, MIB).is_ok());
+        assert!(image.writeback_ram((1 << 30) + MIB, 4096).is_err());
     }
 
     /// A Ryzen desktop with 32 GiB: UC default, WB variable ranges below

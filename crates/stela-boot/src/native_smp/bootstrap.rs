@@ -12,7 +12,7 @@ use crate::Result;
 use core::arch::global_asm;
 use stela_contracts::refuse;
 
-use super::memory_types::{Image, MAX_WRITABLE, Write, amd};
+use super::memory_types::{CAP_COMPARED, Image, MAX_WRITABLE, Write, amd};
 use crate::{layout, tables::PAGE};
 mod early;
 pub(crate) use early::EarlyFault;
@@ -67,11 +67,12 @@ global_asm!(
     "cpuid",
     "cmp (stela_ap_phys_bits - stela_ap_start)(%ebp), %al",
     "jne 90f",
+    // Only the MTRRCAP fields the image uses (`CAP_COMPARED`, all in the
+    // low dword); the image holds them alone.
     "mov $0xfe, %ecx",
     "rdmsr",
+    "and ${cap_compared}, %eax",
     "cmp (stela_ap_mtrr_cap - stela_ap_start)(%ebp), %eax",
-    "jne 90f",
-    "cmp (stela_ap_mtrr_cap - stela_ap_start + 4)(%ebp), %edx",
     "jne 90f",
     // AMD's fixed attribute visibility is separate from effective routing.
     // Recheck this AP's captured identity before touching AMD64 control MSRs.
@@ -277,6 +278,7 @@ global_asm!(
     amd_preserved = const !(amd::FIXED_MODIFY as u32),
     amd_routing = const amd::FIXED_ROUTING as u32,
     amd_types = const !(amd::FIXED_ROUTING as u32),
+    cap_compared = const CAP_COMPARED as u32,
     mtrr_stride = const core::mem::size_of::<Write>(),
     mtrr_bytes = const MAX_WRITABLE * core::mem::size_of::<Write>(),
     options(att_syntax),
