@@ -344,6 +344,9 @@ pub(crate) struct Entry<'a> {
     /// the permanently pinned high-window entry/stack/argument mappings.
     pub root: u64,
     pub five_level: bool,
+    /// Safe architectural CR4 bits (e.g. CR4.DE, CR4.MCE) propagated from
+    /// the bootstrap processor to keep secondary AP control state consistent.
+    pub cr4: u32,
     /// This selected physical AP's own immutable firmware CPUID1 EAX, not
     /// the BSP's signature or a model name selected by the ARM guest profile.
     pub processor_signature: u32,
@@ -436,7 +439,9 @@ pub(crate) unsafe fn prepare(mapped: *mut u8, physical: u64, entry: Entry<'_>) -
         put32(&raw const stela_ap_root, entry.root as u32);
         put32(
             &raw const stela_ap_cr4,
-            0x620 | if entry.five_level { 1 << 12 } else { 0 },
+            0x620
+                | (entry.cr4 & ((1 << 3) | (1 << 6)))
+                | if entry.five_level { 1 << 12 } else { 0 },
         );
         put32(
             &raw const stela_ap_far32,

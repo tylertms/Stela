@@ -239,6 +239,35 @@ fn physical_migration_control_changes_and_lost_capability_refuse() {
     );
 }
 
+#[test]
+fn benign_cr4_bit_asymmetry_tolerated_in_revalidation() {
+    let actual = baseline();
+    let proof = NativeSystemTarget {
+        observed: actual,
+        lease: None,
+        target: actual.target().unwrap(),
+    };
+    assert_eq!(proof.revalidate_observation(actual), Ok(()));
+
+    // Asymmetry in bit 3 (CR4.DE) and bit 6 (CR4.MCE) across hybrid cores is tolerated.
+    let mut de_set = actual;
+    de_set.controls.cr4 ^= 1 << 3;
+    assert_eq!(proof.revalidate_observation(de_set), Ok(()));
+
+    let mut mce_set = actual;
+    mce_set.controls.cr4 ^= 1 << 6;
+    assert_eq!(proof.revalidate_observation(mce_set), Ok(()));
+
+    let mut both_set = actual;
+    both_set.controls.cr4 ^= (1 << 3) | (1 << 6);
+    assert_eq!(proof.revalidate_observation(both_set), Ok(()));
+
+    // Non-benign CR4 bit change (e.g. bit 18 OSXSAVE) must still refuse.
+    let mut non_benign = actual;
+    non_benign.controls.cr4 |= 1 << 18;
+    assert_eq!(proof.revalidate_observation(non_benign), Err(Refusal::Controls));
+}
+
 // Private observation models exercise the same validators. They are not
 // a public fake-hardware constructor and establish no CPL0 validation.
 fn modeled_owner(actual: Observation) -> NativeCpuOwner {

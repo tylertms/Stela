@@ -114,7 +114,7 @@ impl Package {
                     .strip_prefix(app)?
                     .to_str()
                     .context("a file name is not UTF-8")?
-                    .to_owned();
+                    .replace('\\', "/");
                 ensure!(
                     name.bytes()
                         .all(|byte| { byte.is_ascii_graphic() && byte != b'"' && byte != b'\\' }),

@@ -581,6 +581,7 @@ pub(crate) unsafe fn start(
                             handoff.placement,
                             stela_engine::machine::mmu::placement::Placement::FiveLevel
                         ),
+                        cr4: memory_source.cr4 as u32,
                         pat: effective_pat,
                         memory_types: &memory_types,
                         stack_top: layout::stack()

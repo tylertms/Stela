@@ -10,6 +10,10 @@ const CR0_FORBIDDEN: u64 = (1 << 2) | (1 << 3) | (1 << 29) | (1 << 30);
 const CR4_REQUIRED: u64 = (1 << 5) | (1 << 9) | (1 << 10);
 // Global/PCID translations and CET need their own root/call contract.
 const CR4_FORBIDDEN: u64 = (1 << 7) | (1 << 17) | (1 << 23);
+/// Debugging extensions (DE, bit 3) and machine-check enable (MCE, bit 6)
+/// flags may differ across hybrid core topologies (e.g. P-cores vs E-cores)
+/// without affecting execution safety or translation controls.
+const CR4_BENIGN_MASK: u64 = (1 << 3) | (1 << 6);
 const EFER_REQUIRED: u64 = (1 << 10) | (1 << 11);
 const IF: u64 = 1 << 9;
 const CPUID_FLOOR_EDX: u32 = (1 << 0)
@@ -445,7 +449,8 @@ impl NativeSystemTarget {
             return Err(Refusal::TargetChanged);
         }
         if current.controls.cr0 != self.observed.controls.cr0
-            || current.controls.cr4 != self.observed.controls.cr4
+            || (current.controls.cr4 & !CR4_BENIGN_MASK)
+                != (self.observed.controls.cr4 & !CR4_BENIGN_MASK)
             || current.controls.efer != self.observed.controls.efer
             || current.controls.cs != self.observed.controls.cs
             || current.controls.xcr0 != self.observed.controls.xcr0

@@ -229,7 +229,8 @@ fn bundle_header(bundle: &Path) -> Result<String> {
             let name = path
                 .strip_prefix(bundle)?
                 .to_str()
-                .context("a file name is not UTF-8")?;
+                .context("a file name is not UTF-8")?
+                .replace('\\', "/");
             ensure!(
                 name.bytes()
                     .all(|byte| byte.is_ascii_graphic() && byte != b'"' && byte != b'\\'),

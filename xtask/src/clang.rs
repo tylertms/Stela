@@ -570,7 +570,17 @@ impl Host for System {
     }
 
     fn canonical(&self, path: &Path) -> PathBuf {
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        let p = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        #[cfg(windows)]
+        {
+            let s = p.to_string_lossy();
+            if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+                return PathBuf::from(format!(r"\\{rest}"));
+            } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+                return PathBuf::from(rest);
+            }
+        }
+        p
     }
 
     fn list(&self, directory: &Path) -> Vec<String> {
