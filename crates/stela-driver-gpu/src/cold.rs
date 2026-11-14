@@ -198,14 +198,17 @@ fn preflight<C: ConfigSpace>(
     }
     // Linux `pci_reset_function` falls back from FLR to a D3hot soft reset,
     // then to a reset of the bus the function sits on alone. nouveau itself
-    // never resets: it starts what firmware left, which translation keeps
-    // safe. Without translation, an engine firmware left running could
-    // write recycled RAM once bus mastering is on, so then a reset stays
-    // required, the bus reset the last one.
+    // never resets: it starts what firmware left. A GPU an earlier run left
+    // with its secure region (WPR2) standing fails nouveau's FWSEC-FRTS
+    // until it is reset, and translation does not clear that, so every
+    // reset that is available comes first. Only a GPU with none starts as
+    // firmware left it, and only with translation: otherwise an engine
+    // firmware left running could write recycled RAM once bus mastering is
+    // on.
     match function.reset_method().map_err(Error::Reset)? {
         Some(method) => Ok(Some(Reset::Function(method))),
-        None if translated => Ok(None),
         None if bus_reset => Ok(Some(Reset::SecondaryBus)),
+        None if translated => Ok(None),
         None => Err(Error::ResetUnavailable),
     }
 }

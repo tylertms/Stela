@@ -458,36 +458,62 @@ fn without_a_function_reset_or_translation_the_bus_is_reset() {
     }
 }
 #[test]
-fn a_function_reset_or_translation_comes_before_the_bus_reset() {
+fn a_function_reset_comes_before_the_bus_reset() {
     for translated in [false, true] {
         let (mut inputs, state) = inputs();
         state.borrow_mut().bus_reset = true;
-        if translated {
-            let words = &mut inputs.requester.function.config().words;
-            words[0x44 / 4] = 0;
-            words[0x84 / 4] = 8;
-        }
         let candidate = check_candidate(
             &mut inputs.requester.function,
             &PhysicalTimer(state.clone()),
             translated,
             true,
         );
+        assert_eq!(
+            candidate,
+            Ok(Some(Reset::Function(ResetMethod::FunctionLevel)))
+        );
         let mut cold = Cold::new(inputs);
         if translated {
-            assert_eq!(candidate, Ok(None));
             // SAFETY: the symbolic domain stands for a translating one.
             cold = unsafe { cold.translated() };
-        } else {
-            assert_eq!(
-                candidate,
-                Ok(Some(Reset::Function(ResetMethod::FunctionLevel)))
-            );
         }
         let ready = cold
             .quiesce_and_bind()
             .unwrap_or_else(|error| panic!("{:?}", error.error));
-        assert_ne!(ready.reset(), Some(Reset::SecondaryBus));
+        assert_eq!(
+            ready.reset(),
+            Some(Reset::Function(ResetMethod::FunctionLevel))
+        );
         assert!(!state.borrow().events.contains(&"bus-reset"));
     }
+}
+
+/// A GPU an earlier run left holding its secure region needs a reset even
+/// when its DMA is translated, so an available bus reset is not skipped.
+#[test]
+fn a_translated_function_without_a_function_reset_still_gets_the_bus_reset() {
+    let (mut inputs, state) = inputs();
+    {
+        let words = &mut inputs.requester.function.config().words;
+        words[0x44 / 4] = 0;
+        words[0x84 / 4] = 8;
+    }
+    state.borrow_mut().bus_reset = true;
+    let candidate = check_candidate(
+        &mut inputs.requester.function,
+        &PhysicalTimer(state.clone()),
+        true,
+        true,
+    );
+    assert_eq!(candidate, Ok(Some(Reset::SecondaryBus)));
+    // SAFETY: the symbolic domain stands for a translating one.
+    let cold = unsafe { Cold::new(inputs).translated() };
+    let ready = cold
+        .quiesce_and_bind()
+        .unwrap_or_else(|error| panic!("{:?}", error.error));
+    assert_eq!(ready.reset(), Some(Reset::SecondaryBus));
+    assert_eq!(
+        state.borrow().events,
+        ["views-seal", "bus-reset", "root-drain", "bind"]
+    );
 }
