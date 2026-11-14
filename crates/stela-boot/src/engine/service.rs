@@ -146,7 +146,9 @@ impl Service {
         power: power::HostPowerControl,
         tsc_hz: u64,
     ) -> Self {
-        let now = host::rdtsc();
+        // The service moves between cores: its stamps across turns are
+        // the corrected count, not one core's raw TSC.
+        let now = host::fresh_counter();
         Self {
             devices,
             restore,
@@ -240,6 +242,11 @@ impl Service {
         } = self;
         let mut lap = Lap::new(*tsc_hz, boot, step, watch);
         let now = host::rdtsc();
+        // What another turn, maybe on another core, compares: the corrected
+        // count, at `COUNTER_HZ`, as the raw TSCs of cores whose counters
+        // agree only through a software offset differ by seconds.
+        let stamp = host::fresh_counter();
+        let millis = host::COUNTER_HZ / 1000;
         // The guest console's input, which its device model takes under
         // the devices' lock and so cannot wait for the host's port there.
         super::feed_console_input();
@@ -252,7 +259,7 @@ impl Service {
         // only a stall limit (`clock`, `GuestWatch`).
         let from = core::mem::take(next);
         let limit = *tsc_hz / 1_000_000 * STEP_MICROS;
-        let deferred = *tsc_hz / 1000 * DEFERRED_MILLIS;
+        let deferred = millis * DEFERRED_MILLIS;
         let mut turn = Turn::new(from, now, step.then_some(limit));
         let guest = || watch.pending(host::fresh_counter()).is_some();
         // Whether `part` runs in this turn; `drivers` when it calls the host
@@ -261,14 +268,14 @@ impl Service {
         let mut due = |part: usize, drivers: bool, turn: &mut Turn| {
             if drivers
                 && super::storage::host_drivers_taken()
-                && now.wrapping_sub(ran[part]) < deferred
+                && stamp.wrapping_sub(ran[part]) < deferred
             {
                 return false;
             }
             if !turn.due(part, host::rdtsc(), !boot && host::interrupted(), guest()) {
                 return false;
             }
-            ran[part] = now;
+            ran[part] = stamp;
             true
         };
         #[cfg(feature = "diagnostics")]
@@ -344,9 +351,9 @@ impl Service {
             // drivers: a store another processor's driver call holds up
             // goes on at a later turn.
             let ((), drivers) = super::storage::without_waiting(*tsc_hz, || {
-                if now.wrapping_sub(*log_flushed) >= *tsc_hz {
+                if stamp.wrapping_sub(*log_flushed) >= host::COUNTER_HZ {
                     output::flush_due();
-                    *log_flushed = host::rdtsc();
+                    *log_flushed = host::fresh_counter();
                 } else {
                     output::advance_logs();
                 }
@@ -371,7 +378,10 @@ impl Service {
             });
             lap.part(Part::Network);
         }
-        if let Some(bluetooth) = bluetooth.as_mut().filter(|_| due(BLUETOOTH, true, &mut turn)) {
+        if let Some(bluetooth) = bluetooth
+            .as_mut()
+            .filter(|_| due(BLUETOOTH, true, &mut turn))
+        {
             let (packets, room, status) = devices.with(|devices| bluetooth.queued(devices));
             bluetooth.status(status);
             bluetooth.transmit(packets);
@@ -388,14 +398,14 @@ impl Service {
         if due(NOR, true, &mut turn) {
             let mut drivers = String::new();
             if let Some(nor) = nor {
-                let due =
-                    anchored.is_none_or(|at| now.wrapping_sub(at) >= ANCHOR_SECONDS * *tsc_hz);
+                let due = anchored
+                    .is_none_or(|at| stamp.wrapping_sub(at) >= ANCHOR_SECONDS * host::COUNTER_HZ);
                 let (dirty, anchor) = devices.with(|devices| {
                     let anchor = due.then(|| devices.rtc_anchor()).flatten();
                     (nor::HostNor::dirty(devices), anchor)
                 });
                 if anchor.is_some() {
-                    *anchored = Some(now);
+                    *anchored = Some(stamp);
                 }
                 // As the logs' stores: never waiting for the host drivers.
                 let ((), line) = super::storage::without_waiting(*tsc_hz, || {
@@ -440,7 +450,7 @@ impl Service {
                 lap.part(Part::Restore);
             }
         }
-        if now.wrapping_sub(*reported) >= REPORT_SECONDS * *tsc_hz {
+        if stamp.wrapping_sub(*reported) >= REPORT_SECONDS * host::COUNTER_HZ {
             if let Some(line) = restore
                 .as_ref()
                 .and_then(|experiment| experiment.asr_report())
@@ -451,7 +461,7 @@ impl Service {
                 network.report();
             }
             power.disks().report(*tsc_hz);
-            *reported = now;
+            *reported = stamp;
         }
         match turn.ended() {
             Some((part, _)) => {
@@ -708,14 +718,14 @@ pub(super) fn serve(boot: bool, step: bool, watch: &GuestWatch) {
     // A step that left parts for the next keeps the host starved, so the
     // next step follows at the next slice.
     if served == Some(true) {
-        SERVED.store(host::rdtsc(), Ordering::Release);
+        SERVED.store(host::fresh_counter(), Ordering::Release);
         SERVICES[usize::from(boot)].fetch_add(1, Ordering::Relaxed);
     }
 }
 
 /// Whether no PE has served the host for [`STARVED_MILLIS`], or for
 /// [`REQUESTED_MILLIS`] with a device's request `requested`.
-pub(super) fn starved(tsc_hz: u64, requested: bool) -> bool {
+pub(super) fn starved(requested: bool) -> bool {
     if SHUTDOWN.pending() {
         return true;
     }
@@ -724,7 +734,10 @@ pub(super) fn starved(tsc_hz: u64, requested: bool) -> bool {
     } else {
         STARVED_MILLIS
     };
-    host::rdtsc().wrapping_sub(SERVED.load(Ordering::Acquire)) >= tsc_hz / 1000 * millis
+    // Stored by whichever core served last: the corrected count, which
+    // every core reads alike.
+    host::fresh_counter().wrapping_sub(SERVED.load(Ordering::Acquire))
+        >= host::COUNTER_HZ / 1000 * millis
 }
 
 /// The service, back from whichever core serves it, for the run's end.

@@ -856,7 +856,7 @@ pub(super) fn run<H: Host>(
             if !machine.runs_parallel() || idle {
                 let watch = machine.guest_watch();
                 machine.exclude_host_time(|_| service::serve(true, false, &watch));
-            } else if service::starved(tsc_hz, requested) {
+            } else if service::starved(requested) {
                 let watch = machine.guest_watch();
                 machine.exclude_host_time(|_| service::serve(true, true, &watch));
             }
