@@ -217,6 +217,107 @@ fn transaction_errors_soft_retry_in_place_like_linux() {
     assert_eq!(run(&mut c, 1), (failed, 0));
 }
 
+/// A soft reset's Reset Endpoint the controller never answers is stepped by
+/// the TD's polls, each returning at once, and fails the TD only at the
+/// command's own deadline and timeout handling, as the blocking command did
+/// in one call.
+#[test]
+fn an_unanswered_soft_reset_is_stepped_by_polls_until_its_command_deadline() {
+    let mut dma = TestRegion::new(64 * 1024 * 8);
+    let (mut c, peer) = cancellation_controller(&mut dma);
+    let buffer = dma.allocate(64, 64).unwrap().physical();
+    peer.borrow_mut().transaction_errors[4] = 1;
+    peer.borrow_mut().silence = Some(RESET_ENDPOINT);
+    let ticket = c.submit_ticket(1, 4, buffer, 64).unwrap();
+    let started = Clock::ticks();
+    let mut polls = 0;
+    let result = loop {
+        let before = Clock::ticks();
+        let result = c.completed_ticket(&ticket);
+        // One tick is a microsecond here.
+        assert!(Clock::ticks() - before < 10_000, "a poll waited");
+        polls += 1;
+        if let Some(result) = result {
+            break result;
+        }
+        crate::test_clock::advance(c.clock, 10_000);
+    };
+    assert!(Clock::ticks() - started >= COMMAND_US);
+    assert!(polls > 100, "{polls} polls");
+    assert_eq!(result, Err(BlockError::Timeout));
+    assert_eq!(peer.borrow().seen, [RESET_ENDPOINT]);
+    assert!(peer.borrow().outgoing.is_empty());
+    // The TD stays fenced as failed.
+    assert!(c.submit_ticket(1, 4, buffer, 64).is_err());
+}
+
+/// The controller answers the soft reset late: polls return nothing until
+/// then, the TD's ring is rung again only after the completion, and the
+/// retried TD completes.
+#[test]
+fn a_late_soft_reset_completion_rings_the_endpoint_again_at_the_next_poll() {
+    let mut dma = TestRegion::new(64 * 1024 * 8);
+    let (mut c, peer) = cancellation_controller(&mut dma);
+    let buffer = dma.allocate(64, 64).unwrap().physical();
+    peer.borrow_mut().transaction_errors[4] = 1;
+    peer.borrow_mut().silence = Some(RESET_ENDPOINT);
+    let ticket = c.submit_ticket(1, 4, buffer, 64).unwrap();
+    for _ in 0..3 {
+        assert_eq!(c.completed_ticket(&ticket), None);
+    }
+    assert!(peer.borrow().outgoing.is_empty());
+    answer_reset(&peer, 4);
+    // The poll that finds the completion rings the ring; the retried TD's
+    // event is seen at the next poll.
+    assert_eq!(c.completed_ticket(&ticket), None);
+    assert_eq!(peer.borrow().outgoing.len(), 1);
+    assert_eq!(c.completed_ticket(&ticket), Some(Ok(64)));
+    assert_eq!(peer.borrow().soft_resets, [4]);
+    assert!(c.finished.is_empty());
+}
+
+/// A cancellation while the soft reset runs takes its Reset Endpoint over
+/// instead of issuing a second one, which would find the endpoint stopped
+/// and fail; the retried TD's ring is never rung.
+#[test]
+fn a_cancellation_during_a_soft_reset_takes_its_command_over() {
+    let mut dma = TestRegion::new(64 * 1024 * 8);
+    let (mut c, peer) = cancellation_controller(&mut dma);
+    let buffer = dma.allocate(64, 64).unwrap().physical();
+    peer.borrow_mut().transaction_errors[4] = 1;
+    peer.borrow_mut().silence = Some(RESET_ENDPOINT);
+    let ticket = c.submit_ticket(1, 4, buffer, 64).unwrap();
+    assert_eq!(c.completed_ticket(&ticket), None);
+    answer_reset(&peer, 4);
+    c.cancel(1, 4).unwrap();
+    assert_eq!(peer.borrow().seen, [RESET_ENDPOINT, SET_DEQUEUE]);
+    assert!(peer.borrow().outgoing.is_empty());
+    assert!(c.finished.is_empty());
+    assert!(
+        c.slots[1].as_ref().unwrap().endpoints[4]
+            .as_ref()
+            .unwrap()
+            .ring
+            .normal
+            .idle()
+    );
+    // The endpoint works again.
+    let ticket = c.submit_ticket(1, 4, buffer, 64).unwrap();
+    assert_eq!(c.completed_ticket(&ticket), Some(Ok(64)));
+}
+
+/// The silenced Reset Endpoint completes as the model would have done it.
+fn answer_reset(peer: &core::cell::RefCell<CancelModel>, dci: usize) {
+    let mut peer = peer.borrow_mut();
+    peer.silence = None;
+    let at = peer.stuck.take().unwrap();
+    assert_eq!(peer.state(dci), ENDPOINT_HALTED);
+    peer.soft_resets.push(dci);
+    peer.set_state(dci, 3);
+    peer.active[dci] = None;
+    peer.event(at, SUCCESS, COMMAND_COMPLETION, 0, 0);
+}
+
 #[test]
 fn invalid_synchronous_budget_refuses_before_mmio_and_preserves_current_dma_receipt() {
     struct NoAccess;

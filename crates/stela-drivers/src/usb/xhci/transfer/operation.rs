@@ -315,6 +315,16 @@ impl Controller {
             ENDPOINT_RUNNING | ENDPOINT_STOPPED => {}
             _ => return Err(DID_NOT_STOP),
         }
+        // A recovery Reset Endpoint under way becomes this cancellation's
+        // own: a second one would find the endpoint stopped. One not yet
+        // started is dropped; the halted endpoint gets the cancellation's.
+        let endpoint = self.slot(slot)?.endpoints[usize::from(dci)]
+            .as_mut()
+            .unwrap();
+        if let Some(command) = endpoint.ring.normal.take_reset().and_then(|r| r.command) {
+            cancel.command = Some(command);
+            cancel.step = Cancelling::Reset;
+        }
         Ok(cancel)
     }
 

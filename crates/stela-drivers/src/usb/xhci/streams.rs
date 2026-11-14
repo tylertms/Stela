@@ -462,6 +462,21 @@ impl Streams {
         }
     }
 
+    /// The doorbell values of the streams with a TD active.
+    pub(super) fn active_doorbells(&self, dci: u8) -> Vec<u32> {
+        (1..=self.rings.len() as u16)
+            .filter(|id| self.rings[usize::from(*id) - 1].active.is_some())
+            .map(|id| doorbell_value(dci, id))
+            .collect()
+    }
+
+    /// A soft reset for `stream`'s TD failed: the TD fails, if still active.
+    pub(super) fn reset_failed(&mut self, stream: u16, error: &BlockError) {
+        if self.stream(stream).is_ok_and(|ring| ring.active.is_some()) {
+            self.finish(stream, &Err(error.clone()));
+        }
+    }
+
     fn finish(&mut self, stream: u16, result: &Result<usize, BlockError>) {
         if let Err(error) = result {
             self.recovery = true;
@@ -744,8 +759,9 @@ impl Controller {
 
     /// Linux handle_transferless_tx_event: events whose TRB pointer lies in
     /// none of the endpoint's stream rings reset the endpoint, softly while
-    /// within MAX_SOFT_RETRY. Other such events are dropped.
-    fn transferless(&mut self, slot: u8, dci: u8) -> Result<(), BlockError> {
+    /// within MAX_SOFT_RETRY. Other such events are dropped. False while a
+    /// reset it began runs ([`Self::step_recovery_reset`]).
+    fn transferless(&mut self, slot: u8, dci: u8) -> Result<bool, BlockError> {
         loop {
             let state = self
                 .slots
@@ -768,7 +784,7 @@ impl Controller {
                             (base..base + (RING_TRBS * TRB) as u64).contains(&e.parameter)
                         }))
             }) else {
-                return Ok(());
+                return Ok(true);
             };
             let event = self.pending.remove(index);
             if streams.has_chained() {
@@ -810,16 +826,17 @@ impl Controller {
                         .unwrap();
                     let previous = streams.errors;
                     streams.errors = previous.saturating_add(1);
-                    if previous > transfer::MAX_SOFT_RETRY {
+                    let (flags, rings) = if previous > transfer::MAX_SOFT_RETRY {
                         // EP_HARD_RESET with no TD: the endpoint stays
                         // stopped until it is rung again.
-                        self.reset_halted(slot, dci, 0)?;
+                        (0, transfer::Rings::None)
                     } else {
-                        let doorbells: Vec<u32> = (1..=streams.rings.len() as u16)
-                            .filter(|id| streams.rings[usize::from(*id) - 1].active.is_some())
-                            .map(|id| doorbell_value(dci, id))
-                            .collect();
-                        self.soft_reset(slot, dci, &doorbells)?;
+                        (transfer::TSP, transfer::Rings::Streams)
+                    };
+                    let failed = transfer::Failed::Endpoint;
+                    match self.begin_recovery_reset(slot, dci, flags, rings, failed) {
+                        Some(result) => result?,
+                        None => return Ok(false),
                     }
                 }
                 RING_UNDERRUN | RING_OVERRUN | STOPPED_LENGTH_INVALID => {}
@@ -865,8 +882,14 @@ impl Controller {
             Err(error) | Ok(Some(error)) => return Some(Err(error)),
             Ok(None) => {}
         }
-        if let Err(error) = self.transferless(slot, ticket.dci) {
+        // The halted endpoint posts no event until its reset completes.
+        if let Err(error) = self.step_recovery_reset(slot, ticket.dci)? {
             return Some(Err(error));
+        }
+        match self.transferless(slot, ticket.dci) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => return Some(Err(error)),
         }
         let event = self.take(|e| {
             e.kind() == TRANSFER_EVENT
@@ -907,24 +930,13 @@ impl Controller {
                 && !streams.has_chained()
                 && transfer::retry_in_place(&mut streams.errors, no_soft_retry, tt_info)
             {
-                let doorbells: Vec<u32> = (1..=streams.rings.len() as u16)
-                    .filter(|id| streams.rings[usize::from(*id) - 1].active.is_some())
-                    .map(|id| doorbell_value(ticket.dci, id))
-                    .collect();
-                match self.soft_reset(slot, ticket.dci, &doorbells) {
-                    Ok(()) => return None,
-                    Err(error) => {
-                        let streams = self.slot(slot).unwrap().endpoints[usize::from(ticket.dci)]
-                            .as_mut()
-                            .unwrap()
-                            .streams
-                            .as_mut()
-                            .unwrap();
-                        let result = Err(error);
-                        streams.finish(ticket.stream, &result);
-                        return Some(result);
-                    }
-                }
+                // A failed reset fails this stream's TD.
+                let failed = transfer::Failed::Stream(ticket.stream);
+                let (flags, rings) = (transfer::TSP, transfer::Rings::Streams);
+                return match self.begin_recovery_reset(slot, ticket.dci, flags, rings, failed) {
+                    None | Some(Ok(())) => None,
+                    Some(Err(error)) => Some(Err(error)),
+                };
             }
             let result = Err(BlockError::Device {
                 status: event.code(),

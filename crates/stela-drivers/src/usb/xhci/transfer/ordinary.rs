@@ -258,7 +258,10 @@ impl Controller {
             [usize::from(ticket.dci)]
         .as_ref()
         .unwrap();
-        if !endpoint.ring.normal.unfinished(ticket.id, ticket.trb) {
+        // A soft reset under way is stepped at every poll.
+        if !endpoint.ring.normal.unfinished(ticket.id, ticket.trb)
+            || endpoint.ring.normal.resetting()
+        {
             return false;
         }
         self.drain();
@@ -310,6 +313,10 @@ impl Controller {
             )));
         }
         let no_soft_retry = self.quirks.no_soft_retry;
+        // The halted endpoint posts no event until its soft reset completes.
+        if let Err(error) = self.step_recovery_reset(slot, ticket.dci)? {
+            return Some(Err(error));
+        }
         while let Some(event) = self
             .take(|e| e.kind() == TRANSFER_EVENT && e.slot() == slot && e.endpoint() == ticket.dci)
         {
@@ -321,18 +328,12 @@ impl Controller {
                 .normal
                 .soft_retry(&event, no_soft_retry, tt_info)
             {
-                match self.soft_reset(slot, ticket.dci, &[u32::from(ticket.dci)]) {
+                // A failed reset leaves the TD halted on the ring, fenced as
+                // failed.
+                let failed = Failed::Td(event);
+                match self.begin_recovery_reset(slot, ticket.dci, TSP, Rings::Endpoint, failed)? {
                     Ok(()) => continue,
-                    Err(error) => {
-                        // The TD stays halted on the ring; fence it as failed.
-                        let _ = self.slot(slot).unwrap().endpoints[usize::from(ticket.dci)]
-                            .as_mut()
-                            .unwrap()
-                            .ring
-                            .normal
-                            .event(event);
-                        return Some(Err(error));
-                    }
+                    Err(error) => return Some(Err(error)),
                 }
             }
             if event.code() == INCOMPATIBLE_DEVICE {

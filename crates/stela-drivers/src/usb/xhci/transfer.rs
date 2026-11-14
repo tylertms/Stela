@@ -20,7 +20,7 @@ const STOPPED_TRANSFER: u32 = 26;
 const STOPPED_SHORT_PACKET: u32 = 28;
 const INCOMPATIBLE_DEVICE: u32 = 22;
 const EVENT_DATA: u32 = 1 << 2;
-pub(super) use queue::Queue;
+pub(super) use queue::{Failed, Queue, Rings};
 
 /// Linux process_bulk_intr_td's test for a transaction error: never retried
 /// with XHCI_NO_SOFT_RETRY (err_count untouched); otherwise counted, and
@@ -35,34 +35,116 @@ pub(super) fn retry_in_place(errors: &mut u32, no_soft_retry: bool, tt_info: u32
 }
 
 impl Controller {
-    /// Linux xhci_handle_halted_endpoint(EP_SOFT_RESET): Reset Endpoint with
-    /// TSP keeps the halted TD in place, and its completion rings every
-    /// pending ring again (ring_doorbell_for_active_rings). Like
-    /// xhci_handle_cmd_reset_ep, the completion code is ignored; only a
-    /// command the controller never completed is an error.
-    pub(super) fn soft_reset(
+    /// Linux xhci_handle_halted_endpoint: xhci_reset_halted_ep queues Reset
+    /// Endpoint, with TSP for EP_SOFT_RESET to keep the halted TD in place,
+    /// and its completion rings the pending rings again
+    /// (ring_doorbell_for_active_rings). As Linux queues the command and
+    /// handles its completion apart, it is started here and stepped by the
+    /// owner's polls ([`Self::step_recovery_reset`]), under the command's
+    /// own deadline and timeout handling, never waited for in one call.
+    /// `None` while it runs.
+    pub(super) fn begin_recovery_reset(
         &mut self,
         slot: u8,
         dci: u8,
-        doorbells: &[u32],
-    ) -> Result<(), BlockError> {
-        self.reset_halted(slot, dci, TSP)?;
+        flags: u32,
+        rings: Rings,
+        failed: Failed,
+    ) -> Option<Result<(), BlockError>> {
+        let reset = queue::Reset {
+            command: None,
+            flags,
+            rings,
+            failed,
+        };
+        match self.recovery_queue(slot, dci) {
+            Some(queue) => queue.begin_reset(reset),
+            None => return Some(Err(BlockError::Unsupported("xHCI endpoint not configured"))),
+        }
+        self.step_recovery_reset(slot, dci)
+    }
+
+    /// One step of the endpoint's recovery Reset Endpoint: `Some(Ok)` once
+    /// none runs, `None` while it does. Like xhci_handle_cmd_reset_ep, the
+    /// completion code is ignored; only a command the controller never
+    /// completed is an error, left where the reset's `failed` says.
+    pub(super) fn step_recovery_reset(
+        &mut self,
+        slot: u8,
+        dci: u8,
+    ) -> Option<Result<(), BlockError>> {
+        let Some(&mut queue::Reset {
+            mut command, flags, ..
+        }) = self.recovery_queue(slot, dci).and_then(Queue::reset)
+        else {
+            return Some(Ok(()));
+        };
+        let target = u32::from(slot) << 24 | u32::from(dci) << 16;
+        let result = self.step_command(&mut command, 0, 0, RESET_ENDPOINT << 10 | flags | target);
+        // An endpoint that went away meanwhile has no reset left to run.
+        let Some(queue) = self.recovery_queue(slot, dci) else {
+            return Some(Ok(()));
+        };
+        let Some(result) = result else {
+            if let Some(reset) = queue.reset() {
+                reset.command = command;
+            }
+            return None;
+        };
+        let Some(reset) = queue.take_reset() else {
+            return Some(Ok(()));
+        };
+        match result {
+            Ok(_) => {}
+            Err(BlockError::Device { .. }) if !self.command_poisoned => {}
+            Err(error) => {
+                self.recovery_failed(slot, dci, reset.failed, &error);
+                return Some(Err(error));
+            }
+        }
+        let doorbells = match reset.rings {
+            Rings::Endpoint => vec![u32::from(dci)],
+            Rings::Streams => self
+                .slot(slot)
+                .ok()
+                .and_then(|state| state.endpoints[usize::from(dci)].as_ref())
+                .and_then(|endpoint| endpoint.streams.as_ref())
+                .map_or_else(Vec::new, |streams| streams.active_doorbells(dci)),
+            Rings::None => Vec::new(),
+        };
+        // The doorbells below may restart the endpoint.
         self.rang(slot, dci);
         fence(Ordering::SeqCst);
         for value in doorbells {
             self.registers
-                .write32(self.doorbells + 4 * usize::from(slot), *value);
+                .write32(self.doorbells + 4 * usize::from(slot), value);
         }
-        Ok(())
+        Some(Ok(()))
     }
 
-    /// Linux xhci_reset_halted_ep: Reset Endpoint, with TSP for a soft reset.
-    pub(super) fn reset_halted(&mut self, slot: u8, dci: u8, flags: u32) -> Result<(), BlockError> {
-        let target = u32::from(slot) << 24 | u32::from(dci) << 16;
-        match self.command(0, 0, RESET_ENDPOINT << 10 | flags | target) {
-            Ok(_) => Ok(()),
-            Err(BlockError::Device { .. }) if !self.command_poisoned => Ok(()),
-            Err(error) => Err(error),
+    fn recovery_queue(&mut self, slot: u8, dci: u8) -> Option<&mut Queue> {
+        let endpoint = self.slot(slot).ok()?.endpoints.get_mut(usize::from(dci))?;
+        Some(&mut endpoint.as_mut()?.ring.normal)
+    }
+
+    fn recovery_failed(&mut self, slot: u8, dci: u8, failed: Failed, error: &BlockError) {
+        let Some(endpoint) = self
+            .slot(slot)
+            .ok()
+            .and_then(|state| state.endpoints[usize::from(dci)].as_mut())
+        else {
+            return;
+        };
+        match failed {
+            Failed::Td(event) => {
+                let _ = endpoint.ring.normal.event(event);
+            }
+            Failed::Stream(stream) => {
+                if let Some(streams) = &mut endpoint.streams {
+                    streams.reset_failed(stream, error);
+                }
+            }
+            Failed::Endpoint => {}
         }
     }
 

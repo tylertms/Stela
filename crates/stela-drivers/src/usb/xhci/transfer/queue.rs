@@ -23,11 +23,64 @@ pub(in crate::usb::xhci) struct Queue {
     /// Linux `xhci_virt_ep.err_count`: transaction errors since the last
     /// success; cancellation does not clear it.
     errors: u32,
+    /// The endpoint's recovery Reset Endpoint while it runs, for ordinary
+    /// and stream endpoints alike.
+    reset: Option<Reset>,
+}
+
+/// A Reset Endpoint that a transfer's recovery issued, stepped by the
+/// owner's polls instead of waited for (`Controller::step_recovery_reset`).
+#[derive(Clone, Copy)]
+pub(in crate::usb::xhci) struct Reset {
+    /// The started command; none until no other command is outstanding.
+    pub(in crate::usb::xhci) command: Option<u64>,
+    /// [`TSP`] for a soft reset.
+    pub(in crate::usb::xhci) flags: u32,
+    pub(in crate::usb::xhci) rings: Rings,
+    pub(in crate::usb::xhci) failed: Failed,
+}
+
+/// What a recovery Reset Endpoint rings once it completes.
+#[derive(Clone, Copy)]
+pub(in crate::usb::xhci) enum Rings {
+    /// The endpoint's ring.
+    Endpoint,
+    /// Each stream with a TD then active.
+    Streams,
+    /// Nothing: the endpoint stays stopped until it is rung again.
+    None,
+}
+
+/// Where a recovery Reset Endpoint that failed leaves its error.
+#[derive(Clone, Copy)]
+pub(in crate::usb::xhci) enum Failed {
+    /// The TD the event names stays halted on the ring, fenced as failed.
+    Td(Event),
+    /// The stream's active TD fails.
+    Stream(u16),
+    /// Only the poll that stepped it reports the error.
+    Endpoint,
 }
 
 impl Queue {
     pub(in crate::usb::xhci) fn idle(&self) -> bool {
-        self.active.is_empty() && self.readiness().is_ok() && !self.clear_tt
+        self.active.is_empty() && self.readiness().is_ok() && !self.clear_tt && self.reset.is_none()
+    }
+
+    pub(in crate::usb::xhci) fn resetting(&self) -> bool {
+        self.reset.is_some()
+    }
+
+    pub(in crate::usb::xhci) fn reset(&mut self) -> Option<&mut Reset> {
+        self.reset.as_mut()
+    }
+
+    pub(in crate::usb::xhci) fn begin_reset(&mut self, reset: Reset) {
+        self.reset = Some(reset);
+    }
+
+    pub(in crate::usb::xhci) fn take_reset(&mut self) -> Option<Reset> {
+        self.reset.take()
     }
 
     pub(in crate::usb::xhci) fn readiness(&self) -> Result<(), BlockError> {
@@ -193,5 +246,6 @@ impl Queue {
         self.recovery = false;
         self.failure = None;
         self.clear_tt = false;
+        self.reset = None;
     }
 }

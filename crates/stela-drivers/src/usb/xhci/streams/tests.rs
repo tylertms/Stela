@@ -1026,6 +1026,55 @@ fn stream_transaction_errors_soft_retry_every_pending_stream_like_linux() {
     assert!(model.borrow().active.is_empty());
 }
 
+/// A stream soft reset the controller answers late is stepped by any
+/// stream's poll, each returning at once; once it completes, every stream
+/// with a TD then active is rung, one submitted meanwhile included, and the
+/// retried TD completes.
+#[test]
+fn a_late_stream_soft_reset_is_stepped_by_every_stream_poll() {
+    let mut dma = TestRegion::new(256 * 1024 * 8);
+    let (mut controller, model) = controller(&mut dma, 32);
+    controller
+        .configure_streams(1, &[endpoint(0x81, 4)], &[0x81], 3, &mut dma)
+        .unwrap();
+    let data = dma.allocate(256, 64).unwrap();
+    let one = controller
+        .submit_stream(1, 3, 1, data.physical(), 64)
+        .unwrap();
+    model.borrow_mut().silent_command = Some(RESET_ENDPOINT);
+    model.borrow_mut().transaction_error(3, 1);
+    for _ in 0..3 {
+        let before = Clock::ticks();
+        assert_eq!(controller.completed_stream(&one), None);
+        assert!(Clock::ticks() - before < 10_000, "a poll waited");
+    }
+    let two = controller
+        .submit_stream(1, 3, 2, data.physical() + 64, 64)
+        .unwrap();
+    assert_eq!(controller.completed_stream(&two), None);
+    model.borrow_mut().doorbells.clear();
+    {
+        let mut model = model.borrow_mut();
+        model.silent_command = None;
+        let at = model.stuck.take().unwrap();
+        model.soft_resets += 1;
+        model.set_state(3, ENDPOINT_STOPPED);
+        model.event(at, SUCCESS, COMMAND_COMPLETION, 0, 0);
+    }
+    assert_eq!(controller.completed_stream(&two), None);
+    assert_eq!(model.borrow().doorbells, [(3, 1), (3, 2)]);
+    let resets = model
+        .borrow()
+        .commands
+        .iter()
+        .filter(|c| c.0 == RESET_ENDPOINT)
+        .count();
+    assert_eq!((resets, model.borrow().soft_resets), (1, 1));
+    model.borrow_mut().complete(3, 1, SUCCESS, 0);
+    assert_eq!(controller.completed_stream(&one), Some(Ok(64)));
+    assert!(controller.finished.is_empty());
+}
+
 #[test]
 fn transferless_stream_errors_reset_the_endpoint_like_linux() {
     let mut dma = TestRegion::new(256 * 1024 * 8);
