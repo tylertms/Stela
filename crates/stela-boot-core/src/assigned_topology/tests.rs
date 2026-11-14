@@ -602,7 +602,16 @@ fn original_t8112_adapter_projects_dense_driver_ids_for_every_worker_count() {
             &self.0
         }
     }
-    for count in 1..=8 {
+    // The PMGR enables both CPU complexes by index, so one PE cannot form
+    // this guest and every other count keeps a PE of each complex.
+    assert!(
+        Source::t8112_assigned(&original, &first, identity, 0, 1)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("each of the two CPU complexes")
+    );
+    for count in 2..=8 {
         let roster = Roster(
             (0..count)
                 .map(|worker| AssignedCore {
@@ -629,7 +638,11 @@ fn original_t8112_adapter_projects_dense_driver_ids_for_every_worker_count() {
                 .iter()
                 .map(|node| node.property("reg").unwrap().as_u32().unwrap())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 0x100, 0x101, 0x102, 0x103][..count]
+            [0, 1, 2, 3][..count.min(5) - 1]
+                .iter()
+                .chain(&[0x100, 0x101, 0x102, 0x103][..count.saturating_sub(4).max(1)])
+                .copied()
+                .collect::<Vec<_>>()
         );
         assert_eq!(prepared.receipt.cpu_ids.len(), count);
         assert_eq!(prepared.receipt.harvesting, (count < 8).then_some(1));

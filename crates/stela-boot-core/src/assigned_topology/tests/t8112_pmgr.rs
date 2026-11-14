@@ -6,9 +6,13 @@
 //! `die-cluster-id`/`cluster-core-id` from the node or, absent, from MPIDR
 //! Aff1/Aff0 (`ml_get_topology_info` helper at 0xfffffe000bda6da0), and
 //! numbers its clusters in discovery order; ApplePMGR builds complexes and
-//! numbers core records in the mode `acc-harvesting` selects; and
+//! numbers core records in the mode `acc-harvesting` selects;
 //! `AppleT8110PMGR::setCPUCoreEnergyAccumulator` checks each numbered core
-//! against that topology.
+//! against that topology; and `AppleT8110PMGR::restoreHW` and `quiesceHW`
+//! enable and disable complexes 0 and 1 by constant index
+//! (0xfffffe0009fbc9a4, 0xfffffe0009fbc9e8, 0xfffffe0009fbc628,
+//! 0xfffffe0009fbc668), which `ApplePMGR::enableCPUComplex` requires below
+//! the complexes built (0xfffffe0009ba7750).
 use super::*;
 use stela_soc_data::board;
 
@@ -296,9 +300,26 @@ fn topology(tree: &DeviceTree) -> Topology {
     Topology { cpus, clusters }
 }
 
-/// ApplePMGR's numbered cores (CPU number, complex, index in complex) in
-/// `mode`, from the tree's perf domains and records.
-fn pmgr_cores(tree: &DeviceTree, mode: u32, topology: &Topology) -> Vec<(usize, usize, u32)> {
+/// One numbered ApplePMGR core record.
+#[derive(Debug, Clone, Copy)]
+struct PmgrCore {
+    /// The CPU number (`CPUCore+0xae0`), which `function-enable_core` bits
+    /// and the energy accumulator calls name.
+    cpu: usize,
+    complex: usize,
+    /// The index among the complex's numbered cores.
+    index: u32,
+    /// The record's physical core in its complex (`CPUCore+0xae4`), the bit
+    /// `enableCPUCores` sets in the complex.
+    physical: u32,
+}
+/// ApplePMGR's built complexes and numbered cores in `mode`, from the tree's
+/// perf domains and records.
+struct Pmgr {
+    complexes: usize,
+    cores: Vec<PmgrCore>,
+}
+fn pmgr(tree: &DeviceTree, mode: u32, topology: &Topology) -> Pmgr {
     let pmgr = tree.node("/arm-io/pmgr").unwrap();
     let mut complexes = [None; 256];
     let mut created = 0;
@@ -321,6 +342,7 @@ fn pmgr_cores(tree: &DeviceTree, mode: u32, topology: &Topology) -> Vec<(usize, 
         .map(|row| row[3])
         .collect::<Vec<_>>();
     let mut cores = vec![0u32; created];
+    let mut physical = vec![0u32; created];
     let mut numbered = Vec::new();
     for row in pmgr.property("devices").unwrap().value.chunks(48) {
         if row[0] & 0x10 != 0 || !cpu_domains.contains(&row[2]) {
@@ -336,21 +358,41 @@ fn pmgr_cores(tree: &DeviceTree, mode: u32, topology: &Topology) -> Vec<(usize, 
         {
             continue;
         }
+        physical[complex] += 1;
         if mode == 1 && cores[complex] as usize >= topology.clusters[complex] {
             continue;
         }
-        numbered.push((numbered.len(), complex, cores[complex]));
+        numbered.push(PmgrCore {
+            cpu: numbered.len(),
+            complex,
+            index: cores[complex],
+            physical: physical[complex] - 1,
+        });
         cores[complex] += 1;
     }
-    numbered
+    Pmgr {
+        complexes: created,
+        cores: numbered,
+    }
+}
+
+/// `enableCPUComplex`'s REQUIRE for the complexes `restoreHW` and
+/// `quiesceHW` name by constant index.
+fn complexes(pmgr: &Pmgr) -> core::result::Result<(), String> {
+    for complex in [0, 1] {
+        if complex >= pmgr.complexes {
+            return Err(format!(
+                "complex {complex} >= _cpuComplexCount {}",
+                pmgr.complexes
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `setCPUCoreEnergyAccumulator`'s three REQUIREs for every numbered core.
-fn accumulators(
-    topology: &Topology,
-    cores: &[(usize, usize, u32)],
-) -> core::result::Result<(), String> {
-    for &(core, _, _) in cores {
+fn accumulators(topology: &Topology, cores: &[PmgrCore]) -> core::result::Result<(), String> {
+    for &PmgrCore { cpu: core, .. } in cores {
         if core >= topology.cpus.len() {
             return Err(format!("core {core} >= num_cpus {}", topology.cpus.len()));
         }
@@ -368,12 +410,14 @@ fn accumulators(
 #[test]
 fn every_reduced_t8112_roster_matches_the_kernel_and_pmgr_topology() {
     let original = original().serialize();
-    for count in 1..=8usize {
+    for count in 2..=8usize {
         let tree = project(&original, 0, count).unwrap();
         let topology = topology(&tree);
-        let e = count.min(4);
-        let p = count - e;
-        // The kept CPUs are each cluster's first, E before P, as a prefix.
+        // The P complex keeps at least its first core for the PMGR's
+        // complex 1; the E complex takes the rest, up to its four.
+        let p = count.saturating_sub(4).max(1);
+        let e = count - p;
+        // The kept CPUs are each cluster's first, E before P.
         assert_eq!(
             tree.node("/cpus")
                 .unwrap()
@@ -381,12 +425,13 @@ fn every_reduced_t8112_roster_matches_the_kernel_and_pmgr_topology() {
                 .iter()
                 .map(|node| node.property("reg").unwrap().as_u32().unwrap())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 0x100, 0x101, 0x102, 0x103][..count]
+            [0, 1, 2, 3][..e]
+                .iter()
+                .chain(&[0x100, 0x101, 0x102, 0x103][..p])
+                .copied()
+                .collect::<Vec<_>>()
         );
-        assert_eq!(
-            topology.clusters,
-            [e, p].into_iter().filter(|&n| n > 0).collect::<Vec<_>>()
-        );
+        assert_eq!(topology.clusters, [e, p]);
         // Counts agree across /cpus, the AIC and the topology.
         assert_eq!(u32_of(&tree, "/cpus", "max_cpus"), Some(count as u32));
         assert_eq!(u32_of(&tree, "/cpus", "e-core-count"), Some(e as u32));
@@ -403,51 +448,71 @@ fn every_reduced_t8112_roster_matches_the_kernel_and_pmgr_topology() {
         );
         let mode = u32_of(&tree, "/arm-io/pmgr", "acc-harvesting");
         assert_eq!(mode, (count < 8).then_some(1), "count {count}");
-        let cores = pmgr_cores(&tree, mode.unwrap_or(0), &topology);
-        accumulators(&topology, &cores).unwrap_or_else(|e| panic!("count {count}: {e}"));
-        // PMGR core n is kernel CPU n, physically: complex n is cluster n
-        // and the index in the complex is the core in its cluster.
-        assert_eq!(cores.len(), count);
-        for (core, complex, index) in cores {
+        let built = pmgr(&tree, mode.unwrap_or(0), &topology);
+        complexes(&built).unwrap_or_else(|e| panic!("count {count}: {e}"));
+        accumulators(&topology, &built.cores).unwrap_or_else(|e| panic!("count {count}: {e}"));
+        // PMGR core n is kernel CPU n: its complex is the CPU's cluster, its
+        // index the CPU's core in that cluster, and its physical core the
+        // same, as each cluster keeps its first cores.
+        assert_eq!(built.cores.len(), count);
+        let nodes = &tree.node("/cpus").unwrap().children;
+        for core in built.cores {
             assert_eq!(
-                topology.cpus[core],
-                (complex as u32, index),
+                topology.cpus[core.cpu],
+                (core.complex as u32, core.index),
                 "count {count}"
             );
-            // enableCPUCores tests the CPU number's bit, and the PMGR's
-            // physical widths [4, 4] place that bit on the same core.
-            let node = &tree.node("/cpus").unwrap().children[core];
+            assert_eq!(core.physical, core.index);
+            // enableCPUCores tests the CPU number's bit and sets the
+            // record's physical core in its complex: the CPU's own core.
+            let node = &nodes[core.cpu];
             let enable = &node.property("function-enable_core").unwrap().value;
-            assert_eq!(enable[8..], (1u32 << core).to_le_bytes());
-            assert_eq!((core / 4, core % 4), (complex, index as usize));
+            assert_eq!(enable[8..], (1u32 << core.cpu).to_le_bytes());
+            assert_eq!(
+                node.property("reg").unwrap().as_u32(),
+                Some(((core.complex as u32) << 8) | core.physical)
+            );
         }
         if count < 8 {
             // The source constructor mode numbers every original record and
-            // fails the accumulator check: the reported panic.
-            let source_mode = pmgr_cores(&tree, 0, &topology);
-            assert_eq!(source_mode.len(), 8);
+            // fails the accumulator check: the first reported panic.
+            let source_mode = pmgr(&tree, 0, &topology);
+            assert_eq!(source_mode.cores.len(), 8);
             assert!(
-                accumulators(&topology, &source_mode)
+                accumulators(&topology, &source_mode.cores)
                     .unwrap_err()
                     .contains(">= num_cpus")
             );
         }
     }
+    // A roster of the E cluster alone builds one complex in mode 1, and
+    // restoreHW's enable of complex 1 fails: the second reported panic.
+    let tree = project(&original, 0, 8).unwrap();
+    let one_cluster = Topology {
+        cpus: (0..4).map(|core| (0, core)).collect(),
+        clusters: vec![4],
+    };
+    assert!(
+        complexes(&pmgr(&tree, 1, &one_cluster))
+            .unwrap_err()
+            .contains("complex 1 >= _cpuComplexCount 1")
+    );
+    // So no single PE can form this guest.
+    let error = project(&original, 0, 1).unwrap_err().to_string();
+    assert!(error.contains("each of the two CPU complexes"), "{error}");
 }
 
 #[test]
 fn a_reduced_roster_without_its_first_cluster_refuses_instead_of_misbinding_the_pmgr() {
     let original = original().serialize();
-    // Booting from P cpu4 keeps P before E, or P alone: kernel cluster 0
-    // would be P while the PMGR's first complex is E.
-    for count in 1..8 {
+    // Booting from P cpu4 keeps P before E: kernel cluster 0 would be P
+    // while the PMGR's first complex is E.
+    for count in 2..8 {
         let error = project(&original, 0x100, count).unwrap_err().to_string();
-        let reason = if count <= 4 {
-            "keep a prefix of the original clusters"
-        } else {
-            "keep the original CPU order"
-        };
-        assert!(error.contains(reason), "count {count}: {error}");
+        assert!(
+            error.contains("keep the original CPU order"),
+            "count {count}: {error}"
+        );
     }
     let tree = project(&original, 0x100, 8).unwrap();
     assert!(tree.property("/arm-io/pmgr", "acc-harvesting").is_none());

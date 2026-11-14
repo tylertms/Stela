@@ -256,7 +256,7 @@ fn selected_t8112_resources_cover_each_worker_once_and_keep_boot_state() {
     }
     let original = authored(false);
     let prepared = authored(true);
-    for count in 1..=8 {
+    for count in 2..=8 {
         let source = BspSource::t8112_assigned(
             &original,
             &prepared,
@@ -314,9 +314,15 @@ fn selected_t8112_resources_cover_each_worker_once_and_keep_boot_state() {
                 .iter()
                 .map(|slot| slot.reg)
                 .collect::<Vec<_>>(),
-            [0x100, 0x101, 0x102, 0x103, 0, 1, 2, 3][..count]
+            // The boot complex holds up to four PEs, and the other complex
+            // always keeps its first PE for the PMGR's complex 0 and 1.
+            [0x100, 0x101, 0x102, 0x103][..count.min(5) - 1]
+                .iter()
+                .chain(&[0, 1, 2, 3][..count.saturating_sub(4).max(1)])
+                .copied()
+                .collect::<Vec<_>>()
         );
-        assert_eq!(resources.clusters.len(), if count <= 4 { 1 } else { 2 });
+        assert_eq!(resources.clusters.len(), 2);
         assert_eq!(
             resources
                 .powers
@@ -334,7 +340,7 @@ fn selected_t8112_resources_cover_each_worker_once_and_keep_boot_state() {
             resources.clusters.len()
         );
     }
-    for count in [0, 9, usize::MAX] {
+    for count in [0, 1, 9, usize::MAX] {
         assert!(
             BspSource::t8112_assigned(
                 &original,

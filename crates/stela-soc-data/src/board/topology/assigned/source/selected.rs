@@ -11,7 +11,8 @@ impl<'a> BspSource<'a> {
     /// caller must keep a started physical roster and join native permission.
     /// Selection keeps the source boot PE first and each complex contiguous
     /// for XNU's L2-sharing interval consumer, preserving source order within
-    /// each complex after the boot member.
+    /// each complex after the boot member. Both complexes keep at least one
+    /// PE; the other complex takes only the PEs the boot complex cannot hold.
     /// No running state, power ACK, interrupt or executor is manufactured here.
     pub fn t8112_assigned(
         original: &'a [u8],
@@ -37,14 +38,35 @@ impl<'a> BspSource<'a> {
                 "assigned T8112 worker count exceeds the qualified source envelope"
             ));
         }
-        let mut regs = vec![boot_reg];
+        // AppleT8110PMGR::restoreHW and quiesceHW enable and disable CPU
+        // complexes 0 and 1 by constant index, and
+        // ApplePMGR::enableCPUComplex requires that index below the number of
+        // complexes it built from the kept CPUs. Each complex therefore keeps
+        // at least one PE, and a single PE cannot form this guest.
+        // AppleT8112PMGR's SRAM energy accessors pick a bank by CPU number
+        // (0xfffffe0009fc43c4), so with a partial E complex a P core's
+        // samples use a pruned E core's bank; every original bank stays
+        // mapped from `hw-dpe-reg` and holds what software writes.
+        if count < 2 {
+            return Err(refuse!(
+                "assigned T8112 roster needs a PE in each of the two CPU complexes its PMGR enables"
+            ));
+        }
         let boot_complex = boot_reg >> 8;
-        for same_complex in [true, false] {
+        let mut boot_size = 0;
+        for node in &nodes {
+            if word(node, "reg")? >> 8 == boot_complex {
+                boot_size += 1;
+            }
+        }
+        let other = count.saturating_sub(boot_size).max(1);
+        let mut regs = vec![boot_reg];
+        for (same_complex, limit) in [(true, count - other), (false, count)] {
             for node in &nodes {
                 let reg = word(node, "reg")?;
                 if reg != boot_reg
                     && (reg >> 8 == boot_complex) == same_complex
-                    && regs.len() < count
+                    && regs.len() < limit
                 {
                     regs.push(reg);
                 }
