@@ -201,6 +201,14 @@ static EXITS: ExitWatch = ExitWatch::new();
 /// phase: no turn should come near it.
 const LONG_TURN_MILLIS: u64 = 50;
 
+/// A deferred job this long or longer is reported, each one longer than any
+/// before: its processor's guest took no interrupt meanwhile, and XNU
+/// panics when a processor stays out of its guest for about half a second.
+const LONG_JOB_MILLIS: u64 = 100;
+
+/// The longest deferred job reported so far, in TSC ticks.
+static LONGEST_JOB: AtomicU64 = AtomicU64::new(0);
+
 /// Runs one deferred compilation, between two slices of a processor's guest
 /// and never inside a guest's call: a job runs whole, as the compilers have
 /// no point to stop at, so a processor with no guest work to do takes it
@@ -234,7 +242,20 @@ pub(in crate::engine) fn run_job(taker: Taker) -> bool {
                 unsafe { with_interrupts(|| service.run_job(older)) }
             }
         };
-        measured_job(run)
+        let began = host::rdtsc();
+        let ran = measured_job(run);
+        let took = host::rdtsc().wrapping_sub(began);
+        if ran
+            && took >= LONG_JOB_MILLIS * millis
+            && LONGEST_JOB.fetch_max(took, Ordering::Relaxed) < took
+        {
+            output::arguments(format_args!(
+                "GPU LONG JOB ms={} taker={taker:?} pe={}: its guest took no interrupt meanwhile\n",
+                took / millis.max(1),
+                host::processor()
+            ));
+        }
+        ran
     });
     if taker == Taker::Busy {
         // After a job, busy processors leave the next to a waiting one for
