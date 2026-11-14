@@ -88,6 +88,10 @@ pub trait Platform {
     fn warn(&self, file: &CStr, line: i32, condition: Option<&CStr>);
     /// An operation Stela does not provide; the caller continues degraded.
     fn unsupported(&self, operation: &CStr);
+    /// A terminal stop of Linux code, already reported through [`Self::log`]
+    /// at `LOGLEVEL_EMERG`: an owner with a stop of its own names it here and
+    /// does not return. The C caller traps when this returns, as by default.
+    fn fatal(&self, _message: &CStr) {}
     /// Bytes from an already seeded generator. Must not sleep or allocate.
     fn random_bytes(&self, bytes: &mut [u8]);
     /// Mix auxiliary device input into the same retained stream. False means
@@ -182,9 +186,10 @@ struct Services {
     realtime_at: unsafe extern "C" fn(*mut c_void, i64, u32, u32, *mut i64, *mut u32) -> bool,
     mix_random: unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> bool,
     boottime_ns: unsafe extern "C" fn(*mut c_void, *mut i64) -> bool,
+    fatal: unsafe extern "C" fn(*mut c_void, *const c_char),
 }
 
-const _: () = assert!(size_of::<Services>() == 208);
+const _: () = assert!(size_of::<Services>() == 216);
 const _: () = {
     assert!(core::mem::offset_of!(Services, now_ns) == 0);
     assert!(core::mem::offset_of!(Services, minimum_delay_us) == 8);
@@ -212,6 +217,7 @@ const _: () = {
     assert!(core::mem::offset_of!(Services, realtime_at) == 184);
     assert!(core::mem::offset_of!(Services, mix_random) == 192);
     assert!(core::mem::offset_of!(Services, boottime_ns) == 200);
+    assert!(core::mem::offset_of!(Services, fatal) == 208);
 };
 
 /// `struct stela_linux_owner`.
@@ -341,6 +347,11 @@ mod trampolines {
             let condition = (!condition.is_null()).then(|| text(condition));
             platform::<P>(context).warn(text(file), line, condition);
         }
+    }
+
+    pub unsafe extern "C" fn fatal<P: Platform>(context: *mut c_void, message: *const c_char) {
+        // SAFETY: see the module.
+        unsafe { platform::<P>(context).fatal(text(message)) };
     }
 
     pub unsafe extern "C" fn unsupported<P: Platform>(
@@ -576,6 +587,7 @@ impl<P: Platform> Owner<P> {
                 log: t::log::<P>,
                 warn: t::warn::<P>,
                 unsupported: t::unsupported::<P>,
+                fatal: t::fatal::<P>,
                 random_bytes: t::random_bytes::<P>,
                 mix_random: t::mix_random::<P>,
                 shutdown: t::shutdown::<P>,
@@ -628,6 +640,8 @@ mod tests {
         tsc_hz: Cell<Option<core::num::NonZeroU64>>,
         events: RefCell<Vec<String>>,
         fatal_log: Option<std::path::PathBuf>,
+        /// Where an owner with a stop of its own records it, then exits.
+        stop: Option<std::path::PathBuf>,
     }
 
     impl Fake {
@@ -667,6 +681,12 @@ mod tests {
         }
         fn unsupported(&self, operation: &CStr) {
             self.note(std::format!("unsupported {operation:?}"));
+        }
+        fn fatal(&self, message: &CStr) {
+            if let Some(path) = &self.stop {
+                std::fs::write(path, message.to_bytes()).unwrap();
+                std::process::exit(17);
+            }
         }
         fn random_bytes(&self, bytes: &mut [u8]) {
             bytes.fill(7);
@@ -788,6 +808,52 @@ mod tests {
         assert!(!directory.join("logged").exists());
         assert!(!directory.join("dropped").exists());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn a_linux_fatal_reaches_the_owners_own_stop_after_its_report() {
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "STELA_OWNER_FATAL_STOP";
+        const TEST: &str =
+            "owner::tests::a_linux_fatal_reaches_the_owners_own_stop_after_its_report";
+        unsafe extern "C" {
+            fn stela_linux_fatal(message: *const c_char) -> !;
+        }
+        if let Some(directory) = std::env::var_os(CHILD) {
+            let directory = std::path::PathBuf::from(directory);
+            let stop = directory.join("stop");
+            let owner = Owner::new(Fake {
+                fatal_log: Some(directory.join("logged")),
+                stop: (!stop.exists()).then_some(stop),
+                ..Fake::default()
+            });
+            // SAFETY: isolated process, one retained owner, balanced entry.
+            unsafe { stela_linux_enter(owner.raw()) };
+            // SAFETY: the entered owner stays retained; this never returns.
+            unsafe { stela_linux_fatal(c"IRQ action retirement unavailable".as_ptr()) };
+        }
+        let run = |directory: &std::path::Path| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, directory)
+                .status()
+                .unwrap()
+        };
+        let directory = tempfile::tempdir().unwrap();
+        // An owner with a stop of its own ends the process there: no trap.
+        let status = run(directory.path());
+        assert_eq!(status.code(), Some(17), "{status:?}");
+        assert!(directory.path().join("logged").exists());
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("stop")).unwrap(),
+            "IRQ action retirement unavailable"
+        );
+        // An owner whose stop returns still traps after the report.
+        std::fs::remove_file(directory.path().join("logged")).unwrap();
+        let status = run(directory.path());
+        assert_eq!(status.signal(), Some(libc::SIGILL), "{status:?}");
+        assert!(directory.path().join("logged").exists());
     }
 
     #[test]

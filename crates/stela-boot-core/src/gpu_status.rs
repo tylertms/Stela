@@ -62,6 +62,20 @@ pub fn failed(adapters: &[Adapter], error: &str) -> String {
     )
 }
 
+/// The reason the boot stops when Linux's GPU driver stops for good, `stop`
+/// naming what it could not do. `failed_start` is the first error Linux
+/// reported while the GPUs started, when the stop came before the start
+/// finished: it says why the GPU did not start.
+pub fn driver_stopped(stop: &str, failed_start: Option<&str>) -> String {
+    match failed_start {
+        Some(error) => format!(
+            "the NVIDIA GPU did not start ({error}), and Stela cannot yet finish the GPU \
+             driver's cleanup after that ({stop})"
+        ),
+        None => format!("the GPU driver stopped: {stop}"),
+    }
+}
+
 /// How the screen names a display adapter: its maker, PCI address and
 /// device ID.
 pub fn adapter(adapter: &Adapter) -> String {
@@ -159,6 +173,20 @@ mod tests {
              ported to Stela"
         );
         assert!(adapter(&at(1, Vendor::Other(0x1af4), 0x1050)).contains("PCI vendor 1af4"));
+    }
+
+    #[test]
+    fn a_driver_stop_after_a_failed_start_names_the_first_error() {
+        assert_eq!(
+            driver_stopped(
+                "IRQ action retirement unavailable; request retained",
+                Some("nouveau 0000:01:00.0: gsp: init failed, -22")
+            ),
+            "the NVIDIA GPU did not start (nouveau 0000:01:00.0: gsp: init failed, -22), and \
+             Stela cannot yet finish the GPU driver's cleanup after that (IRQ action retirement \
+             unavailable; request retained)"
+        );
+        assert_eq!(driver_stopped("x", None), "the GPU driver stopped: x");
     }
 
     #[test]

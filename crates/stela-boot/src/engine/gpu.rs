@@ -376,6 +376,9 @@ struct Host {
     lines: RefCell<Vec<Line>>,
     /// The unsupported operations already reported.
     reported: RefCell<BTreeSet<String>>,
+    /// The first error Linux reported, which a stop before the start
+    /// finished names as the reason the GPU did not start.
+    first_error: RefCell<Option<String>>,
 }
 
 impl Host {
@@ -467,6 +470,29 @@ impl Platform for Host {
     fn log(&self, level: i32, message: &CStr) {
         let message = message.to_str().unwrap_or("(not UTF-8)").trim_end();
         self.report(format_args!("<{level}> {message}"));
+        // KERN_ALERT to KERN_ERR; KERN_EMERG is a terminal stop's own report.
+        if (1..=3).contains(&level) {
+            let mut first = self.first_error.borrow_mut();
+            if first.is_none() {
+                *first = Some(message.to_owned());
+            }
+        }
+    }
+
+    fn fatal(&self, message: &CStr) {
+        // A named stop in place of the C caller's trap, which the engine
+        // would report as an unexpected exception.
+        let message = message.to_str().unwrap_or("(not UTF-8)").trim_end();
+        // Before the start finished, its first error is why the GPU did not
+        // start; after it, an error is a running GPU's and names nothing.
+        let failed_start = match installed() {
+            None => self.first_error.borrow().clone(),
+            Some(_) => None,
+        };
+        output::fatal(stela_boot_core::gpu_status::driver_stopped(
+            message,
+            failed_start.as_deref(),
+        ))
     }
 
     fn warn(&self, file: &CStr, line: i32, condition: Option<&CStr>) {
@@ -1710,6 +1736,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         devices: RefCell::new(BTreeMap::new()),
         lines: RefCell::new(lines),
         reported: RefCell::new(BTreeSet::new()),
+        first_error: RefCell::new(None),
     };
     // SAFETY: boot's original code and allocator remain installed permanently.
     unsafe {

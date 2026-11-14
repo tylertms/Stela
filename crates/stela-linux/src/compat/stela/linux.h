@@ -91,6 +91,10 @@ struct stela_linux_services {
 	/* Actual elapsed time since this Linux boot, including any suspend.
 	 * Bounded read from the retained owner. False leaves *now unchanged. */
 	bool (*boottime_ns)(void *context, s64 *now);
+	/* A terminal stop the owner names with message, after log reported it.
+	 * It should not return; stela_linux_fatal traps when it does or when the
+	 * owner has none. */
+	void (*fatal)(void *context, const char *message);
 };
 
 struct stela_linux_owner {
@@ -100,7 +104,7 @@ struct stela_linux_owner {
 
 /* Private x86-64 C ABI. All producers and consumers rebuild from this header;
  * Rust mirrors this exact table and checks every x86-64 field offset. */
-_Static_assert(sizeof(struct stela_linux_services) == 208, "Linux services ABI");
+_Static_assert(sizeof(struct stela_linux_services) == 216, "Linux services ABI");
 _Static_assert(__builtin_offsetof(struct stela_linux_services, now_ns) == 0, "Linux now_ns ABI");
 _Static_assert(__builtin_offsetof(struct stela_linux_services, minimum_delay_us) == 8, "Linux minimum_delay_us ABI");
 _Static_assert(__builtin_offsetof(struct stela_linux_services, minimum_deadline_us) == 16, "Linux minimum_deadline_us ABI");
@@ -127,6 +131,7 @@ _Static_assert(__builtin_offsetof(struct stela_linux_services, available_page_fr
 _Static_assert(__builtin_offsetof(struct stela_linux_services, realtime_at) == 184, "Linux realtime ABI");
 _Static_assert(__builtin_offsetof(struct stela_linux_services, mix_random) == 192, "Linux random input ABI");
 _Static_assert(__builtin_offsetof(struct stela_linux_services, boottime_ns) == 200, "Linux boottime ABI");
+_Static_assert(__builtin_offsetof(struct stela_linux_services, fatal) == 208, "Linux fatal ABI");
 _Static_assert(sizeof(struct stela_linux_owner) == 16, "Linux owner ABI");
 
 /* An owner for Linux code that needs none of these services. */
@@ -154,8 +159,8 @@ void stela_linux_printk_flush(void);
 const struct stela_linux_owner *stela_linux_owner(void);
 /* Report an operation Stela does not provide yet to the running owner. */
 void stela_linux_unsupported(const char *operation);
-/* Emit an emergency report through the entered owner, then unconditionally
- * trap without returning; this does not implement Linux panic machinery. */
+/* Emit an emergency report through the entered owner and give it the stop,
+ * then trap if that returns; this does not implement Linux panic machinery. */
 __noreturn void stela_linux_fatal(const char *message);
 
 /* Platform memory behind Linux's allocators: Stela's global heap in its

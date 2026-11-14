@@ -146,7 +146,11 @@ void stela_linux_fatal(const char *message)
 	const struct stela_linux_owner *current_owner = stela_linux_owner();
 	if (current_owner->services->log)
 		current_owner->services->log(current_owner->context, LOGLEVEL_EMERG, message);
-	/* A returning logger cannot turn this failure into a successful return. */
+	/* The owner names the stop, where it has its own, instead of the trap. */
+	if (current_owner->services->fatal)
+		current_owner->services->fatal(current_owner->context, message);
+	/* A returning logger or owner cannot turn this failure into a successful
+	 * return. */
 	__builtin_trap();
 }
 
