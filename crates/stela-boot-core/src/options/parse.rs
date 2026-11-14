@@ -132,6 +132,7 @@ impl ParseState<'_> {
             "--development-restore" => options.development_restore = true,
             "--idle-skip" => options.idle_skip = true,
             "--input" => options.input = true,
+            "--no-guest-bluetooth" => options.no_guest_bluetooth = true,
             "--usb-storage" => {
                 let serial = value().ok_or(Error::MissingUsbStorage)?;
                 if options.usb_storage.iter().any(|other| other == serial) {

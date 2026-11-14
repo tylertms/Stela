@@ -222,6 +222,22 @@ impl Modern {
         entries: u16,
         memory: &DmaBuffer,
     ) -> Result<(u16, Mmio), BlockError> {
+        self.queue_at(handoff, index, entries, memory, AVAIL, USED)
+    }
+
+    /// [`Self::queue`] with the driver and device rings at `driver` and
+    /// `device` bytes into `memory`: VERSION_1 places each part on its own
+    /// (virtio 1.2 section 2.7), so a queue past 16 entries, whose
+    /// descriptors outgrow [`AVAIL`], has its rings after them.
+    pub fn queue_at(
+        &self,
+        handoff: &Handoff,
+        index: u16,
+        entries: u16,
+        memory: &DmaBuffer,
+        driver: usize,
+        device: usize,
+    ) -> Result<(u16, Mmio), BlockError> {
         let common = &self.common;
         common.write16(QUEUE_SELECT, index);
         let maximum = common.read16(QUEUE_SIZE);
@@ -238,8 +254,8 @@ impl Modern {
             if signalled { self.vector } else { NO_VECTOR },
         );
         common.write64(QUEUE_DESCRIPTORS, memory.bus_address());
-        common.write64(QUEUE_DRIVER, memory.bus_address() + AVAIL as u64);
-        common.write64(QUEUE_DEVICE, memory.bus_address() + USED as u64);
+        common.write64(QUEUE_DRIVER, memory.bus_address() + driver as u64);
+        common.write64(QUEUE_DEVICE, memory.bus_address() + device as u64);
         let (bar, start, length, multiplier) = self.notify;
         let offset = u64::from(common.read16(QUEUE_NOTIFY_OFF)) * u64::from(multiplier);
         if offset + 2 > length {
