@@ -133,7 +133,7 @@ impl RootCpu {
             // No CPUID here: it is slow on every CPU and exits under a
             // hypervisor. The caller's `affinity` already proved this is the
             // owning processor (its unique GS record and descriptors), whose
-            // leaves 0, 1 and 6 cannot change; ARAT matters only to the
+            // vendor and family cannot change; ARAT matters only to the
             // timer, and `rearm` checks it before every arm.
             // SAFETY: original owner and CPU remain held. Source checks
             // real control/power eligibility around the coherent read.

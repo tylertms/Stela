@@ -77,31 +77,70 @@ fn msr(snapshot: &Snapshot, index: u32) -> Result<u64, Error> {
     }
     Ok(value)
 }
-/// Linux cc9de5d4 init_amd derives the always-running LAPIC timer for
-/// family0x12 onward even when CPUID6 does not expose the Intel ARAT bit.
+/// CPUID leaf words as `[eax, ebx, ecx, edx]`.
+pub type Leaf = [u32; 4];
+
+fn words(record: Cpuid) -> Leaf {
+    [record.eax, record.ebx, record.ecx, record.edx]
+}
+
+/// What [`deadline_policy`] reads of CPUID leaves 0, 1 and 6: the vendor,
+/// the family, and ARAT where leaf 6 exists. A later check of the same
+/// processor compares these alone. The leaves' other bits follow controls
+/// that may change while the timer runs: CPUID.06H:EAX[1] reads 0 while
+/// IA32_MISC_ENABLE[38] turns turbo off, which some firmware sets and clears
+/// at run time, and CPUID.01H:ECX[27] follows CR4.OSXSAVE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeadlineInputs {
+    vendor: [u32; 3],
+    family: u32,
+    arat: bool,
+}
+
+impl DeadlineInputs {
+    /// The inputs of leaves 0 and 1, and of leaf 6 when leaf 0 lists it.
+    pub fn observe(identity: Leaf, basic: Leaf, thermal: Option<Leaf>) -> Self {
+        let base = basic[0] >> 8 & 15;
+        let family = if base == 15 {
+            base + (basic[0] >> 20 & 255)
+        } else {
+            base
+        };
+        Self {
+            vendor: [identity[1], identity[3], identity[2]],
+            family,
+            arat: identity[0] >= 6 && thermal.is_some_and(|leaf| leaf[0] & (1 << 2) != 0),
+        }
+    }
+
+    /// Linux cc9de5d4 init_amd derives the always-running LAPIC timer for
+    /// family0x12 onward even when CPUID6 does not expose the Intel ARAT bit.
+    pub fn policy(&self) -> Deadline {
+        let amd = self.vendor
+            == [
+                u32::from_le_bytes(*b"Auth"),
+                u32::from_le_bytes(*b"enti"),
+                u32::from_le_bytes(*b"cAMD"),
+            ];
+        if (amd && self.family > 0x11) || self.arat {
+            Deadline::Arat
+        } else {
+            Deadline::RequiresOwnedBroadcast
+        }
+    }
+}
+
+/// The local timer's deadline policy for these observations
+/// ([`DeadlineInputs::policy`]).
 pub fn deadline_policy(snapshot: &Snapshot) -> Result<Deadline, Error> {
-    let identity = leaf(snapshot, 0)?;
-    let basic = leaf(snapshot, 1)?;
-    let amd = [identity.ebx, identity.edx, identity.ecx]
-        == [
-            u32::from_le_bytes(*b"Auth"),
-            u32::from_le_bytes(*b"enti"),
-            u32::from_le_bytes(*b"cAMD"),
-        ];
-    let base = basic.eax >> 8 & 15;
-    let family = if base == 15 {
-        base + (basic.eax >> 20 & 255)
-    } else {
-        base
-    };
-    if amd && family > 0x11 {
-        return Ok(Deadline::Arat);
+    let identity = words(leaf(snapshot, 0)?);
+    let basic = words(leaf(snapshot, 1)?);
+    let vendor_family = DeadlineInputs::observe(identity, basic, None).policy();
+    if vendor_family == Deadline::Arat || identity[0] < 6 {
+        return Ok(vendor_family);
     }
-    if identity.eax >= 6 && leaf(snapshot, 6)?.eax & (1 << 2) != 0 {
-        Ok(Deadline::Arat)
-    } else {
-        Ok(Deadline::RequiresOwnedBroadcast)
-    }
+    let thermal = words(leaf(snapshot, 6)?);
+    Ok(DeadlineInputs::observe(identity, basic, Some(thermal)).policy())
 }
 
 fn intel(identity: Cpuid) -> bool {
@@ -241,5 +280,69 @@ mod deadline_tests {
             deadline_policy(&observed(0x19, false, true)),
             Ok(Deadline::Arat)
         );
+    }
+
+    const INTEL_IDENTITY: Leaf = [
+        0x20,
+        u32::from_le_bytes(*b"Genu"),
+        u32::from_le_bytes(*b"ntel"),
+        u32::from_le_bytes(*b"ineI"),
+    ];
+    /// An Alder Lake BSP: family 6, APIC ID 0, OSXSAVE set.
+    const INTEL_BASIC: Leaf = [0x0009_06a3, 0x0080_0800, 0x7ffa_fbff, 0xbfeb_fbff];
+    /// ARAT, turbo available, HWP.
+    const INTEL_THERMAL: Leaf = [0x00df_8ff7, 0x2, 0x409, 0x0003_0001];
+
+    #[test]
+    fn turbo_and_osxsave_changes_leave_the_deadline_inputs_alone() {
+        let captured = DeadlineInputs::observe(INTEL_IDENTITY, INTEL_BASIC, Some(INTEL_THERMAL));
+        assert_eq!(captured.policy(), Deadline::Arat);
+        // Firmware set IA32_MISC_ENABLE[38]: CPUID.06H:EAX[1] reads 0.
+        let mut turbo_off = INTEL_THERMAL;
+        turbo_off[0] &= !(1 << 1);
+        assert_eq!(
+            DeadlineInputs::observe(INTEL_IDENTITY, INTEL_BASIC, Some(turbo_off)),
+            captured
+        );
+        // CR4.OSXSAVE and IA32_MISC_ENABLE[18] (MONITOR) in leaf 1's ECX.
+        let mut controls = INTEL_BASIC;
+        controls[2] ^= (1 << 27) | (1 << 3);
+        assert_eq!(
+            DeadlineInputs::observe(INTEL_IDENTITY, controls, Some(INTEL_THERMAL)),
+            captured
+        );
+    }
+
+    #[test]
+    fn losing_arat_or_the_vendor_changes_the_deadline_inputs() {
+        let captured = DeadlineInputs::observe(INTEL_IDENTITY, INTEL_BASIC, Some(INTEL_THERMAL));
+        let mut no_arat = INTEL_THERMAL;
+        no_arat[0] &= !(1 << 2);
+        let lost = DeadlineInputs::observe(INTEL_IDENTITY, INTEL_BASIC, Some(no_arat));
+        assert_ne!(lost, captured);
+        assert_eq!(lost.policy(), Deadline::RequiresOwnedBroadcast);
+        // IA32_MISC_ENABLE[22] limits the highest basic leaf to 2: no leaf 6.
+        let mut limited = INTEL_IDENTITY;
+        limited[0] = 2;
+        assert_ne!(
+            DeadlineInputs::observe(limited, INTEL_BASIC, None),
+            captured
+        );
+        let mut other = INTEL_IDENTITY;
+        other[1] = u32::from_le_bytes(*b"Auth");
+        assert_ne!(
+            DeadlineInputs::observe(other, INTEL_BASIC, Some(INTEL_THERMAL)),
+            captured
+        );
+    }
+
+    #[test]
+    fn an_amd_family_past_0x11_needs_no_leaf_6_record() {
+        let mut snapshot = observed(0x19, true, false);
+        snapshot.count = 2;
+        assert_eq!(deadline_policy(&snapshot), Ok(Deadline::Arat));
+        let mut intel = observed(0x19, false, true);
+        intel.count = 2;
+        assert_eq!(deadline_policy(&intel), Err(Error::MissingCpuid(6)));
     }
 }

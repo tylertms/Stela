@@ -17,8 +17,8 @@ mod sequence;
 pub mod sync;
 pub use calibration::{RateWindow, RationalRate, ReferenceScale, Sample, wrapped_delta};
 pub use features::{
-    CounterPolicy, Deadline, HpetPowerConstraint, RateRequirement, Reliability, Serialization,
-    counter_policy, deadline_policy, hpet_power_constraint,
+    CounterPolicy, Deadline, DeadlineInputs, HpetPowerConstraint, Leaf, RateRequirement,
+    Reliability, Serialization, counter_policy, deadline_policy, hpet_power_constraint,
 };
 pub use measurement::{Calibration, WindowEvidence, calibrate_hpet};
 pub use sequence::CounterSequence;
