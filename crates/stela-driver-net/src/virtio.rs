@@ -32,8 +32,14 @@ const CONFIG_STATUS: usize = 6;
 const LINK_UP: u16 = 1;
 const RECEIVE: u16 = 0;
 const TRANSMIT: u16 = 1;
-/// The queue layout `Modern::queue` uses fits 16 descriptors.
-const QUEUE_ENTRIES: u16 = 16;
+/// Receive buffers the device may fill between two reads, at most: the
+/// guest network reads the adapter once per host service, about every
+/// 4 ms, and a device out of buffers holds or drops what arrives (QEMU's
+/// tap queue), so 16 capped a TCP stream into the guest near 6 MB/s. 256
+/// is QEMU's default `rx_queue_size`; a smaller device gets its own size.
+const RECEIVE_ENTRIES: u16 = 256;
+/// Frames in flight to the device at most before a send waits.
+const TRANSMIT_ENTRIES: u16 = 64;
 /// Split used-ring flag, since the driver does not negotiate EVENT_IDX.
 const USED_NO_NOTIFY: u16 = 1;
 /// `virtio_net_hdr` under VERSION_1.
@@ -44,6 +50,23 @@ const BUFFER: usize = 2048;
 const SHORTEST_RECEIVE: usize = HEADER + ETHERNET_HEADER;
 const LONGEST_RECEIVE: usize = HEADER + MAX_FRAME;
 const TRANSMIT_WAIT_US: u64 = 100_000;
+
+/// Where a split queue of `entries` keeps its driver and device rings, and
+/// the bytes it spans: the descriptors at 0, the driver ring after them
+/// (2-byte aligned) and the device ring after that (4-byte aligned, virtio
+/// 1.2 section 2.7). Up to 16 entries this is [`Modern::queue`]'s layout.
+const fn layout(entries: u16) -> (usize, usize, usize) {
+    let entries = entries as usize;
+    let driver = if 16 * entries > AVAIL {
+        16 * entries
+    } else {
+        AVAIL
+    };
+    let device = (driver + 6 + 2 * entries + 3) & !3;
+    let device = if device > USED { device } else { USED };
+    let bytes = (device + 6 + 8 * entries + 4095) & !4095;
+    (driver, device, bytes)
+}
 
 pub fn matches(function: &Function) -> bool {
     matches_identity(&function.identity())
@@ -62,6 +85,9 @@ struct Queue {
     buffers: DmaBuffer,
     notify: Mmio,
     entries: u16,
+    /// The driver and device rings' offsets in `ring` ([`layout`]).
+    driver: usize,
+    device: usize,
     /// The used index consumed so far, and the driver ring's index.
     used: u16,
     available: u16,
@@ -72,16 +98,22 @@ impl Queue {
         transport: &Modern,
         handoff: &Handoff,
         index: u16,
+        entries: u16,
         dma: &mut dyn DmaAllocator,
     ) -> Result<Self, BlockError> {
-        let ring = dma.allocate(4096, 4096)?;
-        let (entries, notify) = transport.queue(handoff, index, QUEUE_ENTRIES, &ring)?;
+        // A device that takes fewer entries leaves the rings room to spare.
+        let (driver, device, bytes) = layout(entries);
+        let ring = dma.allocate(bytes, 4096)?;
+        let (entries, notify) =
+            transport.queue_at(handoff, index, entries, &ring, driver, device)?;
         let buffers = dma.allocate(usize::from(entries) * BUFFER, 4096)?;
         Ok(Self {
             ring,
             buffers,
             notify,
             entries,
+            driver,
+            device,
             used: 0,
             available: 0,
         })
@@ -98,18 +130,18 @@ impl Queue {
 
     /// Add one descriptor to the driver ring without publishing its index.
     fn stage(&mut self, id: u16) {
-        let slot = AVAIL + 4 + 2 * usize::from(self.available % self.entries);
+        let slot = self.driver + 4 + 2 * usize::from(self.available % self.entries);
         self.ring.write(slot, id);
         self.available = self.available.wrapping_add(1);
     }
 
     fn publish(&mut self) {
         fence(Ordering::SeqCst);
-        self.ring.write(AVAIL + 2, self.available);
+        self.ring.write(self.driver + 2, self.available);
         // Expose the new index before checking whether the device needs a
         // kick. A device rearming notifications can then see the new work.
         fence(Ordering::SeqCst);
-        if self.ring.read::<u16>(USED) & USED_NO_NOTIFY == 0 {
+        if self.ring.read::<u16>(self.device) & USED_NO_NOTIFY == 0 {
             self.notify.write16(0, 0);
         }
     }
@@ -132,14 +164,14 @@ impl Queue {
     /// descriptor the driver never offered, or a length past its buffer,
     /// breaks the queue, as Linux `virtqueue_get_buf` does.
     fn take(&mut self) -> Result<Option<(u16, usize)>, Broken> {
-        let produced: u16 = self.ring.read(USED + 2);
+        let produced: u16 = self.ring.read(self.device + 2);
         if self.used == produced {
             return Ok(None);
         }
         // The device publishes the index after writing the used entry and
         // buffer. Order those reads after observing a completed descriptor.
         fence(Ordering::SeqCst);
-        let slot = USED + 4 + 8 * usize::from(self.used % self.entries);
+        let slot = self.device + 4 + 8 * usize::from(self.used % self.entries);
         let id = self.ring.read::<u32>(slot);
         let length = self.ring.read::<u32>(slot + 4) as usize;
         self.used = self.used.wrapping_add(1);
@@ -191,8 +223,8 @@ impl VirtioNet {
                 "virtio-net device without a MAC address",
             ));
         }
-        let receive = Queue::new(&transport, handoff, RECEIVE, dma)?;
-        let transmit = Queue::new(&transport, handoff, TRANSMIT, dma)?;
+        let receive = Queue::new(&transport, handoff, RECEIVE, RECEIVE_ENTRIES, dma)?;
+        let transmit = Queue::new(&transport, handoff, TRANSMIT, TRANSMIT_ENTRIES, dma)?;
         let signalled = transport.signals();
         let device = transport.device;
         let mac = Mac(core::array::from_fn(|n| device.read8(CONFIG_MAC + n)));
@@ -349,6 +381,8 @@ mod tests {
                 buffers: dma.allocate(usize::from(ENTRIES) * BUFFER, 4096).unwrap(),
                 notify: mmio,
                 entries: ENTRIES,
+                driver: AVAIL,
+                device: USED,
                 used: 0,
                 available: 0,
             };
@@ -554,6 +588,24 @@ mod tests {
         give_back(&mut net.transmit, &mut produced, sent, 0);
         assert!(net.transmit(&[1; 60]).is_err());
         assert!(net.broken);
+    }
+
+    /// Small queues keep the transport's fixed layout; the receive queue's
+    /// rings follow its 4 KiB of descriptors without overlapping.
+    #[test]
+    fn queue_layouts_keep_their_parts_apart() {
+        assert_eq!(layout(ENTRIES), (AVAIL, USED, 4096));
+        assert_eq!(layout(16), (AVAIL, USED, 4096));
+        for entries in [32u16, TRANSMIT_ENTRIES, RECEIVE_ENTRIES, 1024] {
+            let (driver, device, bytes) = layout(entries);
+            let n = usize::from(entries);
+            assert_eq!(driver, 16 * n);
+            assert!(driver + 6 + 2 * n <= device);
+            assert_eq!(device % 4, 0);
+            assert!(device + 6 + 8 * n <= bytes);
+            assert_eq!(bytes % 4096, 0);
+        }
+        assert_eq!(layout(RECEIVE_ENTRIES), (4096, 4616, 8192));
     }
 
     #[test]
