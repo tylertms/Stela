@@ -255,7 +255,8 @@ pub(super) fn report(sticks: &[Stick]) -> (String, bool) {
                 due |= stick.record.is_some();
                 let _ = writeln!(text, "Next: {command}");
             }
-            None if stick.record.is_some() => {
+            // A newer stick's line named the download that changes it.
+            None if matches!(stick.state, State::Healthy) => {
                 let _ = writeln!(text, "Nothing to do.");
             }
             None => {}

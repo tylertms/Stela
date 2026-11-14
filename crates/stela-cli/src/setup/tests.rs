@@ -6340,6 +6340,12 @@ fn journey_d_a_newer_stick_is_left_alone() {
         "{shown}"
     );
     assert!(shown.ends_with("└ No problems found."), "{shown}");
+    // Without a terminal: the newer stela to download, and nothing that
+    // says otherwise.
+    let (text, due) = home::report(&home::sticks(&environment(&f.host)).unwrap());
+    assert!(!due, "{text}");
+    assert!(text.contains("Download stela 99.0.0 or newer"), "{text}");
+    assert!(!text.contains("Nothing to do"), "{text}");
     // Nothing that changes the stick is offered.
     assert!(!shown.contains("Update"), "{shown}");
     assert!(!shown.contains("Repair"), "{shown}");
