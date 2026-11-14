@@ -7049,6 +7049,103 @@ fn home_create_dispatches_create_after_wizard_confirmation() {
 }
 
 #[test]
+fn no_download_over_a_gigabyte_starts_without_its_question() {
+    let fetch = |_: &Path, _: &str, _: &str, need: sources::Need| -> Result<sources::Fetched> {
+        anyhow::bail!("asked for {need:?}")
+    };
+    let size = |_: &str, _: &str| -> Result<(u64, u64)> { Ok((1_000_000, 3_000_000_000)) };
+    // A stopped create whose size Apple's server never says: Finish it
+    // asks, saying the size is not known, and a no changes nothing.
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    interrupt_setup(&f);
+    let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
+    let person = ui::tests::Scripted::new(&["Finish it", "no"]);
+    let request = Request {
+        efi: Some(f.efi.clone()),
+        ..Request::home(command::Global::default())
+    };
+    home::run(
+        &Environment {
+            fetch_image: &fetch,
+            ui: &person,
+            ..environment(&f.host)
+        },
+        request,
+    )
+    .unwrap();
+    let shown = person.transcript();
+    assert!(person.done(), "{shown}");
+    assert!(shown.contains("its size is not known yet"), "{shown}");
+    assert!(shown.ends_with("■ Nothing was changed."), "{shown}");
+    assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
+    // `stela repair` without a terminal needs --yes for it.
+    let mut repair = update_request(&f, &f._dir.path().join("cache"));
+    repair.action = Action::Repair;
+    let error = repair
+        .dispatch(&Environment {
+            fetch_image: &fetch,
+            ..environment(&f.host)
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("of a size not known yet") && error.contains("Add --yes"),
+        "{error}"
+    );
+    assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
+    // A stopped macOS switch: its choice names the size, and asks nothing
+    // more once chosen.
+    let f = made_by(Some(release::CURRENT));
+    let mut switching = record(&f);
+    switching.replacing = Some("STELA2".into());
+    record::write_record(&f.esp, &switching).unwrap();
+    let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
+    let person = ui::tests::Scripted::new(&["Finish the switch to macOS STELA2"]);
+    let request = Request {
+        efi: Some(f.efi.clone()),
+        ..Request::home(command::Global::default())
+    };
+    let error = home::run(
+        &Environment {
+            image_size: &size,
+            fetch_image: &fetch,
+            ui: &person,
+            ..environment(&f.host)
+        },
+        request,
+    )
+    .unwrap_err()
+    .to_string();
+    let shown = person.transcript();
+    assert!(
+        shown.contains(
+            "○ Finish the switch to macOS STELA2 · Downloads the rest of the new copy (3.0 GB)"
+        ),
+        "{shown}"
+    );
+    assert!(!shown.contains("from Apple"), "{shown}");
+    assert!(error.contains("asked for WholeImage"), "{error}");
+    // `stela repair` asks for it, and without a terminal needs --yes.
+    let mut repair = update_request(&f, &f._dir.path().join("cache"));
+    repair.action = Action::Repair;
+    let error = repair
+        .dispatch(&Environment {
+            image_size: &size,
+            fetch_image: &fetch,
+            ..environment(&f.host)
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("this downloads 3.0 GB") && error.contains("Add --yes"),
+        "{error}"
+    );
+    assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
+}
+
+#[test]
 fn a_card_reader_without_a_card_is_no_stick() {
     // Linux lists an empty reader with size 0, and Windows gives it no
     // size when its geometry cannot be read.

@@ -442,6 +442,9 @@ struct Offers {
     /// What finishing a create downloads, when known.
     finish_bytes: Option<u64>,
     finish: String,
+    /// What finishing a macOS switch downloads, when known.
+    switch_bytes: Option<u64>,
+    switch: String,
     update: String,
     macos: Option<(&'static builds::Build, MacosText)>,
 }
@@ -462,6 +465,17 @@ impl Offers {
             ),
             None => "Keeps what is written, checks it, and writes the rest".into(),
         };
+        let switch_bytes = match (&stick.state, record) {
+            (State::Replacing(next), Some(record)) => switch_bytes(environment, record, next),
+            _ => None,
+        };
+        let switch = match switch_bytes {
+            Some(bytes) => format!(
+                "Downloads the rest of the new copy ({})",
+                host::size_text(bytes)
+            ),
+            None => "Writes the rest of the new copy".into(),
+        };
         let update = match stick.state {
             State::Older => update_text(environment, record),
             _ => String::new(),
@@ -473,10 +487,29 @@ impl Offers {
         Self {
             finish_bytes,
             finish,
+            switch_bytes,
+            switch,
             update,
             macos,
         }
     }
+}
+
+/// What finishing `record`'s switch to `build` downloads, when its source
+/// can be found now.
+fn switch_bytes(environment: &Environment<'_>, record: &Record, build: &str) -> Option<u64> {
+    let lookup = sources::Lookup {
+        need: sources::need(record, build, true)?,
+        build,
+        model: &record.model,
+        ipsw: None,
+        download_dir: None,
+        medium: record.medium_of(build),
+    };
+    sources::locate(environment, &lookup)
+        .ok()
+        .map(|source| sources::download_bytes(&source))
+        .filter(|&bytes| bytes > 0)
 }
 
 /// A complete stick that this stela may change.
@@ -538,7 +571,7 @@ fn row(choice: Choice, stick: &Stick, offers: &Offers, first: bool) -> super::wi
             };
             (
                 format!("Finish the switch to macOS {next}"),
-                "Writes the rest of the new copy",
+                offers.switch.as_str(),
             )
         }
         Choice::Update if first => ("Update".into(), ""),
@@ -713,7 +746,14 @@ fn run_choice(
                 ..maintenance(Action::Repair)
             },
         ),
-        Choice::FinishSwitch | Choice::Repair => perform(environment, maintenance(Action::Repair)),
+        Choice::FinishSwitch => perform(
+            environment,
+            Request {
+                accepted_download: offers.switch_bytes,
+                ..maintenance(Action::Repair)
+            },
+        ),
+        Choice::Repair => perform(environment, maintenance(Action::Repair)),
         Choice::Update => {
             act_on(environment, maintenance(Action::UpdateStela))?;
             offer_macos(environment, &request, &volume)

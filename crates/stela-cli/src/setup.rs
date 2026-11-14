@@ -1116,8 +1116,14 @@ impl Request {
         )
     }
 
-    /// Bring the stick of `record` to the request's build of macOS.
-    fn update_os(&self, environment: &Environment<'_>, mut record: Record) -> Result<String> {
+    /// Bring the stick of `record` to the request's build of macOS; `named`
+    /// when the command named that build, as `update --macos` does.
+    fn update_os(
+        &self,
+        environment: &Environment<'_>,
+        mut record: Record,
+        named: bool,
+    ) -> Result<String> {
         check_installed_efi(environment, &record)?;
         record.install_image = self.install_image.or(record.install_image);
         update::update_os(
@@ -1130,6 +1136,8 @@ impl Request {
                 download_dir: self.download_dir.as_deref(),
                 dry_run: self.dry_run,
                 yes: self.yes,
+                named,
+                accepted: self.accepted_download,
             },
         )
     }
@@ -1182,15 +1190,14 @@ impl Request {
         match action {
             // An interrupted first setup is finished as it began.
             Action::Repair if !record.complete => self.finish_create(environment, &record),
-            // A macOS switch that removed the old copy for room goes on.
+            // A macOS switch that removed the old copy for room goes on. The
+            // repair names no download: a large one is asked about, unless
+            // the menu's choice named its size.
             Action::Repair if record.replacing.is_some() => Request {
-                action: Action::UpdateOs,
                 build: record.replacing.clone().unwrap_or_default(),
-                // The old copy is gone already: nothing is left to ask about.
-                yes: true,
                 ..self
             }
-            .dispatch(environment),
+            .update_os(environment, record, false),
             // What `status` names `update` for (`needs_update`) is put
             // right as `update` does it, and the repair goes on with the
             // rest.
@@ -1221,7 +1228,7 @@ impl Request {
                 }
                 Ok(text)
             }
-            Action::UpdateOs => self.update_os(environment, record),
+            Action::UpdateOs => self.update_os(environment, record, true),
             Action::NextBoot(next) => self.next_boot(environment, &record, next),
             Action::Configure => {
                 // Without a terminal nothing is asked, so a run that names
@@ -1273,21 +1280,31 @@ impl Request {
         if self.wifi.is_some() && self.wifi_passphrase_file.is_none() && key.is_file() {
             self.wifi_passphrase = Some(wifi::read_passphrase(&key)?);
         }
-        if !self.dry_run
-            && let Some(bytes) = resume_bytes(
+        if !self.dry_run {
+            let what = format!("the rest of macOS {}", record.build);
+            match resume_bytes(
                 environment,
                 record,
                 self.ipsw.as_deref(),
                 self.download_dir.as_deref(),
-            )
-        {
-            consent_download(
-                environment,
-                self.yes || self.accepted_download == Some(bytes),
-                false,
-                bytes,
-                &format!("the rest of macOS {}", record.build),
-            )?;
+            ) {
+                Some(bytes) => consent_download(
+                    environment,
+                    self.yes || self.accepted_download == Some(bytes),
+                    false,
+                    bytes,
+                    &what,
+                )?,
+                // Apple's server did not say its size: asked without one.
+                None => consent(
+                    environment,
+                    self.yes,
+                    &format!(
+                        "This downloads {what} from Apple; its size is not known yet. Download it?"
+                    ),
+                    &format!("this downloads {what} from Apple, of a size not known yet"),
+                )?,
+            }
         }
         self.action = Action::Create;
         self.create(environment)

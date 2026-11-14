@@ -495,6 +495,13 @@ pub(super) struct OsOptions<'a> {
     pub(super) dry_run: bool,
     /// `--yes`: remove the old copy for room without asking.
     pub(super) yes: bool,
+    /// The command named the download, as `update --macos` does: without a
+    /// terminal it is not asked about. A repair that finishes a stopped
+    /// switch names none.
+    pub(super) named: bool,
+    /// The bytes of a download plain `stela`'s choice named and the person
+    /// chose, which is not asked about again.
+    pub(super) accepted: Option<u64>,
 }
 
 /// Add the new build's install medium and every machine's restore bundles,
@@ -511,6 +518,8 @@ pub(super) fn update_os(
         download_dir,
         dry_run,
         yes,
+        named,
+        accepted,
     } = options;
     // Everything that can refuse the update comes before any download.
     check_bundle_revision(environment, &record)?;
@@ -596,11 +605,12 @@ pub(super) fn update_os(
     };
     // `--macos` names the download, so only a terminal run asks first.
     if !dry_run {
+        let bytes = super::sources::download_bytes(&source);
         super::consent_download(
             environment,
-            yes,
-            true,
-            super::sources::download_bytes(&source),
+            yes || accepted == Some(bytes),
+            named,
+            bytes,
             &format!("macOS {build}"),
         )?;
     }
