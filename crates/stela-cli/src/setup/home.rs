@@ -115,7 +115,15 @@ impl Stick {
         };
         match &self.state {
             State::Empty if self.disk.bytes != 0 && self.disk.bytes < NETWORK_MIN => None,
-            State::Empty => Some(format!("stela create {}", self.path())),
+            // Without a terminal, erasing needs the stick typed back.
+            State::Empty => Some(format!(
+                "stela create {} --confirm-disk {}",
+                self.path(),
+                match self.disk.bytes {
+                    0 => super::quoted(&self.disk.name),
+                    bytes => host::size_text(bytes).replace(' ', ""),
+                }
+            )),
             State::Interrupted | State::Replacing(_) | State::Damaged(_) => {
                 Some(format!("stela repair{}", stick()))
             }

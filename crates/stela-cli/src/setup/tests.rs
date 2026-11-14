@@ -6469,8 +6469,21 @@ fn journey_h_without_a_terminal_plain_stela_reports_and_fails_when_something_is_
     home::run(&environment(&f.host), request).unwrap();
     let (text, due) = home::report(&home::sticks(&environment(&f.host)).unwrap());
     assert!(!due, "{text}");
-    let command = format!("Next: stela create {}disk5", host::DISK_PREFIX);
-    assert!(text.contains(&command), "{text}");
+    // It is a command that runs without a terminal: the stick is typed back,
+    // in words that confirm it.
+    let command = format!(
+        "Next: stela create {}disk5 --confirm-disk ",
+        host::DISK_PREFIX
+    );
+    let line = text
+        .lines()
+        .find(|line| line.starts_with(&command))
+        .unwrap_or_else(|| panic!("{command:?} missing:\n{text}"));
+    let typed = &line[command.len()..];
+    let disk = f.host.disks().unwrap();
+    let disk = disk.iter().find(|d| d.identifier == "disk5").unwrap();
+    assert!(disk.confirmed_by(typed), "{typed:?}");
+    assert!(!typed.contains(' '), "{typed:?}");
 }
 
 #[test]
