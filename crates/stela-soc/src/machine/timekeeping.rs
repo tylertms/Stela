@@ -67,10 +67,7 @@ impl AppleDevices {
             if self.reset.is_none() {
                 self.reset = Some(Reset {
                     transition: Transition::Halt,
-                    reason: format!(
-                        "RTC service time refused: {error:?}{}",
-                        self.rtc_regression()
-                    ),
+                    reason: format!("{}{error:?}{}", MODEL_REFUSED[1], self.rtc_regression()),
                 });
             }
             false

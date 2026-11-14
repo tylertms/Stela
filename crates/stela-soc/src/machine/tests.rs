@@ -31,6 +31,33 @@ fn a_board_entry_given_an_earlier_count_is_named_in_the_stop_reason() {
     assert_eq!(d.rtc_regression(), " (deadline at 0x5 after lines at 0xa)");
 }
 
+/// Issue 78: the SPMI controller's advance refused the PMU's clock at a
+/// count far past any boot, and the stop read as a 4-byte guest read at
+/// offset 0 that macOS halted on. It is the board's count the clock
+/// refused, and the halt is the machine's.
+#[test]
+fn a_device_that_cannot_reach_the_count_names_the_count_and_stops_as_the_machine() {
+    let now = 0x7fff_ffff_f763_c44e;
+    let DeviceError::Refused(reason) = describe(stela_contracts::bus::refuse_advance(
+        "SPMI",
+        now,
+        refuse!("PMU RTC upcount past its 47-bit range"),
+    )) else {
+        panic!("a refusal");
+    };
+    let text = alloc::format!("{reason}");
+    assert_eq!(
+        text,
+        "SPMI time at count 0x7ffffffff763c44e: PMU RTC upcount past its 47-bit range"
+    );
+    let stop = alloc::format!("{}{:?}", MODEL_REFUSED[0], DeviceError::Refused(reason));
+    assert!(model_refused(&stop));
+    assert!(model_refused("RTC service time refused: Refused(..)"));
+    assert!(!model_refused(
+        "apple-wdt: watchdog 0 bite: system reset requested at counter 5"
+    ));
+}
+
 #[test]
 fn native_dart_mounts_program_the_selected_register_bank_and_transfer_real_dma_bytes() {
     use {

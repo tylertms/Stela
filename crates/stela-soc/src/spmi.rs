@@ -85,7 +85,8 @@ use {
     stela_contracts::bus::Access, stela_contracts::bus::Direction, stela_contracts::bus::Lifecycle,
     stela_contracts::bus::LifecycleState, stela_contracts::bus::MmioDevice,
     stela_contracts::bus::MmioError, stela_contracts::bus::Width, stela_contracts::bus::refuse,
-    stela_contracts::interrupt::AicInput, stela_contracts::interrupt::Wire,
+    stela_contracts::bus::refuse_advance, stela_contracts::interrupt::AicInput,
+    stela_contracts::interrupt::Wire,
 };
 
 const NAME: &str = "SPMI";
@@ -679,13 +680,13 @@ impl MmioDevice for Spmi {
     fn advance(&mut self, access: &mut Access<'_>) -> Result<Option<u64>, MmioError> {
         // Slaves such as the PMIC own independent clocks, rails and timers.
         // Gating the SPMI master cannot suspend their autonomous time.
+        // A refusal here is no guest transfer: the slave's own clock
+        // cannot be at the count the board advanced to.
         for (_, slave) in &self.slaves {
             slave.check_time(access.now).map_err(|error| {
-                refuse(
+                refuse_advance(
                     NAME,
-                    0,
-                    Width::Word,
-                    Direction::Read,
+                    access.now,
                     match error {
                         SlaveError::Unsupported(reason) => reason,
                         SlaveError::Nack => refuse!("SPMI autonomous slave refused time"),

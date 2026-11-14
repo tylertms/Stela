@@ -560,7 +560,22 @@ fn autonomous_preflight_refusal_does_not_advance_any_peer() {
     let mut latch = InterruptLatch::new();
     let now = ((1u128 << 47) * u128::from(FREQUENCY_HZ) / u128::from(RTC_HZ)) as u64;
     let mut access = Access::new(0, now, &mut latch);
-    assert!(c.advance(&mut access).is_err());
+    // No guest transfer was made: the refusal names the board's count,
+    // which lies 2^32 seconds of upcount past the epoch.
+    match c.advance(&mut access) {
+        Err(MmioError::Advance {
+            device: NAME,
+            now: refused,
+            reason,
+        }) => {
+            assert_eq!(refused, now);
+            assert!(
+                alloc::format!("{reason}").contains("past its 47-bit range"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected the slave's time refused, got {other:?}"),
+    }
     assert_eq!(count.get(), 0);
     access.now = 0;
     assert_eq!(c.advance(&mut access), Ok(None));

@@ -1291,8 +1291,14 @@ fn finish<H: Host>(
                     show_reset("macOS turned the Mac off", "Turning the PC off", hold);
                     host_power.power_off()
                 }
+                // A model's refusal is the machine's stop, not a halt macOS
+                // asked for; a panic macOS printed still names it first.
                 Transition::Halt => stop_here(
-                    &guest_down(format!("macOS halted the Mac: {}", reset.reason)),
+                    &guest_down(if stela_soc::machine::model_refused(&reset.reason) {
+                        format!("Stela stopped the Mac: {}", reset.reason)
+                    } else {
+                        format!("macOS halted the Mac: {}", reset.reason)
+                    }),
                     power::RESTART_CODE,
                 ),
             }

@@ -58,6 +58,19 @@ use stela_engine::system::access::AccessKind;
 use stela_soc_data::board::PowerOwner;
 pub use usb::POWER_BUTTON_HELD;
 
+/// How a halt the board's own models made begins: a device that could not
+/// advance to the count, or the RTC service refusing its time. No guest
+/// request made it, so a stop shows it as the machine's, not macOS's.
+pub const MODEL_REFUSED: [&str; 2] = ["device advance refused: ", "RTC service time refused: "];
+
+/// Whether a reset's `reason` is a halt the board's models made
+/// ([`MODEL_REFUSED`]) rather than one the guest asked for.
+pub fn model_refused(reason: &str) -> bool {
+    MODEL_REFUSED
+        .iter()
+        .any(|prefix| reason.starts_with(prefix))
+}
+
 use crate::aes;
 use crate::aes::Aes;
 use crate::agx::firmware::Coprocessor as GfxCoprocessor;
@@ -539,6 +552,13 @@ fn describe(error: MmioError) -> DeviceError {
             )
             .because(reason),
         ),
+        MmioError::Advance {
+            device,
+            now,
+            reason,
+        } => DeviceError::Refused(
+            refuse!("{device} time at count {now:#x}", device, now).because(reason),
+        ),
     }
 }
 
@@ -839,7 +859,7 @@ impl AppleDevices {
             // would, with the model's own reason.
             self.reset = Some(Reset {
                 transition: Transition::Halt,
-                reason: format!("device advance refused: {error:?}{}", self.rtc_regression()),
+                reason: format!("{}{error:?}{}", MODEL_REFUSED[0], self.rtc_regression()),
             });
         }
         self.watch_pmu();

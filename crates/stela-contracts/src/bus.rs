@@ -69,6 +69,13 @@ pub enum MmioError {
         direction: Direction,
         reason: Refusal,
     },
+    /// A device refused to bring its own state, such as a clock it owns,
+    /// to count `now` as the board advanced it: no guest access was made.
+    Advance {
+        device: &'static str,
+        now: u64,
+        reason: Refusal,
+    },
 }
 
 /// What a guest request does to the whole machine.
@@ -231,6 +238,16 @@ pub fn refuse(
         offset,
         width,
         direction,
+        reason: reason.into(),
+    }
+}
+
+/// `device` refused to bring its own state to count `now`
+/// ([`MmioError::Advance`]).
+pub fn refuse_advance(device: &'static str, now: u64, reason: impl Into<Refusal>) -> MmioError {
+    MmioError::Advance {
+        device,
+        now,
         reason: reason.into(),
     }
 }

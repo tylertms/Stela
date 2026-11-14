@@ -143,8 +143,12 @@ impl RtcClock {
         let elapsed = u128::from(elapsed) * u128::from(RTC_HZ) / u128::from(FREQUENCY_HZ);
         let ticks = u128::from(self.0.epoch.ticks) + elapsed;
         if ticks >= u128::from(LIMIT) {
+            // 2^32 seconds of upcount: a count this far past the epoch is
+            // one no boot reaches, so the board's time itself is wrong.
+            let epoch = self.0.epoch.counter;
             return Err(refuse!(
-                "PMU RTC upcount/alarm wrap behavior is unqualified"
+                "PMU RTC upcount past its 47-bit range: the count is over 136 years after the epoch at {epoch:#x}; upcount/alarm wrap behavior is unqualified",
+                epoch
             ));
         }
         Ok(ticks as u64)
