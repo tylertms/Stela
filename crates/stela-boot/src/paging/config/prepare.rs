@@ -34,7 +34,7 @@ impl Prepared {
         let physical_bits = crate::cpu::physical_bits();
         let rsdp = crate::storage::rsdp().ok_or(Error::ResourceInventory)?;
         // SAFETY: UEFI configuration table before EBS; the ACPI parser
-        // checks the source table/checksum and returns owned MCFG observations.
+        // checks the source table's length and returns owned MCFG observations.
         let table = unsafe { acpi::find(rsdp, b"MCFG") }.map_err(|_| Error::ResourceInventory)?;
         let all = acpi::mcfg(table).map_err(|_| Error::ResourceInventory)?;
         let inventory = EcamInventory::validate(&all, physical_bits).map_err(Error::Mapping)?;

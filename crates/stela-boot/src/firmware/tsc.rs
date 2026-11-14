@@ -183,7 +183,7 @@ fn measure_against_timers() -> Option<(Calibrated, TscSource)> {
     let rsdp = crate::storage::rsdp()?;
     let timers = Timers {
         // SAFETY: the UEFI configuration table's ACPI root, before EBS;
-        // `find` checks every table's checksum.
+        // `find` checks each table's length.
         pm: unsafe { acpi::find(rsdp, b"FACP") }
             .ok()
             .and_then(|table| pm_timer::Prepared::from_fadt(table).ok())

@@ -231,6 +231,15 @@ fn stop_firmware_watchdog() {
     }
 }
 
+/// Say once that the firmware's ACPI table `signature` has a wrong checksum
+/// and is used as it is (`acpi::table`).
+fn acpi_checksum_fault(signature: [u8; 4]) {
+    output::arguments(format_args!(
+        "FIRMWARE ACPI {} checksum wrong: table used as it is\n",
+        signature.escape_ascii()
+    ));
+}
+
 #[uefi::entry]
 fn main() -> Status {
     // Before any Rust state exists: the system engine runs from this copy.
@@ -243,6 +252,7 @@ fn main() -> Status {
         "STELA UEFI MOUNT version={}\n",
         env!("CARGO_PKG_VERSION")
     ));
+    stela_runtime::pc::acpi::on_checksum_fault(acpi_checksum_fault);
     if !serial::present() {
         output::arguments(format_args!(
             "SERIAL no UART at COM1: nothing is sent to it or read from it\n"

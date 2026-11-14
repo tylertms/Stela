@@ -307,7 +307,7 @@ impl Prepared {
         drop(tpl);
         let rsdp = crate::storage::rsdp().ok_or(refuse!("MMIO ACPI root unavailable"))?;
         // SAFETY: the UEFI configuration table points to kept readable
-        // firmware tables before EBS. find validates RSDP/root/SDT checksums.
+        // firmware tables before EBS. find checks the RSDP and table lengths.
         for (signature, destination, length) in [
             (b"APIC", &mut wire.madt[..], &mut wire.madt_bytes),
             (b"MCFG", &mut wire.mcfg[..], &mut wire.mcfg_bytes),
@@ -322,7 +322,7 @@ impl Prepared {
             destination[..source.len()].copy_from_slice(source);
             *length = source.len();
         }
-        // HPET is optional for other clocks. Absence, invalid checksum or
+        // HPET is optional for other clocks. Absence, an invalid length or
         // unsupported original length leaves the typed HPET factory unavailable;
         // no default address/capability is reconstructed.
         // SAFETY: same pre-EBS readable firmware ACPI root as above.

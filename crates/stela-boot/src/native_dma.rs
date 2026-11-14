@@ -98,7 +98,7 @@ pub(crate) fn firmware_units() -> Result<FirmwareUnits> {
     let mut complete = true;
     for signature in [b"DMAR", b"IVRS"] {
         // SAFETY: the firmware's RSDP; its tables stay mapped while boot
-        // services run, and `find` checks every checksum on the way.
+        // services run, and `find` checks each table's length.
         let added = match unsafe { acpi::find(rsdp, signature) } {
             Ok(table) if signature == b"DMAR" => units.add_dmar(table),
             Ok(table) => units.add_ivrs(table),
