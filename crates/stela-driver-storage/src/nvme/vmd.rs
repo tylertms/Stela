@@ -23,15 +23,31 @@ use alloc::{boxed::Box, rc::Rc, string::String, sync::Arc};
 pub type Attachment<R = NativeRegisters> =
     Result<(Attached, RetiredHierarchy<R>), (BlockError, RetiredHierarchy<R>)>;
 
+/// Each hierarchy refusal keeps its own cause in the boot log.
 fn block(error: Error) -> BlockError {
+    use BlockError::{Protocol, Unsupported};
     match error {
         Error::Config(error) => BlockError::Config(error),
         Error::PciCapability(error) => BlockError::PciCapability(error),
         Error::PciPower(error) => BlockError::PciPower(error),
-        Error::ReadFailed | Error::Readback | Error::Mapping | Error::Quarantined => {
-            BlockError::Protocol("VMD retained hierarchy access failed")
+        Error::ReadFailed => Protocol("VMD hierarchy configuration read failed"),
+        Error::Readback => Protocol("VMD hierarchy register did not read back as written"),
+        Error::Mapping => Protocol("VMD hierarchy register window not mapped"),
+        Error::Quarantined => Protocol("VMD hierarchy quarantined after a fault"),
+        Error::UnstoppedChild(..) => {
+            Protocol("a child behind VMD kept DMA or interrupts on after a stop")
         }
-        _ => BlockError::Unsupported("VMD firmware NVMe assignment or lifecycle"),
+        Error::UnsupportedDevice => {
+            Unsupported("VMD endpoint or a function on its path is not one this driver takes")
+        }
+        Error::InvalidResource => {
+            Unsupported("VMD endpoint BAR, bridge window or bus range does not route")
+        }
+        Error::Address => Unsupported("VMD child address outside the hierarchy's buses"),
+        Error::Capability => Unsupported("VMD hierarchy capability list malformed"),
+        Error::Exhausted => Unsupported("no PCI domain number left for VMD"),
+        Error::Suspended => Unsupported("VMD hierarchy suspended"),
+        Error::ActiveChild => Unsupported("VMD hierarchy not in the stopped state this step needs"),
     }
 }
 

@@ -529,3 +529,31 @@ fn composed_final_host_publication_failure_cannot_reuse_retired_registers_or_hie
     f.assert_retained(&returned, 0);
     assert_eq!(f.protocol.snapshot().register_owner_drops, 0);
 }
+
+#[test]
+fn every_hierarchy_refusal_names_its_own_cause() {
+    let errors = [
+        Error::UnsupportedDevice,
+        Error::InvalidResource,
+        Error::Mapping,
+        Error::ReadFailed,
+        Error::Readback,
+        Error::Address,
+        Error::Capability,
+        Error::Exhausted,
+        Error::Suspended,
+        Error::Quarantined,
+        Error::ActiveChild,
+        Error::UnstoppedChild(1, 2, 3),
+    ];
+    let mut messages: Vec<_> = errors
+        .into_iter()
+        .map(|error| match block(error) {
+            BlockError::Protocol(message) | BlockError::Unsupported(message) => message,
+            other => panic!("{error:?} became {other:?}"),
+        })
+        .collect();
+    messages.sort_unstable();
+    messages.dedup();
+    assert_eq!(messages.len(), errors.len());
+}
