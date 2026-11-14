@@ -552,6 +552,15 @@ impl System {
         self.preboot.is_some() && self.recovery.is_none() && !self.upgrade
     }
 
+    /// This boot starts a full system from the boot disk, the installed
+    /// macOS or a recoveryOS, whose WindowServer, and in the installed macOS
+    /// its other Metal clients, use a Metal device whenever one exists. A
+    /// restore and a staged update run Apple's restore ramdisk
+    /// (`-restore`), which starts no WindowServer and no Metal client.
+    pub fn starts_metal_clients(&self) -> bool {
+        self.preboot.is_some() && !self.upgrade
+    }
+
     /// Whether this boot hides the guest's AGX model (`sgx` and its `gfx-asc`
     /// coprocessor) from macOS, `metal_device` saying whether a host GPU
     /// serves macOS's Metal through StelaGPU.
@@ -559,15 +568,22 @@ impl System {
     /// The model runs no GPU work: a Metal client's command buffers on it
     /// never complete, so Apple's GPU kext stops its firmware for recovery,
     /// and macOS panics when the model cannot follow that stop (a kext
-    /// revision whose initdata layout it has not checked). The installed
-    /// macOS therefore never sees it: with a host GPU StelaGPU is its only
-    /// Metal device, and a single-user or repair boot that continues without
-    /// one has no Metal device at all, which its console does not need. A
-    /// restore, recoveryOS or staged update keeps the model as it always has:
-    /// those boots open no host GPU, and the model's firmware start is all
-    /// they have of a GPU.
+    /// revision whose initdata layout it has not checked). So no boot that
+    /// starts Metal clients sees it ([`Self::starts_metal_clients`]): with a
+    /// host GPU StelaGPU is the only Metal device, and without one the boot
+    /// has none. The model draws nothing, so hiding it takes nothing from a
+    /// boot without a GPU: a single-user or repair boot's console needs no
+    /// Metal device, and a recoveryOS's WindowServer composites in software
+    /// when it finds none (SkyLight of the 26B123 arm64e cache carries a
+    /// software compositor: "The software renderer does not support 10-bit
+    /// or YUV DisplayStream output", "We do not support zoom and software
+    /// compositor (yet)"), where with the model it would choose the model.
+    /// A restore and a staged update keep the model as they always have: they
+    /// open no host GPU, run no Metal client (no install log shows a work
+    /// doorbell or a protected context in 1-2 h), and the model's firmware
+    /// start is all they have of a GPU.
     pub fn hides_agx(&self, metal_device: bool) -> bool {
-        metal_device || self.boots_macos()
+        metal_device || self.starts_metal_clients()
     }
 
     /// Select the exact number of host processors the loader reserves.

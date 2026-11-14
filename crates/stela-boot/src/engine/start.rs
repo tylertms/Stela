@@ -903,10 +903,14 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             output::arguments(format_args!(
                 "GPU none: this {} boot gives macOS no Metal device; the AGX model, which runs \
                  no GPU work, is hidden from it\n",
-                if options.bundle_repair {
+                if options.recovery.is_some() {
+                    "recoveryOS"
+                } else if options.bundle_repair {
                     "Metal plugin repair"
-                } else {
+                } else if options.single_user {
                     "single-user"
+                } else {
+                    "macOS"
                 }
             ));
         }
