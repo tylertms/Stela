@@ -183,6 +183,8 @@ use Register::{Eax, Ebx, Ecx, Edx};
 
 const APIC: Bit = Bit::new(1, Edx, 9);
 const MTRR: Bit = Bit::new(1, Edx, 12);
+/// Machine-check architecture (CPUID 1 EDX 14).
+const MCA: Bit = Bit::new(1, Edx, 14);
 const PAT_BIT: Bit = Bit::new(1, Edx, 16);
 const X2APIC_BIT: Bit = Bit::new(1, Ecx, 21);
 const TSC_ADJUST_BIT: Bit = Bit::new(7, Ebx, 1);
@@ -198,6 +200,9 @@ pub const TSC_ADJUST: Msr = Msr::new(0x3b, Gate::Cpuid(TSC_ADJUST_BIT));
 pub const PRED_CMD: Msr = Msr::new(0x49, Gate::AnyCpuid(&IBPB));
 pub const MTRR_CAP: Msr = Msr::new(0xfe, Gate::Cpuid(MTRR));
 pub const ARCH_CAPABILITIES: Msr = Msr::new(0x10a, Gate::Cpuid(ARCH_CAPABILITIES_BIT));
+/// IA32_MCG_CAP; with it IA32_MCG_STATUS and the banks it counts
+/// (`machine_check`).
+pub const MCG_CAP: Msr = Msr::new(crate::machine_check::MCG_CAP, Gate::Cpuid(MCA));
 /// IA32_MTRR_PHYSBASE0; PHYSMASKn and later pairs follow (`at`).
 pub const MTRR_PHYS_BASE: Msr = Msr::new(0x200, Gate::Cpuid(MTRR));
 pub const XFD: Msr = Msr::new(0x1c4, Gate::Cpuid(XFD_BIT));

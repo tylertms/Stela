@@ -434,9 +434,14 @@ pub(crate) unsafe fn prepare(mapped: *mut u8, physical: u64, entry: Entry<'_>) -
             );
         }
         put32(&raw const stela_ap_root, entry.root as u32);
+        // PAE, MCE, OSFXSR and OSXMMEXCPT: a machine check from here on
+        // reaches the early IDT installed before this write, then the
+        // engine's, instead of shutting the PC down.
         put32(
             &raw const stela_ap_cr4,
-            0x620 | if entry.five_level { 1 << 12 } else { 0 },
+            0x620
+                | stela_boot_core::machine_check::CR4_MCE as u32
+                | if entry.five_level { 1 << 12 } else { 0 },
         );
         put32(
             &raw const stela_ap_far32,

@@ -513,7 +513,10 @@ pub unsafe fn take_over() -> Result<()> {
         asm!("lidt [{}]", in(reg) &descriptor, options(readonly, nostack, preserves_flags));
     }
     cr0 = controls::native_cr0(cr0);
-    cr4 = (cr4 | CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT) & !(CR4_GLOBAL | CR4_PCID);
+    // CR4.MCE: a machine check reaches the fatal handler installed above,
+    // and the engine's after it, instead of shutting the PC down.
+    cr4 = (cr4 | CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT | stela_boot_core::machine_check::CR4_MCE)
+        & !(CR4_GLOBAL | CR4_PCID);
     let efer = efer | EFER_NX_ENABLE;
     // SAFETY: NX is enabled before tables that use it are loaded; clearing
     // PGE flushes every global firmware translation.

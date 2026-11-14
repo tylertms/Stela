@@ -49,6 +49,7 @@ pub mod interrupt_image;
 pub mod ioapic;
 pub mod irq_context;
 pub mod log_sinks;
+pub mod machine_check;
 pub mod madt;
 pub mod memory_budget;
 pub mod memory_types;

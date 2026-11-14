@@ -654,9 +654,14 @@ pub fn fatal(frame: &Frame) -> ! {
     } else {
         "free"
     };
+    let machine_check = match frame.vector {
+        18 => machine_check(),
+        _ => alloc::string::String::new(),
+    };
     output::fatal(format_args!(
         "unexpected x86 exception in the system engine: vector={} error={:#x} rip={:#x} \
-         (image+{:#x}) code={} rax={:#x} cr2={:#x} cr3={:#x} drivers={drivers} stack={callers}",
+         (image+{:#x}) code={} rax={:#x} cr2={:#x} cr3={:#x} drivers={drivers} \
+         stack={callers}{machine_check}",
         frame.vector,
         frame.error,
         frame.rip,
@@ -666,6 +671,28 @@ pub fn fatal(frame: &Frame) -> ! {
         cr2(),
         cr3()
     ))
+}
+
+/// `; ` and this processor's machine-check report
+/// (`stela_boot_core::machine_check`), for a #MC's fatal report; empty on a
+/// processor without machine-check architecture.
+fn machine_check() -> alloc::string::String {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    use stela_boot_core::{machine_check::MachineCheck, msr};
+    if !msr::MCG_CAP.implemented() {
+        return alloc::string::String::new();
+    }
+    let apic = match __cpuid(0).eax >= 0xb && __cpuid_count(0xb, 0).ebx != 0 {
+        true => __cpuid_count(0xb, 0).edx,
+        false => __cpuid(1).ebx >> 24,
+    };
+    let report = MachineCheck::read(apic, |index| {
+        // SAFETY: CPL0 on the processor that took #MC, which implements
+        // machine-check architecture: its global registers and the banks
+        // MCG_CAP counts are architectural, and reading them changes nothing.
+        unsafe { msr::rdmsr(index) }
+    });
+    alloc::format!("; {report}")
 }
 
 /// Print an x86 exception's detail, straight to the port: whatever raised it
