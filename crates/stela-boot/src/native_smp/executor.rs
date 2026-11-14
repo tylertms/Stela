@@ -720,12 +720,24 @@ fn serve(
         match argument.status.load(Ordering::Acquire) {
             SYNCING if !started[index].synced => {
                 let begun = apic::rdtsc();
-                argument.tsc.source();
+                let met = argument.tsc.source();
                 started[index].synced = true;
                 // The APs waiting meanwhile lose none of their second.
                 let spent = apic::rdtsc().wrapping_sub(begun);
                 for other in started.iter_mut() {
                     other.since = other.since.wrapping_add(spent);
+                }
+                if !met {
+                    // The AP stopped mid-synchronization; the abandoned
+                    // rendezvous refuses its later points, so it never
+                    // reports ready on its own.
+                    crate::output::arguments(format_args!(
+                        "NATIVE TSC slot={slot} missed a synchronization point: left out\n"
+                    ));
+                    let failing = started.swap_remove(index);
+                    crate::native_mmio::PROCESSORS.exclude(failing.destination);
+                    failed.push((slot, StartupFailure::Timeout { slot }));
+                    continue;
                 }
                 let outcome = argument.tsc.outcome();
                 crate::output::arguments(format_args!(
