@@ -11,10 +11,10 @@ use crate::bus::{
     pci::regs,
     vmd::endpoint::test_support::*,
 };
-use alloc::vec::Vec;
+use alloc::{collections::BTreeMap, vec::Vec};
 use core::{
     ops::Range,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 extern crate std;
 use crate::{block::BlockDevice, nvme::owned::protocol};
@@ -140,6 +140,9 @@ unsafe impl DmaDomain for Domain {
     }
 }
 
+/// A one-controller attachment, as the single-controller tests see it.
+type Single = Result<(Attached, RetiredHierarchy<Model>), (BlockError, RetiredHierarchy<Model>)>;
+
 struct Fixture {
     host: Option<Host<Model>>,
     bar: Option<FirmwareBar>,
@@ -179,27 +182,40 @@ impl Fixture {
             domain: Some(domain),
         }
     }
-    fn attach(&mut self) -> Attachment<Model> {
+    fn attach(&mut self) -> Single {
         self.attach_with_clock(model_clock())
     }
-    fn attach_with_clock(&mut self, clock: Clock) -> Attachment<Model> {
+    fn attach_with_clock(&mut self, clock: Clock) -> Single {
         let protocol = &self.protocol;
         // SAFETY: this isolated fixture keeps one configuration model,
         // its selected independent register peer and original model domain.
         // The private sequence is exactly the public native sequence; no fake
         // native MMIO permission or physical requester claim is supplied.
-        unsafe {
+        let attachment = unsafe {
             attach_with(
                 self.host.take().unwrap(),
-                self.bar.take().unwrap(),
+                vec![Controller {
+                    bar: self.bar.take().unwrap(),
+                    label: "composed VMD behind root and bridge".into(),
+                    quirks: crate::nvme::Quirks::NONE,
+                }],
                 self.domain.as_ref().unwrap().clone(),
                 self.protocol.pages(),
                 clock,
                 model_timer(),
-                "composed VMD behind root and bridge".into(),
-                crate::nvme::Quirks::NONE,
-                (|_| Ok(protocol.registers()), protocol::attach),
+                (|_: &FirmwareBar| Ok(protocol.registers()), protocol::attach),
             )
+        };
+        // One controller: its own result is the attachment's.
+        match attachment {
+            Ok((mut controllers, returned)) => {
+                assert_eq!(controllers.len(), 1);
+                match controllers.pop().unwrap().1 {
+                    Ok(attached) => Ok((attached, returned)),
+                    Err(error) => Err((error, returned)),
+                }
+            }
+            Err(refused) => Err(refused),
         }
     }
     fn attached(&mut self) -> (Attached, RetiredHierarchy<Model>) {
@@ -572,4 +588,264 @@ fn every_hierarchy_refusal_names_its_own_cause() {
     messages.sort_unstable();
     messages.dedup();
     assert_eq!(messages.len(), errors.len());
+}
+
+/// One of two controllers' view of the shared configuration model: its own
+/// path, the root port and bridge both share, and its own endpoint.
+struct Controller2 {
+    state: Arc<Mutex<State>>,
+    endpoint: usize,
+    index: usize,
+    stopping: Arc<AtomicUsize>,
+}
+impl protocol::Access for Controller2 {
+    fn registers_available(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.parent(regs::COMMAND, 2) & u32::from(regs::COMMAND_MEMORY) != 0
+            && [ROOT, BRIDGE, self.endpoint].into_iter().all(|base| {
+                state.child(base + COMMAND_OFFSET, 2) & u32::from(regs::COMMAND_MEMORY) != 0
+                    && state.child(base + 0x84, 2) & 3 == 0
+            })
+    }
+    fn dma_enabled(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.parent(regs::COMMAND, 2) & u32::from(regs::COMMAND_MASTER) != 0
+            && [ROOT, BRIDGE, self.endpoint].into_iter().all(|base| {
+                state.child(base + COMMAND_OFFSET, 2) & u32::from(regs::COMMAND_MASTER) != 0
+            })
+    }
+    /// This controller's own requests: the bridges above may master for
+    /// the other one.
+    fn any_bus_master(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .child(self.endpoint + COMMAND_OFFSET, 2)
+            & u32::from(regs::COMMAND_MASTER)
+            != 0
+    }
+    fn observe(&self, event: &'static str) {
+        if event == "stop" {
+            self.stopping.store(self.index, Ordering::Relaxed);
+        }
+        self.state.lock().unwrap().events.push(Event::Nvme(event));
+    }
+}
+
+/// The one domain both controllers' requests reach the root through, under
+/// the VMD parent's requester ID, over each controller's independent peer:
+/// a mapping goes to the controller being attached, and every later use of
+/// it to the peer that made it.
+struct Shared2 {
+    peers: [Arc<dyn DmaDomain>; 2],
+    attaching: Arc<AtomicUsize>,
+    stopping: Arc<AtomicUsize>,
+    next: AtomicU64,
+    mappings: Mutex<BTreeMap<u64, (usize, DomainMapping)>>,
+}
+impl Shared2 {
+    fn peer(&self, mapping: DomainMapping) -> (usize, DomainMapping) {
+        let (peer, original) = self.mappings.lock().unwrap()[&mapping.id];
+        assert_eq!(original.bytes, mapping.bytes);
+        (peer, original)
+    }
+}
+// SAFETY: forwards each operation unchanged to the independent peer that
+// owns the mapping; no drain acknowledgement is invented.
+unsafe impl DmaDomain for Shared2 {
+    unsafe fn map(
+        &self,
+        pages: &DmaPages,
+        direction: Direction,
+        limit: u64,
+    ) -> Result<DomainMapping, DmaError> {
+        let peer = self.attaching.load(Ordering::Relaxed);
+        // SAFETY: forwarding the model pins and request.
+        let original = unsafe { self.peers[peer].map(pages, direction, limit) }?;
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.mappings.lock().unwrap().insert(id, (peer, original));
+        Ok(DomainMapping { id, ..original })
+    }
+    unsafe fn unmap(&self, mapping: DomainMapping) -> Result<(), DmaError> {
+        let (peer, original) = self.peer(mapping);
+        // SAFETY: the owning peer checks stop, drain and its own token.
+        unsafe { self.peers[peer].unmap(original) }?;
+        self.mappings.lock().unwrap().remove(&mapping.id);
+        Ok(())
+    }
+    unsafe fn sync_for_device(
+        &self,
+        mapping: DomainMapping,
+        range: Range<usize>,
+        direction: Direction,
+    ) -> Result<(), DmaError> {
+        let (peer, original) = self.peer(mapping);
+        // SAFETY: the owning peer's exact token and range.
+        unsafe { self.peers[peer].sync_for_device(original, range, direction) }
+    }
+    unsafe fn sync_for_cpu(
+        &self,
+        mapping: DomainMapping,
+        range: Range<usize>,
+        direction: Direction,
+    ) -> Result<(), DmaError> {
+        let (peer, original) = self.peer(mapping);
+        // SAFETY: the owning peer refuses outstanding device ownership.
+        unsafe { self.peers[peer].sync_for_cpu(original, range, direction) }
+    }
+    unsafe fn read_coherent_u32(
+        &self,
+        mapping: DomainMapping,
+        offset: usize,
+        direction: Direction,
+    ) -> Result<u32, DmaError> {
+        let (peer, original) = self.peer(mapping);
+        // SAFETY: the owning peer performs the isolated coherent read.
+        unsafe { self.peers[peer].read_coherent_u32(original, offset, direction) }
+    }
+    unsafe fn drain_posted_writes(&self) -> Result<(), DmaError> {
+        // The controller being torn down, which its peer checks stopped.
+        let peer = self.stopping.load(Ordering::Relaxed);
+        // SAFETY: that peer requires CC.EN0, its endpoint's BM clear and no
+        // pending command before its own drain.
+        unsafe { self.peers[peer].drain_posted_writes() }
+    }
+}
+
+/// Where the chosen disk's identity sits on its medium in this model: a
+/// GUID partition table's disk GUID at LBA 1.
+const DISK_GUID_OFFSET: usize = 512 + 56;
+
+#[test]
+fn two_controllers_behind_one_vmd_attach_and_the_chosen_disk_on_the_second_is_found() {
+    let model = Model::default();
+    let state = model.state.clone();
+    let drops = model.drops.clone();
+    {
+        let mut state = state.lock().unwrap();
+        for base in PATH {
+            state.set(base + 0x40, 2, 0x8010);
+            state.set(base + 0x80, 2, 1);
+            state.set(base + 0x82, 2, 3);
+        }
+        state.second_nvme();
+    }
+    let (host, bar) = fixture(model);
+    let second = second_bar(&host);
+    let attaching = Arc::new(AtomicUsize::new(0));
+    let stopping = Arc::new(AtomicUsize::new(0));
+    let protocols: Vec<Protocol> = [NVME, NVME2]
+        .into_iter()
+        .enumerate()
+        .map(|(index, endpoint)| {
+            Protocol::new(Arc::new(Controller2 {
+                state: state.clone(),
+                endpoint,
+                index,
+                stopping: stopping.clone(),
+            }))
+        })
+        .collect();
+    // The chosen disk, by the identity the stick's configuration names, is
+    // the second controller's.
+    let chosen = *b"chosen-disk-guid";
+    protocols[0].medium([0x11; 8], DISK_GUID_OFFSET, b"another-disk-gui");
+    protocols[1].medium([0x22; 8], DISK_GUID_OFFSET, &chosen);
+    let domain: Arc<dyn DmaDomain> = Arc::new(Shared2 {
+        peers: [protocols[0].domain(), protocols[1].domain()],
+        attaching: attaching.clone(),
+        stopping: stopping.clone(),
+        next: AtomicU64::new(1),
+        mappings: Mutex::new(BTreeMap::new()),
+    });
+    let controllers = vec![
+        Controller {
+            bar,
+            label: "VMD 02:00.0".into(),
+            quirks: crate::nvme::Quirks::NONE,
+        },
+        Controller {
+            bar: second,
+            label: "VMD 02:01.0".into(),
+            quirks: crate::nvme::Quirks::NONE,
+        },
+    ];
+    let registers = |bar: &FirmwareBar| {
+        let index = usize::from(bar.child().device);
+        attaching.store(index, Ordering::Relaxed);
+        Ok(protocols[index].registers())
+    };
+    // SAFETY: one configuration model, each controller's own independent
+    // register peer and the one model domain both forward through.
+    let attachment = unsafe {
+        attach_with(
+            host,
+            controllers,
+            domain.clone(),
+            protocols[0].pages(),
+            model_clock(),
+            model_timer(),
+            (registers, protocol::attach),
+        )
+    };
+    let Ok((controllers, mut returned)) = attachment else {
+        panic!("two-controller attach refused");
+    };
+    let mut disks: Vec<(String, Attached)> = controllers
+        .into_iter()
+        .map(|(label, result)| (label, result.expect("controller attached")))
+        .collect();
+    assert_eq!(disks.len(), 2);
+    // Both controllers run: their endpoints and the path above master.
+    for base in [ROOT, BRIDGE, NVME, NVME2] {
+        assert_ne!(
+            state.lock().unwrap().child(base + COMMAND_OFFSET, 2) & u32::from(regs::COMMAND_MASTER),
+            0
+        );
+    }
+    // Find the chosen disk by its identity, as the boot does among every
+    // disk it attached.
+    let mut found = Vec::new();
+    for (label, attached) in &mut disks {
+        for disk in &mut attached.namespaces {
+            let mut sector = [0; 512];
+            disk.read(1, &mut sector).unwrap();
+            if sector[56..72] == chosen {
+                found.push(label.clone());
+            }
+        }
+    }
+    assert_eq!(found, ["VMD 02:01.0"]);
+    // The chosen disk takes writes while the other controller runs too.
+    let chosen_disk = &mut disks[1].1.namespaces[0];
+    chosen_disk.write(8, &[0x5a; 4096]).unwrap();
+    let mut back = [0; 4096];
+    chosen_disk.read(8, &mut back).unwrap();
+    assert_eq!(back, [0x5a; 4096]);
+    // The first controller retires while the second runs; the hierarchy
+    // returns only after the second retired too.
+    disks[0].1.namespaces[0].retire_owned().unwrap();
+    assert!(!returned.is_ready());
+    assert_eq!(
+        state.lock().unwrap().child(NVME + COMMAND_OFFSET, 2)
+            & u32::from(regs::COMMAND_MASTER | regs::COMMAND_MEMORY),
+        0
+    );
+    chosen_disk_still_runs(&mut disks[1].1);
+    disks[1].1.namespaces[0].retire_owned().unwrap();
+    assert!(returned.is_ready());
+    assert!(!state.lock().unwrap().any_master());
+    drop(disks);
+    drop(domain);
+    // SAFETY: every controller retired, its mappings unmapped and its
+    // handles dropped; the isolated model domain is gone.
+    let original = unsafe { returned.take_after_retirement() }.unwrap();
+    drop(original);
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+}
+
+fn chosen_disk_still_runs(attached: &mut Attached) {
+    let mut back = [0; 4096];
+    attached.namespaces[0].read(8, &mut back).unwrap();
+    assert_eq!(back, [0x5a; 4096]);
 }

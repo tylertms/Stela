@@ -866,16 +866,17 @@ pub(super) fn companion(
     Some(current)
 }
 
-/// An Intel VMD host's first NVMe controller, the devices behind it no
-/// driver here takes, and the hierarchy owner that hands back the parent's
-/// owners when the controller retires.
+/// An Intel VMD host's NVMe controllers, each attached or with the reason it
+/// is not, by location, the devices behind it no driver here takes, and the
+/// hierarchy owner that hands back the parent's owners when every attached
+/// controller retires.
 pub struct Vmd {
-    pub nvme: Option<nvme::Attached>,
+    pub nvme: Vec<(String, Result<nvme::Attached, crate::block::BlockError>)>,
     pub others: Vec<vmd::Child>,
     pub owner: Box<dyn Any>,
 }
 
-/// Attach the NVMe controller behind an Intel VMD host: BAR0 holds the
+/// Attach every NVMe controller behind an Intel VMD host: BAR0 holds the
 /// children's configuration space, BAR2 and BAR4 their memory windows.
 ///
 /// # Safety
@@ -978,50 +979,78 @@ pub(super) unsafe fn vmd(
         Ok(children) => children,
         Err(error) => return Err(failed(error, Box::new((host, attachment)))),
     };
-    let Some(index) = others.iter().position(|child| child.class == [1, 8, 2]) else {
-        return Ok(Vmd {
-            nvme: None,
-            others,
-            owner: Box::new((host, attachment)),
-        });
+    let location = |child: &vmd::Child| {
+        alloc::format!(
+            "{address} VMD {:02x}:{:02x}.{}",
+            child.address.bus,
+            child.address.device,
+            child.address.function
+        )
     };
-    let child = others.remove(index);
-    let quirks = nvme::Quirks::for_device(child.vendor, child.device)
-        | nvme::Quirks::for_platform(child.vendor, child.device, platform);
-    let bytes = match host.memory_bar_bytes(child.address) {
-        Ok(bytes) => bytes,
-        Err(error) => return Err(failed(error, Box::new((host, attachment)))),
-    };
-    // SAFETY: `bytes` is the child's firmware-assigned BAR0, sized with its
-    // decode off, and the stopped hierarchy has no other owner.
-    let bar = match unsafe { vmd::endpoint::FirmwareBar::claim(&mut host, child.address, bytes) } {
-        Ok(bar) => bar,
-        Err(error) => return Err(failed(error, Box::new((host, attachment)))),
-    };
-    let label = alloc::format!(
-        "{address} VMD {:02x}:{:02x}.{}",
-        child.address.bus,
-        child.address.device,
-        child.address.function
-    );
+    // Every NVMe controller below the host, each with its own firmware BAR0
+    // inside the host's windows, as Linux's VMD driver enumerates them; one
+    // whose BAR is refused stays a stopped function with its own cause.
+    let mut controllers = Vec::new();
+    let mut unclaimed = Vec::new();
+    let mut first_refusal = None;
+    let mut index = 0;
+    while index < others.len() {
+        if others[index].class != [1, 8, 2] {
+            index += 1;
+            continue;
+        }
+        let child = others.remove(index);
+        let label = location(&child);
+        // SAFETY: `bytes` is the child's firmware-assigned BAR0, sized with
+        // its decode off, and the stopped hierarchy has no other owner.
+        let bar = host
+            .memory_bar_bytes(child.address)
+            .and_then(|bytes| unsafe {
+                vmd::endpoint::FirmwareBar::claim(&mut host, child.address, bytes)
+            });
+        match bar {
+            Ok(bar) => controllers.push(crate::storage::nvme::vmd::Controller {
+                bar,
+                label,
+                quirks: nvme::Quirks::for_device(child.vendor, child.device)
+                    | nvme::Quirks::for_platform(child.vendor, child.device, platform),
+            }),
+            Err(error) => {
+                first_refusal.get_or_insert(error);
+                unclaimed.push((label, error));
+            }
+        }
+    }
+    if controllers.is_empty() {
+        return match first_refusal {
+            // No controller's BAR could be claimed.
+            Some(error) => Err(failed(error, Box::new((host, attachment)))),
+            None => Ok(Vmd {
+                nvme: Vec::new(),
+                others,
+                owner: Box::new((host, attachment)),
+            }),
+        };
+    }
+    let unclaimed = unclaimed
+        .into_iter()
+        .map(|(label, error)| (label, Err(crate::storage::nvme::vmd::block(error))));
     // SAFETY: the host's own attached domain covers its requester, under
     // which every child's request reaches the root; the mount's permission
     // issued these mappings, and the hierarchy is stopped.
     match unsafe {
         crate::storage::nvme::vmd::attach(
             host,
-            bar,
+            controllers,
             domain,
             authority,
             services.pages(),
             clock,
             minimum.clone(),
-            label,
-            quirks,
         )
     } {
         Ok((attached, hierarchy)) => Ok(Vmd {
-            nvme: Some(attached),
+            nvme: attached.into_iter().chain(unclaimed).collect(),
             others,
             owner: Box::new((hierarchy, attachment)),
         }),

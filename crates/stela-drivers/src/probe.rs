@@ -2589,11 +2589,20 @@ unsafe fn attach_native(
                         devices.device_failures.push((
                             location,
                             BlockError::Unsupported(
-                                "device behind VMD other than its first NVMe controller",
+                                "device behind VMD other than an NVMe controller",
                             ),
                         ));
                     }
-                    if let Some(attached) = found.nvme {
+                    // Every controller's namespaces join the disks, among
+                    // which the chosen one is found by its identity.
+                    for (location, attached) in found.nvme {
+                        let attached = match attached {
+                            Ok(attached) => attached,
+                            Err(error) => {
+                                devices.device_failures.push((location, error));
+                                continue;
+                            }
+                        };
                         if !attached.quirks.is_empty() {
                             devices
                                 .warnings
@@ -2605,7 +2614,7 @@ unsafe fn attach_native(
                         devices
                             .device_failures
                             .extend(attached.failures.into_iter().map(|(namespace, error)| {
-                                (alloc::format!("{address} VMD namespace {namespace}"), error)
+                                (alloc::format!("{location} namespace {namespace}"), error)
                             }));
                         devices.disks.extend(
                             attached

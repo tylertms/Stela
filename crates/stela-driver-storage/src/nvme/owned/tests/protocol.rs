@@ -105,6 +105,13 @@ impl Protocol {
         model.fail_unmap = matches!(fault, Fault::Unmap);
         model.fail_retire = matches!(fault, Fault::RegistersRetire);
     }
+    /// Give the namespace this EUI-64 and write `bytes` to its medium at
+    /// byte `offset`, as a disk's own contents before the boot.
+    pub(crate) fn medium(&self, eui64: [u8; 8], offset: usize, bytes: &[u8]) {
+        let mut model = self.model.lock().unwrap();
+        model.eui64 = eui64;
+        model.disk[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
     pub(crate) fn sibling(namespace: &Namespace) -> Namespace {
         Namespace {
             controller: namespace.controller.clone(),
