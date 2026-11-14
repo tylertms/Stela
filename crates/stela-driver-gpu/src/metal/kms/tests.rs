@@ -3,6 +3,7 @@ use alloc::{vec, vec::Vec};
 
 mod outputs;
 mod power;
+mod reconnect;
 mod scanout;
 
 fn mode(width: u16, height: u16, kind: u32) -> ModeInfo {
@@ -552,27 +553,28 @@ fn an_output_that_returns_gets_a_full_mode_set_on_the_buffer_on_screen() {
         let mut display = Display::take(&mut card, (2, 2)).unwrap();
         front = display.buffers[0].framebuffer;
         let unchanged = Watched::default();
-        assert_eq!(display.watch(), Ok(unchanged));
+        assert_eq!(display.watch(), unchanged);
         display.drm.connected = false;
         let lost = Watched {
             lost: 1,
             ..unchanged
         };
-        assert_eq!(display.watch(), Ok(lost));
-        assert_eq!(display.watch(), Ok(unchanged));
+        assert_eq!(display.watch(), lost);
+        assert_eq!(display.watch(), unchanged);
         // Where a request must wait, nothing is read.
         display.drm.connected = true;
         display.drm.immediate = false;
-        assert_eq!(display.watch(), Ok(unchanged));
+        assert_eq!(display.watch(), unchanged);
         display.drm.immediate = true;
         let probes = display.drm.probes;
         let restored = Watched {
             restored: 1,
             ..unchanged
         };
-        assert_eq!(display.watch(), Ok(restored));
-        assert_eq!(display.drm.probes, probes);
-        assert_eq!(display.watch(), Ok(unchanged));
+        assert_eq!(display.watch(), restored);
+        // The monitor may be another one: its modes are read anew.
+        assert_eq!(display.drm.probes, probes + 1);
+        assert_eq!(display.watch(), unchanged);
     }
     // The first set, then off and on again.
     assert_eq!(card.mode_sets, 3);

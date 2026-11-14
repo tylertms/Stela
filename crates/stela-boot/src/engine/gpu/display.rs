@@ -202,16 +202,18 @@ impl KmsScanout {
         self.next_look = now.saturating_add(self.tsc_hz.saturating_mul(LOOK_SECONDS));
         self.looks = self.looks.wrapping_add(1);
         match &mut self.display {
-            Some((name, display)) => match display.watch() {
-                Ok(watched) => report_watched(name, display, watched),
-                Err(error) => {
-                    if !core::mem::replace(&mut self.reported, true) {
-                        output::arguments(format_args!(
-                            "GPU {name}: display connector unreadable: {error:?}\n"
-                        ));
-                    }
+            Some((name, display)) => {
+                let watched = display.watch();
+                report_watched(name, display, watched);
+                if let Some(error) = watched.error
+                    && !core::mem::replace(&mut self.reported, true)
+                {
+                    output::arguments(format_args!(
+                        "GPU {name}: display request refused: {error:?}; the other outputs \
+                         are still read and set\n"
+                    ));
                 }
-            },
+            }
             None => self.attach(self.looks.is_multiple_of(PROBE_LOOKS)),
         }
     }
@@ -281,10 +283,9 @@ fn report_watched(name: &str, display: &Display<Node>, watched: Watched) {
         (watched.lost, "display disconnected"),
         (watched.restored, "display connected again"),
         (watched.joined, "display added on a new output"),
-        (
-            watched.unshown,
-            "new output has no free mode or controller in the display's size",
-        ),
+        (watched.unshown, "new output has no free mode or controller in the display's size"),
+        (watched.modeless, "display connected again has no mode of the display's size: left dark"),
+        (watched.refused, "display connected again refused its mode: left dark"),
     ];
     for (count, what) in lines {
         if count != 0 {

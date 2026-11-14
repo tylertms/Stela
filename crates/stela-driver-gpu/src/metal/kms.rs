@@ -263,6 +263,8 @@ struct Head {
     mode: ModeInfo,
     /// The connector was last read disconnected ([`Display::watch`]).
     lost: bool,
+    /// Restores tried since the connector was last read disconnected.
+    tries: u8,
     /// Not the first head: its flip to the newest buffer is still to be
     /// requested.
     behind: bool,
@@ -302,6 +304,11 @@ pub struct Display<D> {
     power: Option<bool>,
 }
 
+/// Looks at which a shown output connected again is set once more, before
+/// it is left dark until it is connected again: a monitor whose EDID is
+/// read late, or whose link trains at the second set.
+const RESTORE_TRIES: u8 = 3;
+
 /// What [`Display::watch`] read of the connectors since the last read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Watched {
@@ -309,6 +316,15 @@ pub struct Watched {
     pub lost: u32,
     /// Shown outputs connected again, their modes set again.
     pub restored: u32,
+    /// Shown outputs connected again, now left dark: the monitor lists no
+    /// mode of the display's size.
+    pub modeless: u32,
+    /// Shown outputs connected again, now left dark: the driver refused
+    /// the mode set.
+    pub refused: u32,
+    /// The first request the driver refused in this read, other outputs
+    /// read and set after it.
+    pub error: Option<Error>,
     /// Outputs connected that now show the picture too.
     pub joined: u32,
     /// Outputs connected that cannot show it: no mode of its size, or no
@@ -319,6 +335,16 @@ pub struct Watched {
 // SAFETY: the buffers' mappings go with the display, which one PE uses at a
 // time through the board's lock.
 unsafe impl<D: Send> Send for Display<D> {}
+
+/// What [`Display::restore`] did.
+enum Restore {
+    /// The output runs the picture again.
+    Set,
+    /// The probe read it disconnected.
+    Gone,
+    /// It lists no mode of the display's size; its controller is untouched.
+    NoMode,
+}
 
 /// A complete frame in the hidden buffer. Dropping it leaves the display
 /// unchanged. No other frame can be prepared before this one is released.
@@ -834,6 +860,7 @@ impl<D: Drm> Display<D> {
                     encoders: found.encoders,
                     mode,
                     lost: false,
+                    tries: 0,
                     behind: false,
                 }),
                 _ => others.push((id, true)),
@@ -968,6 +995,7 @@ impl<D: Drm> Display<D> {
             if let Err(error) = result {
                 if on {
                     self.heads[index].lost = true;
+                    self.heads[index].tries = 0;
                 }
                 if applied.is_ok() {
                     applied = Err(error);
@@ -985,34 +1013,63 @@ impl<D: Drm> Display<D> {
     /// where a request completes now.
     ///
     /// A shown output connected again after a read found it disconnected
-    /// has its controller turned off and set again on the buffer on screen:
-    /// a full mode set, which trains a DisplayPort link anew, where an
-    /// unchanged one would change nothing. A refused mode set leaves it
-    /// lost, to be tried at the next read.
+    /// is probed, as the monitor may be another one, and set in a mode of
+    /// the display's size from its new list: the mode it ran where the list
+    /// still has it, else one of that size at the same refresh, else the
+    /// size's first. Its controller is turned off first: a full mode set,
+    /// which trains a DisplayPort link anew, where an unchanged one would
+    /// change nothing. With no mode of the size the controller is not
+    /// touched. Either failure leaves it lost, tried at the next reads up
+    /// to [`RESTORE_TRIES`] looks, then counted once and left dark until it
+    /// is connected again.
     ///
     /// An output not shown, connected since it was last read disconnected
     /// or since the take, is probed once and joins the picture in its mode
     /// of the display's size on a free controller, else stays dark until it
     /// is connected again.
-    pub fn watch(&mut self) -> Result<Watched, Error> {
+    ///
+    /// A refused request stops only the output it was for: the others are
+    /// still read and set, and the first refusal is in [`Watched::error`].
+    pub fn watch(&mut self) -> Watched {
         let mut watched = Watched::default();
         if !self.drm.immediate() {
-            return Ok(watched);
+            return watched;
         }
         for index in 0..self.heads.len() {
-            let connected = detected_on(&mut self.drm, self.heads[index].connector)?;
-            match (connected, self.heads[index].lost) {
+            let connected = match detected_on(&mut self.drm, self.heads[index].connector) {
+                Ok(connected) => connected,
+                Err(error) => {
+                    watched.error.get_or_insert(error);
+                    continue;
+                }
+            };
+            let head = &mut self.heads[index];
+            match (connected, head.lost) {
                 (false, false) => {
-                    self.heads[index].lost = true;
+                    head.lost = true;
+                    head.tries = 0;
                     watched.lost += 1;
                 }
+                (false, true) => head.tries = 0,
                 // While the outputs are off, a returning one is lit with
                 // the others ([`Self::set_power`]), and set here after.
-                (true, true) if !self.dark => {
-                    self.crtc_off(index)?;
-                    self.set_mode(index)?;
-                    self.heads[index].lost = false;
-                    watched.restored += 1;
+                (true, true) if !self.dark && head.tries < RESTORE_TRIES => {
+                    head.tries += 1;
+                    let last = head.tries == RESTORE_TRIES;
+                    match self.restore(index, &mut watched) {
+                        Ok(Restore::Set) => {
+                            self.heads[index].lost = false;
+                            watched.restored += 1;
+                        }
+                        // Read disconnected after all: the next read that
+                        // finds it connected tries again.
+                        Ok(Restore::Gone) => self.heads[index].tries = 0,
+                        Ok(Restore::NoMode) => watched.modeless += u32::from(last),
+                        Err(error) => {
+                            watched.error.get_or_insert(error);
+                            watched.refused += u32::from(last);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1020,24 +1077,68 @@ impl<D: Drm> Display<D> {
         let mut index = 0;
         while let Some(&(id, tried)) = self.others.get(index) {
             index += 1;
-            if !detected_on(&mut self.drm, id)? {
-                self.others[index - 1].1 = false;
-                continue;
+            match detected_on(&mut self.drm, id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.others[index - 1].1 = false;
+                    continue;
+                }
+                Err(error) => {
+                    watched.error.get_or_insert(error);
+                    continue;
+                }
             }
             if tried || self.dark {
                 continue;
             }
             self.others[index - 1].1 = true;
-            match self.join(id)? {
-                true => {
+            match self.join(id) {
+                Ok(true) => {
                     self.others.remove(index - 1);
                     index -= 1;
                     watched.joined += 1;
                 }
-                false => watched.unshown += 1,
+                Ok(false) => watched.unshown += 1,
+                Err(error) => {
+                    watched.error.get_or_insert(error);
+                    watched.unshown += 1;
+                }
             }
         }
-        Ok(watched)
+        watched
+    }
+
+    /// Set head `index` again on its connector as its driver reads it now
+    /// ([`Self::watch`]).
+    fn restore(&mut self, index: usize, watched: &mut Watched) -> Result<Restore, Error> {
+        let found = output(&mut self.drm, self.heads[index].connector)?;
+        if !found.connected {
+            return Ok(Restore::Gone);
+        }
+        let ran = self.heads[index].mode;
+        let size = (self.width, self.height);
+        let mode = found
+            .modes
+            .iter()
+            .find(|&&mode| mode == ran)
+            .or_else(|| {
+                found
+                    .modes
+                    .iter()
+                    .find(|mode| size_of_mode(mode) == size && refresh(mode) == refresh(&ran))
+            })
+            .copied()
+            .or_else(|| mode_of(&found.modes, size, &|_, _, _| true));
+        let Some(mode) = mode else {
+            return Ok(Restore::NoMode);
+        };
+        self.heads[index].mode = mode;
+        // A refused off still leaves the set to try.
+        if let Err(error) = self.crtc_off(index) {
+            watched.error.get_or_insert(error);
+        }
+        self.set_mode(index)?;
+        Ok(Restore::Set)
     }
 
     /// Show the picture on connector `id` as well, where it has a mode of
@@ -1057,6 +1158,7 @@ impl<D: Drm> Display<D> {
             encoders: found.encoders,
             mode,
             lost: false,
+            tries: 0,
             behind: false,
         });
         let last = self.heads.len() - 1;

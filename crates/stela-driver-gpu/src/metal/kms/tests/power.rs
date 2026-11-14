@@ -24,7 +24,7 @@ fn display_sleep_turns_the_output_off_and_a_wake_shows_the_newest_frame() {
         assert!(display.queued());
         assert!(display.drm.flips.is_empty());
         // A returning connector is not lit while the outputs are off.
-        assert_eq!(display.watch(), Ok(Watched::default()));
+        assert_eq!(display.watch(), Watched::default());
         assert_eq!(display.drm.set, None);
         // The wake sets the mode on the buffer on screen, then flips the
         // newest frame.
@@ -54,6 +54,6 @@ fn an_output_that_cannot_be_lit_again_is_left_for_the_next_look() {
         restored: 1,
         ..Watched::default()
     };
-    assert_eq!(display.watch(), Ok(restored));
+    assert_eq!(display.watch(), restored);
     assert!(display.drm.set.is_some());
 }

@@ -2,7 +2,7 @@
 //! size.
 use super::*;
 
-fn at(width: u16, height: u16, kind: u32, vrefresh: u32) -> ModeInfo {
+pub(super) fn at(width: u16, height: u16, kind: u32, vrefresh: u32) -> ModeInfo {
     ModeInfo {
         vrefresh,
         ..mode(width, height, kind)
@@ -11,7 +11,7 @@ fn at(width: u16, height: u16, kind: u32, vrefresh: u32) -> ModeInfo {
 
 /// A card with a monitor on each connector: a large one on the first that
 /// also runs the second's native size, and the second's.
-fn two_monitors() -> Card {
+pub(super) fn two_monitors() -> Card {
     let mut card = Card::new(vec![at(6, 4, PREFERRED, 60), at(4, 2, 0, 60)]);
     card.first = vec![at(8, 4, PREFERRED, 60), at(6, 4, 0, 75), at(4, 2, 0, 60)];
     card.first_connected = true;
@@ -190,16 +190,16 @@ fn a_monitor_connected_later_joins_the_picture_in_its_size() {
         assert_eq!((display.outputs(), display.unshown()), (1, 0));
         front = display.buffers[0].framebuffer;
         let unchanged = Watched::default();
-        assert_eq!(display.watch(), Ok(unchanged));
+        assert_eq!(display.watch(), unchanged);
         display.drm.first_connected = true;
         let joined = Watched {
             joined: 1,
             ..unchanged
         };
-        assert_eq!(display.watch(), Ok(joined));
+        assert_eq!(display.watch(), joined);
         assert_eq!(display.outputs(), 2);
         assert_eq!(display.drm.set_40, Some((joining, front)));
-        assert_eq!(display.watch(), Ok(unchanged));
+        assert_eq!(display.watch(), unchanged);
         spare = display.buffers[2].framebuffer;
         display.present(&[7; 96]).unwrap();
         // It is shown now: unplugged and plugged again, its mode is set again.
@@ -208,13 +208,13 @@ fn a_monitor_connected_later_joins_the_picture_in_its_size() {
             lost: 1,
             ..unchanged
         };
-        assert_eq!(display.watch(), Ok(lost));
+        assert_eq!(display.watch(), lost);
         display.drm.first_connected = true;
         let restored = Watched {
             restored: 1,
             ..unchanged
         };
-        assert_eq!(display.watch(), Ok(restored));
+        assert_eq!(display.watch(), restored);
     }
     assert_eq!(card.flips, [spare]);
     assert_eq!(card.flips_40, [spare]);
@@ -233,16 +233,16 @@ fn a_monitor_connected_later_without_the_size_is_tried_once_per_connection() {
         unshown: 1,
         ..unchanged
     };
-    assert_eq!(display.watch(), Ok(unshown));
+    assert_eq!(display.watch(), unshown);
     assert_eq!(display.unshown(), 1);
     let probes = display.drm.probes;
-    assert_eq!(display.watch(), Ok(unchanged));
+    assert_eq!(display.watch(), unchanged);
     assert_eq!(display.drm.probes, probes);
     display.drm.first_connected = false;
-    assert_eq!(display.watch(), Ok(unchanged));
+    assert_eq!(display.watch(), unchanged);
     assert_eq!(display.unshown(), 0);
     display.drm.first_connected = true;
-    assert_eq!(display.watch(), Ok(unshown));
+    assert_eq!(display.watch(), unshown);
     assert_eq!(display.outputs(), 1);
     assert!(display.drm.set_40.is_none());
 }
