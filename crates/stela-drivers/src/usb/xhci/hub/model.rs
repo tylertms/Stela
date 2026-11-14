@@ -179,6 +179,14 @@ impl Node {
     pub fn bot_commands(&self) -> &[(u32, u8)] {
         &self.bot.as_ref().expect("BOT peer required").commands
     }
+    /// Hang the BOT peer until a port reset readdresses it
+    /// ([`bot::Disk::wedged`]).
+    pub fn wedge_bot(&mut self) {
+        self.bot.as_mut().expect("BOT peer required").wedged = true;
+    }
+    pub fn bot_wedged(&self) -> bool {
+        self.bot.as_ref().expect("BOT peer required").wedged
+    }
     fn device(&self) -> Vec<u8> {
         let mut out = vec![
             18, 1, 0, 3, 0, 0, 0, 9, 0x34, 0x12, 0x78, 0x56, 0, 1, 0, 0, 0, 1,
@@ -383,6 +391,8 @@ pub(in super::super) struct Hardware {
     pub root_untrainable: bool,
     pub notification_override: Option<u32>,
     pending_interrupts: BTreeMap<(u8, u8), (u64, u64, usize)>,
+    /// Bulk TDs a wedged BOT peer never completes; a Stop Endpoint ends them.
+    withheld: BTreeMap<(u8, u8), u64>,
     pub mmio_reads: usize,
     pub mmio_writes: usize,
     registers: BTreeMap<usize, u32>,
@@ -423,6 +433,7 @@ impl Hardware {
             root_untrainable: false,
             notification_override: None,
             pending_interrupts: BTreeMap::new(),
+            withheld: BTreeMap::new(),
             mmio_reads: 0,
             mmio_writes: 0,
             registers: BTreeMap::new(),
@@ -565,6 +576,17 @@ impl Hardware {
                     ];
                     let route = words[0] & 0xfffff;
                     self.routes.insert(slot, route);
+                    // Only a port reset readdresses a device: it ends a
+                    // wedged BOT peer's hang.
+                    if kind == ADDRESS_DEVICE
+                        && let Some(disk) = self
+                            .nodes
+                            .get_mut(&route)
+                            .and_then(|node| node.bot.as_mut())
+                    {
+                        disk.wedged = false;
+                        disk.reset();
+                    }
                     self.contexts.push((slot, kind, words));
                     if kind == ADDRESS_DEVICE && self.loss_after_child_route == Some(route) {
                         self.nodes.get_mut(&0).unwrap().hub_status = 1;
@@ -573,6 +595,7 @@ impl Hardware {
                 reset::DISABLE_SLOT => {
                     self.free_slots.insert(slot);
                     assert!(self.pending_interrupts.keys().all(|(s, _)| *s != slot));
+                    assert!(self.withheld.keys().all(|(s, _)| *s != slot));
                     for &(s, dci) in self.endpoints.keys() {
                         if s == slot {
                             assert_eq!(
@@ -590,6 +613,9 @@ impl Hardware {
                 STOP_ENDPOINT | RESET_ENDPOINT => {
                     if let Some((trb, _, _)) = self.pending_interrupts.remove(&(slot, dci)) {
                         // Stopped transfer event precedes Stop ACK.
+                        self.event(trb, 26, TRANSFER_EVENT, slot, dci, 0);
+                    }
+                    if let Some(trb) = self.withheld.remove(&(slot, dci)) {
                         self.event(trb, 26, TRANSFER_EVENT, slot, dci, 0);
                     }
                     let output = self.outputs[&slot] + u64::from(dci) * self.context_bytes as u64;
@@ -631,6 +657,9 @@ impl Hardware {
             }
             (0x21, 0xff) if node.bot.is_some() => {
                 assert_eq!(request, setup(0x21, 0xff, 0, 0, 0));
+                if node.bot.as_ref().unwrap().wedged {
+                    return Err(6);
+                }
                 node.bot.as_mut().unwrap().reset();
                 Ok(Vec::new())
             }
@@ -995,6 +1024,10 @@ impl Hardware {
                 .bot
                 .as_mut()
             {
+                if disk.wedged {
+                    assert!(self.withheld.insert((slot, dci), trb).is_none());
+                    return;
+                }
                 disk.transfer(dci & 1 != 0, buffer, length as usize);
             } else if dci & 1 != 0 {
                 // SAFETY: published IN payload belongs to this fixture.

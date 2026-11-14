@@ -204,6 +204,11 @@ trait Scsi {
     {
         None
     }
+    /// Whether [`Self::reset_device`] needs memory its old binding cannot
+    /// give back: a device behind a hub gets new rings.
+    fn reset_needs_allocation(&self) -> bool {
+        false
+    }
 }
 impl<I: Io> Scsi for Bot<I> {
     type Lun = u8;
@@ -282,6 +287,9 @@ impl<I: Io> Scsi for Bot<I> {
     ) -> Option<Result<Self, (String, BlockError)>> {
         I::reset_device(self, dma)
     }
+    fn reset_needs_allocation(&self) -> bool {
+        self.io.reset_needs_allocation()
+    }
 }
 impl Scsi for uas::Host {
     type Lun = uas::Lun;
@@ -353,6 +361,9 @@ impl Scsi for uas::Host {
         dma: &mut dyn DmaAllocator,
     ) -> Option<Result<Self, (String, BlockError)>> {
         Some(uas::Host::reset_and_rebind(self, dma))
+    }
+    fn reset_needs_allocation(&self) -> bool {
+        uas::Host::reset_needs_allocation(self)
     }
     fn max_transfer_bytes(&self) -> usize {
         uas::Host::max_transfer_bytes(self)

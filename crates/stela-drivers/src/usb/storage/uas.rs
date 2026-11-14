@@ -427,6 +427,15 @@ impl Host {
     pub fn requires_rebind(&self) -> bool {
         self.engine.poisoned
     }
+    /// Whether [`Self::reset_and_rebind`] needs fresh rings from its
+    /// allocator, as a device behind a hub does.
+    pub(super) fn reset_needs_allocation(&self) -> bool {
+        self.engine
+            .io
+            .controller
+            .try_borrow()
+            .is_ok_and(|controller| controller.reset_needs_allocation(self.device.id))
+    }
     /// What the last command's data phase moved in before it failed.
     pub(super) fn take_failed_data(&mut self) -> Option<Vec<u8>> {
         self.engine.failed_data.take()

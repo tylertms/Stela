@@ -23,6 +23,9 @@ pub(super) struct Disk {
     media: Vec<u8>,
     phase: Phase,
     pub(super) commands: Vec<(u32, u8)>,
+    /// Hung after its configuration, as a stick may be: it takes no bulk
+    /// transfer and stalls the class reset until a port reset readdresses it.
+    pub(super) wedged: bool,
 }
 
 impl Disk {
@@ -31,6 +34,7 @@ impl Disk {
             media: alloc::vec![0; BLOCK_BYTES * BLOCKS],
             phase: Phase::Command,
             commands: Vec::new(),
+            wedged: false,
         }
     }
 

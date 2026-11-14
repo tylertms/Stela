@@ -334,8 +334,15 @@ impl<T: Scsi> Owner<T> {
             return;
         }
         // A root device's reset reuses its old binding's rings and
-        // buffers. One behind a hub needs new rings, which only an explicit
-        // rescan with the drivers' allocator can supply, so it fails here.
+        // buffers. One behind a hub needs new rings, which only
+        // [`UsbStorage::service`] with the drivers' allocator supplies; that
+        // reset disables the old slot and resets the port before it
+        // allocates, so begun here it would lose the device for good. The
+        // transport stays poisoned for the service's reset.
+        if self.transport.reset_needs_allocation() {
+            self.invalidate();
+            return;
+        }
         // SAFETY: the empty range hands out no memory.
         let mut none = unsafe { crate::bus::dma::RegionAllocator::new(0..0) };
         let Some(replaced) = self.transport.reset_device(&mut none) else {

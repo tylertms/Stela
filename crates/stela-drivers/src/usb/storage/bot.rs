@@ -170,6 +170,11 @@ pub(super) trait Io {
     {
         None
     }
+    /// Whether [`Self::reset_device`] needs fresh rings from its allocator,
+    /// as a device behind a hub does.
+    fn reset_needs_allocation(&self) -> bool {
+        false
+    }
 }
 
 /// A control transfer or halt clear ([`Io::begin_control`], [`Io::begin_clear`]).
@@ -229,6 +234,12 @@ impl Io for Native {
         dma: &mut dyn DmaAllocator,
     ) -> Option<Result<Bot<Self>, (alloc::string::String, BlockError)>> {
         Some(bot.reset_and_rebind(dma))
+    }
+
+    fn reset_needs_allocation(&self) -> bool {
+        self.controller
+            .try_borrow()
+            .is_ok_and(|controller| controller.reset_needs_allocation(self.id))
     }
 
     fn signals(&self) -> bool {

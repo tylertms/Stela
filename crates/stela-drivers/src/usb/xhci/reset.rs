@@ -224,6 +224,18 @@ impl Controller {
         }
         result
     }
+    /// Whether [`Self::reset_and_reuse_root`] of `id` needs fresh rings and
+    /// contexts from its allocator: a device behind a hub gets new ones, as
+    /// only a root port's device reuses its own retired storage. It disables
+    /// the old slot and resets the port before it allocates, so a caller
+    /// with no allocator must not begin it.
+    pub(crate) fn reset_needs_allocation(&self, id: SlotId) -> bool {
+        self.known_id(id)
+            && self.slots[usize::from(id.hardware_slot())]
+                .as_ref()
+                .is_some_and(|slot| slot.attachment.parent.is_some())
+    }
+
     /// Reset one exclusively owned leaf, reusing complete native storage when
     /// it is directly attached to a root port. Downstream topology keeps the
     /// original nonrecycling service until a parent/subtree reuse proof exists.

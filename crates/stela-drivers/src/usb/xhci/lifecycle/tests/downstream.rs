@@ -156,3 +156,57 @@ fn downstream_reset_reobserves_root_and_hub_power_before_endpoint_retirement() {
         assert!(controller.power.retained(old.slot));
     }
 }
+
+/// A stick behind a hub that hangs after its configuration: its first
+/// command never completes and its class reset stalls. The storage owner
+/// must leave the port reset to the storage service, which has the
+/// allocator a device behind a hub needs for its new rings; begun without
+/// one, the reset disabled the slot and reset the port before it failed,
+/// and the service's own reset then found the device gone for good.
+#[test]
+fn a_hung_stick_behind_a_hub_is_reset_by_the_storage_service_and_found() {
+    use crate::block::BlockDevice;
+    let _clock = crate::test_clock::virtualize();
+    for speed in [HIGH_SPEED, SUPER_SPEED] {
+        let mut dma = TestRegion::new(1024 * 1024 * 8);
+        let (mut controller, hardware) = hub::tests::controller(
+            &mut dma,
+            64,
+            BTreeMap::from([(0, Node::hub(speed, 1)), (1, Node::bot_disk(speed))]),
+        );
+        let mut failures = Vec::new();
+        let devices = controller.enumerate(&mut dma, &mut failures);
+        assert!(failures.is_empty(), "{failures:?}");
+        let stick = devices
+            .iter()
+            .find(|d| d.descriptor[4] != HUB_CLASS)
+            .unwrap()
+            .clone();
+        let shared = Rc::new(RefCell::new(controller));
+        hardware.borrow_mut().nodes.get_mut(&1).unwrap().wedge_bot();
+        let resets = hardware.borrow().nodes[&0].ports.as_ref().unwrap()[0].reset_count;
+        let mut found = Found::default();
+        bind::bind(&shared, stick.clone(), &mut dma, &mut found);
+        // The first INQUIRY timed out; the stick came back after one port
+        // reset by the service and was found on the same port.
+        assert!(!hardware.borrow().nodes[&1].bot_wedged());
+        assert_eq!(
+            hardware.borrow().nodes[&0].ports.as_ref().unwrap()[0].reset_count,
+            resets + 1
+        );
+        assert!(
+            found.failures.iter().all(|(_, error)| *error
+                != BlockError::Unsupported("xHCI device generation is permanently retired")),
+            "{:?}",
+            found.failures
+        );
+        assert_eq!(found.disks.len(), 1, "{:?}", found.failures);
+        assert_eq!(found.storage.len(), 1);
+        assert!(shared.borrow_mut().device(stick.id).is_err());
+        let payload = [0x3c; 512];
+        found.disks[0].write(4, &payload).unwrap();
+        let mut read = [0; 512];
+        found.disks[0].read(4, &mut read).unwrap();
+        assert_eq!(read, payload);
+    }
+}
