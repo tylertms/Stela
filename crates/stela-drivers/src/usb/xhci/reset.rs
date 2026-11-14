@@ -277,6 +277,15 @@ impl Controller {
         Some(self.root_port_status(port))
     }
 
+    /// Whether [`Self::reset_and_reuse_root`] of `id` can run with its own
+    /// retired storage alone: a live device on a root port.
+    pub(crate) fn reset_reuses_storage(&self, id: SlotId) -> bool {
+        self.known_id(id)
+            && self.slots[usize::from(id.hardware_slot())]
+                .as_ref()
+                .is_some_and(|slot| slot.attachment.parent.is_none())
+    }
+
     /// Whether [`Self::reset_and_reuse_root`] of `id` needs fresh rings and
     /// contexts from its allocator: a device behind a hub gets new ones, as
     /// only a root port's device reuses its own retired storage. It disables

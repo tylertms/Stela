@@ -184,6 +184,11 @@ impl Node {
     pub fn wedge_bot(&mut self) {
         self.bot.as_mut().expect("BOT peer required").wedged = true;
     }
+    /// [`Self::wedge_bot`], with the class reset acknowledged and no help.
+    pub fn wedge_bot_acking_reset(&mut self) {
+        self.wedge_bot();
+        self.bot.as_mut().unwrap().acks_reset = true;
+    }
     pub fn bot_wedged(&self) -> bool {
         self.bot.as_ref().expect("BOT peer required").wedged
     }
@@ -703,7 +708,11 @@ impl Hardware {
             }
             (0x21, 0xff) if node.bot.is_some() => {
                 assert_eq!(request, setup(0x21, 0xff, 0, 0, 0));
-                if node.bot.as_ref().unwrap().wedged {
+                let disk = node.bot.as_ref().unwrap();
+                if disk.wedged && disk.acks_reset {
+                    return Ok(Vec::new());
+                }
+                if disk.wedged {
                     return Err(6);
                 }
                 node.bot.as_mut().unwrap().reset();

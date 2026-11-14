@@ -26,6 +26,8 @@ pub(super) struct Disk {
     /// Hung after its configuration, as a stick may be: it takes no bulk
     /// transfer and stalls the class reset until a port reset readdresses it.
     pub(super) wedged: bool,
+    /// The hung peer acknowledges a class reset and stays hung.
+    pub(super) acks_reset: bool,
 }
 
 impl Disk {
@@ -35,6 +37,7 @@ impl Disk {
             phase: Phase::Command,
             commands: Vec::new(),
             wedged: false,
+            acks_reset: false,
         }
     }
 

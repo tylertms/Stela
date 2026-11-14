@@ -179,6 +179,12 @@ pub(super) trait Io {
     fn port_status(&mut self) -> Option<String> {
         None
     }
+    /// Whether a timed-out command is recovered by the owner's port reset
+    /// ([`Self::reset_device`]) rather than a class reset first: where that
+    /// reset runs at once, without fresh allocation.
+    fn port_reset_first(&self) -> bool {
+        false
+    }
 }
 
 /// A control transfer or halt clear ([`Io::begin_control`], [`Io::begin_clear`]).
@@ -248,6 +254,17 @@ impl Io for Native {
 
     fn port_status(&mut self) -> Option<String> {
         self.controller.try_borrow_mut().ok()?.port_status(self.id)
+    }
+
+    /// A root device's reset runs at once from its owner. During the first
+    /// scan, one behind a hub is reset by the storage service that runs the
+    /// scan, with the allocator its new rings need.
+    fn port_reset_first(&self) -> bool {
+        self.command_us.get() == SCAN_COMMAND_US
+            || self
+                .controller
+                .try_borrow()
+                .is_ok_and(|controller| controller.reset_reuses_storage(self.id))
     }
 
     fn signals(&self) -> bool {
@@ -856,6 +873,17 @@ impl<I: Io> Bot<I> {
         // Read as the transfer failed, before its recovery changes it.
         if self.failure_status.is_none() {
             self.failure_status = self.io.port_status();
+        }
+        // Linux `usb_stor_invoke_transport`: a command that timed out is
+        // recovered by a port reset first, and the class reset only follows
+        // a failed one. A device hung that way rarely answers its class
+        // reset, which then costs its own timeout and settle before the port
+        // reset runs anyway. The cancelled transfer left the endpoints idle;
+        // the owner resets the port of a poisoned transport. Where the port
+        // reset cannot run at once, the class reset stays first.
+        if error == BlockError::Timeout && self.io.port_reset_first() {
+            self.poisoned = true;
+            return Err(error);
         }
         self.recover();
         Err(self.minimum_error.clone().unwrap_or(error))

@@ -338,3 +338,82 @@ fn a_slow_warm_reset_of_a_hung_stick_is_waited_for() {
     bind::bind(&shared, devices[0].clone(), &mut dma, &mut found);
     assert_eq!(found.disks.len(), 1, "{:?}", found.failures);
 }
+
+/// A stick whose first command hangs and whose class reset is acknowledged
+/// without bringing it back. As Linux's `usb_stor_invoke_transport`, the
+/// timed-out command is recovered by a port reset first, where the class
+/// reset ended the command, the unit failed, and nothing reset the port.
+#[test]
+fn a_timed_out_first_command_resets_a_root_stick_port_before_any_class_reset() {
+    let _clock = crate::test_clock::virtualize();
+    for speed in [HIGH_SPEED, SUPER_SPEED] {
+        let mut dma = TestRegion::new(1024 * 1024 * 8);
+        let (mut controller, hardware) =
+            hub::tests::controller(&mut dma, 64, BTreeMap::from([(0, Node::bot_disk(speed))]));
+        hardware.borrow_mut().root_status =
+            Some(PP | CCS | PED | u32::from(speed) << PORT_SPEED_SHIFT);
+        let mut failures = Vec::new();
+        let devices = controller.enumerate(&mut dma, &mut failures);
+        assert!(failures.is_empty(), "{failures:?}");
+        let shared = Rc::new(RefCell::new(controller));
+        hardware
+            .borrow_mut()
+            .nodes
+            .get_mut(&0)
+            .unwrap()
+            .wedge_bot_acking_reset();
+        let mut found = Found::default();
+        bind::bind(&shared, devices[0].clone(), &mut dma, &mut found);
+        assert_eq!(found.disks.len(), 1, "{:?}", found.failures);
+        assert!(!hardware.borrow().nodes[&0].bot_wedged());
+        assert!(
+            !hardware
+                .borrow()
+                .requests
+                .iter()
+                .any(|(_, _, request)| *request == setup(0x21, 0xff, 0, 0, 0))
+        );
+    }
+}
+
+/// The same during the first scan of a stick behind a hub: the storage
+/// service that runs the scan resets its port with the allocator its new
+/// rings need, and no class reset runs first.
+#[test]
+fn a_timed_out_first_command_resets_a_hub_stick_port_before_any_class_reset() {
+    let _clock = crate::test_clock::virtualize();
+    for speed in [HIGH_SPEED, SUPER_SPEED] {
+        let mut dma = TestRegion::new(1024 * 1024 * 8);
+        let (mut controller, hardware) = hub::tests::controller(
+            &mut dma,
+            64,
+            BTreeMap::from([(0, Node::hub(speed, 1)), (1, Node::bot_disk(speed))]),
+        );
+        let mut failures = Vec::new();
+        let devices = controller.enumerate(&mut dma, &mut failures);
+        assert!(failures.is_empty(), "{failures:?}");
+        let stick = devices
+            .iter()
+            .find(|d| d.descriptor[4] != HUB_CLASS)
+            .unwrap()
+            .clone();
+        let shared = Rc::new(RefCell::new(controller));
+        hardware
+            .borrow_mut()
+            .nodes
+            .get_mut(&1)
+            .unwrap()
+            .wedge_bot_acking_reset();
+        let mut found = Found::default();
+        bind::bind(&shared, stick, &mut dma, &mut found);
+        assert_eq!(found.disks.len(), 1, "{:?}", found.failures);
+        assert!(!hardware.borrow().nodes[&1].bot_wedged());
+        assert!(
+            !hardware
+                .borrow()
+                .requests
+                .iter()
+                .any(|(_, _, request)| *request == setup(0x21, 0xff, 0, 0, 0))
+        );
+    }
+}
