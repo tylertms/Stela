@@ -90,6 +90,8 @@ pub struct SystemIdentity<'a> {
     /// The first type-2 baseboard's manufacturer, the structure Linux's
     /// `dmi_decode` saves as DMI_BOARD_VENDOR. Not observed without one.
     pub board_vendor: Observation<'a>,
+    /// That baseboard's product, Linux's DMI_BOARD_NAME.
+    pub board_name: Observation<'a>,
 }
 impl Default for SystemIdentity<'_> {
     fn default() -> Self {
@@ -98,6 +100,7 @@ impl Default for SystemIdentity<'_> {
             product_name: Observation::NotObserved,
             product_version: Observation::NotObserved,
             board_vendor: Observation::NotObserved,
+            board_name: Observation::NotObserved,
         }
     }
 }
@@ -280,15 +283,20 @@ pub fn identity(entry: Entry, table: &[u8]) -> Result<SystemIdentity<'_>, Error>
                 product_name: field(table[at + 5], strings)?,
                 product_version: field(table[at + 6], strings)?,
                 board_vendor: Observation::NotObserved,
+                board_name: Observation::NotObserved,
             });
         }
         if head[0] == 2 && board.is_none() {
             // dmi_save_ident skips a field past the structure's length.
-            board = Some(if length > 4 {
-                field(table[at + 4], &table[at + length..next])?
-            } else {
-                Observation::NotObserved
-            });
+            let strings = &table[at + length..next];
+            let saved = |offset: usize| {
+                if offset < length {
+                    field(table[at + offset], strings)
+                } else {
+                    Ok(Observation::NotObserved)
+                }
+            };
+            board = Some((saved(4)?, saved(5)?));
         }
         at = next;
         if head[0] == 127 {
@@ -306,9 +314,14 @@ pub fn identity(entry: Entry, table: &[u8]) -> Result<SystemIdentity<'_>, Error>
         return Err(Error::MissingEnd);
     }
     found
-        .map(|identity| SystemIdentity {
-            board_vendor: board.unwrap_or(Observation::NotObserved),
-            ..identity
+        .map(|identity| {
+            let (board_vendor, board_name) =
+                board.unwrap_or((Observation::NotObserved, Observation::NotObserved));
+            SystemIdentity {
+                board_vendor,
+                board_name,
+                ..identity
+            }
         })
         .ok_or(Error::MissingType1)
 }
@@ -471,6 +484,7 @@ mod tests {
                     product_name: Observation::Absent,
                     product_version: Observation::Absent,
                     board_vendor: Observation::NotObserved,
+                    board_name: Observation::NotObserved,
                 }
             );
             assert_eq!(
@@ -480,29 +494,27 @@ mod tests {
         }
     }
     #[test]
-    fn the_first_baseboard_names_the_board_vendor() {
+    fn the_first_baseboard_names_the_board_vendor_and_name() {
         let (raw, table) = fixture(Format::Smbios3);
         let end = table.len() - 6;
         let mut boards = table[..end].to_vec();
-        boards.extend_from_slice(&[2, 8, 2, 0, 1, 0, 0, 0]);
-        boards.extend_from_slice(b"Board Co\0\0");
+        boards.extend_from_slice(&[2, 8, 2, 0, 1, 2, 0, 0]);
+        boards.extend_from_slice(b"Board Co\0PRIME Z370-A\0\0");
         boards.extend_from_slice(&[2, 8, 3, 0, 1, 0, 0, 0]);
         boards.extend_from_slice(b"Second\0\0");
         boards.extend_from_slice(&table[end..]);
         let mut entry = entry(&raw, Format::Smbios3).unwrap();
         entry.table_bytes = boards.len();
-        assert_eq!(
-            identity(entry, &boards).unwrap().board_vendor,
-            Observation::Value(&b"Board Co\0"[..])
-        );
+        let first = identity(entry, &boards).unwrap();
+        assert_eq!(first.board_vendor, Observation::Value(&b"Board Co\0"[..]));
+        assert_eq!(first.board_name, Observation::Value(&b"PRIME Z370-A\0"[..]));
         let mut short = table[..end].to_vec();
         short.extend_from_slice(&[2, 4, 2, 0, 0, 0]);
         short.extend_from_slice(&table[end..]);
         entry.table_bytes = short.len();
-        assert_eq!(
-            identity(entry, &short).unwrap().board_vendor,
-            Observation::NotObserved
-        );
+        let short = identity(entry, &short).unwrap();
+        assert_eq!(short.board_vendor, Observation::NotObserved);
+        assert_eq!(short.board_name, Observation::NotObserved);
     }
     #[test]
     fn checked_entry_lengths_checksums_versions_and_native_bounds_refuse() {
