@@ -31,6 +31,7 @@ use crate::{
 };
 use alloc::string::ToString;
 use alloc::{format, string::String, vec, vec::Vec};
+use stela_boot_core::chosen_disk;
 use stela_boot_core::screen::{disk_size as size, window};
 use stela_contracts::refuse;
 use stela_crypto::Sha256;
@@ -564,20 +565,26 @@ fn disks() -> Vec<Disk> {
             Ok(Found::Blank | Found::Interrupted) => {}
             Err(_) => disk.foreign = true,
         }
-        // Stela's own drivers must reach the disk, and find it again by its
-        // serial number.
-        let controller = crate::pci_io::disk_controller(handle)
+        // Why Stela's own drivers cannot reach the disk, if they cannot.
+        disk.refusal = crate::pci_io::disk_controller(handle)
             .and_then(|function| stela_drivers::probe::disk_refusal(&function));
-        disk.refusal = match &disk.serial {
-            _ if controller.is_some() => controller,
-            None => Some("No serial number"),
-            Some(serial) if serial.contains(char::is_whitespace) => {
-                Some("Serial number has spaces")
-            }
-            Some(_) if disk.bytes() < MIN_BYTES => Some("Smaller than 60 GB"),
-            Some(_) => None,
-        };
         disks.push(disk);
+    }
+    // Stela's own drivers must reach each disk, and find it again by a
+    // serial number no other listed disk reports.
+    let candidates: Vec<_> = disks
+        .iter()
+        .map(|disk| chosen_disk::Candidate {
+            serial: disk.serial.as_deref(),
+            bytes: disk.bytes(),
+            controller: disk.refusal,
+        })
+        .collect();
+    let refusals: Vec<_> = (0..disks.len())
+        .map(|index| chosen_disk::picker_refusal(&candidates, index, MIN_BYTES))
+        .collect();
+    for (disk, refusal) in disks.iter_mut().zip(refusals) {
+        disk.refusal = refusal;
     }
     disks
 }
