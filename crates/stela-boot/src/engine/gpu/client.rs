@@ -6,6 +6,10 @@
 //! round trip, not a core. Each call runs on one of a few standing Linux
 //! tasks, since an ioctl may sleep on the GPU. On the boot CPU itself there is
 //! no one to wait for, so the caller runs the environment until its call is done.
+//! Each wait is bounded ([`posted_call`]): a call no task took in time is
+//! withdrawn and answered `ETIMEDOUT`, and one a task performs too long stops
+//! the boot, naming it, as a processor held out of its guest for long makes
+//! XNU panic.
 //!
 //! A thread Mesa starts is a Linux task too, as Linux's own kthreads are, so it
 //! makes its calls in place and sleeps in Linux. It runs Mesa on a stack of its
@@ -37,6 +41,7 @@ use core::{
     },
 };
 use stela_boot_core::page_window::Cache;
+use stela_boot_core::posted_call::{self, Claim};
 use stela_drivers::platform::work::{WorkError, service::Idle};
 use stela_linux::{
     client,
@@ -82,6 +87,7 @@ const ENODEV: i64 = -19;
 const EFAULT: i64 = -14;
 const ENOMEM: i64 = -12;
 const EAGAIN: i64 = -11;
+const ETIMEDOUT: i64 = -110;
 
 /// `struct stela_libc_drm_device`.
 #[repr(C)]
@@ -196,7 +202,9 @@ fn current_thread(gpu: &Installed) -> Option<Running> {
     (pointer < thread.top).then_some(*thread)
 }
 
-/// A posted call, which its caller keeps until `done`.
+/// A posted call, which its caller keeps until `done`, unless it withdrew
+/// it ([`Claim`]): a withdrawn call is boxed, and the task that meets it
+/// frees it ([`release_withdrawn`]).
 struct Request {
     operation: Operation,
     next: Cell<*const Request>,
@@ -205,6 +213,8 @@ struct Request {
     wake_task: bool,
     /// The TSC at posting, for the report of calls that wait.
     posted: u64,
+    /// Whether a task took it, or its poster withdrew it.
+    claim: Claim,
 }
 
 impl Request {
@@ -216,7 +226,18 @@ impl Request {
             done: AtomicU32::new(0),
             wake_task: false,
             posted: host::rdtsc(),
+            claim: Claim::new(),
         }
+    }
+
+    /// Whether its poster may withdraw it once its wait passes
+    /// [`posted_call::WITHDRAW_MS`]: a call whose absence its caller answers
+    /// as a failure. A thread, a wake and the stop are waited for.
+    fn withdrawable(&self) -> bool {
+        !matches!(
+            self.operation,
+            Operation::Thread(_) | Operation::Wake | Operation::Shutdown
+        )
     }
 
     fn complete(&self, result: i64) -> bool {
@@ -460,7 +481,12 @@ impl Service {
     fn refuse_queued(&self, result: i64) {
         let queued = core::mem::take(&mut *self.queue.borrow_mut());
         for request in queued {
-            // SAFETY: a queued call's poster keeps it until it is done.
+            // SAFETY: a queued call's poster keeps it until it is done or
+            // withdrawn, and then the call is this task's to free.
+            if unsafe { release_withdrawn(request) } {
+                continue;
+            }
+            // SAFETY: as above; taken, so its poster waits for it.
             self.wake(unsafe { request.as_ref() }.refuse(result));
         }
     }
@@ -494,8 +520,9 @@ unsafe impl ManagedJob for Worker {
             let next = service.queue.borrow_mut().pop_front();
             if let Some(request) = next {
                 idle_since = None;
-                // SAFETY: a queued call's poster keeps it until it is done.
-                serve(gpu, unsafe { request.as_ref() });
+                // SAFETY: a queued call's poster keeps it until it is done
+                // or withdrawn, and then the call is this worker's to free.
+                unsafe { serve(gpu, request) };
                 continue;
             }
             let now = host::rdtsc();
@@ -517,8 +544,34 @@ unsafe impl ManagedJob for Worker {
 static SERVING: [(AtomicU32, AtomicU64); 32] =
     [const { (AtomicU32::new(0), AtomicU64::new(0)) }; 32];
 
-/// Performs `request` on this task and answers its poster.
-fn serve(gpu: &Installed, request: &Request) {
+/// Frees `request` when its poster withdrew it, which no task then performs;
+/// else takes it to perform. Whether it was freed.
+///
+/// # Safety
+/// `request` is a live posted call this task met; a withdrawn one is boxed
+/// and no one else frees it.
+unsafe fn release_withdrawn(request: NonNull<Request>) -> bool {
+    // SAFETY: the caller's.
+    if unsafe { request.as_ref() }.claim.take() {
+        return false;
+    }
+    // SAFETY: withdrawn calls are boxed by `submit`, and the poster left it.
+    drop(unsafe { Box::from_raw(request.as_ptr()) });
+    true
+}
+
+/// Performs `request` on this task and answers its poster, unless its poster
+/// withdrew it.
+///
+/// # Safety
+/// `request` is a queued call this worker took off the queue.
+unsafe fn serve(gpu: &Installed, request: NonNull<Request>) {
+    // SAFETY: the caller's.
+    if unsafe { release_withdrawn(request) } {
+        return;
+    }
+    // SAFETY: taken, so its poster keeps it until it is done.
+    let request = unsafe { request.as_ref() };
     let code = request_code(&request.operation);
     let started = host::rdtsc();
     let slot = SERVING.iter().find(|slot| {
@@ -795,6 +848,10 @@ pub(super) fn start(gpu: &Installed) -> Result<(), WorkError> {
                 }
             }
             Operation::Thread(_) => start_thread(gpu, current)?,
+            // SAFETY: the posted call met here, which nothing queued yet;
+            // `request` is its non-null pointer.
+            _ if current.claim.withdrawn()
+                && unsafe { release_withdrawn(NonNull::new_unchecked(request.cast_mut())) } => {}
             _ => {
                 count(
                     &TAKEN,
@@ -869,16 +926,79 @@ fn submit(operation: Operation) -> i64 {
         return result;
     }
     let code = request_code(&operation);
-    let request = Request::new(operation);
-    let posted = host::rdtsc();
-    wait(gpu, &request, u64::MAX);
+    // Boxed, so that a withdrawn call outlives this frame with the task
+    // that meets it.
+    let request = NonNull::from(Box::leak(Box::new(Request::new(operation))));
+    // SAFETY: this frame owns the box until it frees it or withdraws the call.
+    let posted = unsafe { request.as_ref() }.posted;
+    // SAFETY: as above.
+    let Some(result) = posted_wait(gpu, unsafe { request.as_ref() }, code) else {
+        return ETIMEDOUT;
+    };
+    // SAFETY: done, so no task touches it again; this frame's box.
+    drop(unsafe { Box::from_raw(request.as_ptr()) });
     let waited = host::rdtsc().wrapping_sub(posted);
     if let Some(mine) = MINE.get(host::processor() as usize) {
         mine.0.fetch_add(1, Ordering::Relaxed);
         mine.1.fetch_add(waited, Ordering::Relaxed);
     }
     count(&POSTED, code, waited);
-    request.result.load(Ordering::Acquire)
+    result
+}
+
+/// Calls withdrawn so far, for the report of the first and of each power of
+/// two after it.
+static WITHDRAWN: AtomicU64 = AtomicU64::new(0);
+
+/// Posts `request` and waits for its result, within the bounds of
+/// [`posted_call`]: None when it was withdrawn, no task having taken it by
+/// [`posted_call::WITHDRAW_MS`]; it then stays with the task that meets it.
+/// A call a task performs past that is reported and waited for, and one
+/// still running at [`posted_call::STOP_MS`] stops the boot, naming it.
+fn posted_wait(gpu: &Installed, request: &Request, code: u32) -> Option<i64> {
+    let millis = (gpu.tsc_hz / 1000).max(1);
+    let posted = request.posted;
+    let ms = || host::rdtsc().wrapping_sub(posted) / millis;
+    let done = || request.done.load(Ordering::Acquire) != 0;
+    let withdraw_at = posted.saturating_add(posted_call::WITHDRAW_MS * millis);
+    wait(gpu, request, withdraw_at);
+    if !done() {
+        if request.withdrawable() && request.claim.withdraw() {
+            let count = WITHDRAWN.fetch_add(1, Ordering::Relaxed) + 1;
+            if count.is_power_of_two() {
+                output::arguments(format_args!(
+                    "GPU call {code:#x} withdrawn after {} ms on PE {}: no task took it; \
+                     answered ETIMEDOUT ({count} withdrawn)\n",
+                    ms(),
+                    host::processor()
+                ));
+                // The pool's state is the boot CPU's to read.
+                if host::processor() == BOOT_CPU.load(Ordering::Relaxed)
+                    && let Some(line) = pool_report(gpu.tsc_hz)
+                {
+                    output::arguments(format_args!("{line}\n"));
+                }
+            }
+            return None;
+        }
+        output::arguments(format_args!(
+            "GPU call {code:#x} still running after {} ms on PE {}, which waits for it\n",
+            ms(),
+            host::processor()
+        ));
+        spin(
+            gpu,
+            request,
+            posted.saturating_add(posted_call::STOP_MS * millis),
+        );
+        if !done() {
+            output::fatal(format_args!(
+                "a GPU call ({code:#x}) still ran after {} ms",
+                posted_call::STOP_MS
+            ));
+        }
+    }
+    Some(request.result.load(Ordering::Acquire))
 }
 
 /// Requests posted to the service task since [`take_posted`] by request
@@ -1133,13 +1253,19 @@ fn workers_line(tsc_hz: u64) -> Option<alloc::string::String> {
 /// Posts `request` to the service and waits for it, until the host counter
 /// reaches `deadline`.
 fn wait(gpu: &Installed, request: &Request, deadline: u64) {
-    let waiting = || request.done.load(Ordering::Acquire) == 0 && host::rdtsc() < deadline;
     post(request);
     if let Err(error) = gpu.events.notify() {
         output::fatal(format_args!(
             "the host's Linux environment failed: {error:?}"
         ));
     }
+    spin(gpu, request, deadline);
+}
+
+/// Waits for the posted `request`, until the host counter reaches
+/// `deadline`: a PE spins, the boot CPU runs the environment.
+fn spin(gpu: &Installed, request: &Request, deadline: u64) {
+    let waiting = || request.done.load(Ordering::Acquire) == 0 && host::rdtsc() < deadline;
     if host::processor() != BOOT_CPU.load(Ordering::Relaxed) {
         while waiting() {
             // The boot CPU's work may be retiring a mapping, which waits for this.
