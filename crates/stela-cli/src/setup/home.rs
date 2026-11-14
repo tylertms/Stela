@@ -422,7 +422,7 @@ fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<
             let rows = super::ui::rows(&[("Update", ""), ("Other choices", ""), ("Quit", "")]);
             match ui.select(&question, &rows, 0)? {
                 0 => {
-                    perform(environment, maintenance(Action::UpdateStela))?;
+                    act_on(environment, maintenance(Action::UpdateStela))?;
                     offer_macos(environment, &request, &volume)
                 }
                 1 => menu(environment, request, &stick),
@@ -495,7 +495,7 @@ fn offer_macos(environment: &Environment<'_>, request: &Request, volume: &Path) 
     let ui = environment.ui;
     let record = read_record(environment, volume)?;
     let Some(newest) = newer_macos(&record) else {
-        return ui.outro("Done. Check it any time with `stela status`.");
+        return ui.outro(DONE);
     };
     let (text, large) = macos_text(environment, &record, newest.build);
     ui.info(&text)?;
@@ -506,7 +506,7 @@ fn offer_macos(environment: &Environment<'_>, request: &Request, volume: &Path) 
     );
     match ui.select(&question, &rows, usize::from(large))? {
         0 => change_macos(environment, request, volume, newest.build),
-        _ => ui.outro("Done. Check it any time with `stela status`."),
+        _ => ui.outro(DONE),
     }
 }
 
@@ -570,10 +570,7 @@ fn change_macos(
             yes: true,
             ..Request::default()
         },
-    )?;
-    environment
-        .ui
-        .outro("Done. Check it any time with `stela status`.")
+    )
 }
 
 /// The other choices for a Stela stick, only those that apply.
@@ -680,23 +677,51 @@ fn create(environment: &Environment<'_>, mut request: Request, stick: &Stick) ->
     super::create_installer(environment, request)
 }
 
+/// Run `request`, show what it did, and close the run with one line.
+pub(super) fn perform(environment: &Environment<'_>, request: Request) -> Result<()> {
+    let closing = act_on(environment, request)?;
+    environment.ui.outro(&closing)
+}
+
+/// How a run that changed the stick closes.
+const DONE: &str = "Done. Check it any time with `stela status`.";
+
 /// Run `request` and show what it did, or save it to the request's output
-/// file.
-pub(super) fn perform(environment: &Environment<'_>, mut request: Request) -> Result<()> {
+/// file; and the line that closes the run: where the file went, what
+/// `status` found, or that it is done.
+fn act_on(environment: &Environment<'_>, mut request: Request) -> Result<String> {
     let output = request.output.take();
-    let (report, result) = super::split_report(request.dispatch(environment));
-    match (output, &result) {
-        (Some(path), Ok(())) => {
-            std::fs::write(&path, &report)
-                .with_context(|| format!("cannot write {}", path.display()))?;
-            #[cfg(unix)]
-            super::hand_to_invoker(&path);
-            environment.ui.outro(&format!(
-                "Saved the boot logs to {}",
-                crate::boot_log::shown(&path).display()
-            ))?;
-        }
-        _ => print!("{report}"),
+    let status = matches!(request.action, Action::Status);
+    let dry_run = request.dry_run;
+    let result = match request.dispatch(environment) {
+        // A `status` that finds problems did what it was asked: its report
+        // names them and its summary closes, with no error after it.
+        Err(error) if status => match error.downcast::<Reported>() {
+            Ok(reported) => {
+                print!("{}", reported.report);
+                return Ok(reported.summary);
+            }
+            Err(error) => Err(error),
+        },
+        result => result,
+    };
+    let (report, result) = super::split_report(result);
+    if let (Some(path), Ok(())) = (&output, &result) {
+        std::fs::write(path, &report)
+            .with_context(|| format!("cannot write {}", path.display()))?;
+        #[cfg(unix)]
+        super::hand_to_invoker(path);
+        return Ok(format!(
+            "Saved the boot logs to {}",
+            crate::boot_log::shown(path).display()
+        ));
     }
-    result
+    print!("{report}");
+    result?;
+    Ok(match (status, dry_run) {
+        (true, _) => "No problems found.",
+        (false, true) => "Done.",
+        (false, false) => DONE,
+    }
+    .into())
 }

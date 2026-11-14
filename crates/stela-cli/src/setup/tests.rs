@@ -6286,6 +6286,7 @@ fn journey_d_a_newer_stick_is_left_alone() {
         shown.contains("▲ This stick has Stela 99.0.0, newer than this stela"),
         "{shown}"
     );
+    assert!(shown.ends_with("└ No problems found."), "{shown}");
     // Nothing that changes the stick is offered.
     assert!(!shown.contains("Update"), "{shown}");
     assert!(!shown.contains("Repair"), "{shown}");
@@ -6361,6 +6362,16 @@ fn journey_f_an_interrupted_macos_switch_offers_to_finish_it() {
     );
     assert!(
         shown.contains("cannot install macOS until it is"),
+        "{shown}"
+    );
+    assert_eq!(stick_files(&f), before);
+    // Its status names the stopped switch and closes with the summary, not
+    // with an error.
+    let (shown, result, done) = plain_stela(&f, &["Show status"], &[]);
+    result.unwrap();
+    assert!(done, "{shown}");
+    assert!(
+        shown.ends_with("└ 1 problem; the report above names its fix"),
         "{shown}"
     );
     assert_eq!(stick_files(&f), before);
@@ -6442,6 +6453,11 @@ fn journey_settings_change_the_wifi_and_cancel_changes_nothing() {
     );
     result.unwrap();
     assert!(done, "{shown}");
+    // The change closes as every change does.
+    assert!(
+        shown.ends_with("└ Done. Check it any time with `stela status`."),
+        "{shown}"
+    );
     let saved = record(&f);
     assert_eq!(
         saved.wifi.as_ref().map(|wifi| wifi.ssid.as_str()),
@@ -6500,6 +6516,12 @@ fn home_create_dispatches_create_after_wizard_confirmation() {
     let result = home::run(&environment, request);
     assert!(result.is_ok(), "{result:?}");
     assert!(person.done(), "{}", person.transcript());
+    // A dry run closes as any run that is done does.
+    assert!(
+        person.transcript().ends_with("└ Done."),
+        "{}",
+        person.transcript()
+    );
     assert_eq!(stick_files(&f), before);
     assert!(f.host.unmounted.borrow().is_empty());
 }

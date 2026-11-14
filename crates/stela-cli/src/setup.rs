@@ -837,7 +837,7 @@ fn create_installer(environment: &Environment<'_>, request: Request) -> Result<(
     }
     if dry_run {
         print!("{report}");
-        return Ok(());
+        return ui.outro("Done.");
     }
     let profile = match profile {
         true => "\nProfiling is on. Keep EFI/stela/boot.log after your run.",
@@ -850,7 +850,7 @@ fn create_installer(environment: &Environment<'_>, request: Request) -> Result<(
             create::network_next_step(&report)
         ),
     )?;
-    ui.outro("Your installer stick is ready")
+    ui.outro("Your installer stick is ready.")
 }
 
 impl Request {
