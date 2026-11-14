@@ -196,15 +196,8 @@ impl Image {
             );
         }
         match (kind, self.bytes, self.boot_bytes) {
-            (InstallImage::Full, Some(bytes), _) => (
-                bytes,
-                format!(
-                    "{}, written to the stick as it arrives",
-                    host::size_text(bytes)
-                ),
-            ),
-            (InstallImage::Network, _, Some(bytes)) => {
-                (bytes, format!("{} now", host::size_text(bytes)))
+            (InstallImage::Full, Some(bytes), _) | (InstallImage::Network, _, Some(bytes)) => {
+                (bytes, host::size_text(bytes))
             }
             _ => (0, "the size is unknown until Apple's server answers".into()),
         }
@@ -319,8 +312,8 @@ fn ask(environment: &Environment<'_>, command: &mut Request, stick: &Stick) -> R
                     |serial| format!("{} · serial {serial}", usb.description())
                 ),
                 match online {
-                    false => "Offline · the install needs no internet",
-                    true => "Online · the install downloads macOS",
+                    false => InstallImage::Full.name(),
+                    true => InstallImage::Network.name(),
                 },
                 image.version,
                 command.build,

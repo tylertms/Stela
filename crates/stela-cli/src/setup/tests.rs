@@ -6277,8 +6277,6 @@ fn journey_a_blank_stick_walks_through_the_wizard_and_cancel_changes_nothing() {
         "● Offline · macOS is copied to the stick now",
         "? Wi-Fi during installation",
         "◇ Review",
-        "  Installer  Online · the install downloads macOS",
-        "  Installer  Offline · the install needs no internet",
         "? Change what?",
         "● Erase and create",
         "■ Nothing was changed.",
@@ -6286,6 +6284,37 @@ fn journey_a_blank_stick_walks_through_the_wizard_and_cancel_changes_nothing() {
         assert!(shown.contains(line), "{line:?} missing:\n{shown}");
     }
     assert!(shown.contains("Everything on"), "{shown}");
+    // Review names the installer and the download's size alone: the
+    // installer choice explained them.
+    let review: Vec<&str> = shown.lines().collect();
+    for line in ["  Installer  Online", "  Installer  Offline"] {
+        assert!(review.contains(&line), "{line:?} missing:\n{shown}");
+    }
+    for (answers, download) in [
+        (&["Offline", "Quit"][..], "  Download   25.6 GB"),
+        (
+            &["Online", "No Wi-Fi (Ethernet)", "Quit"][..],
+            "  Download   1.2 GB",
+        ),
+    ] {
+        let person = ui::tests::Scripted::new(answers);
+        let size = |_: &str, _: &str| -> Result<(u64, u64)> { Ok((1_200_000_000, 25_600_000_000)) };
+        let request = Request {
+            efi: Some(f.efi.clone()),
+            ..Request::home(command::Global::default())
+        };
+        let environment = Environment {
+            ui: &person,
+            image_size: &size,
+            ..environment(&f.host)
+        };
+        home::run(&environment, request).unwrap();
+        let shown = person.transcript();
+        assert!(
+            shown.lines().any(|line| line == download),
+            "{download:?} missing:\n{shown}"
+        );
+    }
     assert_eq!(stick_files(&f), before);
     assert!(f.host.unmounted.borrow().is_empty());
     // Escape at the first question changes nothing either.
