@@ -569,8 +569,7 @@ impl Controller {
                 self.teardown = Teardown::Stopped;
             }
             Teardown::Active => {
-                self.registers.write32(CONFIGURATION, 0)?;
-                self.wait_status(self.ready_timeout_us, |status| status & READY == 0)?;
+                self.stop_and_wait()?;
                 self.teardown = Teardown::Stopped;
             }
             _ => {}

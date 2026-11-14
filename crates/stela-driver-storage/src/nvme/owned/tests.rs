@@ -143,6 +143,12 @@ struct Model {
     /// Identify Controller's VID and model, the model space-padded.
     vendor: u16,
     model: &'static str,
+    /// The I/O submission queue's QPRIO, as last created.
+    submission_priority: u32,
+    /// CSTS reads all ones for this long after CC.EN is cleared, and when
+    /// it was last cleared, in ticks.
+    removed_after_stop_us: u64,
+    stopped_at: u64,
     /// OAES; the held Asynchronous Event Request; Asynchronous Event
     /// Configurations set and log pages read.
     async_events: u32,
@@ -250,6 +256,9 @@ impl Model {
             apst_sets: Vec::new(),
             vendor: 0,
             model: "",
+            submission_priority: 0,
+            removed_after_stop_us: 0,
+            stopped_at: 0,
             async_events: 0,
             event_request: None,
             event_configs: Vec::new(),
@@ -562,9 +571,10 @@ impl Model {
             }
             (0, 1) => {
                 assert_eq!(
-                    (command[10] & 0xffff, command[10] >> 16, command[11]),
+                    (command[10] & 0xffff, command[10] >> 16, command[11] & !6),
                     (1, 15, 0x10001)
                 );
+                self.submission_priority = command[11] >> 1 & 3;
                 self.queues[1].0 = u64::from(command[6]) | u64::from(command[7]) << 32;
             }
             // Delete I/O SQ, then its CQ: a CQ with a live SQ is Invalid
@@ -813,6 +823,12 @@ unsafe impl Registers for Regs {
         if m.fail_read {
             return Err(register_error());
         }
+        if offset == 0x1c
+            && m.removed_after_stop_us != 0
+            && Clock::ticks() - m.stopped_at < m.removed_after_stop_us * 1000
+        {
+            return Ok(u32::MAX);
+        }
         if offset == 0x1c && m.enabled && m.enabling_reads > 0 {
             if m.enabling_reads != usize::MAX {
                 m.enabling_reads -= 1;
@@ -843,6 +859,7 @@ unsafe impl Registers for Regs {
                     m.record("enable");
                 } else {
                     m.record("stop");
+                    m.stopped_at = Clock::ticks();
                     if !m.stuck_ready {
                         // A controller reset ends every queue and command.
                         m.enabled = false;
@@ -1561,6 +1578,65 @@ fn apst_is_configured_at_attach_and_after_resets() {
         [(true, 1 << 3 | 100 << 8); 2]
     );
     a.namespaces[0].retire_owned().unwrap();
+}
+
+/// The Intel 600P's quirks create its I/O submission queue with medium
+/// priority and offer no Write Zeroes; the GAMMIX S70 BLADE's no FUA.
+#[test]
+fn pci_id_quirks_set_queue_priority_write_zeroes_and_fua() {
+    let mut f = Fixture::new();
+    f.model.lock().unwrap().oncs = COMMANDS_WRITE_ZEROES;
+    let plain = f.attach().unwrap();
+    let features = plain.namespaces[0].identity().features;
+    assert!(features.write_zeroes.is_some() && features.fua);
+    assert_eq!(f.model.lock().unwrap().submission_priority, 0);
+    drop(plain);
+
+    f = Fixture::new();
+    f.model.lock().unwrap().oncs = COMMANDS_WRITE_ZEROES;
+    f.quirks = Quirks::for_device(0x8086, 0xf1a5);
+    let a = f.attach().unwrap();
+    assert_eq!(a.namespaces[0].identity().features.write_zeroes, None);
+    assert_eq!(f.model.lock().unwrap().submission_priority, 2);
+    drop(a);
+
+    f = Fixture::new();
+    f.quirks = Quirks::for_device(0x1cc1, 0x5370);
+    let a = f.attach().unwrap();
+    let features = a.namespaces[0].identity().features;
+    assert!(features.write_cache && !features.fua);
+}
+
+/// A controller whose CSTS reads all ones for 2.3 s after CC.EN is cleared
+/// starts, and resets, only with `NVME_QUIRK_DELAY_BEFORE_CHK_RDY`.
+#[test]
+fn the_ready_delay_quirk_waits_before_reading_csts_at_attach_and_resets() {
+    let _clock = crate::test_clock::virtualize();
+    let delayed = |quirks| {
+        let mut f = Fixture::new();
+        f.model.lock().unwrap().removed_after_stop_us = 2_300_000;
+        f.quirks = quirks;
+        f
+    };
+    assert_eq!(
+        delayed(Quirks::NONE).attach().err(),
+        Some(removed().at(DISABLE_WAIT))
+    );
+    let f = delayed(Quirks::for_device(0x1c58, 0x0003));
+    let started = Clock::ticks();
+    let mut a = f.attach().unwrap();
+    assert!(Clock::ticks() - started >= 2_300_000 * 1000);
+    let disk = &mut a.namespaces[0];
+    disk.write(0, &[0x42; 512]).unwrap();
+    let mut m = f.model.lock().unwrap();
+    m.delay_io = 1;
+    m.abortable = false;
+    drop(m);
+    disk.flush().unwrap();
+    let mut data = [0; 512];
+    disk.read(0, &mut data).unwrap();
+    assert_eq!(data, [0x42; 512]);
+    disk.retire_owned().unwrap();
 }
 
 /// A PCI ID with `NVME_QUIRK_NO_DEEPEST_PS` keeps APST out of PS1, here the

@@ -18,8 +18,8 @@ pub struct Quirks(u16);
 
 impl Quirks {
     pub const NONE: Self = Self(0);
-    /// `NVME_QUIRK_DELAY_BEFORE_CHK_RDY`: CSTS is read only 2.3 s after
-    /// CC.EN is cleared.
+    /// `NVME_QUIRK_DELAY_BEFORE_CHK_RDY`: CSTS is read only
+    /// [`READY_CHECK_DELAY_US`] after CC.EN is cleared.
     pub const READY_DELAY: Self = Self(1 << 0);
     /// `NVME_QUIRK_NO_APST`: autonomous power state transitions are turned
     /// off.
@@ -41,8 +41,11 @@ impl Quirks {
     pub const BOGUS_IDS: Self = Self(1 << 7);
     /// `NVME_QUIRK_NO_FUA`: FUA is never offered.
     pub const NO_FUA: Self = Self(1 << 8);
+    /// Linux `nvme_pci_enable`'s Samsung PM1725 rule: a CAP.MQES of 0 is
+    /// read as 64 entries.
+    pub const QUEUE_DEPTH_64: Self = Self(1 << 9);
 
-    const NAMES: [(Self, &'static str); 9] = [
+    const NAMES: [(Self, &'static str); 10] = [
         (Self::READY_DELAY, "ready check delayed 2.3 s"),
         (Self::NO_APST, "APST off"),
         (Self::NO_DEEPEST_POWER_STATE, "no deepest power state"),
@@ -52,6 +55,7 @@ impl Quirks {
         (Self::NO_DESCRIPTOR_LIST, "no namespace descriptor list"),
         (Self::BOGUS_IDS, "namespace IDs ignored"),
         (Self::NO_FUA, "FUA off"),
+        (Self::QUEUE_DEPTH_64, "CAP.MQES 0 read as 64 entries"),
     ];
 
     pub fn contains(self, other: Self) -> bool {
@@ -145,6 +149,9 @@ impl BitOr for Quirks {
     }
 }
 
+/// Linux `NVME_QUIRK_DELAY_AMOUNT`.
+pub const READY_CHECK_DELAY_US: u64 = 2_300_000;
+
 /// Identify Controller's FR.
 const CONTROLLER_FIRMWARE: core::ops::Range<usize> = 64..72;
 
@@ -232,8 +239,8 @@ const DEVICES: &[(u16, u16, Quirks)] = &[
     (0x1c58, 0x0023, READY),                    // WDC SN200 adapter
     (0x1c5f, 0x0540, READY),                    // Memblaze Pblaze4 adapter
     (0x1c5f, 0x0555, DESCRIPTORS),              // Memblaze Pblaze5 adapter
-    (0x144d, 0xa821, READY),                    // Samsung PM1725
-    (0x144d, 0xa822, q(&[READY, ZEROES])),      // Samsung PM1725a
+    (0x144d, 0xa821, q(&[READY, Quirks::QUEUE_DEPTH_64])), // Samsung PM1725
+    (0x144d, 0xa822, q(&[READY, ZEROES, Quirks::QUEUE_DEPTH_64])), // Samsung PM1725a
     (0x15b7, 0x5009, DEEPEST),                  // Sandisk SN550
     (0x1987, 0x5012, IDS),                      // Phison E12
     (0x1987, 0x5016, IDS),                      // Phison E16

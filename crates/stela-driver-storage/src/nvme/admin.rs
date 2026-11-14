@@ -68,8 +68,17 @@ impl Controller {
         }
         // CAP.MQES, zero-based, bounds the I/O queues alone; AQA sizes the
         // admin queue. Linux shortens its I/O queues to it, refusing none
-        // (the value 0, one entry, is reserved).
-        let longest = (capabilities & 0xffff) + 1;
+        // (the value 0, one entry, is reserved). `nvme_pci_enable` gives a
+        // quirked controller two entries, one command, and the PM1725's
+        // MQES 0 64 entries.
+        let mqes = capabilities & 0xffff;
+        let longest = if self.quirks.contains(Quirks::QUEUE_DEPTH_ONE) {
+            2
+        } else if mqes == 0 && self.quirks.contains(Quirks::QUEUE_DEPTH_64) {
+            64
+        } else {
+            mqes + 1
+        };
         if longest < 2 {
             return Err(BlockError::Unsupported(
                 "NVMe controller reports one-entry queues (CAP.MQES 0)",
@@ -88,8 +97,7 @@ impl Controller {
         if capabilities & CAPABILITY_COMMAND_SETS != 0 {
             self.configuration |= COMMAND_SETS_ALL;
         }
-        self.registers.write32(CONFIGURATION, 0)?;
-        self.wait_status(self.ready_timeout_us, |status| status & READY == 0)
+        self.stop_and_wait()
             .map_err(|error| error.at(DISABLE_WAIT))?;
         self.configure_admin()?;
         if let Some(owner) = self.owned.as_mut() {
@@ -97,6 +105,18 @@ impl Controller {
         }
         let timeout = self.enable()?;
         self.wait_enabled(timeout)
+    }
+
+    /// Linux `nvme_disable_ctrl`: clear CC, then wait for CSTS.RDY to clear,
+    /// first sleeping Linux's delay for a quirked controller. Waits: only at
+    /// attach and teardown, outside any service turn; a passed device start
+    /// budget ends the delay early.
+    pub(super) fn stop_and_wait(&mut self) -> Result<(), BlockError> {
+        self.registers.write32(CONFIGURATION, 0)?;
+        if self.quirks.contains(Quirks::READY_DELAY) {
+            self.clock.wait(quirks::READY_CHECK_DELAY_US, || false);
+        }
+        self.wait_status(self.ready_timeout_us, |status| status & READY == 0)
     }
 
     /// Linux `nvme_wait_ready` after CC.EN is set: CSTS.RDY alone ends the
@@ -129,7 +149,12 @@ impl Controller {
         let mut command = [0u32; 16];
         let address = if submission {
             command[0] = u32::from(ADMIN_CREATE_SUBMISSION);
-            command[11] = 1 << 16 | 1; // completion queue 1, contiguous
+            // Completion queue 1, contiguous; medium priority for a
+            // controller that otherwise enables weighted round robin.
+            command[11] = 1 << 16 | 1;
+            if self.quirks.contains(Quirks::MEDIUM_PRIORITY_QUEUE) {
+                command[11] |= SUBMISSION_PRIORITY_MEDIUM;
+            }
             self.io.submissions.address()?
         } else {
             command[0] = u32::from(ADMIN_CREATE_COMPLETION);

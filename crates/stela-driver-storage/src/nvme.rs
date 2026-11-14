@@ -99,6 +99,9 @@ const ADMIN_IDENTIFY: u8 = 0x06;
 const ADMIN_ABORT: u8 = 0x08;
 const ADMIN_SET_FEATURES: u8 = 0x09;
 const ADMIN_ASYNC_EVENT: u8 = 0x0c;
+/// Create I/O Submission Queue CDW11 QPRIO: medium (Linux
+/// `NVME_SQ_PRIO_MEDIUM`).
+const SUBMISSION_PRIORITY_MEDIUM: u32 = 2 << 1;
 /// One MSI-X table entry: message address, data and vector control.
 const MSIX_ENTRY_BYTES: u64 = 16;
 /// Autonomous Power State Transition (NVMe Base 2.1 5.27.1.6).
@@ -566,8 +569,10 @@ enum Recovery {
         id: u16,
         deadline: crate::Deadline,
     },
-    /// CC.EN cleared; waiting for CSTS.RDY to clear.
-    Disabling(crate::Deadline),
+    /// CC.EN cleared; waiting for CSTS.RDY to clear by the first deadline,
+    /// and under `NVME_QUIRK_DELAY_BEFORE_CHK_RDY` reading CSTS only once
+    /// the second passed.
+    Disabling(crate::Deadline, Option<crate::Deadline>),
     /// CC.EN set; waiting for CSTS.RDY.
     Enabling(crate::Deadline),
     /// A bring-up command, its identifier, and the Identify Controller data
@@ -1051,12 +1056,13 @@ fn discover(
         quirks: controller.quirks,
     };
     let mut found = Vec::new();
-    let (max_transfer, max_command_bytes, commands, scans, limits) = (
+    let (max_transfer, max_command_bytes, commands, scans, limits, quirks) = (
         controller.max_transfer,
         controller.max_command_bytes,
         controller.commands,
         controller.scans,
         controller.limits,
+        controller.quirks,
     );
     for namespace in candidates {
         let Some((mut ids, independent)) = controller.namespace_ids(namespace)? else {
@@ -1123,6 +1129,7 @@ fn discover(
                         data: max_transfer,
                         command: max_command_bytes,
                     },
+                    quirks,
                 ),
             },
         })
@@ -1196,12 +1203,15 @@ struct TransferLimits {
 /// (`nvme_init_non_mdts_limits`), which may deallocate where the namespace
 /// reads deallocated blocks as zeros and says Write Zeroes deallocates
 /// (`NVME_NS_DEAC`). A Write Zeroes command takes at most 2^16 blocks.
+/// `NVME_QUIRK_NO_FUA` leaves FUA out, and `NVME_QUIRK_DISABLE_WRITE_ZEROES`
+/// Write Zeroes.
 fn features(
     write_cache: bool,
     commands: u16,
     limits: Limits,
     format: &Format,
     transfer: TransferLimits,
+    quirks: Quirks,
 ) -> Features {
     let block_shift = format.block_size.trailing_zeros();
     let sectors = u64::from(u32::MAX) >> (block_shift - 9);
@@ -1216,7 +1226,7 @@ fn features(
     };
     Features {
         write_cache,
-        fua: write_cache,
+        fua: write_cache && !quirks.contains(Quirks::NO_FUA),
         max_transfer: transfer.data,
         max_read_transfer: None,
         discard: (commands & COMMANDS_DATASET_MANAGEMENT != 0).then_some(DiscardLimits {
@@ -1230,7 +1240,9 @@ fn features(
                 ranges => usize::from(ranges).min(MAX_DEALLOCATE_RANGES),
             },
         }),
-        write_zeroes: (commands & COMMANDS_WRITE_ZEROES != 0).then_some(WriteZeroes {
+        write_zeroes: (commands & COMMANDS_WRITE_ZEROES != 0
+            && !quirks.contains(Quirks::NO_WRITE_ZEROES))
+        .then_some(WriteZeroes {
             blocks: (zeroes >> block_shift).min(1 << 16),
             unmap: format.deallocate & 0x7 == 1 && format.deallocate & 1 << 3 != 0,
         }),
@@ -1320,7 +1332,8 @@ impl Namespace {
             controller.max_transfer,
             controller.max_command_bytes,
         );
-        let (commands, limits) = (controller.commands, controller.limits);
+        let (commands, limits, quirks) =
+            (controller.commands, controller.limits, controller.quirks);
         let data = match controller.identify(IDENTIFY_NAMESPACE, self.namespace) {
             Ok(data) => data,
             Err(BlockError::Device { .. }) => {
@@ -1350,6 +1363,7 @@ impl Namespace {
                         data: max_transfer,
                         command: max_command_bytes,
                     },
+                    quirks,
                 );
                 Ok(())
             }

@@ -80,15 +80,26 @@ impl Controller {
         Ok(())
     }
 
-    /// Clear CC.EN (and any shutdown notification).
+    /// Clear CC.EN (and any shutdown notification). A quirked controller's
+    /// CSTS is read only after Linux's delay, which [`Self::recover`] steps
+    /// through without waiting.
     pub(super) fn disable(&mut self) -> Result<(), BlockError> {
         let configuration = self.registers.read32(CONFIGURATION)?;
         self.registers.write32(
             CONFIGURATION,
             configuration & !(ENABLE | SHUTDOWN_NOTIFICATION),
         )?;
-        let deadline = self.deadline(self.ready_timeout_us)?;
-        self.recovery = Some(Recovery::Disabling(deadline));
+        let delay = if self.quirks.contains(Quirks::READY_DELAY) {
+            quirks::READY_CHECK_DELAY_US
+        } else {
+            0
+        };
+        let check = match delay {
+            0 => None,
+            delay => Some(self.deadline(delay)?),
+        };
+        let deadline = self.deadline(self.ready_timeout_us + delay)?;
+        self.recovery = Some(Recovery::Disabling(deadline, check));
         Ok(())
     }
 
@@ -138,6 +149,11 @@ impl Controller {
     /// disabled, enabled with the admin queue, brought up again, then the
     /// interrupted commands run again under their tags.
     pub(super) fn recover(&mut self) -> Result<(), BlockError> {
+        if let Some(Recovery::Disabling(_, Some(check))) = &self.recovery
+            && !check.passed()
+        {
+            return Ok(());
+        }
         let status = self.registers.read32(STATUS)?;
         if status == REMOVED {
             return Err(removed());
@@ -162,12 +178,12 @@ impl Controller {
                 Some(_) if submission => self.delete_next(false),
                 _ => self.disable(),
             },
-            Some(Recovery::Disabling(deadline)) => {
+            Some(Recovery::Disabling(deadline, check)) => {
                 if status & READY != 0 {
                     if deadline.passed() {
                         return Err(BlockError::Timeout);
                     }
-                    self.recovery = Some(Recovery::Disabling(deadline));
+                    self.recovery = Some(Recovery::Disabling(deadline, check));
                     return Ok(());
                 }
                 self.restart_queues()?;

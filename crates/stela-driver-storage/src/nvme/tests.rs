@@ -483,6 +483,101 @@ fn a_short_mqes_shortens_the_io_queue_and_only_one_entry_is_refused() {
     assert!(matches!(c.initialize(), Err(BlockError::Unsupported(_))));
 }
 
+/// `NVME_QUIRK_QDEPTH_ONE` runs one command on a two-entry queue whatever
+/// CAP.MQES says, and the PM1725 rule reads its MQES 0 as 64 entries
+/// instead of refusing it.
+#[test]
+fn queue_depth_quirks_set_the_io_queue_whatever_mqes_says() {
+    let _clock = crate::test_clock::virtualize();
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    c.clock = Clock {
+        ticks_per_microsecond: 1,
+    };
+    c.quirks = Quirks::QUEUE_DEPTH_ONE;
+    c.registers
+        .write64(CAPABILITIES, 63 | 1 << 24 | 1 << 37)
+        .unwrap();
+    assert_eq!(c.initialize(), Err(BlockError::Timeout.at(ENABLE_WAIT)));
+    assert_eq!((c.io.entries, c.tags.len()), (2, 1));
+    assert_eq!(c.create_queue(true).unwrap()[10] >> 16, 1);
+
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    c.clock = Clock {
+        ticks_per_microsecond: 1,
+    };
+    assert!(Quirks::for_device(0x144d, 0xa821).contains(Quirks::QUEUE_DEPTH_64));
+    c.quirks = Quirks::QUEUE_DEPTH_64;
+    c.registers
+        .write64(CAPABILITIES, 1 << 24 | 1 << 37)
+        .unwrap();
+    assert_eq!(c.initialize(), Err(BlockError::Timeout.at(ENABLE_WAIT)));
+    assert_eq!((c.io.entries, c.tags.len()), (64, DEPTH));
+}
+
+/// A reset of a controller with `NVME_QUIRK_DELAY_BEFORE_CHK_RDY` reads
+/// CSTS only 2.3 s after clearing CC.EN, and each look meanwhile returns
+/// at once: CSTS reading all ones in that time is not a removal.
+#[test]
+fn a_reset_reads_csts_only_after_the_ready_delay_under_its_quirk() {
+    let _clock = crate::test_clock::virtualize();
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    c.quirks = Quirks::READY_DELAY;
+    c.disable().unwrap();
+    assert_eq!(c.registers.read32(CONFIGURATION).unwrap(), 0);
+    c.registers.write32(STATUS, REMOVED).unwrap();
+    for _ in 0..3 {
+        let started = Clock::ticks();
+        assert_eq!(c.recover(), Ok(()));
+        assert!(Clock::ticks() - started < 1000 * 1000, "a step took 1 ms");
+        assert!(matches!(c.recovery, Some(Recovery::Disabling(_, Some(_)))));
+    }
+    crate::test_clock::advance(c.clock, quirks::READY_CHECK_DELAY_US);
+    c.registers.write32(STATUS, 0).unwrap();
+    assert_eq!(c.recover(), Ok(()));
+    assert!(matches!(c.recovery, Some(Recovery::Enabling(_))));
+
+    // Without it, the same CSTS is a removal at the first look.
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    c.disable().unwrap();
+    assert!(matches!(c.recovery, Some(Recovery::Disabling(_, None))));
+    c.registers.write32(STATUS, REMOVED).unwrap();
+    assert_eq!(c.recover(), Err(removed()));
+}
+
+/// `NVME_QUIRK_NO_FUA` and `NVME_QUIRK_DISABLE_WRITE_ZEROES` leave FUA and
+/// Write Zeroes out of a namespace's features; other quirks change neither.
+#[test]
+fn feature_quirks_leave_fua_and_write_zeroes_out() {
+    let format = Format {
+        blocks: 1024,
+        block_size: 512,
+        read_only: false,
+        deallocate: 0,
+    };
+    let transfer = TransferLimits {
+        data: BOUNCE_BYTES,
+        command: MAX_COMMAND_BYTES,
+    };
+    let commands = COMMANDS_DATASET_MANAGEMENT | COMMANDS_WRITE_ZEROES;
+    let of = |quirks| features(true, commands, Limits::default(), &format, transfer, quirks);
+    let plain = of(Quirks::NONE);
+    assert!(plain.fua && plain.write_zeroes.is_some());
+    assert_eq!(
+        of(Quirks::NO_DEEPEST_POWER_STATE | Quirks::BOGUS_IDS),
+        plain
+    );
+    let no_fua = of(Quirks::NO_FUA);
+    assert!(no_fua.write_cache && !no_fua.fua);
+    assert_eq!(no_fua.write_zeroes, plain.write_zeroes);
+    let no_zeroes = of(Quirks::NO_WRITE_ZEROES);
+    assert_eq!(no_zeroes.write_zeroes, None);
+    assert!(no_zeroes.fua && no_zeroes.discard.is_some());
+}
+
 #[test]
 fn submission_publication_keeps_the_whole_wire_entry_and_rings_its_queue() {
     let fixture = Fixture::new();
@@ -995,7 +1090,7 @@ fn a_command_past_its_deadline_is_aborted_then_resets_the_controller_and_runs_ag
     assert_eq!(disk.finish(read), None);
     {
         let controller = disk.controller.borrow();
-        assert!(matches!(controller.recovery, Some(Recovery::Disabling(_))));
+        assert!(matches!(controller.recovery, Some(Recovery::Disabling(..))));
         assert_eq!(controller.registers.read32(CONFIGURATION).unwrap(), 0);
         assert!(!disk.room());
     }
