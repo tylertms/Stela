@@ -270,6 +270,11 @@ pub struct System {
     /// Cable the native USB keyboard and pointer to the last USB-C
     /// controller and feed it the host's virtio-input devices (`--input`).
     pub input: bool,
+    /// Leave the guest without the Bluetooth controller `--input` cables
+    /// to it (`--no-guest-bluetooth`). On a host with no Bluetooth radio
+    /// (a VM, typically) the modeled controller has no radio, and Setup
+    /// Assistant can stall on it; past setup, macOS wants a controller.
+    pub no_guest_bluetooth: bool,
     /// Explicit native executors and guest PEs (`--native-cores N`), one per
     /// logical processor; SMT siblings count after every physical core.
     pub native_cores: Option<usize>,
@@ -388,6 +393,7 @@ impl Default for System {
             survey: false,
             idle_skip: false,
             input: false,
+            no_guest_bluetooth: false,
             native_cores: None,
             guest_pes: None,
             native_bootstrap_check: false,
@@ -800,6 +806,7 @@ impl fmt::Display for System {
         line.value(IPV4_GATEWAY, self.ipv4_gateway)?;
         line.value(DNS, (!self.dns.is_empty()).then(|| Servers(&self.dns)))?;
         line.flag("--input", self.input)?;
+        line.flag("--no-guest-bluetooth", self.no_guest_bluetooth)?;
         line.flag("--idle-skip", self.idle_skip)?;
         line.flag("--survey", self.survey)?;
         line.flag("--sep-observe", self.sep_observe)?;

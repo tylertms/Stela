@@ -2898,7 +2898,8 @@ fn start_devices(
             }
             host_usb = Some(usb);
             // The guest's controller hangs off the hub of its keyboard.
-            host_bluetooth = host_controller.filter(|_| options.input);
+            host_bluetooth =
+                host_controller.filter(|_| options.input && !options.no_guest_bluetooth);
             // With no adapter started, the screen names each one found and
             // why it stayed off, before the steps that need one say so.
             if links.devices.is_empty() && (wants_network || options.guest_network) {
