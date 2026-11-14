@@ -541,11 +541,13 @@ pub(crate) fn feed_console_input() {
 
 /// The guest's console UART, shown line by line as `GUEST| ...`. In the
 /// automatic Metal plugin repair's boot it also types the repair's commands
-/// (`bundle_repair`), ahead of the host's own input.
+/// (`bundle_repair`), and the host's own input waits until it is done.
 #[derive(Default)]
 struct GuestConsole {
     lines: console_lines::Lines,
     repair: ConsoleRepair,
+    /// Host input was dropped while the repair typed; reported once.
+    dropped: bool,
 }
 
 #[derive(Default)]
@@ -575,17 +577,22 @@ impl GuestConsole {
         }
     }
 
-    /// Log what the driver did. A repair whose shell stopped answering, or
-    /// whose guest did not restart, restarts the PC, once: the next normal
-    /// boot tries the kext, and NVRAM's record makes a still missing plugin
-    /// stop there with the manual remedy instead of repairing again. A
-    /// failed step the shell answered restarts the guest itself.
+    /// Log what the driver did. A repair whose shell stopped answering or
+    /// left, or whose guest did not restart, restarts the PC, once: the
+    /// next normal boot tries the kext, and NVRAM's record makes a still
+    /// missing plugin stop there with the manual remedy instead of
+    /// repairing again. A shell that never took input asks for one more
+    /// repair boot instead (`bundle_repair::unanswered`). A failed step the
+    /// shell answered restarts the guest itself.
     fn report_repair(&mut self) {
         let Some(driver) = self.repair() else {
             return;
         };
         let events = driver.take_events();
         let restart = driver.failed();
+        let unanswered = driver
+            .failure()
+            .is_some_and(stela_boot_core::bundle_repair::Failure::unanswered);
         for event in &events {
             output::arguments(format_args!(
                 "{}\n",
@@ -594,9 +601,15 @@ impl GuestConsole {
         }
         if restart {
             self.repair = ConsoleRepair::Off;
-            output::arguments(format_args!(
-                "BUNDLE REPAIR restarting the PC; the next boot tries the kext once\n"
-            ));
+            if unanswered && bundle_repair::unanswered() {
+                output::arguments(format_args!(
+                    "BUNDLE REPAIR nothing ran; restarting the PC into one more repair boot\n"
+                ));
+            } else {
+                output::arguments(format_args!(
+                    "BUNDLE REPAIR restarting the PC; the next boot tries the kext once\n"
+                ));
+            }
             service::request_restart();
         }
     }
@@ -614,7 +627,19 @@ impl ConsoleSink for GuestConsole {
         }
         let input = &CONSOLE_INPUT;
         let taken = input.taken.load(Ordering::Relaxed);
-        if taken == input.put.load(Ordering::Acquire) {
+        let put = input.put.load(Ordering::Acquire);
+        if taken == put {
+            return None;
+        }
+        if matches!(self.repair, ConsoleRepair::Driving(_)) {
+            // Bytes between the repair's would break into its commands, and
+            // a break or ^C would stop the shell.
+            input.taken.store(put, Ordering::Release);
+            if !core::mem::replace(&mut self.dropped, true) {
+                output::arguments(format_args!(
+                    "BUNDLE REPAIR host console input dropped while the repair types\n"
+                ));
+            }
             return None;
         }
         let byte = input.bytes[taken % CONSOLE_INPUT_BYTES].load(Ordering::Relaxed);
@@ -623,6 +648,11 @@ impl ConsoleSink for GuestConsole {
     }
 
     fn transmit(&mut self, byte: u8) -> Result<(), ConsoleBusy> {
+        // Each byte, for the shell's prompt, which ends no line.
+        if let Some(driver) = self.repair() {
+            driver.output(byte, Self::millis());
+            self.report_repair();
+        }
         if let Some(fragment) = self.lines.push(byte) {
             if let Ok(mut panic) = GUEST_PANIC.0.try_borrow_mut() {
                 panic.observe(&fragment);

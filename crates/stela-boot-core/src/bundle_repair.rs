@@ -18,7 +18,8 @@
 //! (`--bundle-repair`) and records [`BUNDLE_REPAIR_ATTEMPTED`] before it
 //! boots, so neither a failure nor a power loss in the middle repeats the
 //! repair by itself. In that boot the engine types [`steps`] at the guest's
-//! root console ([`Driver`]), as the manual remedy does: it mounts the Data
+//! root console ([`Driver`]) once the shell's prompt shows, as the manual
+//! remedy does: it mounts the Data
 //! volume, creates the plugin's directories root-owned and 0755, marks them
 //! restricted, syncs, remounts it read-only and restarts quickly
 //! ([`REBOOT`]). The next boot's kext then creates the
@@ -28,7 +29,15 @@
 //! answering restarts the PC, so the next normal boot always tries the kext
 //! once. A boot that finds the plugin installed removes the record; one
 //! that finds it missing after an attempt stops with the manual remedy
-//! ([`decide`]).
+//! ([`decide`]), which `stela repair` turns back into a request
+//! ([`again`]).
+//!
+//! A repair whose shell never took input, because no prompt came or the
+//! shell left before the first step was typed ([`Failure::unanswered`]),
+//! asks for one more maintenance boot: it records
+//! [`BUNDLE_REPAIR_RETRY`] ([`retry`]), which the loader turns into
+//! [`BUNDLE_REPAIR_RETRIED`] as it does a request, and a second such
+//! failure is final like any other.
 //!
 //! A finished erase install knows the plugin is missing without a boot to
 //! find it: it records [`BUNDLE_REPAIR_INSTALLED`] ([`Change::Installed`]),
@@ -49,7 +58,8 @@ use alloc::{
     vec::Vec,
 };
 use stela_loader::boot_selection::{
-    BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED, BUNDLE_REPAIR_INSTALLED, BUNDLE_REPAIR_PENDING, lookup,
+    BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED, BUNDLE_REPAIR_INSTALLED, BUNDLE_REPAIR_PENDING,
+    BUNDLE_REPAIR_RETRIED, BUNDLE_REPAIR_RETRY, lookup,
 };
 use stela_soc_data::nor::nvram::{Partition, Variables};
 
@@ -94,6 +104,10 @@ pub enum Record {
     /// An erase install's request, which the loader removes when it takes
     /// it.
     Installed,
+    /// A repair whose shell never took input asks for one more.
+    Retry,
+    /// The loader took [`Record::Retry`]: the second and last attempt.
+    Retried,
     /// A value Stela never writes.
     Other,
 }
@@ -107,6 +121,8 @@ impl Record {
             Some(BUNDLE_REPAIR_PENDING) => Self::Pending,
             Some(BUNDLE_REPAIR_ATTEMPTED) => Self::Attempted,
             Some(BUNDLE_REPAIR_INSTALLED) => Self::Installed,
+            Some(BUNDLE_REPAIR_RETRY) => Self::Retry,
+            Some(BUNDLE_REPAIR_RETRIED) => Self::Retried,
             Some(_) => Self::Other,
         }
     }
@@ -121,39 +137,56 @@ pub enum Change {
     Forget,
     /// An erase install finished: the first macOS boot repairs.
     Installed,
+    /// The repair's shell never took input: one more maintenance boot.
+    Retry,
 }
 
 impl Change {
+    /// Every change, in the order the engine keeps them by number.
+    pub const ALL: [Self; 4] = [Self::Request, Self::Forget, Self::Installed, Self::Retry];
+
     /// Apply to `variables`; whether they changed, when the bank must be
     /// saved.
     pub fn apply(self, variables: &mut Variables) -> Result<bool, String> {
-        match self {
-            Self::Request => {
-                if Record::read(variables) == Record::Pending {
-                    return Ok(false);
-                }
-                variables
-                    .set(Partition::System, BUNDLE_REPAIR, BUNDLE_REPAIR_PENDING)
-                    .map_err(|error| format!("{error:?}"))?;
-                Ok(true)
-            }
-            Self::Installed => {
-                if Record::read(variables) == Record::Installed {
-                    return Ok(false);
-                }
-                variables
-                    .set(Partition::System, BUNDLE_REPAIR, BUNDLE_REPAIR_INSTALLED)
-                    .map_err(|error| format!("{error:?}"))?;
-                Ok(true)
-            }
+        let (record, value) = match self {
+            Self::Request => (Record::Pending, BUNDLE_REPAIR_PENDING),
+            Self::Installed => (Record::Installed, BUNDLE_REPAIR_INSTALLED),
+            Self::Retry => (Record::Retry, BUNDLE_REPAIR_RETRY),
             Self::Forget => {
                 let mut changed = false;
                 for partition in [Partition::System, Partition::Common] {
                     changed |= variables.remove(partition, BUNDLE_REPAIR).is_some();
                 }
-                Ok(changed)
+                return Ok(changed);
             }
+        };
+        if Record::read(variables) == record {
+            return Ok(false);
         }
+        variables
+            .set(Partition::System, BUNDLE_REPAIR, value)
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(true)
+    }
+}
+
+/// What a repair boot whose shell never took input ([`Failure::unanswered`])
+/// changes, given the record this boot opened with: the first attempt, or
+/// an erase install's whose record the loader removed, asks for one more;
+/// the retry itself asks for nothing.
+pub fn retry(record: Record) -> Option<Change> {
+    matches!(record, Record::Attempted | Record::None).then_some(Change::Retry)
+}
+
+/// Let the automatic repair run again (`stela repair`): an attempt that did
+/// not help, or a value Stela never writes, becomes a request for the next
+/// macOS boot. A request still waiting, or no record, is left as it is: a
+/// normal boot that finds the plugin missing asks by itself. Whether
+/// `variables` changed.
+pub fn again(variables: &mut Variables) -> Result<bool, String> {
+    match Record::read(variables) {
+        Record::Attempted | Record::Retried | Record::Other => Change::Request.apply(variables),
+        Record::None | Record::Pending | Record::Installed | Record::Retry => Ok(false),
     }
 }
 
@@ -186,10 +219,10 @@ pub fn decide(report: Report, boot: Boot, record: Record, persistent: bool) -> D
             Record::None | Record::Other if persistent => Decision::Repair,
             // A request this boot did not take means NVRAM was not read
             // for it; another request would loop.
-            Record::None | Record::Other | Record::Pending | Record::Installed => {
+            Record::None | Record::Other | Record::Pending | Record::Installed | Record::Retry => {
                 Decision::StopMissing { attempted: false }
             }
-            Record::Attempted => Decision::StopMissing { attempted: true },
+            Record::Attempted | Record::Retried => Decision::StopMissing { attempted: true },
         },
     }
 }
@@ -256,10 +289,19 @@ pub const SYNC_AND_REBOOT: &str = "/bin/sync; /sbin/reboot -q";
 pub const BANNER: &str = "*** Single-user boot ***";
 /// How long the single-user banner may take to appear, from the start.
 pub const BANNER_SECONDS: u64 = 1800;
-/// How long to wait after the banner before the first command: launchd
-/// starts the shell after it, and input before the shell reads may be
-/// flushed.
-pub const SETTLE_SECONDS: u64 = 5;
+/// The end of the shell's prompt: launchd starts the shell after the
+/// banner, and the shell prints its prompt, root's `-sh-3.2# ` (`PS1`'s
+/// `\s-\v\$ `), once it reads its terminal, so typed input is neither
+/// flushed nor taken by anyone else. It starts a line and ends it without
+/// a line feed.
+pub const PROMPT: &str = "# ";
+/// How long the prompt may take to appear after the banner.
+pub const PROMPT_SECONDS: u64 = 60;
+/// What launchd logs when the single-user shell ends: `was signaled: ...`
+/// or `exited ...`. Before the restart, it means launchd goes on to a
+/// multi-user boot that no step typed after it reaches.
+pub const SHELL_LEFT: &str = "Single-user shell ";
+const SHELL_LEFT_HOW: [&str; 2] = ["signaled", "exited"];
 /// How long the guest may take to restart after [`REBOOT`] in all.
 pub const RESTART_SECONDS: u64 = 120;
 /// How long the guest's console may stay silent after [`REBOOT`]: the
@@ -271,6 +313,11 @@ pub const QUIET_SECONDS: u64 = 30;
 pub enum Failure {
     /// No single-user banner in time.
     NoShell,
+    /// The banner, but no shell prompt in time.
+    NoPrompt,
+    /// launchd reported the shell gone: before any step was typed
+    /// (`None`), or while step `index` ran.
+    ShellLeft { index: Option<usize> },
     /// Step `index` printed no exit status in time.
     Timeout { index: usize },
     /// Step `index` exited with `status`.
@@ -279,10 +326,30 @@ pub enum Failure {
     NoRestart,
 }
 
+impl Failure {
+    /// Whether the shell never took input, so no step ran: what one more
+    /// maintenance boot may get past ([`retry`]). A boot that never showed
+    /// the banner is not: it would stall the same way.
+    pub fn unanswered(&self) -> bool {
+        matches!(self, Self::NoPrompt | Self::ShellLeft { index: None })
+    }
+}
+
 impl core::fmt::Display for Failure {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NoShell => write!(f, "no single-user shell within {BANNER_SECONDS} s"),
+            Self::NoPrompt => write!(
+                f,
+                "the single-user shell showed no prompt within {PROMPT_SECONDS} s; nothing was typed"
+            ),
+            Self::ShellLeft { index: None } => write!(
+                f,
+                "the single-user shell ended before it took input; nothing was typed"
+            ),
+            Self::ShellLeft { index: Some(index) } => {
+                write!(f, "the single-user shell ended during step {}", index + 1)
+            }
             Self::Timeout { index } => {
                 write!(f, "step {} printed no exit status in time", index + 1)
             }
@@ -301,6 +368,8 @@ impl core::fmt::Display for Failure {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     Shell,
+    /// The shell's prompt showed: typing starts.
+    Prompt,
     Sent {
         index: usize,
         command: String,
@@ -325,8 +394,8 @@ enum State {
     Banner {
         deadline: u64,
     },
-    Settle {
-        until: u64,
+    Prompt {
+        deadline: u64,
     },
     Step {
         index: usize,
@@ -337,18 +406,25 @@ enum State {
         quiet: u64,
         deadline: u64,
     },
-    Failed,
+    Failed(Failure),
 }
+
+/// The most of the console's current line [`Driver::output`] keeps.
+const TAIL_BYTES: usize = 64;
 
 /// Types [`steps`] at the guest's console, one at a time, each followed by
 /// an `echo` of its exit status under a marker, and goes on only when that
-/// line says 0. Times are milliseconds on any monotonic clock.
+/// line says 0. It types nothing before the shell's prompt shows, and ends
+/// when launchd reports the shell gone. Times are milliseconds on any
+/// monotonic clock.
 pub struct Driver {
     steps: Vec<Step>,
     state: State,
     input: Vec<u8>,
     sent: usize,
     events: Vec<Event>,
+    /// The console's current line, as [`Driver::output`] saw it.
+    tail: Vec<u8>,
 }
 
 const MILLIS: u64 = 1000;
@@ -363,6 +439,7 @@ impl Driver {
             input: Vec::new(),
             sent: 0,
             events: Vec::new(),
+            tail: Vec::with_capacity(TAIL_BYTES),
         }
     }
 
@@ -385,18 +462,49 @@ impl Driver {
     }
 
     fn fail(&mut self, failure: Failure) {
-        self.events.push(Event::Failed(failure));
-        self.state = State::Failed;
+        self.events.push(Event::Failed(failure.clone()));
+        self.state = State::Failed(failure);
+    }
+
+    /// One byte the guest's console printed, for what shows before a line
+    /// ends: the shell's prompt.
+    pub fn output(&mut self, byte: u8, now: u64) {
+        if matches!(byte, b'\n' | b'\r') {
+            self.tail.clear();
+            return;
+        }
+        if self.tail.len() == TAIL_BYTES {
+            self.tail.remove(0);
+        }
+        self.tail.push(byte);
+        if matches!(self.state, State::Prompt { .. }) && Self::prompt(&self.tail) {
+            self.events.push(Event::Prompt);
+            self.advance(0, now);
+        }
+    }
+
+    /// Whether the console's current line is a prompt: one word ending in
+    /// [`PROMPT`], as `-sh-3.2# `, not kernel text with `# ` in it.
+    fn prompt(line: &[u8]) -> bool {
+        line.strip_suffix(PROMPT.as_bytes())
+            .is_some_and(|word| !word.iter().any(u8::is_ascii_whitespace))
     }
 
     /// A complete line the guest's console printed.
     pub fn line(&mut self, text: &str, now: u64) {
+        let left = text
+            .find(SHELL_LEFT)
+            .is_some_and(|at| SHELL_LEFT_HOW.iter().any(|how| text[at..].contains(how)));
         match self.state {
             State::Banner { .. } if text.contains(BANNER) => {
                 self.events.push(Event::Shell);
-                self.state = State::Settle {
-                    until: now + SETTLE_SECONDS * MILLIS,
+                self.state = State::Prompt {
+                    deadline: now + PROMPT_SECONDS * MILLIS,
                 };
+            }
+            State::Prompt { .. } if left => self.fail(Failure::ShellLeft { index: None }),
+            State::Step { index, .. } if left => {
+                self.fail(Failure::ShellLeft { index: Some(index) })
             }
             State::Step { index, .. } => {
                 let marker = Self::marker(index);
@@ -453,11 +561,11 @@ impl Driver {
         };
     }
 
-    /// Advance the clock: the settle's end and every deadline.
+    /// Advance the clock: every deadline.
     pub fn tick(&mut self, now: u64) {
         match self.state {
             State::Banner { deadline } if now >= deadline => self.fail(Failure::NoShell),
-            State::Settle { until } if now >= until => self.advance(0, now),
+            State::Prompt { deadline } if now >= deadline => self.fail(Failure::NoPrompt),
             State::Step { index, deadline } if now >= deadline => {
                 self.fail(Failure::Timeout { index })
             }
@@ -468,7 +576,7 @@ impl Driver {
 
     /// The next byte to type, if any. A failed repair types nothing more.
     pub fn next_byte(&mut self) -> Option<u8> {
-        if self.state == State::Failed {
+        if self.failed() {
             return None;
         }
         let byte = *self.input.get(self.sent)?;
@@ -486,10 +594,18 @@ impl Driver {
     }
 
     /// Whether the repair stopped without a guest restart on its way: the
-    /// shell did not answer or macOS did not restart. The engine then
-    /// restarts the PC itself.
+    /// shell did not answer or left, or macOS did not restart. The engine
+    /// then restarts the PC itself.
     pub fn failed(&self) -> bool {
-        self.state == State::Failed
+        matches!(self.state, State::Failed(_))
+    }
+
+    /// Why the repair stopped, once [`Driver::failed`].
+    pub fn failure(&self) -> Option<&Failure> {
+        match &self.state {
+            State::Failed(failure) => Some(failure),
+            _ => None,
+        }
     }
 }
 
@@ -497,6 +613,7 @@ impl Driver {
 pub fn describe(event: &Event) -> String {
     match event {
         Event::Shell => "BUNDLE REPAIR single-user shell up".to_string(),
+        Event::Prompt => "BUNDLE REPAIR shell prompt shown; typing the steps".to_string(),
         Event::Sent { index, command } => {
             format!("BUNDLE REPAIR step {} sent: {command}", index + 1)
         }

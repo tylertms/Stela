@@ -18,11 +18,13 @@ static PERSISTENT: AtomicBool = AtomicBool::new(false);
 static CHANGE: AtomicU8 = AtomicU8::new(0);
 
 const BOOTS: [Boot; 3] = [Boot::Normal, Boot::SingleUser, Boot::Repair];
-const RECORDS: [Record; 5] = [
+const RECORDS: [Record; 7] = [
     Record::None,
     Record::Pending,
     Record::Attempted,
     Record::Installed,
+    Record::Retry,
+    Record::Retried,
     Record::Other,
 ];
 
@@ -55,11 +57,20 @@ pub(super) fn nvram(bank: &[u8]) {
     }
 }
 
+fn this_record() -> Record {
+    RECORDS[usize::from(RECORD.load(Ordering::Relaxed)) % RECORDS.len()]
+}
+
+/// Keep `change` for the stop.
+fn keep(change: Change) {
+    CHANGE.store(1 + change as u8, Ordering::Relaxed);
+}
+
 /// What the kext's `report` decides for this boot; a change to NVRAM's
 /// record is kept for the stop. Only the GPU gate reports.
 #[cfg(feature = "nvk")]
 pub(super) fn decide(report: Report) -> Decision {
-    let record = RECORDS[usize::from(RECORD.load(Ordering::Relaxed)) % RECORDS.len()];
+    let record = this_record();
     let decision = bundle_repair::decide(
         report,
         this_boot(),
@@ -72,16 +83,33 @@ pub(super) fn decide(report: Report) -> Decision {
         _ => None,
     };
     if let Some(change) = change {
-        CHANGE.store(1 + change as u8, Ordering::Relaxed);
+        keep(change);
     }
     decision
+}
+
+/// This repair boot's shell never took input
+/// (`bundle_repair::Failure::unanswered`): the stop asks for one more
+/// maintenance boot, unless this was it. Whether it does.
+pub(super) fn unanswered() -> bool {
+    if !PERSISTENT.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(change) = bundle_repair::retry(this_record()) else {
+        output::arguments(format_args!(
+            "BUNDLE REPAIR nothing ran in the second attempt either; stela repair lets it run again\n"
+        ));
+        return false;
+    };
+    keep(change);
+    true
 }
 
 /// An erase install finished: its stop asks the first macOS boot to be the
 /// repair, which a fresh Data volume always needs.
 pub(super) fn installed() {
     if PERSISTENT.load(Ordering::Relaxed) {
-        CHANGE.store(1 + Change::Installed as u8, Ordering::Relaxed);
+        keep(Change::Installed);
     }
 }
 
@@ -93,11 +121,11 @@ pub(super) fn change_pending() -> bool {
 /// Apply the kept change to `image`'s boot bank at the stop, the guest no
 /// longer running: the sectors to store, or none when nothing changes.
 pub(super) fn at_stop(image: &mut Image) -> Vec<(usize, Vec<u8>)> {
-    let change = match CHANGE.swap(0, Ordering::Relaxed) {
-        1 => Change::Request,
-        2 => Change::Forget,
-        3 => Change::Installed,
-        _ => return Vec::new(),
+    let Some(change) = usize::from(CHANGE.swap(0, Ordering::Relaxed))
+        .checked_sub(1)
+        .and_then(|number| Change::ALL.get(number).copied())
+    else {
+        return Vec::new();
     };
     let result = (|| -> Result<Vec<(usize, Vec<u8>)>, alloc::string::String> {
         let (_, proxy) = image.boot_bank().map_err(|e| alloc::format!("{e:?}"))?;

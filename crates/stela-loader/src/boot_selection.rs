@@ -104,10 +104,15 @@ pub const FAILURE_REASONS: [&[u8]; 2] = [b"iboot-failure-reason", b"iboot-failur
 /// what a finished erase install leaves: the next macOS boot is the same
 /// maintenance boot and removes the record, so a normal boot that still
 /// finds the plugin missing asks for the repair as usual.
+/// [`BUNDLE_REPAIR_RETRY`] is what a maintenance boot whose shell never took
+/// input leaves: like a request, but taken as [`BUNDLE_REPAIR_RETRIED`],
+/// after which nothing asks again by itself.
 pub const BUNDLE_REPAIR: &[u8] = b"stela-bundle-repair";
 pub const BUNDLE_REPAIR_PENDING: &[u8] = b"pending";
 pub const BUNDLE_REPAIR_ATTEMPTED: &[u8] = b"attempted";
 pub const BUNDLE_REPAIR_INSTALLED: &[u8] = b"installed";
+pub const BUNDLE_REPAIR_RETRY: &[u8] = b"retry";
+pub const BUNDLE_REPAIR_RETRIED: &[u8] = b"retried";
 const TRUE: &[u8] = b"true";
 const FALSE: &[u8] = b"false";
 /// `8-4-4-4-12` hexadecimal digits.
@@ -532,6 +537,9 @@ pub fn select(variables: &Variables) -> Result<Selection> {
             BUNDLE_REPAIR_PENDING => selection
                 .assigned
                 .push((BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED)),
+            BUNDLE_REPAIR_RETRY => selection
+                .assigned
+                .push((BUNDLE_REPAIR, BUNDLE_REPAIR_RETRIED)),
             BUNDLE_REPAIR_INSTALLED => selection.consumed.push(BUNDLE_REPAIR),
             _ => return Ok(selection),
         }

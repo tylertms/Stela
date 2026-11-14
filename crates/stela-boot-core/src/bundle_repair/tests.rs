@@ -178,15 +178,27 @@ const BOOT: [&str; 4] = [
     "\t$ /sbin/mount -P 1",
 ];
 
+/// The shell's prompt, which ends its line without a line feed.
+const PROMPT_TEXT: &[u8] = b"-sh-3.2# ";
+
+fn print(driver: &mut Driver, bytes: &[u8], now: u64) {
+    for &byte in bytes {
+        driver.output(byte, now);
+    }
+}
+
 fn start(driver: &mut Driver, now: &mut u64) {
     for line in BOOT {
+        print(driver, line.as_bytes(), *now);
+        print(driver, b"\r\n", *now);
         driver.line(line, *now);
     }
-    // Nothing is typed before the shell settles.
-    driver.tick(*now + SETTLE_SECONDS * 1000 - 1);
+    // Nothing is typed before the shell's prompt shows, however long it
+    // takes.
+    driver.tick(*now + PROMPT_SECONDS * 1000 - 1);
     assert_eq!(driver.next_byte(), None);
-    *now += SETTLE_SECONDS * 1000;
-    driver.tick(*now);
+    *now += 1000;
+    print(driver, PROMPT_TEXT, *now);
 }
 
 fn pump(
@@ -417,4 +429,171 @@ fn a_restart_that_stops_printing_fails_after_the_quiet_bound_and_a_busy_one_at_t
     driver.tick(cap);
     assert!(driver.failed());
     const { assert!(QUIET_SECONDS < RESTART_SECONDS) };
+}
+
+#[test]
+fn a_prompt_before_the_banner_or_in_the_middle_of_a_line_types_nothing() {
+    let mut driver = Driver::new(steps(), 0);
+    print(&mut driver, b"-sh-3.2# ", 1);
+    assert_eq!(driver.next_byte(), None);
+    print(&mut driver, b"\n", 1);
+    driver.line(BANNER, 2);
+    // The banner's own help lines end in `$ ` commands, not a prompt.
+    print(&mut driver, b"\t$ /sbin/mount -P 1\r\n", 3);
+    print(
+        &mut driver,
+        b"apfs: disk3s1 # 4 -sh-3.2# in kernel text\n",
+        3,
+    );
+    assert_eq!(driver.next_byte(), None);
+    // A kernel line that broke into the prompt leaves its end on a line
+    // of its own.
+    print(&mut driver, b"-sh-3.2", 4);
+    print(&mut driver, b"nx_volume_group_update:819: disk3s1\r\n# ", 4);
+    assert_eq!(
+        driver.take_events(),
+        [
+            Event::Shell,
+            Event::Prompt,
+            Event::Sent {
+                index: 0,
+                command: "/sbin/mount -P 1".into()
+            }
+        ]
+    );
+    assert_eq!(driver.next_byte(), Some(b'/'));
+}
+
+#[test]
+fn a_shell_interrupted_before_its_prompt_ends_the_repair_at_once_as_unanswered() {
+    // The sequence both reports of issue 74 logged.
+    let mut driver = Driver::new(steps(), 0);
+    driver.line("*** Single-user boot ***", 36_736);
+    driver.line(
+        "com.apple.xpc.launchd|2026-11-14 16:24:07.756689 <Notice>: Single-user shell was signaled: Interrupt: 2",
+        36_781,
+    );
+    assert!(driver.failed());
+    let failure = Failure::ShellLeft { index: None };
+    assert_eq!(driver.failure(), Some(&failure));
+    assert!(failure.unanswered());
+    assert_eq!(
+        driver.take_events(),
+        [Event::Shell, Event::Failed(failure.clone())]
+    );
+    assert_eq!(
+        describe(&Event::Failed(failure)),
+        "BUNDLE REPAIR failed: the single-user shell ended before it took input; nothing was typed"
+    );
+    // The multi-user boot launchd goes on to gets nothing typed, prompt or
+    // not.
+    print(&mut driver, b"-sh-3.2# ", 41_000);
+    driver.tick(161_000);
+    assert_eq!(driver.next_byte(), None);
+    assert!(driver.take_events().is_empty());
+}
+
+#[test]
+fn no_prompt_in_time_is_unanswered_and_a_shell_lost_mid_step_is_not() {
+    let mut driver = Driver::new(steps(), 0);
+    driver.line(BANNER, 1000);
+    driver.tick(1000 + PROMPT_SECONDS * 1000 - 1);
+    assert!(!driver.failed());
+    driver.tick(1000 + PROMPT_SECONDS * 1000);
+    assert_eq!(driver.failure(), Some(&Failure::NoPrompt));
+    assert!(Failure::NoPrompt.unanswered());
+    assert_eq!(driver.next_byte(), None);
+
+    let mut now = 0;
+    let mut driver = Driver::new(steps(), now);
+    let mut console = Console::new();
+    start(&mut driver, &mut now);
+    let status = |command: &str| (command != "/sbin/mount -P 2").then_some(0);
+    pump(&mut driver, &mut console, &mut now, &status);
+    driver.line(
+        "com.apple.xpc.launchd <Notice>: Single-user shell exited with status 1",
+        now,
+    );
+    let failure = Failure::ShellLeft { index: Some(2) };
+    assert_eq!(driver.failure(), Some(&failure));
+    assert!(!failure.unanswered());
+    // Neither are a missing banner, a silent step or a failed one.
+    for failure in [
+        Failure::NoShell,
+        Failure::Timeout { index: 0 },
+        Failure::Exit {
+            index: 0,
+            status: 1,
+        },
+        Failure::NoRestart,
+    ] {
+        assert!(!failure.unanswered(), "{failure}");
+    }
+}
+
+#[test]
+fn the_restart_ending_the_shell_is_no_failure() {
+    let mut now = 0;
+    let mut driver = rebooting(&mut now);
+    driver.line(
+        "com.apple.xpc.launchd <Notice>: Single-user shell was signaled: Killed: 9",
+        now + 10,
+    );
+    assert!(!driver.failed());
+}
+
+#[test]
+fn an_unanswered_repair_asks_for_one_more_and_stela_repair_rearms_a_finished_one() {
+    // The first attempt, or an erase install's whose record the loader
+    // removed, asks once more; the retry itself does not.
+    assert_eq!(retry(Record::Attempted), Some(Change::Retry));
+    assert_eq!(retry(Record::None), Some(Change::Retry));
+    assert_eq!(retry(Record::Retried), None);
+    let mut vars = variables(Some(BUNDLE_REPAIR_ATTEMPTED));
+    assert!(Change::Retry.apply(&mut vars).unwrap());
+    assert!(!Change::Retry.apply(&mut vars).unwrap());
+    assert_eq!(Record::read(&vars), Record::Retry);
+    let selection = stela_loader::boot_selection::select(&vars).unwrap();
+    assert!(selection.bundle_repair);
+    stela_loader::boot_selection::consume(&mut vars, &selection).unwrap();
+    assert_eq!(Record::read(&vars), Record::Retried);
+    // A normal boot after the second attempt stops as after the first.
+    let missing = |record| decide(Report::Missing, Boot::Normal, record, true);
+    assert_eq!(
+        missing(Record::Retried),
+        Decision::StopMissing { attempted: true }
+    );
+    assert_eq!(
+        missing(Record::Retry),
+        Decision::StopMissing { attempted: false }
+    );
+    assert_eq!(
+        decide(Report::Current, Boot::Normal, Record::Retried, true),
+        Decision::Continue(Some(Change::Forget))
+    );
+    // `stela repair`: a finished attempt becomes a request again.
+    for value in [BUNDLE_REPAIR_ATTEMPTED, BUNDLE_REPAIR_RETRIED, &b"x"[..]] {
+        let mut vars = variables(Some(value));
+        assert!(again(&mut vars).unwrap());
+        assert_eq!(Record::read(&vars), Record::Pending);
+        assert!(!again(&mut vars).unwrap());
+    }
+    for value in [
+        None,
+        Some(BUNDLE_REPAIR_PENDING),
+        Some(BUNDLE_REPAIR_INSTALLED),
+        Some(BUNDLE_REPAIR_RETRY),
+    ] {
+        let mut vars = variables(value);
+        let before = Record::read(&vars);
+        assert!(!again(&mut vars).unwrap());
+        assert_eq!(Record::read(&vars), before);
+    }
+}
+
+#[test]
+fn every_change_has_its_number() {
+    for (number, change) in Change::ALL.into_iter().enumerate() {
+        assert_eq!(change as usize, number);
+    }
 }

@@ -403,6 +403,20 @@ fn a_pending_bundle_repair_boots_macos_once_for_it_and_never_again_by_itself() {
 }
 
 #[test]
+fn a_retry_boots_macos_for_the_repair_once_more_and_then_never_by_itself() {
+    let mut vars = variables(&[(Partition::System, BUNDLE_REPAIR, BUNDLE_REPAIR_RETRY)]);
+    let selection = select(&vars).unwrap();
+    assert_eq!(selection.target, Target::MacOs { safe: false });
+    assert!(selection.bundle_repair);
+    let (options, _) = route(CONFIG, Some(&selection)).unwrap();
+    assert!(options.ends_with(BUNDLE_REPAIR_OPTION), "{options}");
+    assert!(consume(&mut vars, &selection).unwrap());
+    assert_eq!(lookup(&vars, BUNDLE_REPAIR), Some(BUNDLE_REPAIR_RETRIED));
+    let next = select(&vars).unwrap();
+    assert!(!next.bundle_repair && !next.consumes());
+}
+
+#[test]
 fn an_installs_bundle_repair_boots_macos_once_for_it_and_leaves_no_record() {
     let mut vars = variables(&[(Partition::System, BUNDLE_REPAIR, BUNDLE_REPAIR_INSTALLED)]);
     let selection = select(&vars).unwrap();
