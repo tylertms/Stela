@@ -1046,6 +1046,10 @@ pub struct Machine<H: Host, D: Devices> {
     /// ([`Self::send_outgoing`]).
     outgoing: Vec<parallel::Maintenance>,
     lines_epoch: u64,
+    /// The host count at which the running PE left its run loop to serve
+    /// the host (`parallel::Machine::serve_host`), while it does: guest work
+    /// waits for it at most since then.
+    serving_since: Option<u64>,
     pending_device_read: Option<device_read::Pending>,
     pending_device_write: Option<device_write::Pending>,
     pending_device_tail: alloc::collections::VecDeque<shared_memory::RecoveredDeviceAccess>,
@@ -1435,6 +1439,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             publishing_target: None,
             outgoing: Vec::new(),
             lines_epoch: 0,
+            serving_since: None,
             pending_device_read: None,
             pending_device_write: None,
             pending_device_tail: alloc::collections::VecDeque::new(),

@@ -4590,6 +4590,111 @@ fn tlbi_invalidates_and_wfi_waits_for_the_virtual_timer() {
     assert_eq!(wait(&mut machine, 0xd503_207f), Err(Stop::Idle));
 }
 
+/// A machine at host count 5000 whose virtual timer has control `control`
+/// and compare value `compare`, with PSTATE.DAIF `daif`.
+pub(super) fn serving_timer(control: u64, compare: u64, daif: u8) -> Machine<FakeHost, NoDevices> {
+    let mut machine = machine_on(one_timer_bank(), &[]);
+    machine.host.now = 5000;
+    let registers = &mut machine.cpu.registers;
+    registers.set(SystemRegister::CNTV_CVAL_EL0, 0, compare);
+    registers.set(SystemRegister::CNTV_CTL_EL0, 0, control);
+    machine.cpu.pstate.daif = daif;
+    machine.derived_changed();
+    assert_eq!(machine.now(), 5000, "the count is the host's");
+    machine
+}
+
+/// What a service begun at host count 5000 sees: the count it marks for
+/// the shared count's hold, and the guest work its watch finds at host
+/// count `at`, with how long that waited.
+fn served_at(
+    machine: &mut Machine<FakeHost, NoDevices>,
+    at: u64,
+) -> (Option<u64>, Option<(parallel::Pending, Option<u64>)>) {
+    machine.serve_host(|machine| {
+        let now = machine.now();
+        let mark = machine.serving_mark(now);
+        let watch = machine.guest_watch();
+        machine.host.now = at;
+        (mark, watch.waited(at))
+    })
+}
+
+/// A timer that cannot fire is no guest work for a PE that serves: one
+/// disabled, one masked by its IMASK, and one whose FIQ the running PE
+/// masks at PSTATE neither end the service nor hold the shared count,
+/// however long ago their compare value passed (the boot's "Starting
+/// macOS" turns, whose timer had passed seconds before with FIQs masked).
+#[test]
+fn a_timer_that_cannot_fire_is_no_guest_work_for_a_serving_pe() {
+    use crate::machine::exception::{DAIF_F, DAIF_I};
+    for (control, daif, why) in [
+        (0, 0, "disabled"),
+        (timer::IMASK, 0, "disabled and masked"),
+        (timer::ENABLE | timer::IMASK, 0, "masked by IMASK"),
+        (timer::ENABLE, DAIF_F, "FIQ masked at the PE"),
+        (
+            timer::ENABLE,
+            DAIF_I | DAIF_F,
+            "IRQ and FIQ masked at the PE",
+        ),
+    ] {
+        let mut machine = serving_timer(control, 100, daif);
+        assert_eq!(served_at(&mut machine, 5100), (None, None), "{why}");
+    }
+    // With IRQs alone masked, the timer's FIQ is taken.
+    let mut machine = serving_timer(timer::ENABLE, 100, DAIF_I);
+    assert!(
+        served_at(&mut machine, 5100).1.is_some(),
+        "IRQ alone masked"
+    );
+}
+
+/// A PE that waits in WFI with its FIQ masked is still woken by its timer
+/// (Arm `AArch64_InterruptPending` ends WFI masked or not): that timer is
+/// guest work for it while it serves.
+#[test]
+fn a_waiting_pe_waits_for_its_timer_whatever_its_masks() {
+    use crate::machine::exception::{DAIF_F, DAIF_I};
+    let mut machine = serving_timer(timer::ENABLE, 6000, DAIF_I | DAIF_F);
+    machine.system_instruction(0xd503_207f).unwrap(); // wfi
+    assert!(machine.waiting.is_some(), "the timer is ahead");
+    assert_eq!(
+        served_at(&mut machine, 6500),
+        (Some(6000), Some((parallel::Pending::Timer, Some(500))))
+    );
+}
+
+/// A timer that can fire, due before the PE left its run loop (a stale
+/// deadline), waited for it only since it left: it ran guest code until
+/// then. One due during the service waits from its deadline.
+#[test]
+fn a_serving_pe_waits_for_its_timer_only_since_it_began_to_serve() {
+    // Due long before the service began at 5000.
+    let mut machine = serving_timer(timer::ENABLE, 100, 0);
+    assert_eq!(
+        served_at(&mut machine, 5070),
+        (Some(5000), Some((parallel::Pending::Timer, Some(70)))),
+        "the wait is the service's own, never the deadline's age"
+    );
+    // A real late timer: due at 6000, during the service.
+    let mut machine = serving_timer(timer::ENABLE, 6000, 0);
+    assert_eq!(served_at(&mut machine, 5999), (Some(6000), None));
+    let mut machine = serving_timer(timer::ENABLE, 6000, 0);
+    assert_eq!(
+        served_at(&mut machine, 7500),
+        (Some(6000), Some((parallel::Pending::Timer, Some(1500))))
+    );
+    // A nested service keeps the outer one's start.
+    let mut machine = serving_timer(timer::ENABLE, 100, 0);
+    let waited = machine.serve_host(|machine| {
+        machine.host.now = 5200;
+        served_at(machine, 5300).1
+    });
+    assert_eq!(waited, Some((parallel::Pending::Timer, Some(300))));
+    assert_eq!(machine.serving_since, None, "outside any service");
+}
+
 #[test]
 fn untimed_wfi_uses_cached_lines_without_reading_the_counter() {
     let mut machine = machine_on(one_timer_bank(), &[]);

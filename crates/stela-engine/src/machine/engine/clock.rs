@@ -33,7 +33,12 @@
 //! - A PE whose guest waits holds nothing, unless guest work comes for it
 //!   while it is out of its run loop serving the host (`Machine::serve_host`):
 //!   an interrupt or fast IPI another PE sends it, or its own timer coming
-//!   due. Another core's XNU times that PE's answer (a cross-call's
+//!   due, while that PE accepts the line: it ends the PE's wait, or it
+//!   runs and takes it at its PSTATE (`Machine::accepted_lines`). A timer
+//!   that is disabled, masked by its IMASK or masked at the PE holds
+//!   nothing, and neither does a deadline from before the PE left its run
+//!   loop, which then counts from the moment it left. Another core's XNU
+//!   times that PE's answer (a cross-call's
 //!   acknowledgement, a timer call queued on its CPU), so from that moment
 //!   (the wake, or the timer's deadline) it counts as a PE with guest work
 //!   that ran nothing: the count holds a stall limit later if it is still

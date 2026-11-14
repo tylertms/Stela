@@ -3926,6 +3926,61 @@ fn a_timer_due_on_a_pe_that_serves_the_host_ends_its_service_and_holds_the_count
     assert_eq!(first.read(|| 10_010), deadline + SERVED_STALL + 10);
 }
 
+/// A line change for a serving PE that accepts no line (it runs with IRQ
+/// and FIQ masked) is no guest work: no kick, no mark, its service goes
+/// on. A host call ends the service but holds no count: no guest waits
+/// for it.
+#[test]
+fn only_guest_work_a_serving_pe_would_take_holds_the_count() {
+    let (hub, kicks, host, mut first, mut second) = serving_pair();
+    first.idle(|| 1000, 0, None);
+    first.busy(|| 1000, 0, None);
+    second.idle(|| 1000, 0, None);
+    let epoch = hub.lines_epoch(1);
+    hub.set_accepts(1, Lines::default());
+    hub.set_serving(1, Some(epoch));
+    let watch = GuestWatch::new(Some(Arc::clone(&hub)), 1, epoch, None);
+    host.store(2000, Ordering::SeqCst);
+    hub.lines_changed_unwoken(1);
+    hub.wake(1);
+    assert_eq!(kicks.load(Ordering::SeqCst), 0, "not kicked");
+    assert_eq!(watch.pending(2000), None, "its service goes on");
+    hub.inboxes[1].host_call.store(true, Ordering::SeqCst);
+    hub.wake(1);
+    assert_eq!(kicks.load(Ordering::SeqCst), 1, "a host call kicks it");
+    assert_eq!(
+        watch.waited(2100),
+        Some((super::Pending::HostCall, Some(100)))
+    );
+    let mut retired = 0;
+    for now in (2010..10_000).step_by(10) {
+        retired += 100;
+        first.mark(|| now, retired, None);
+        assert_eq!(first.read(|| now), now, "nothing holds the count");
+    }
+    hub.set_serving(1, None);
+    // Accepting the FIQ alone, a line change is guest work again.
+    hub.inboxes[1].host_call.store(false, Ordering::SeqCst);
+    let epoch = hub.lines_epoch(1);
+    hub.set_accepts(
+        1,
+        Lines {
+            irq: false,
+            fiq: true,
+        },
+    );
+    hub.set_serving(1, Some(epoch));
+    host.store(10_000, Ordering::SeqCst);
+    hub.lines_changed_unwoken(1);
+    hub.wake(1);
+    assert_eq!(kicks.load(Ordering::SeqCst), 2);
+    for now in (10_000..20_000).step_by(10) {
+        retired += 100;
+        first.mark(|| now, retired, None);
+    }
+    assert_eq!(first.read(|| 20_000), 10_000 + SERVED_STALL);
+}
+
 /// Guest work already there when a PE begins to serve marks the count, as
 /// a wake would, without kicking its own core; a forwarded access waits
 /// only for the home machine, a stop only for the others.
@@ -3956,4 +4011,38 @@ fn guest_work_before_a_service_begins_marks_the_count_without_a_kick() {
         None,
         "home runs on"
     );
+}
+
+/// A serving PE's line changes are guest work only while it takes a line:
+/// running with IRQ and FIQ masked it takes none, waiting it is woken by
+/// either.
+#[test]
+fn a_serving_pe_waits_for_a_line_change_only_while_it_takes_a_line() {
+    use super::super::tests::serving_timer;
+    use crate::machine::exception::{DAIF_F, DAIF_I};
+    struct NoKick;
+    impl Kick for NoKick {
+        fn kick(&self, _pe: usize) {}
+    }
+    for (daif, wait, expected) in [
+        (DAIF_I | DAIF_F, false, None),
+        (DAIF_I, false, Some(super::Pending::Lines)),
+        (0, false, Some(super::Pending::Lines)),
+        (DAIF_I | DAIF_F, true, Some(super::Pending::Lines)),
+    ] {
+        let mut machine = serving_timer(0, 0, daif);
+        let hub = Hub::new(1, NoKick);
+        hub.set_live(0, true);
+        machine.enter_parallel(Arc::clone(&hub)).unwrap();
+        if wait {
+            machine.system_instruction(0xd503_207f).unwrap(); // wfi
+            assert!(machine.waiting.is_some());
+        }
+        let pending = machine.serve_host(|machine| {
+            let watch = machine.guest_watch();
+            hub.lines_changed_unwoken(0);
+            watch.pending(machine.host.now)
+        });
+        assert_eq!(pending, expected, "DAIF {daif:#x}, waiting {wait}");
+    }
 }
