@@ -417,6 +417,37 @@ fn a_retry_boots_macos_for_the_repair_once_more_and_then_never_by_itself() {
 }
 
 #[test]
+fn taking_a_bundle_repair_removes_the_last_attempts_result() {
+    for record in [
+        BUNDLE_REPAIR_PENDING,
+        BUNDLE_REPAIR_RETRY,
+        BUNDLE_REPAIR_INSTALLED,
+    ] {
+        let mut vars = variables(&[
+            (Partition::System, BUNDLE_REPAIR, record),
+            (Partition::System, BUNDLE_REPAIR_RESULT, b"step 3 exited"),
+        ]);
+        let selection = select(&vars).unwrap();
+        assert!(selection.consumed.contains(&BUNDLE_REPAIR_RESULT));
+        assert!(consume(&mut vars, &selection).unwrap());
+        assert_eq!(lookup(&vars, BUNDLE_REPAIR_RESULT), None);
+        // A boot that takes nothing keeps it for the stop to name.
+        let mut empty = select(&variables(&[
+            (Partition::System, BUNDLE_REPAIR, record),
+            (Partition::System, BUNDLE_REPAIR_RESULT, b"step 3 exited"),
+        ]))
+        .unwrap();
+        empty.missing_boot_media();
+        assert!(!empty.consumes());
+    }
+    let vars = variables(&[
+        (Partition::System, BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED),
+        (Partition::System, BUNDLE_REPAIR_RESULT, b"step 3 exited"),
+    ]);
+    assert!(!select(&vars).unwrap().consumes());
+}
+
+#[test]
 fn an_installs_bundle_repair_boots_macos_once_for_it_and_leaves_no_record() {
     let mut vars = variables(&[(Partition::System, BUNDLE_REPAIR, BUNDLE_REPAIR_INSTALLED)]);
     let selection = select(&vars).unwrap();

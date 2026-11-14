@@ -589,6 +589,9 @@ impl GuestConsole {
             return;
         };
         let events = driver.take_events();
+        if let Some(outcome) = driver.outcome() {
+            bundle_repair::outcome(outcome);
+        }
         let restart = driver.failed();
         let unanswered = driver
             .failure()

@@ -113,6 +113,12 @@ pub const BUNDLE_REPAIR_ATTEMPTED: &[u8] = b"attempted";
 pub const BUNDLE_REPAIR_INSTALLED: &[u8] = b"installed";
 pub const BUNDLE_REPAIR_RETRY: &[u8] = b"retry";
 pub const BUNDLE_REPAIR_RETRIED: &[u8] = b"retried";
+/// What the repair's maintenance boot reported at its stop, as text: the
+/// step that failed and its status, or that every required step passed.
+/// A boot that still finds the plugin missing names it in its stop, and
+/// `stela status` shows it. Taking a new request removes it, so it always
+/// belongs to the latest attempt.
+pub const BUNDLE_REPAIR_RESULT: &[u8] = b"stela-bundle-repair-result";
 const TRUE: &[u8] = b"true";
 const FALSE: &[u8] = b"false";
 /// `8-4-4-4-12` hexadecimal digits.
@@ -376,7 +382,8 @@ impl Selection {
             // The repair waits for a macOS boot, as for any recoveryOS one.
             self.bundle_repair = false;
             self.assigned.retain(|(name, _)| *name != BUNDLE_REPAIR);
-            self.consumed.retain(|name| *name != BUNDLE_REPAIR);
+            self.consumed
+                .retain(|name| ![BUNDLE_REPAIR, BUNDLE_REPAIR_RESULT].contains(name));
             self.reasons
                 .push("missing-boot-media: the boot disk holds no installed system".into());
         }
@@ -542,6 +549,10 @@ pub fn select(variables: &Variables) -> Result<Selection> {
                 .push((BUNDLE_REPAIR, BUNDLE_REPAIR_RETRIED)),
             BUNDLE_REPAIR_INSTALLED => selection.consumed.push(BUNDLE_REPAIR),
             _ => return Ok(selection),
+        }
+        // The new attempt reports for itself.
+        if lookup(variables, BUNDLE_REPAIR_RESULT).is_some() {
+            selection.consumed.push(BUNDLE_REPAIR_RESULT);
         }
         selection.reasons.push(shown(BUNDLE_REPAIR, value));
         selection.bundle_repair = true;

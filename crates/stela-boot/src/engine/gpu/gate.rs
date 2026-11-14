@@ -470,17 +470,7 @@ fn bundle(report: BundleReport) {
             ));
             super::super::service::request_restart();
         }
-        (Decision::StopMissing { attempted: true }, _) => stop(
-            "StelaGPU.bundle is still not installed in /Library/GPUBundles after the automatic \
-             single-user repair (its BUNDLE REPAIR lines say how it went): run stela repair on \
-             the stick to let the repair run again at the next start, or boot macOS once with \
-             --single-user and install it there by hand",
-        ),
-        (Decision::StopMissing { attempted: false }, _) => stop(
-            "StelaGPU.bundle is not installed in /Library/GPUBundles, a kext cannot create \
-             its directories, and without the machine state's NVRAM no automatic repair can be \
-             recorded: boot macOS once with --single-user and install it there by hand",
-        ),
+        (Decision::StopMissing { attempted }, _) => stop(&bundle_repair::missing(attempted)),
         (Decision::StopFailed, _) => stop(
             "the StelaGPU kext could not install StelaGPU.bundle; its StelaGPU lines above say why",
         ),

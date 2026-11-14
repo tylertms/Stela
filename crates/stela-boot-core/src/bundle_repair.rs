@@ -27,10 +27,13 @@
 //! failing optional step is logged and the repair goes on. A failed
 //! required step still syncs and restarts, and a repair whose shell stops
 //! answering restarts the PC, so the next normal boot always tries the kext
-//! once. A boot that finds the plugin installed removes the record; one
-//! that finds it missing after an attempt stops with the manual remedy
-//! ([`decide`]), which `stela repair` turns back into a request
-//! ([`again`]).
+//! once. The repair boot's stop records what it reported ([`Outcome`],
+//! [`store_result`]). A boot that finds the plugin installed removes the
+//! record; one that finds it missing after an attempt stops ([`decide`]),
+//! naming that result ([`stop_reason`]), and `stela repair` turns the
+//! attempt back into a request ([`again`]). The manual single-user remedy
+//! is no advice: the guest's console takes input only from the PC's COM1,
+//! which most PCs lack, and no `stela` command asks for that boot.
 //!
 //! A repair whose shell never took input, because no prompt came or the
 //! shell left before the first step was typed ([`Failure::unanswered`]),
@@ -59,7 +62,7 @@ use alloc::{
 };
 use stela_loader::boot_selection::{
     BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED, BUNDLE_REPAIR_INSTALLED, BUNDLE_REPAIR_PENDING,
-    BUNDLE_REPAIR_RETRIED, BUNDLE_REPAIR_RETRY, lookup,
+    BUNDLE_REPAIR_RESULT, BUNDLE_REPAIR_RETRIED, BUNDLE_REPAIR_RETRY, lookup,
 };
 use stela_soc_data::nor::nvram::{Partition, Variables};
 
@@ -126,6 +129,48 @@ impl Record {
             Some(_) => Self::Other,
         }
     }
+
+    /// The record as NVRAM spells it, for messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Pending => "pending",
+            Self::Attempted => "attempted",
+            Self::Installed => "installed",
+            Self::Retry => "retry",
+            Self::Retried => "retried",
+            Self::Other => "a value Stela never writes",
+        }
+    }
+}
+
+/// The most bytes of [`BUNDLE_REPAIR_RESULT`] kept and shown.
+pub const RESULT_BYTES: usize = 160;
+
+/// What the last repair boot reported ([`BUNDLE_REPAIR_RESULT`]), as
+/// printable text of at most [`RESULT_BYTES`]: the guest can write NVRAM
+/// too.
+pub fn result(variables: &Variables) -> Option<String> {
+    let value = lookup(variables, BUNDLE_REPAIR_RESULT)?;
+    let text: String = value
+        .iter()
+        .take(RESULT_BYTES)
+        .filter(|byte| (b' '..=b'~').contains(*byte))
+        .map(|&byte| char::from(byte))
+        .collect();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Record `text` as the repair boot's result; whether `variables` changed.
+pub fn store_result(variables: &mut Variables, text: &str) -> Result<bool, String> {
+    let value = &text.as_bytes()[..text.len().min(RESULT_BYTES)];
+    if lookup(variables, BUNDLE_REPAIR_RESULT) == Some(value) {
+        return Ok(false);
+    }
+    variables
+        .set(Partition::System, BUNDLE_REPAIR_RESULT, value)
+        .map_err(|error| format!("{error:?}"))?;
+    Ok(true)
 }
 
 /// What NVRAM's record becomes at the stop.
@@ -155,7 +200,9 @@ impl Change {
             Self::Forget => {
                 let mut changed = false;
                 for partition in [Partition::System, Partition::Common] {
-                    changed |= variables.remove(partition, BUNDLE_REPAIR).is_some();
+                    for name in [BUNDLE_REPAIR, BUNDLE_REPAIR_RESULT] {
+                        changed |= variables.remove(partition, name).is_some();
+                    }
                 }
                 return Ok(changed);
             }
@@ -199,8 +246,8 @@ pub enum Decision {
     Log,
     /// Record the request and restart into the repair.
     Repair,
-    /// Stop with the manual remedy; `attempted` when the automatic repair
-    /// already ran and did not help, or cannot run.
+    /// Stop ([`stop_reason`]); `attempted` when the automatic repair
+    /// already ran and did not help, otherwise it cannot run.
     StopMissing { attempted: bool },
     /// The kext failed to write the plugin; its lines say why.
     StopFailed,
@@ -225,6 +272,52 @@ pub fn decide(report: Report, boot: Boot, record: Record, persistent: bool) -> D
             Record::Attempted | Record::Retried => Decision::StopMissing { attempted: true },
         },
     }
+}
+
+/// What a user can do once an attempt did not help, with the `stela` of
+/// this release: the record lives on the PC's own disk, which only a
+/// system started on that PC reaches.
+const AGAIN: &str = "start another system on this PC (Linux, Windows or a live USB), plug in \
+                     the stick and run stela repair, which lets the repair run again at the next \
+                     start; stela log saves the boot logs for a report";
+
+/// The stop's reason for a normal boot that finds the plugin missing
+/// ([`Decision::StopMissing`]): what the last repair boot reported
+/// (`result`, [`result`]), or why no repair can run, given NVRAM's `record`
+/// and whether it was read (`persistent`).
+pub fn stop_reason(
+    attempted: bool,
+    record: Record,
+    persistent: bool,
+    result: Option<&str>,
+) -> String {
+    const MISSING: &str = "StelaGPU.bundle is not installed in /Library/GPUBundles and a kext \
+                           cannot create its directories";
+    if attempted {
+        let reported = match result {
+            Some(result) => format!("its boot reported: {result}"),
+            None => "its boot left no result, so it ended before its stop (its BUNDLE REPAIR \
+                     lines in the log say how far it got)"
+                .into(),
+        };
+        return format!(
+            "StelaGPU.bundle is still not installed in /Library/GPUBundles after the automatic \
+             single-user repair; {reported}. To try again, {AGAIN}"
+        );
+    }
+    if !persistent {
+        return format!(
+            "{MISSING}, and the machine state's NVRAM was not read at this start, so no \
+             automatic repair can be recorded (its NVRAM lines in the log say why); stela log \
+             saves the boot logs for a report"
+        );
+    }
+    format!(
+        "{MISSING}, and NVRAM holds a repair record ({}) this start did not take, as when NVRAM \
+         is not read before the boot (its NVRAM lines in the log say why); stela log saves the \
+         boot logs for a report",
+        record.name()
+    )
 }
 
 /// One console command and the seconds it may take.
@@ -364,6 +457,78 @@ impl core::fmt::Display for Failure {
     }
 }
 
+/// How a repair boot ended, for its stop to record ([`store_result`]) and a
+/// later stop to name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Every required step passed and the restart was typed.
+    Done,
+    /// The first failure: a required step's, or the shell's or restart's.
+    Failed(Failure),
+}
+
+impl Outcome {
+    /// One number for an atomic: the kind in the low byte, a step's index
+    /// in the next and a status in the high half; never 0.
+    pub fn encode(&self) -> u64 {
+        let (kind, index, status) = match self {
+            Self::Done => (1, 0, 0),
+            Self::Failed(Failure::NoShell) => (2, 0, 0),
+            Self::Failed(Failure::NoPrompt) => (3, 0, 0),
+            Self::Failed(Failure::ShellLeft { index: None }) => (4, 0, 0),
+            Self::Failed(Failure::ShellLeft { index: Some(index) }) => (5, *index, 0),
+            Self::Failed(Failure::Timeout { index }) => (6, *index, 0),
+            Self::Failed(Failure::Exit { index, status }) => (7, *index, *status),
+            Self::Failed(Failure::NoRestart) => (8, 0, 0),
+        };
+        kind | ((index.min(0xff) as u64) << 8) | (u64::from(status) << 32)
+    }
+
+    /// The outcome [`Outcome::encode`] gave `code`.
+    pub fn decode(code: u64) -> Option<Self> {
+        let index = ((code >> 8) & 0xff) as usize;
+        let status = (code >> 32) as u32;
+        Some(match code & 0xff {
+            1 => Self::Done,
+            2 => Self::Failed(Failure::NoShell),
+            3 => Self::Failed(Failure::NoPrompt),
+            4 => Self::Failed(Failure::ShellLeft { index: None }),
+            5 => Self::Failed(Failure::ShellLeft { index: Some(index) }),
+            6 => Self::Failed(Failure::Timeout { index }),
+            7 => Self::Failed(Failure::Exit { index, status }),
+            8 => Self::Failed(Failure::NoRestart),
+            _ => return None,
+        })
+    }
+
+    /// The text NVRAM keeps: the failure with its step's command up to the
+    /// plugin's paths, so it fits [`RESULT_BYTES`].
+    pub fn text(&self, steps: &[Step]) -> String {
+        let step = |index: usize| {
+            let command = steps.get(index).map_or("?", |step| {
+                step.command
+                    .split(" /System/Volumes/Data/Library")
+                    .next()
+                    .unwrap_or(&step.command)
+            });
+            format!("step {} ({command})", index + 1)
+        };
+        match self {
+            Self::Done => "every required step passed and the directories were created".into(),
+            Self::Failed(Failure::ShellLeft { index: Some(index) }) => {
+                format!("the single-user shell ended during {}", step(*index))
+            }
+            Self::Failed(Failure::Timeout { index }) => {
+                format!("{} printed no exit status in time", step(*index))
+            }
+            Self::Failed(Failure::Exit { index, status }) => {
+                format!("{} exited with status {status}", step(*index))
+            }
+            Self::Failed(failure) => failure.to_string(),
+        }
+    }
+}
+
 /// What the driver did, for the log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -425,6 +590,8 @@ pub struct Driver {
     events: Vec<Event>,
     /// The console's current line, as [`Driver::output`] saw it.
     tail: Vec<u8>,
+    /// How the repair went, once known: the first failure, or the end.
+    outcome: Option<Outcome>,
 }
 
 const MILLIS: u64 = 1000;
@@ -440,6 +607,7 @@ impl Driver {
             sent: 0,
             events: Vec::new(),
             tail: Vec::with_capacity(TAIL_BYTES),
+            outcome: None,
         }
     }
 
@@ -462,6 +630,8 @@ impl Driver {
     }
 
     fn fail(&mut self, failure: Failure) {
+        self.outcome
+            .get_or_insert_with(|| Outcome::Failed(failure.clone()));
         self.events.push(Event::Failed(failure.clone()));
         self.state = State::Failed(failure);
     }
@@ -525,8 +695,10 @@ impl Driver {
                 } else if self.steps[index].required {
                     // The shell answers: keep what was written and restart,
                     // so the next boot tries the kext.
-                    self.events
-                        .push(Event::Failed(Failure::Exit { index, status }));
+                    let failure = Failure::Exit { index, status };
+                    self.outcome
+                        .get_or_insert_with(|| Outcome::Failed(failure.clone()));
+                    self.events.push(Event::Failed(failure));
                     return self.reboot(SYNC_AND_REBOOT, false, now);
                 } else {
                     self.events.push(Event::Skipped { index, status });
@@ -552,6 +724,9 @@ impl Driver {
     }
 
     fn reboot(&mut self, command: &str, repaired: bool, now: u64) {
+        if repaired {
+            self.outcome.get_or_insert(Outcome::Done);
+        }
         self.input.extend_from_slice(command.as_bytes());
         self.input.push(b'\n');
         self.events.push(Event::Rebooting { repaired });
@@ -598,6 +773,12 @@ impl Driver {
     /// then restarts the PC itself.
     pub fn failed(&self) -> bool {
         matches!(self.state, State::Failed(_))
+    }
+
+    /// How the repair went, once known: the first failure, which may come
+    /// before a restart the guest makes itself, or the end of the steps.
+    pub fn outcome(&self) -> Option<&Outcome> {
+        self.outcome.as_ref()
     }
 
     /// Why the repair stopped, once [`Driver::failed`].

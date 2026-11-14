@@ -597,3 +597,136 @@ fn every_change_has_its_number() {
         assert_eq!(change as usize, number);
     }
 }
+
+#[test]
+fn every_outcome_survives_its_number() {
+    let mut outcomes = Vec::from([
+        Outcome::Done,
+        Outcome::Failed(Failure::NoShell),
+        Outcome::Failed(Failure::NoPrompt),
+        Outcome::Failed(Failure::ShellLeft { index: None }),
+        Outcome::Failed(Failure::NoRestart),
+    ]);
+    for index in [0, 4, steps().len() - 1] {
+        outcomes.push(Outcome::Failed(Failure::ShellLeft { index: Some(index) }));
+        outcomes.push(Outcome::Failed(Failure::Timeout { index }));
+        for status in [1, 66, u32::MAX] {
+            outcomes.push(Outcome::Failed(Failure::Exit { index, status }));
+        }
+    }
+    for outcome in outcomes {
+        let code = outcome.encode();
+        assert_ne!(code, 0);
+        assert_eq!(Outcome::decode(code), Some(outcome.clone()));
+        let text = outcome.text(&steps());
+        assert!(text.len() <= RESULT_BYTES, "{text}");
+    }
+    assert_eq!(Outcome::decode(0), None);
+}
+
+#[test]
+fn the_driver_keeps_the_first_failure_or_the_end_for_the_stop() {
+    // Every step passed: a restart that then stalls keeps the steps' end.
+    let mut now = 0;
+    let mut driver = rebooting(&mut now);
+    assert_eq!(driver.outcome(), Some(&Outcome::Done));
+    driver.tick(now + RESTART_SECONDS * 1000);
+    assert!(driver.failed());
+    assert_eq!(driver.outcome(), Some(&Outcome::Done));
+    // A failed required step, before the restart the guest makes itself.
+    let mut now = 0;
+    let mut driver = Driver::new(steps(), now);
+    let mut console = Console::new();
+    start(&mut driver, &mut now);
+    assert_eq!(driver.outcome(), None);
+    let status = |command: &str| Some(u32::from(command.starts_with("/sbin/mount -P 2")) * 66);
+    pump(&mut driver, &mut console, &mut now, &status);
+    let exit = Outcome::Failed(Failure::Exit {
+        index: 2,
+        status: 66,
+    });
+    assert!(!driver.failed());
+    assert_eq!(driver.outcome(), Some(&exit));
+    driver.tick(now + RESTART_SECONDS * 1000);
+    assert_eq!(driver.outcome(), Some(&exit));
+    assert_eq!(
+        exit.text(&steps()),
+        "step 3 (/sbin/mount -P 2) exited with status 66"
+    );
+    // A step that never answers.
+    let mut driver = Driver::new(steps(), 0);
+    let mut now = 0;
+    start(&mut driver, &mut now);
+    driver.tick(now + 120 * 1000);
+    let timeout = Outcome::Failed(Failure::Timeout { index: 0 });
+    assert_eq!(driver.outcome(), Some(&timeout));
+    assert_eq!(
+        timeout.text(&steps()),
+        "step 1 (/sbin/mount -P 1) printed no exit status in time"
+    );
+    // A step naming the plugin's paths is named by its command alone.
+    let mkdir = steps()
+        .iter()
+        .position(|step| step.command.starts_with("/bin/mkdir"))
+        .unwrap();
+    assert_eq!(
+        Outcome::Failed(Failure::Exit {
+            index: mkdir,
+            status: 1
+        })
+        .text(&steps()),
+        format!(
+            "step {} (/bin/mkdir -p -m 0755) exited with status 1",
+            mkdir + 1
+        )
+    );
+}
+
+#[test]
+fn the_result_round_trips_through_nvram_as_bounded_text_and_goes_with_the_record() {
+    let mut vars = variables(Some(BUNDLE_REPAIR_ATTEMPTED));
+    assert_eq!(result(&vars), None);
+    let text = "step 3 (/sbin/mount -P 2) exited with status 66";
+    assert!(store_result(&mut vars, text).unwrap());
+    assert!(!store_result(&mut vars, text).unwrap());
+    let saved = Variables::parse(&vars.encode().unwrap()).unwrap();
+    assert_eq!(result(&saved).as_deref(), Some(text));
+    // What the guest might write is shown as printable text, bounded.
+    let mut odd = variables(None);
+    let mut value = Vec::from(&b"a\x1b[2Jb\n"[..]);
+    value.extend(core::iter::repeat_n(b'x', 400));
+    odd.set(Partition::System, BUNDLE_REPAIR_RESULT, &value)
+        .unwrap();
+    let shown = result(&odd).unwrap();
+    assert!(shown.starts_with("a[2Jb") && shown.len() <= RESULT_BYTES);
+    // An installed plugin forgets the result with the record.
+    assert!(Change::Forget.apply(&mut vars).unwrap());
+    assert_eq!((Record::read(&vars), result(&vars)), (Record::None, None));
+}
+
+#[test]
+fn the_stop_names_the_repairs_result_and_advice_the_cli_can_follow() {
+    let reported = "step 3 (/sbin/mount -P 2) exited with status 66";
+    for record in [Record::Attempted, Record::Retried] {
+        let reason = stop_reason(true, record, true, Some(reported));
+        assert!(
+            reason.contains(&format!("its boot reported: {reported}")),
+            "{reason}"
+        );
+        assert!(reason.contains("run stela repair"), "{reason}");
+        assert!(reason.contains("stela log"), "{reason}");
+        // No console takes the manual remedy on a PC without COM1, and no
+        // command asks for that boot.
+        assert!(!reason.contains("--single-user"), "{reason}");
+    }
+    let silent = stop_reason(true, Record::Attempted, true, None);
+    assert!(silent.contains("left no result"), "{silent}");
+    let unread = stop_reason(false, Record::None, false, None);
+    assert!(unread.contains("NVRAM was not read"), "{unread}");
+    assert!(!unread.contains("stela repair"), "{unread}");
+    let untaken = stop_reason(false, Record::Pending, true, None);
+    assert!(untaken.contains("(pending)"), "{untaken}");
+    for reason in [silent, unread, untaken] {
+        assert!(!reason.contains("--single-user"), "{reason}");
+    }
+}
