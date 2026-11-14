@@ -312,3 +312,29 @@ fn a_failed_port_reset_of_a_hung_stick_is_reported_with_its_port_status() {
         "{reset}"
     );
 }
+
+/// A warm reset may take far longer than a hot one: Linux's
+/// `hub_port_wait_reset` waits `HUB_RESET_TIMEOUT`, 800 ms, for either. A
+/// hung stick whose warm reset ends after 600 ms comes back.
+#[test]
+fn a_slow_warm_reset_of_a_hung_stick_is_waited_for() {
+    let _clock = crate::test_clock::virtualize();
+    let mut dma = TestRegion::new(1024 * 1024 * 8);
+    let (mut controller, hardware) = hub::tests::controller(
+        &mut dma,
+        64,
+        BTreeMap::from([(0, Node::bot_disk(SUPER_SPEED))]),
+    );
+    hardware.borrow_mut().root_status =
+        Some(PP | CCS | PED | u32::from(SUPER_SPEED) << PORT_SPEED_SHIFT);
+    let mut failures = Vec::new();
+    let devices = controller.enumerate(&mut dma, &mut failures);
+    assert!(failures.is_empty(), "{failures:?}");
+    let shared = Rc::new(RefCell::new(controller));
+    hardware.borrow_mut().nodes.get_mut(&0).unwrap().wedge_bot();
+    hardware.borrow_mut().wedge_drops_root_link = Some(true);
+    hardware.borrow_mut().root_reset_us = Some(600_000);
+    let mut found = Found::default();
+    bind::bind(&shared, devices[0].clone(), &mut dma, &mut found);
+    assert_eq!(found.disks.len(), 1, "{:?}", found.failures);
+}

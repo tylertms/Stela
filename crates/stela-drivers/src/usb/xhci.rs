@@ -298,7 +298,9 @@ const QUIET_DRAINS: u8 = 64;
 const ABORT_US: u64 = 5_000_000;
 const RING_STOP_US: u64 = 2_000_000;
 const CONTROL_US: u64 = 5_000_000;
-const PORT_RESET_US: u64 = 500_000;
+/// Linux `HUB_RESET_TIMEOUT`: how long `hub_port_wait_reset` waits for a
+/// port's reset, hot or warm, to end.
+const PORT_RESET_US: u64 = 800_000;
 /// Linux `hub_port_reset`: 10 ms of reset recovery and 40 ms more, as the
 /// hub path here waits.
 const RESET_RECOVERY_US: u64 = 50_000;

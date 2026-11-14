@@ -393,6 +393,10 @@ pub(in super::super) struct Hardware {
     /// showing a connection or not, as a device whose firmware hung may;
     /// then only a warm reset retrains it.
     pub wedge_drops_root_link: Option<bool>,
+    /// How long a root port reset runs; at once when `None`.
+    pub root_reset_us: Option<u64>,
+    /// The root port reset under way and when it ends.
+    root_reset_done: Option<(u32, u64)>,
     pub notification_override: Option<u32>,
     pending_interrupts: BTreeMap<(u8, u8), (u64, u64, usize)>,
     /// Bulk TDs a wedged BOT peer never completes; a Stop Endpoint ends them.
@@ -436,6 +440,8 @@ impl Hardware {
             root_status: None,
             root_untrainable: false,
             wedge_drops_root_link: None,
+            root_reset_us: None,
+            root_reset_done: None,
             notification_override: None,
             pending_interrupts: BTreeMap::new(),
             withheld: BTreeMap::new(),
@@ -454,6 +460,41 @@ impl Hardware {
             free_slots: Default::default(),
             slot_limit: 32,
         }
+    }
+    /// A root port reset (`value`'s PR or WPR) ends, with its port status
+    /// event.
+    fn end_root_reset(&mut self, value: u32) {
+        let actual_speed = self.nodes[&0].speed;
+        let untrainable = self.root_untrainable;
+        if let Some(status) = self.root_status.as_mut() {
+            if value & PR != 0 && *status >> PLS_SHIFT & PLS_FIELD == LINK_INACTIVE {
+                // A hot reset cannot retrain an SS.Inactive link: it
+                // completes with the port still disabled.
+                *status = *status & !PR | PRC;
+            } else if value & PR != 0 {
+                // The device handshake determines speed when reset enables
+                // the port; its pre-reset speed field may be undefined.
+                *status = *status & !(PR | (PORT_SPEED_FIELD << PORT_SPEED_SHIFT))
+                    | PED
+                    | PRC
+                    | u32::from(actual_speed) << PORT_SPEED_SHIFT;
+            }
+            if value & WPR != 0 {
+                // A warm reset clears Cold Attach Status and retrains
+                // the link to U0 (xHCI 1.2 4.19.5.1).
+                let trained = if untrainable {
+                    0
+                } else {
+                    CCS | PED | u32::from(actual_speed) << PORT_SPEED_SHIFT
+                };
+                *status = *status
+                    & !(PR | CAS | CCS | PED | PLS | (PORT_SPEED_FIELD << PORT_SPEED_SHIFT))
+                    | WRC
+                    | PRC
+                    | trained;
+            }
+        }
+        self.event(1 << 24, SUCCESS, reset::PORT_STATUS_CHANGE, 0, 0, 0);
     }
     pub fn notify_root(&mut self) {
         self.notify_root_code(SUCCESS);
@@ -1146,6 +1187,16 @@ impl Registers for RegistersModel {
             }
             0x88 => 1 | 1 << 8,
             0x440 => {
+                let now = Clock {
+                    ticks_per_microsecond: 1,
+                }
+                .now_us();
+                if let Some((value, done)) = state.root_reset_done
+                    && now >= done
+                {
+                    state.root_reset_done = None;
+                    state.end_root_reset(value);
+                }
                 // Hubs answer their interrupt TDs while the host samples ports.
                 state.complete_interrupts();
                 state
@@ -1163,39 +1214,25 @@ impl Registers for RegistersModel {
             state.abort();
         }
         if at == 0x440 {
-            let actual_speed = state.nodes[&0].speed;
-            let untrainable = state.root_untrainable;
             if let Some(status) = state.root_status.as_mut() {
                 *status &= !(value & PORT_CHANGES);
-                if value & PR != 0 && *status >> PLS_SHIFT & PLS_FIELD == LINK_INACTIVE {
-                    // A hot reset cannot retrain an SS.Inactive link: it
-                    // completes with the port still disabled.
-                    *status = *status & !PR | PRC;
-                } else if value & PR != 0 {
-                    // The device handshake determines speed when reset enables
-                    // the port; its pre-reset speed field may be undefined.
-                    *status = *status & !(PR | (PORT_SPEED_FIELD << PORT_SPEED_SHIFT))
-                        | PED
-                        | PRC
-                        | u32::from(actual_speed) << PORT_SPEED_SHIFT;
-                }
-                if value & WPR != 0 {
-                    // A warm reset clears Cold Attach Status and retrains
-                    // the link to U0 (xHCI 1.2 4.19.5.1).
-                    let trained = if untrainable {
-                        0
-                    } else {
-                        CCS | PED | u32::from(actual_speed) << PORT_SPEED_SHIFT
-                    };
-                    *status = *status
-                        & !(CAS | CCS | PED | PLS | (PORT_SPEED_FIELD << PORT_SPEED_SHIFT))
-                        | WRC
-                        | PRC
-                        | trained;
-                }
             }
             if value & (PR | WPR) != 0 {
-                state.event(1 << 24, SUCCESS, reset::PORT_STATUS_CHANGE, 0, 0, 0);
+                match state.root_reset_us {
+                    // The reset runs, Port Reset set, until its time passed.
+                    Some(us) => {
+                        let done = Clock {
+                            ticks_per_microsecond: 1,
+                        }
+                        .now_us()
+                            + us;
+                        state.root_reset_done = Some((value & (PR | WPR), done));
+                        if let Some(status) = state.root_status.as_mut() {
+                            *status |= PR;
+                        }
+                    }
+                    None => state.end_root_reset(value),
+                }
             }
         }
         if at == 0x40 {
