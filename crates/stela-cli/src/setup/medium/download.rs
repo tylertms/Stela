@@ -3,7 +3,7 @@
 //! Each piece is synced before the next starts, and [`RESUME_FILE`] beside
 //! the pieces records those done. A download that stopped goes on when the
 //! image on the server is the same one (URL, entity tag, size) and the piece
-//! size is too: each recorded piece is read back from the USB, in order, to
+//! size is too: each recorded piece is read back from the stick, in order, to
 //! rebuild the whole image's hashes, and kept when it matches its recorded
 //! hash; every missing or damaged piece is asked for again by range. The
 //! catalog's SHA-1 of the whole image still decides.
@@ -176,7 +176,7 @@ fn finished(manifest_path: &Path, image: &restore::Image, total: u64, sizes: &[u
     }
 }
 
-/// Whether the piece `index` a stopped download recorded is on the USB as
+/// Whether the piece `index` a stopped download recorded is on the stick as
 /// recorded: read back once, its bytes go into the whole image's hashes and
 /// its block hashes into `blocks`. A piece already promoted by a stop
 /// during publication becomes a partial again. A missing, short or
@@ -264,13 +264,13 @@ fn write_from(
     }
     if !record.done.is_empty() {
         eprintln!(
-            "note: checking the {} of {} pieces already on the USB; only missing or damaged \
+            "note: checking the {} of {} pieces already on the stick; only missing or damaged \
              pieces are downloaded again",
             record.done.len().min(sizes.len()),
             sizes.len()
         );
     }
-    let progress = crate::progress::Phase::bytes("Downloading macOS onto USB", total);
+    let progress = crate::progress::Phase::bytes("Downloading macOS onto the stick", total);
     let (mut pieces, mut piece_blocks) = (Vec::new(), Vec::new());
     let (mut kept, mut position) = (0, 0);
     let mut offset = 0;
@@ -374,11 +374,11 @@ fn write_from(
         // If inventory failed early, retain the old ordered verification and
         // promotion. A media failure still takes precedence and leaves the
         // same verified prefix promoted before that failure.
-        let progress = crate::progress::Phase::bytes("Verifying USB", total);
+        let progress = crate::progress::Phase::bytes("Verifying the stick", total);
         promote(&directory, &pieces, |_, piece, partial| {
             ensure!(
                 hash_file(partial, piece.bytes, &progress)? == piece.sha256,
-                "USB data does not read back as written"
+                "the stick's data does not read back as written"
             );
             Ok(())
         })?;
@@ -462,7 +462,7 @@ impl<'a> Joined<'a> {
         let (hashes, tail) = hashes.as_chunks::<32>();
         ensure!(
             tail.is_empty() && hashes.len() as u64 == total.div_ceil(HASH_BLOCK_BYTES),
-            "USB readback has the wrong number of block digests"
+            "the stick's readback has the wrong number of block digests"
         );
         Ok(Self {
             directory,
@@ -508,7 +508,7 @@ impl<'a> Joined<'a> {
             if Sha256::digest(bytes).as_slice() != self.hashes[block] {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "USB data does not read back as written",
+                    "the stick's data does not read back as written",
                 ));
             }
             let bits = &mut self.checked[block / 8];
@@ -526,7 +526,7 @@ impl<'a> Joined<'a> {
         self.current = None;
         let directory = self.directory;
         let progress = crate::progress::Phase::bytes(
-            "Verifying remaining USB bytes",
+            "Verifying the rest of the stick",
             self.total - self.checked_bytes,
         );
         promote(directory, pieces, |index, piece, _| {
@@ -592,7 +592,7 @@ impl Seek for Joined<'_> {
         if position < 0 || position > i128::from(self.total) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "seek outside USB image",
+                "seek outside the stick's image",
             ));
         }
         self.position = position as u64;
@@ -1036,7 +1036,10 @@ mod tests {
             BLOCK as u64,
         )
         .unwrap_err();
-        assert_eq!(error.to_string(), "USB data does not read back as written");
+        assert_eq!(
+            error.to_string(),
+            "the stick's data does not read back as written"
+        );
         assert_eq!(fs::read(path.join(piece_name(0)))?, &data[..BLOCK]);
         assert!(partial.exists());
         assert!(!path.join(piece_name(1)).exists());

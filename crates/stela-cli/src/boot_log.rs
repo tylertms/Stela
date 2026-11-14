@@ -1,5 +1,5 @@
 //! `stela log`: the boot logs `stela.efi` keeps. Every boot writes the
-//! USB's own log, [`crate::efi::BOOT_LOG`] on the USB's EFI partition, from
+//! USB's own log, [`crate::efi::BOOT_LOG`] on the stick's EFI partition, from
 //! its first line; an install keeps another on its machine-state partition
 //! (`stela_runtime::pc::boot_log`), at the partition's start, or in the tail
 //! of an Apple region that also holds the machine state
@@ -187,7 +187,7 @@ pub(crate) fn shown(path: &Path) -> PathBuf {
 
 /// Every boot log in FILE, each with where it is: the file itself when it
 /// is a copied `boot.log`; else in each GPT partition, or in FILE itself
-/// without a GPT, the USB's log file on a FAT32 volume, then the machine
+/// without a GPT, the stick's log file on a FAT32 volume, then the machine
 /// state's at the start or in the tail.
 fn find(path: &Path) -> Result<Vec<(String, Log)>> {
     let mut file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
@@ -241,7 +241,7 @@ fn find(path: &Path) -> Result<Vec<(String, Log)>> {
     Ok(logs.all())
 }
 
-/// The boot logs found on one disk or partition: the USB's own log file,
+/// The boot logs found on one disk or partition: the stick's own log file,
 /// then the machine state's.
 #[derive(Default)]
 pub(crate) struct Logs {
@@ -289,7 +289,7 @@ impl ReadAt for Span<'_, '_> {
     }
 }
 
-/// Every boot log of a `bytes`-long partition named `place`: the USB's
+/// Every boot log of a `bytes`-long partition named `place`: the stick's
 /// own file when it holds a FAT32 volume, as `stela.efi`'s own FAT reader
 /// finds it, and the machine state's at its start and in its last bytes.
 fn partition_logs(read: &mut Reader<'_>, bytes: u64, place: &str) -> Logs {
@@ -458,7 +458,7 @@ pub(crate) fn scan(host: &dyn Host) -> Result<Vec<(String, Log)>> {
         format!("Could not read:\n{unread}")
     };
     bail!(
-        "no Stela boot log on this computer's disks.\n{looked}{unread}Plug in the USB Stela \
+        "no Stela boot log on this computer's disks.\n{looked}{unread}Plug in the stick Stela \
          booted from and run this again {rights}."
     )
 }
@@ -495,7 +495,7 @@ pub(crate) fn summary(log: &Log) -> String {
     text
 }
 
-/// End every device skip the USB's boot log at `path` holds (`pc::device_starts`):
+/// End every device skip the stick's boot log at `path` holds (`pc::device_starts`):
 /// the functions an earlier boot did not finish starting, which later boots
 /// skip until `by` (`stela repair` or `stela update`) clears them.
 /// The functions it named, for the report; none when the log names none or
@@ -748,7 +748,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// `stela repair` and `stela update` end every skip the USB's log
+    /// `stela repair` and `stela update` end every skip the stick's log
     /// holds, in place, and a dry run changes nothing.
     #[test]
     fn clearing_device_skips_ends_them_in_place() {

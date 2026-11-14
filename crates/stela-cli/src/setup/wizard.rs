@@ -312,7 +312,7 @@ fn ask(environment: &Environment<'_>, command: &mut Request, stick: &Stick) -> R
         ui.note(
             "Review",
             &format!(
-                "USB        {}\nInstaller  {}\nmacOS      {} ({})\nMac        {model_name}\n\
+                "Stick      {}\nInstaller  {}\nmacOS      {} ({})\nMac        {model_name}\n\
                  {network}Download   {download_text}\n{}",
                 usb.serial.as_ref().map_or_else(
                     || usb.description(),

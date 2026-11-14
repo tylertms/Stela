@@ -6,7 +6,7 @@
 //!
 //! A setup whose install medium streams the image keeps them; a full
 //! installer's medium holds the whole image already (`sources`). They are
-//! written whenever bundles are prepared and the USB does not hold them yet,
+//! written whenever bundles are prepared and the stick does not hold them yet,
 //! and go with their build's directory when an update removes it.
 use super::{Environment, MARGIN, bundle, record::Record};
 use crate::restore;
@@ -106,6 +106,6 @@ pub(super) fn keep(
     let names = names(environment, ipsw, &record.model)?;
     let path = path(&record.volume, build);
     fs::create_dir_all(path.parent().expect("a build directory"))?;
-    restore::payload::copy_named(ipsw, &names, &path, "Keeping boot files on the USB")?;
+    restore::payload::copy_named(ipsw, &names, &path, "Keeping boot files on the stick")?;
     Ok(())
 }

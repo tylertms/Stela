@@ -1,6 +1,6 @@
 //! Install the UEFI mount on a USB's EFI system partition as its
 //! removable-media boot loader, `\EFI\BOOT\BOOTX64.EFI`, which a PC's
-//! firmware starts when it boots from the USB; no other boot manager is
+//! firmware starts when it boots from the stick; no other boot manager is
 //! involved.
 //!
 //! `install` copies `stela.efi` there and writes the mount's
@@ -186,9 +186,9 @@ pub(crate) fn loader_is_stela(esp: &Path) -> Result<Option<bool>> {
 pub(crate) fn check_loader(esp: &Path) -> Result<()> {
     ensure!(
         loader_is_stela(esp)? != Some(false),
-        "{} already boots another loader ({}). Stela boots the USB itself, as its only boot \
-         loader, and does not replace another one: use a USB whose EFI partition has no \
-         {LOADER}, or erase the USB first.",
+        "{} already boots another loader ({}). Stela boots the stick itself, as its only boot \
+         loader, and does not replace another one: use a stick whose EFI partition has no \
+         {LOADER}, or erase the stick first.",
         esp.display(),
         esp.join(LOADER).display()
     );
@@ -206,7 +206,7 @@ pub fn install(command: &Install) -> Result<serde_json::Value> {
         None => bail!("pass --source: {} has no {SOURCE}", esp.display()),
     };
     // Check the partition before writing the payload, which goes before the
-    // loader, so the USB never boots Stela with a half-written payload.
+    // loader, so the stick never boots Stela with a half-written payload.
     check_loader(esp)?;
     let payload = match &command.ipsw {
         Some(ipsw) => Some(crate::restore::payload::write(
@@ -259,7 +259,7 @@ pub(crate) fn add_mount(
             true,
         )?;
     }
-    // The loader goes in last, so the USB never boots it without its files.
+    // The loader goes in last, so the stick never boots it without its files.
     write_atomic(&esp.join(LOADER), image, false)?;
     Ok(json!({
         "loader": esp.join(LOADER),

@@ -372,7 +372,7 @@ pub(super) fn update_stela(
                 writeln!(text, "  remove         {}", pack.path.display())?;
             }
         }
-        None => writeln!(text, "  translations   no store on this USB")?,
+        None => writeln!(text, "  translations   no store on this stick")?,
     }
     if dry_run {
         text.push_str("Dry run: nothing was changed.\n");
@@ -459,7 +459,7 @@ fn room_for_new_copy(
     if dry_run {
         writeln!(
             text,
-            "  remove first   {} ({size}), after asking: the USB has room for one copy of \
+            "  remove first   {} ({size}), after asking: the stick has room for one copy of \
              macOS, and cannot install macOS until the new one is complete",
             directory.display()
         )?;
@@ -676,7 +676,7 @@ pub(super) fn update_os(
     write_record(&record.esp.clone(), &record)?;
     text.push_str(
         "Done. An installed macOS keeps updating itself. To install this build on a new or \
-         erased disk, boot the USB and choose Install macOS, which erases that disk.\n",
+         erased disk, boot the stick and choose Install macOS, which erases that disk.\n",
     );
     Ok(text)
 }

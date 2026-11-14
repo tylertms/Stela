@@ -239,7 +239,7 @@ pub(super) fn relaunch() -> Result<()> {
     };
     ensure!(
         result as isize > 32,
-        "administrator access was cancelled or unavailable; your USB was not changed"
+        "administrator access was cancelled or unavailable; your stick was not changed"
     );
     RELAUNCHED.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())

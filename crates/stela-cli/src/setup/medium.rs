@@ -1,4 +1,4 @@
-//! The install medium: the full IPSW on the USB's FAT32 data partition, as
+//! The install medium: the full IPSW on the stick's FAT32 data partition, as
 //! `stela.efi`'s `--install` reads it.
 //!
 //! ```text
@@ -51,7 +51,7 @@ const BUFFER: usize = 64 * HASH_BLOCK_BYTES as usize;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct Medium {
     pub(super) build: String,
-    /// The mounted FAT32 data partition of the USB that holds it.
+    /// The mounted FAT32 data partition of the stick that holds it.
     pub(super) volume: PathBuf,
     /// That partition's GPT unique GUID, by which `stela.efi` finds it.
     pub(super) partition_guid: String,
@@ -212,7 +212,7 @@ impl Medium {
     }
 }
 
-/// The pieces of the install medium the USB's boot log says failed their
+/// The pieces of the install medium the stick's boot log says failed their
 /// block check during an install (`DAMAGED_LOG_LINE`, `ipsw.003 block 12`),
 /// in lines written after byte `after` of the log's stream: the log's head
 /// when a repair last checked the medium ([`log_head`]). Each piece once.
@@ -248,7 +248,7 @@ pub(super) fn reported_damage(esp: &Path, after: u64) -> Vec<String> {
     found
 }
 
-/// The end of the USB's boot log stream: what a check of the medium now
+/// The end of the stick's boot log stream: what a check of the medium now
 /// has seen ([`reported_damage`]). Zero without a log.
 pub(super) fn log_head(esp: &Path) -> u64 {
     fs::read(esp.join(efi::BOOT_LOG))
@@ -315,14 +315,14 @@ pub(super) fn locate(
     }
     if let Some(explicit) = explicit {
         bail!(
-            "{} is not a FAT32 data partition of the USB that holds {}:\n{reasons}",
+            "{} is not a FAT32 data partition of the stick that holds {}:\n{reasons}",
             explicit.display(),
             esp.display()
         );
     }
     bail!(
-        "The boot bundles and the install medium go on a FAT32 data partition of the USB beside \
-         its EFI partition, and {usb} has none mounted:\n{reasons}Setup does not repartition the USB: add a FAT32 \
+        "The boot bundles and the install medium go on a FAT32 data partition of the stick beside \
+         its EFI partition, and {usb} has none mounted:\n{reasons}Setup does not repartition the stick: add a FAT32 \
          partition of at least 30 GB with a disk utility, mount it, and run setup again."
     )
 }
@@ -388,7 +388,7 @@ pub(super) fn check_space(host: &dyn Host, options: SpaceOptions<'_>) -> Result<
     ensure!(
         free >= need,
         "{} has {:.1} GB free; the install medium needs {:.1} GB more (the macOS {build} IPSW is \
-         {:.1} GB). Free space on it, or use a larger USB.",
+         {:.1} GB). Free space on it, or use a larger stick.",
         volume.display(),
         free as f64 / 1e9,
         need as f64 / 1e9,
@@ -573,7 +573,8 @@ pub(super) fn write(options: WriteOptions<'_>) -> Result<Written> {
     let mut piece_blocks = Vec::new();
     let mut written = Written::default();
     let mut offset = 0;
-    let progress = crate::progress::Phase::bytes("Writing and verifying the USB image", total * 2);
+    let progress =
+        crate::progress::Phase::bytes("Writing and verifying the stick image", total * 2);
     for (index, &size) in sizes.iter().enumerate() {
         let name = piece_name(index);
         let path = directory.join(&name);
@@ -618,7 +619,7 @@ pub(super) fn write(options: WriteOptions<'_>) -> Result<Written> {
             // Read back, so a USB that loses writes is found now.
             ensure!(
                 hash_file(&partial, size, &progress)? == digest,
-                "{} does not read back as written; the USB may be failing",
+                "{} does not read back as written; the stick may be failing",
                 partial.display()
             );
             fs::rename(&partial, &path)?;

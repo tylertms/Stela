@@ -1,4 +1,4 @@
-//! The persistent translation store's home on the USB: where `stela.efi`
+//! The persistent translation store's home on the stick: where `stela.efi`
 //! keeps its `STLTPACK` packs, how much room each may take, and which packs are
 //! kept. The pack format is the engine's; setup never reads a pack beyond
 //! its header.
@@ -21,7 +21,7 @@
 //! the first four bytes of its translator id in hex, and its header names
 //! the whole id.
 //!
-//! The home is the USB's FAT32 data partition, which also holds the install
+//! The home is the stick's FAT32 data partition, which also holds the install
 //! medium and the boot bundles, as the firmware writes it. `stela.efi`
 //! writes only its own translator id's pack, never past the bound. Setup
 //! keeps the most recently written pack and removes the others when Stela is
@@ -69,7 +69,7 @@ pub(super) const PACKS_KEPT: usize = 1;
 /// The store a setup keeps.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct Store {
-    /// The FAT32 volume of the USB that holds it.
+    /// The FAT32 volume of the stick that holds it.
     pub(super) volume: PathBuf,
     /// One pack's bound.
     pub(super) pack_bytes: u64,
@@ -347,7 +347,7 @@ fn fitting(room: u64) -> u64 {
     bound / MIB * MIB
 }
 
-/// The store's home among `candidates` (the USB's data partition): the
+/// The store's home among `candidates` (the stick's data partition): the
 /// first FAT32 one. `planned` is what setup writes to a volume besides the
 /// store, and `requested` the user's bound (`--translation-store-bytes`, 0
 /// for none).
@@ -434,7 +434,7 @@ pub(super) fn choose(
     Ok((
         None,
         Some(
-            "no translation store: the USB has no FAT32 volume the firmware writes; every boot \
+            "no translation store: the stick has no FAT32 volume the firmware writes; every boot \
              translates anew"
                 .into(),
         ),

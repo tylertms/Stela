@@ -59,7 +59,7 @@ pub(super) struct InstalledDisk {
     /// the Apple region. None for a machine-state partition of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) machine_state_offset: Option<u64>,
-    /// The Apple region is a partition of the setup USB, and every PC disk
+    /// The Apple region is a partition of the Stela stick, and every PC disk
     /// is the Mac's external drive (`--external-disks`), which recoveryOS
     /// partitions, formats and installs macOS onto.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
@@ -139,7 +139,7 @@ impl InstalledDisk {
         })
     }
 
-    /// The options that boot the USB's bundle `bundle`, such as a restore
+    /// The options that boot the stick's bundle `bundle`, such as a restore
     /// bundle, with this disk and its NVRAM.
     pub(super) fn bundle_options(&self, bundle: &str, ecid: Option<Ecid>) -> Result<System> {
         Ok(System {
@@ -373,9 +373,9 @@ pub(super) struct Request<'a> {
     pub(super) erase_target: bool,
     pub(super) initialize_nor: bool,
     /// The setup USB's whole disk, which holds neither partition, unless
-    /// the Apple region is the USB's own (`external_disks`).
+    /// the Apple region is the stick's own (`external_disks`).
     pub(super) usb_disk: Option<&'a str>,
-    /// The Apple region is a partition of the setup USB, and the PC's disks
+    /// The Apple region is a partition of the Stela stick, and the PC's disks
     /// are the Mac's external drives.
     pub(super) external_disks: bool,
 }
@@ -448,7 +448,7 @@ fn usable(
     );
     ensure!(
         usb_disk != Some(info.disk.as_str()),
-        "{identifier} is on the setup USB; the {role} belongs on the PC's own disk"
+        "{identifier} is on the Stela stick; the {role} belongs on the PC's own disk"
     );
     if erasing {
         return Ok(info);

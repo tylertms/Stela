@@ -19,7 +19,7 @@ use stela_boot_core::options::{System, Uuid};
 use stela_loader::mount_interface::{Choice, Choices};
 
 /// What setup writes, recorded on the ESP so `uninstall` can remove it.
-/// Records before schema 8 also named a recoveryOS bundle on the USB, and
+/// Records before schema 8 also named a recoveryOS bundle on the stick, and
 /// records before schema 9 kept the data partition's files under `EFI/`;
 /// this `stela` reads them only to uninstall them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,7 +77,7 @@ pub(super) struct Record {
     /// Schema 5: the install medium; read into `media`.
     #[serde(default, skip_serializing)]
     pub(super) medium: Option<medium::Medium>,
-    /// Schema 6: the install media, each a full IPSW on the USB's FAT32
+    /// Schema 6: the install media, each a full IPSW on the stick's FAT32
     /// data partition: the active build's, and the next one's while
     /// `update os` writes it.
     #[serde(default)]
@@ -93,7 +93,7 @@ pub(super) struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) install_image: Option<InstallImage>,
     /// The build an `update os` is writing after it removed the active
-    /// build's copy for room: until it is active, the USB cannot install
+    /// build's copy for room: until it is active, the stick cannot install
     /// macOS, and running that update again finishes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) replacing: Option<String>,
@@ -102,7 +102,7 @@ pub(super) struct Record {
     /// (`medium::reported_damage`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) medium_checked: Option<u64>,
-    /// The translation store `stela.efi` keeps its packs in, if the USB
+    /// The translation store `stela.efi` keeps its packs in, if the stick
     /// has room for one (`setup::translations`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) translations: Option<translations::Store>,
@@ -130,7 +130,7 @@ pub(super) const RECORD_SCHEMA: u32 = 9;
 
 impl Record {
     /// Whether installs stream `ipsw`'s build from Apple's servers rather
-    /// than read it from the USB, by the setup's installer
+    /// than read it from the stick, by the setup's installer
     /// ([`Self::install_kind`]). A full installer's erase restore needs the
     /// macOS system image, which an archive of boot files
     /// (`restore::fetch_inputs`) leaves out.
@@ -150,8 +150,8 @@ impl Record {
     }
 
     /// What resuming this interrupted setup continues, after the medium the
-    /// stopped setup left on the USB: "continuing the Offline installer: 3
-    /// of 6 parts of macOS already on the USB".
+    /// stopped setup left on the stick: "continuing the Offline installer: 3
+    /// of 6 parts of macOS already on the stick".
     pub(super) fn resume_summary(&self) -> String {
         if self.install_kind() == InstallImage::Network {
             return "continuing the Online installer".into();
@@ -163,12 +163,12 @@ impl Record {
         match found {
             Some((present, Some(total))) => format!(
                 "continuing the Offline installer: {present} of {total} parts of macOS already \
-                 on the USB"
+                 on the stick"
             ),
             Some((present, None)) if present > 0 => format!(
-                "continuing the Offline installer: {present} parts of macOS already on the USB"
+                "continuing the Offline installer: {present} parts of macOS already on the stick"
             ),
-            _ => "continuing the Offline installer: no part of macOS on the USB yet".into(),
+            _ => "continuing the Offline installer: no part of macOS on the stick yet".into(),
         }
     }
 
@@ -519,7 +519,7 @@ pub(super) fn read_record(environment: &Environment<'_>, usb: &Path) -> Result<R
         path.display(),
         match schema {
             8 => "it keeps its files under EFI/ on the data partition",
-            _ => "it booted a recoveryOS bundle from the USB",
+            _ => "it booted a recoveryOS bundle from the stick",
         }
     );
     let mut value = header;
@@ -539,7 +539,7 @@ pub(super) fn read_record(environment: &Environment<'_>, usb: &Path) -> Result<R
     Ok(record)
 }
 
-/// Where the data partition of the USB whose EFI partition is `esp` is
+/// Where the data partition of the stick whose EFI partition is `esp` is
 /// mounted now: `usb` when it names it, else the FAT32 data partition beside
 /// the EFI partition, else the EFI partition itself, as for a setup with one
 /// partition.
@@ -550,7 +550,7 @@ pub(super) fn current_volume(host: &dyn Host, esp: &Path, usb: &Path) -> PathBuf
     medium::locate(host, esp, None).map_or_else(|_| esp.to_path_buf(), |(volume, _)| volume)
 }
 
-/// Move every path of the record `value` to where the USB is mounted now:
+/// Move every path of the record `value` to where the stick is mounted now:
 /// `esp`, and the data partition at `volume` ([`current_volume`]). The record
 /// holds the paths of the computer and user that wrote it, and another user,
 /// computer or system mounts the same USB somewhere else.
@@ -609,7 +609,7 @@ fn rebase(value: &mut serde_json::Value, esp: &Path, volume: &Path) {
 /// which this `stela` has no kind for; their build directories are removed
 /// with the rest. Before schema 9 the data partition's files were under
 /// `EFI/`, which the record's volumes then gain, so every directory derived
-/// from them is where that setup wrote it. Its paths follow the USB to where
+/// from them is where that setup wrote it. Its paths follow the stick to where
 /// it is mounted now ([`rebase`]): the EFI partition `esp`, and the data
 /// partition `usb` names or beside it.
 pub(super) fn read_any_record(host: &dyn Host, esp: &Path, usb: &Path) -> Result<Record> {
@@ -651,7 +651,7 @@ pub(super) fn read_any_record(host: &dyn Host, esp: &Path, usb: &Path) -> Result
 
 /// The record on the EFI partition `esp` when it is this schema's and its
 /// first setup was interrupted (`complete` is false): what `create::plan`
-/// resumes. Its paths follow the USB to where it is mounted now, as
+/// resumes. Its paths follow the stick to where it is mounted now, as
 /// [`read_record`]'s do: a USB taken out part way is often mounted somewhere
 /// else when setup runs again.
 pub(super) fn interrupted(host: &dyn Host, esp: &Path, usb: &Path) -> Option<Record> {
@@ -666,7 +666,7 @@ pub(super) fn interrupted(host: &dyn Host, esp: &Path, usb: &Path) -> Option<Rec
 /// leaves the previous record or this one whole: the record is the journal
 /// every interrupted setup and update is resumed from.
 ///
-/// It spells each path on the USB the way a read does ([`rebase`]), however
+/// It spells each path on the stick the way a read does ([`rebase`]), however
 /// the path was built: `stela/boot` joined whole keeps its `/` where the
 /// system writes `\`, and a record just made would differ from the same
 /// record read and written again.

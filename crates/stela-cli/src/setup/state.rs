@@ -205,9 +205,9 @@ pub(super) fn boot_log(
     let usb = match fs::read(&path) {
         Ok(region) => boot_log::read(&region)
             .with_context(|| format!("{} has no boot log", path.display()))
-            .map(|log| shown(&format!("Boot log on the USB ({})", path.display()), &log)),
+            .map(|log| shown(&format!("Boot log on the stick ({})", path.display()), &log)),
         // A folder the host refuses, or an EFI partition it no longer
-        // mounts: the same file through the USB's raw partition.
+        // mounts: the same file through the stick's raw partition.
         Err(error) => [record.esp.as_path(), command.usb.as_path()]
             .into_iter()
             .find_map(|usb| usb_disk(environment.host, usb))
@@ -220,7 +220,7 @@ pub(super) fn boot_log(
                     crate::boot_log::describe(&disk),
                     crate::efi::BOOT_LOG
                 );
-                Ok(raw_text(&disk, logs, "Boot log on the USB"))
+                Ok(raw_text(&disk, logs, "Boot log on the stick"))
             })
             .with_context(|| format!("cannot read {}: {error}", path.display())),
     };

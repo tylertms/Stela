@@ -539,7 +539,7 @@ fn setup_installs_from_the_usb_and_uninstall_restores_it() {
     assert!(plan.contains("Dry run: nothing was changed."), "{plan}");
     assert!(plan.contains("ECID           0x"), "{plan}");
     assert!(plan.contains("gs.apple.com"), "{plan}");
-    // macOS is on the USB, and the plan still says the install needs the
+    // macOS is on the stick, and the plan still says the install needs the
     // network, for the signing server alone.
     let local = create::OFFLINE_SIGNING_NOTE;
     assert!(plan.contains(local), "{plan}");
@@ -649,7 +649,7 @@ fn setup_rejects_efi_interface_mismatch() {
 
 #[test]
 fn setup_places_bundles_on_fat32_data_volume() {
-    // The firmware cannot read HFS+, so the USB has no data partition.
+    // The firmware cannot read HFS+, so the stick has no data partition.
     let f = fixture(GIB / 32, false);
     let error = setup(&environment(&f.host), command(&f, &f.data))
         .unwrap_err()
@@ -768,7 +768,7 @@ fn older_setups_are_still_read_and_undone() {
     uninstall(&environment(&f.host), &f.esp, false).unwrap();
     assert_eq!(snapshot(&f.esp), before);
 
-    // Schema 7, with a recoveryOS bundle on the USB: this stela no longer
+    // Schema 7, with a recoveryOS bundle on the stick: this stela no longer
     // reads it, and uninstalls it.
     let f = fixture(64 * GIB, false);
     let before = snapshot(&f.esp);
@@ -953,7 +953,7 @@ fn stela_volume(f: &Fixture) -> PathBuf {
     f._dir.path().join("STELA")
 }
 
-/// Give the USB its FAT32 data partition, once.
+/// Give the stick its FAT32 data partition, once.
 fn add_stela(f: &mut Fixture) {
     let volume = stela_volume(f);
     if volume.exists() {
@@ -1003,7 +1003,7 @@ fn nvram(f: &Fixture) -> Variables {
     nvram_of(f, NOR)
 }
 
-/// Give the USB an unmounted raw partition, as the Mac's internal SSD.
+/// Give the stick an unmounted raw partition, as the Mac's internal SSD.
 fn add_stick_ssd(f: &mut Fixture, identifier: &str, guid: &str) {
     add_stela(f);
     let usb = f
@@ -1126,7 +1126,7 @@ fn setup_erases_usb_and_refuses_internal_disk() {
         let report = setup(&environment(&host), card).unwrap();
         assert!(report.contains("would erase disk6"), "{report}");
     }
-    // Without an image, the USB is left as it was: no erase is tried.
+    // Without an image, the stick is left as it was: no erase is tried.
     let mut no_image = command(&f, Path::new("disk5"));
     no_image.ipsw = None;
     no_image.confirmed = true;
@@ -1200,7 +1200,7 @@ fn preparation_preflights_signing_and_capacity() {
     opted.install_image = None;
     let error = setup(&environment(&f.host), opted).unwrap_err();
     assert!(
-        error.to_string().contains("needs a USB of at least"),
+        error.to_string().contains("needs a stick of at least"),
         "{error:#}"
     );
     assert_eq!((snapshot(&f.esp), snapshot(&f.data)), before);
@@ -1371,7 +1371,7 @@ fn the_last_word_on_the_network_follows_the_installer() {
 fn install_reads_full_or_streamed_image() {
     let mut f = fixture(64 * GIB, false);
     add_installed_disk(&mut f, &[], &[]);
-    // Network: the USB holds the inventory alone, and the Install choice
+    // Network: the stick holds the inventory alone, and the Install choice
     // names no partition to read the IPSW from.
     let mut network = installed_command(&f);
     network.install_image = Some(InstallImage::Network);
@@ -1401,7 +1401,7 @@ fn install_reads_full_or_streamed_image() {
         "{status}"
     );
     assert!(status.contains(create::ONLINE_NOTE), "{status}");
-    // Repair makes it full: the IPSW in pieces on the USB.
+    // Repair makes it full: the IPSW in pieces on the stick.
     let switch = |image| {
         rerun(&f, |c| {
             c.action = Action::Repair;
@@ -1552,7 +1552,7 @@ fn installed_disk_preserves_boot_choices_and_partitions() {
         )
         .is_empty()
     );
-    // The medium is the IPSW in pieces on the USB's FAT32 partition.
+    // The medium is the IPSW in pieces on the stick's FAT32 partition.
     let medium = record.active_medium().cloned().unwrap();
     assert_eq!(
         (medium.volume.as_path(), medium.partition_guid.as_str()),
@@ -1659,7 +1659,7 @@ fn installed_disk_preserves_boot_choices_and_partitions() {
     assert_eq!(partition_bytes(&f, NOR), nor);
     f.host.partitions.get_mut(NOR).unwrap().0.guid = NOR_GUID.to_ascii_lowercase();
 
-    // Uninstall restores the USB and keeps the installed disk and NVRAM.
+    // Uninstall restores the stick and keeps the installed disk and NVRAM.
     uninstall(&environment(&f.host), &f.esp, false).unwrap();
     assert_eq!(snapshot(&f.esp), before);
     assert_eq!(snapshot(&stela_volume(&f)), stela_before);
@@ -1811,10 +1811,10 @@ fn additional_disk_gets_separate_machine_identity() {
         })
     };
     // The second is a new machine and needs its own bundle, prepared from
-    // the USB's own copy of the image without --ipsw, or from --ipsw.
+    // the stick's own copy of the image without --ipsw, or from --ipsw.
     let before = snapshot(&f.esp);
     let plan = add(REGION2, NOR2, false, true).unwrap();
-    assert!(plan.contains("from this USB's copy of macOS"), "{plan}");
+    assert!(plan.contains("from this stick's copy of macOS"), "{plan}");
     assert_eq!(snapshot(&f.esp), before);
     assert!(add(REGION2, NOR2, true, true).unwrap().contains("Dry run"));
     assert_eq!(snapshot(&f.esp), before);
@@ -1907,7 +1907,7 @@ fn additional_disk_gets_separate_machine_identity() {
     assert!(!bundle_of(&f, Some(second)).exists());
     assert!(!restore2.exists());
     assert_eq!(partition_bytes(&f, NOR2), nor2);
-    // The list still opens on its own while the USB can install macOS.
+    // The list still opens on its own while the stick can install macOS.
     assert_eq!(choices().timeout_seconds, CHOOSER_SECONDS);
     assert_eq!(choices().entries[1].name, INSTALL_CHOICE);
     assert_eq!(record(&f).installs.len(), 1);
@@ -2330,7 +2330,7 @@ fn revision_update_rebuilds_bundles() {
         })
     };
     let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
-    // With --ipsw, a dry run prepares from it; without, it names the USB's
+    // With --ipsw, a dry run prepares from it; without, it names the stick's
     // own copy of the image, which the update reads; neither downloads
     // (this environment's downloads panic) nor changes anything.
     let plan = update(true, true).unwrap();
@@ -2340,13 +2340,13 @@ fn revision_update_rebuilds_bundles() {
         assert!(plan.contains(&directory.display().to_string()), "{plan}");
     }
     let plan = update(false, true).unwrap();
-    assert!(plan.contains("from this USB's copy of macOS"), "{plan}");
+    assert!(plan.contains("from this stick's copy of macOS"), "{plan}");
     assert!(plan.contains("nothing is downloaded"), "{plan}");
     for directory in directories(1) {
         assert!(plan.contains(&directory.display().to_string()), "{plan}");
     }
     assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
-    // A copy that does not read back as written is refused before the USB
+    // A copy that does not read back as written is refused before the stick
     // changes.
     let piece = medium::directory(&first.volume, &first.build).join("ipsw.000");
     let good = fs::read(&piece).unwrap();
@@ -2359,7 +2359,7 @@ fn revision_update_rebuilds_bundles() {
     assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before_bad);
     fs::write(&piece, &good).unwrap();
     // The update itself needs no image and no network: the stick holds
-    // the image. What it read from the USB is not kept.
+    // the image. What it read from the stick is not kept.
     update(false, false).unwrap();
     assert!(fs::read_dir(&cache).unwrap().next().is_none());
     let updated = record(&f);
@@ -2393,7 +2393,7 @@ fn revision_update_rebuilds_bundles() {
 }
 
 /// A setup at revision 0 whose install streams the image from Apple's
-/// servers, so the USB holds no copy of it, and the environment of a stela
+/// servers, so the stick holds no copy of it, and the environment of a stela
 /// that prepares revision 1.
 fn network_setup(f: &mut Fixture, older: &[Box<Prepare>; 2]) {
     add_stela(f);
@@ -2425,7 +2425,7 @@ fn revision_update_of_a_network_setup_prepares_from_the_boot_files_it_keeps() {
     let mut dry = update_request(&f, &cache);
     dry.dry_run = true;
     let plan = dry.dispatch(&environment).unwrap();
-    assert!(plan.contains("kept on this USB"), "{plan}");
+    assert!(plan.contains("kept on this stick"), "{plan}");
     update_request(&f, &cache).dispatch(&environment).unwrap();
     assert_eq!(record(&f).bundle_revision, 1);
     assert!(kept.is_file());
@@ -2451,7 +2451,7 @@ fn revision_update_without_any_image_fails_before_changing_anything() {
     drop_inputs(&f);
     let cache = f._dir.path().join("cache");
     let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
-    // No image, no cache, no network: refused with what to do, the USB
+    // No image, no cache, no network: refused with what to do, the stick
     // as it was.
     let error = update_request(&f, &cache)
         .dispatch(&environment_at(&f.host, &newer, 1))
@@ -2577,13 +2577,13 @@ fn repair_puts_a_damaged_bundle_back_from_the_usbs_own_image() {
         .to_string();
     assert!(problems.contains("`stela repair`"), "{problems}");
     assert!(!problems.contains("--fetch"), "{problems}");
-    // No image, no network: the USB holds the image.
+    // No image, no network: the stick holds the image.
     let plan = rerun(&f, |c| {
         c.action = Action::Repair;
         c.dry_run = true;
     })
     .unwrap();
-    assert!(plan.contains("from this USB's copy of macOS"), "{plan}");
+    assert!(plan.contains("from this stick's copy of macOS"), "{plan}");
     rerun(&f, |c| c.action = Action::Repair).unwrap();
     assert!(
         rerun(&f, |c| c.action = Action::Status)
@@ -2592,7 +2592,7 @@ fn repair_puts_a_damaged_bundle_back_from_the_usbs_own_image() {
     );
 }
 
-/// The boot files read from the USB's full install medium are the members
+/// The boot files read from the stick's full install medium are the members
 /// a download fetches, not the recovery set.
 #[test]
 fn boot_files_read_from_the_usb_are_the_members_a_download_fetches() {
@@ -2664,7 +2664,7 @@ fn os_update_checks_everything_before_any_download() {
     let error = os("STELA2", &environment(&f.host)).unwrap_err().to_string();
     assert!(error.contains("--ipsw FILE"), "{error}");
     assert!(error.contains("the whole image"), "{error}");
-    // A whole image larger than the USB's free space: refused before the
+    // A whole image larger than the stick's free space: refused before the
     // download, with the sizes.
     let huge = |_: &str, _: &str| -> Result<(u64, u64)> { Ok((GIB, 1000 * GIB)) };
     let environment = Environment {
@@ -2756,7 +2756,7 @@ fn a_piece_an_install_found_damaged_is_named_by_status_and_put_right_by_repair()
         plan.contains(&format!("download {piece} from Apple")),
         "{plan}"
     );
-    assert!(plan.contains("this USB's copy lacks"), "{plan}");
+    assert!(plan.contains("this stick's copy lacks"), "{plan}");
     // The image, downloaded earlier.
     let cache = f._dir.path().join("cache");
     fs::create_dir_all(&cache).unwrap();
@@ -2857,7 +2857,7 @@ fn repair_of_a_short_piece_downloads_that_piece_alone_saying_so() {
         plan.contains(&format!("download {total} from Apple")),
         "{plan}"
     );
-    assert!(plan.contains("this USB's copy lacks"), "{plan}");
+    assert!(plan.contains("this stick's copy lacks"), "{plan}");
     assert!(plan.contains("checked and kept"), "{plan}");
     assert!(!plan.contains("boot files"), "{plan}");
     let error = repair(None, false).unwrap_err().to_string();
@@ -3389,8 +3389,8 @@ fn interrupted_first_setup_prepares_a_damaged_bundle_again() {
     assert!(status.contains("No problems found."), "{status}");
 }
 
-/// Rewrite the record on the USB as another computer would have written it,
-/// with the USB's partitions mounted at `old_esp` and `old_volume`.
+/// Rewrite the record on the stick as another computer would have written it,
+/// with the stick's partitions mounted at `old_esp` and `old_volume`.
 fn written_elsewhere(f: &Fixture, old_esp: &Path, old_volume: &Path) {
     let path = f.esp.join(RECORD);
     let text = fs::read_to_string(&path)
@@ -3433,7 +3433,7 @@ fn an_interrupted_setup_follows_the_usb_to_where_it_is_mounted_now() {
     assert!(resumed.complete);
     assert_eq!(resumed.volume, stela_volume(&f));
     assert_eq!(resumed.media, done.media);
-    // Undone from another mount, it removes this USB's files only.
+    // Undone from another mount, it removes this stick's files only.
     interrupt_setup(&f);
     written_elsewhere(&f, &old_esp, &old_volume);
     uninstall(&environment(&f.host), &f.esp, false).unwrap();
@@ -3483,9 +3483,9 @@ fn an_interrupted_full_setup_resumes_as_a_full_install_and_keeps_its_pieces() {
     }
     let report = resume_setup(&f);
     assert!(report.contains("Done."), "{report}");
-    // The last piece is short, so it is not counted as on the USB.
+    // The last piece is short, so it is not counted as on the stick.
     let found = format!(
-        "continuing the Offline installer: {} parts of macOS already on the USB",
+        "continuing the Offline installer: {} parts of macOS already on the stick",
         pieces.len() - 1
     );
     assert!(report.contains(&found), "{report}");
@@ -3839,7 +3839,7 @@ fn repair_restores_recorded_state() {
     })
     .unwrap();
     fs::write(f.esp.join("EFI/stela/stela.cfg"), b"--system\n").unwrap();
-    // ... and the bundle is prepared again from the USB's own copy of the
+    // ... and the bundle is prepared again from the stick's own copy of the
     // image, or from --ipsw.
     let damaged = snapshot(&f.esp);
     let plan = rerun(&f, |c| {
@@ -3847,7 +3847,7 @@ fn repair_restores_recorded_state() {
         c.dry_run = true;
     })
     .unwrap();
-    assert!(plan.contains("from this USB's copy of macOS"), "{plan}");
+    assert!(plan.contains("from this stick's copy of macOS"), "{plan}");
     assert_eq!(snapshot(&f.esp), damaged);
     rerun(&f, |c| {
         c.action = Action::Repair;
@@ -4163,17 +4163,17 @@ fn boot_log_prints_the_install_s_log_and_names_a_missing_one() {
     let usb = crate::boot_log::tests::region(&["CHOICE 3 (Install macOS)\n"]);
     fs::write(f.esp.join(efi::BOOT_LOG), &usb).unwrap();
     let text = rerun(&f, |c| c.action = Action::BootLog).unwrap();
-    assert!(text.starts_with("Boot log on the USB ("), "{text}");
+    assert!(text.starts_with("Boot log on the stick ("), "{text}");
     assert!(text.contains("CHOICE 3 (Install macOS)\n"), "{text}");
     assert!(
         text.ends_with("=== STELA BOOT 1 ===\nNOR persistent fresh=true\n"),
         "{text}"
     );
     // The log is optional: a smaller partition is noted, not refused,
-    // and the USB's log still prints.
+    // and the stick's log still prints.
     f.host.partitions.get_mut(NOR).unwrap().0.bytes = PARTITION_BYTES - 1;
     let text = rerun(&f, |c| c.action = Action::BootLog).unwrap();
-    assert!(text.starts_with("Boot log on the USB ("), "{text}");
+    assert!(text.starts_with("Boot log on the stick ("), "{text}");
     assert!(text.ends_with("without one\n"), "{text}");
     fs::write(f.esp.join(efi::BOOT_LOG), vec![0; LOG_BYTES as usize]).unwrap();
     let error = format!(
@@ -5411,7 +5411,7 @@ fn a_new_setup_makes_the_installer_asked_for_or_else_offline_where_it_fits() {
         choose(full, 16_000_000_000, None),
         Err(
             "Offline needs a USB stick of 32 GB or more (this one is 16.0 GB). Use --installer \
-             online, or a larger USB"
+             online, or a larger stick"
                 .into()
         )
     );
@@ -5604,7 +5604,7 @@ fn boot_log_scan_reads_the_usb_raw_before_the_system_disk() {
     assert_eq!(
         logs.len(),
         1,
-        "the system disk waits while the USB has a log"
+        "the system disk waits while the stick has a log"
     );
     assert_eq!(
         logs[0].0,
@@ -5638,7 +5638,7 @@ fn boot_log_scan_reads_the_usb_raw_before_the_system_disk() {
     );
     assert!(
         error.ends_with(&format!(
-            "Plug in the USB Stela booted from and run this again {} {}.",
+            "Plug in the stick Stela booted from and run this again {} {}.",
             if cfg!(windows) { "from" } else { "with" },
             host::ADMIN
         )),
@@ -5659,7 +5659,7 @@ fn setup_boot_log_reads_the_usb_raw_when_its_folder_cannot_be_read() {
     fs::remove_file(f.esp.join(efi::BOOT_LOG)).unwrap();
     let text = rerun(&f, |c| c.action = Action::BootLog).unwrap();
     assert!(
-        text.starts_with("Boot log on the USB (Disk disk5 (137.4 GB, "),
+        text.starts_with("Boot log on the stick (Disk disk5 (137.4 GB, "),
         "{text}"
     );
     assert!(
@@ -6487,7 +6487,7 @@ fn the_menu_saves_the_boot_logs_to_the_file_it_names() {
     };
     home::perform(&environment, request).unwrap();
     let saved = fs::read_to_string(&output).unwrap();
-    assert!(saved.starts_with("Boot log on the USB ("), "{saved}");
+    assert!(saved.starts_with("Boot log on the stick ("), "{saved}");
     assert!(saved.contains("CHOICE 3 (Install macOS)\n"), "{saved}");
     assert!(
         person.transcript().starts_with("└ Saved the boot logs to "),

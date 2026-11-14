@@ -304,7 +304,7 @@ fn store(directory: &Path, artifact: &Artifact, bytes: &[u8]) -> Result<Vec<u8>>
     read_cached(&path, artifact)
 }
 
-/// Notes about this computer's NVIDIA GPUs, for information only: the USB
+/// Notes about this computer's NVIDIA GPUs, for information only: the stick
 /// holds every supported GPU's firmware whatever this computer has.
 pub(super) fn host_notes(host: &dyn super::host::Host) -> Result<Vec<String>> {
     let mut notes = Vec::new();
@@ -312,7 +312,7 @@ pub(super) fn host_notes(host: &dyn super::host::Host) -> Result<Vec<String>> {
         if recipes::nvidia_chip(device).is_none() {
             notes.push(format!(
                 "this computer's NVIDIA GPU (device {device:04x}) is not one Stela supports \
-                 ({}); the USB still works on a PC that has one",
+                 ({}); the stick still works on a PC that has one",
                 stela_boot_core::gpu_status::SUPPORTED
             ));
         }
@@ -347,7 +347,7 @@ pub(super) fn prefetch_bundle(mount_image: &[u8], volume: Option<&Path>) -> Resu
             .as_deref(),
         &mut |artifact| download(&client, artifact),
     )
-    .context("the firmware bundle could not be downloaded, so the USB was left as it was")?;
+    .context("the firmware bundle could not be downloaded, so the stick was left as it was")?;
     Ok(())
 }
 
@@ -505,7 +505,7 @@ pub(super) fn publish_bundle(
     Ok(())
 }
 
-/// Put the complete bundle on the USB's data volume `volume`, beside the
+/// Put the complete bundle on the stick's data volume `volume`, beside the
 /// EFI partition `esp` whose boot program is `mount_image`, downloading
 /// what the cache lacks. A volume short of room gets what fits, in
 /// [`bundle::FAMILIES`] order, and the notes name what was left out. Once
@@ -536,7 +536,7 @@ pub(super) fn provision_bundle(
     publish_bundle(volume, &files, &mut |artifact| {
         read_cached(&cache.join(artifact.sha256), artifact)
     })
-    .context("the USB did not get the complete firmware bundle")?;
+    .context("the stick did not get the complete firmware bundle")?;
     let mut notes = Vec::new();
     if !left.is_empty() {
         notes.push(format!(
@@ -590,10 +590,10 @@ pub(super) fn bundle_status(volume: &Path) -> std::result::Result<String, String
             })
             .count();
         return Err(if present == 0 {
-            "the USB has no firmware bundle".into()
+            "the stick has no firmware bundle".into()
         } else {
             format!(
-                "the firmware bundle is incomplete: {present} of {} files are on the USB",
+                "the firmware bundle is incomplete: {present} of {} files are on the stick",
                 bundle::size().0
             )
         });
@@ -725,7 +725,7 @@ impl Requested {
         lines
     }
 
-    /// Download the pinned files and publish them with what the USB's
+    /// Download the pinned files and publish them with what the stick's
     /// firmware on `esp` already holds.
     pub(super) fn provision(&self, esp: &Path, mount_image: &[u8]) -> Result<()> {
         self.plan(
@@ -734,7 +734,7 @@ impl Requested {
             &super::cache_dir().join("firmware"),
             false,
         )
-        .context("the USB did not get the firmware the last boot asked for")?;
+        .context("the stick did not get the firmware the last boot asked for")?;
         Ok(())
     }
 
@@ -762,7 +762,7 @@ impl Requested {
 /// What the newest inventory in the boot log on `esp` asks for that the
 /// USB's firmware lacks, for a boot program `mount_image`. A USB without a
 /// log or without such a line, and a boot program that reads no firmware
-/// from the USB, need nothing.
+/// from the stick, need nothing.
 pub(super) fn requested(esp: &Path, mount_image: &[u8]) -> Result<Requested> {
     if !host_firmware::supports_mount(mount_image) {
         return Ok(Requested::default());
@@ -1142,7 +1142,7 @@ mod tests {
         let status = bundle_status(dir.path()).unwrap_err();
         assert_eq!(
             status,
-            "the firmware bundle is incomplete: 3 of 86 files are on the USB"
+            "the firmware bundle is incomplete: 3 of 86 files are on the stick"
         );
     }
 
@@ -1648,7 +1648,7 @@ mod tests {
             lines.contains("brcm/synthetic.bin (synthetic-bluetooth pci:14e4:5fa0 c0), which Stela has no pinned source for"),
             "{lines}"
         );
-        // The plan keeps what the USB holds and downloads nothing in a dry run.
+        // The plan keeps what the stick holds and downloads nothing in a dry run.
         let cache = dir.path().join("cache");
         let plan = found.plan(&esp, &image, &cache, true).unwrap().unwrap();
         assert!(plan.contains("2 exact observed bindings"), "{plan}");
@@ -1663,7 +1663,7 @@ mod tests {
         };
         assert!(only.plan(&esp, &image, &cache, true).unwrap().is_none());
         only.provision(&esp, &image).unwrap();
-        // A boot program that reads no firmware from the USB asked for none.
+        // A boot program that reads no firmware from the stick asked for none.
         assert!(requested(&esp, b"no marker").unwrap().is_empty());
         // A line cut short is named, not followed.
         boot_log(&esp, &[&newer[..60]]);

@@ -3,8 +3,8 @@
 //! system's life.
 //!
 //! Setup writes the install medium (`setup::medium`) of the installer the
-//! user chooses ([`InstallImage`]): Offline, the whole IPSW on the USB's
-//! FAT32 data partition, which needs a USB of 32 GB or more; or Online,
+//! user chooses ([`InstallImage`]): Offline, the whole IPSW on the stick's
+//! FAT32 data partition, which needs a stick of 32 GB or more; or Online,
 //! the IPSW's inventory, from which `stela.efi` streams the IPSW from
 //! Apple's servers during the install. Offline is the default where it
 //! fits ([`offline_unavailable`]). It prepares each machine's restore bundle (`stela
@@ -17,15 +17,15 @@
 //! boots the installed system afterwards. The restore personalizes its root
 //! tickets, its Cryptex1 ticket and the recoveryOS LocalPolicy with Apple's
 //! signing server (TSS); setup asks for them while it prepares the bundle
-//! (`boot::ticket::staged`), so an install with macOS on the USB needs no
+//! (`boot::ticket::staged`), so an install with macOS on the stick needs no
 //! network.
 //!
-//! One command checks the USB and the restore image without writing
+//! One command checks the stick and the restore image without writing
 //! anything, prepares the restore bundle on this computer, then copies it
-//! to the USB's FAT32 data partition, which the PC's firmware can read and
+//! to the stick's FAT32 data partition, which the PC's firmware can read and
 //! which also holds the install medium and the translation store
 //! (`stela/boot`, `stela/install` and `stela/store`), installs `stela.efi`
-//! as the USB's boot loader (`efi`) with a `stela.cfg` that boots the
+//! as the stick's boot loader (`efi`) with a `stela.cfg` that boots the
 //! installed macOS, and records what it wrote in `EFI/stela/setup.json` on
 //! the EFI partition. `--dry-run` stops after the checks; `uninstall`
 //! removes everything the record names.
@@ -33,7 +33,7 @@
 //! Each Stela machine has its own ECID (`setup::ecid`), drawn once, kept in
 //! the record and given to every bundle prepared for it. Without `--target`,
 //! Install macOS asks for a disk of the PC in `stela.efi`, or a raw
-//! partition of the USB is the Mac's internal SSD. With `--target`, setup
+//! partition of the stick is the Mac's internal SSD. With `--target`, setup
 //! runs on the PC itself and names the PC's own disk (`setup::installed`):
 //! one empty partition becomes the Mac's internal SSD and keeps the machine
 //! state (NVRAM, the SEP's state, the boot log) in its last bytes, outside
@@ -42,7 +42,7 @@
 //! disk's own recoveryOS when NVRAM asks for it or the disk holds no system,
 //! as a Mac does. Further disks become further installs of the same setup
 //! (`setup::machines`), each its own machine, chosen at boot from
-//! `stela.efi`'s startup choices. Setup writes no disk but the USB, except
+//! `stela.efi`'s startup choices. Setup writes no disk but the stick, except
 //! fresh machine state with `--initialize-nor` and NVRAM with
 //! `nvram next-boot`.
 //!
@@ -355,10 +355,10 @@ fn restore_choice_name(kind: Kind) -> &'static str {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum InstallImage {
-    // The whole IPSW on the USB; with the signing answers setup fetched,
+    // The whole IPSW on the stick; with the signing answers setup fetched,
     // the install needs no network. Records name it `full`, and those
     // written before that name `offline`. The doc line is `--help`'s.
-    /// macOS is copied to the USB (32 GB or more); the install needs no internet
+    /// macOS is copied to the stick (32 GB or more); the install needs no internet
     #[serde(alias = "offline")]
     #[value(name = "offline")]
     Full,
@@ -412,7 +412,7 @@ fn image_is_remote(ipsw: &Path, choice: InstallImage) -> Result<bool> {
         InstallImage::Full => {
             ensure!(
                 restore::payload::holds_system_image(ipsw)?,
-                "{} holds only boot files, without the macOS system image this USB's \
+                "{} holds only boot files, without the macOS system image this stick's \
                  install reads from it; pass the whole IPSW with --ipsw",
                 ipsw.display()
             );
@@ -488,7 +488,7 @@ pub(crate) struct Request {
     chooser_timeout: Option<command::Wait>,
     translation_store_bytes: Option<u64>,
     confirm_disk: Option<String>,
-    /// The person running setup confirmed erasing the USB, as the wizard
+    /// The person running setup confirmed erasing the stick, as the wizard
     /// asks; otherwise a scripted erase at a terminal asks.
     confirmed: bool,
     wifi: Option<String>,
@@ -595,7 +595,7 @@ type InventoryOf = dyn Fn(&Path, &str) -> Result<restore::payload::Inventory>;
 type ImageSizeOf<'a> = dyn Fn(&str, &str) -> Result<(u64, u64)> + 'a;
 /// Fetch what a command needs of a build's image for a model into a
 /// directory: the boot files (`prepare::fetch_inputs`), or the boot files
-/// of a whole image that is written onto the USB as it downloads
+/// of a whole image that is written onto the stick as it downloads
 /// (`medium::download::Download`).
 /// The members of an image `boot prepare` reads for a model's restore
 /// bundle (`boot::restore_inputs_in`), from the image's directory and

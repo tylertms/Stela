@@ -257,7 +257,7 @@ fn firmware_status(record: &Record, report: &mut Report) {
     let requested = match super::firmware::requested(&record.esp, &tool) {
         Ok(requested) => requested,
         Err(error) => {
-            report.problem(format!("the USB's host firmware: {error:#}"));
+            report.problem(format!("the stick's host firmware: {error:#}"));
             return;
         }
     };
@@ -279,7 +279,7 @@ fn firmware_status(record: &Record, report: &mut Report) {
     let repair = report.fix("repair");
     for request in &requested.pinned {
         report.problem(format!(
-            "the last boot asked for firmware {}, which the USB lacks: {repair} adds it",
+            "the last boot asked for firmware {}, which the stick lacks: {repair} adds it",
             super::firmware::describe(request)
         ));
     }
@@ -378,7 +378,7 @@ fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Re
                 super::medium::reported_damage(&record.esp, record.medium_checked.unwrap_or(0))
             {
                 problems.push(format!(
-                    "{} failed its block check when an install read it (the USB's boot log \
+                    "{} failed its block check when an install read it (the stick's boot log \
                      says so)",
                     medium.directory().join(&piece).display()
                 ));
@@ -860,7 +860,7 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
             text,
             "  install medium {}",
             match record.active_medium() {
-                Some(m) if m.remote => "streams from Apple: no piece is on the USB to check",
+                Some(m) if m.remote => "streams from Apple: no piece is on the stick to check",
                 Some(_) => "incomplete: the missing or short pieces are written again",
                 None => "none",
             }

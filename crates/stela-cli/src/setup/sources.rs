@@ -216,9 +216,9 @@ pub(super) fn locate(environment: &Environment<'_>, lookup: &Lookup<'_>) -> Resu
         .collect::<Vec<_>>()
         .join(", ");
     let medium = match lookup.medium {
-        Some(m) if m.remote => "this USB streams it from Apple's servers",
-        Some(_) => "this USB's copy of it is damaged",
-        None => "this USB holds no copy of it",
+        Some(m) if m.remote => "this stick streams it from Apple's servers",
+        Some(_) => "this stick's copy of it is damaged",
+        None => "this stick holds no copy of it",
     };
     match (environment.image_size)(lookup.build, lookup.model) {
         Ok((boot, whole)) => Ok(Source::Remote {
@@ -263,11 +263,11 @@ pub(super) fn describe(source: &Source, lookup: &Lookup<'_>) -> String {
         Source::Given(path) => format!("from {}", path.display()),
         Source::Cached(path) => format!("from {}, downloaded earlier", path.display()),
         Source::Kept(path) => format!(
-            "from the boot files kept on this USB in {}; nothing is downloaded",
+            "from the boot files kept on this stick in {}; nothing is downloaded",
             path.display()
         ),
         Source::Medium(medium) => format!(
-            "from this USB's copy of macOS {build} in {}; nothing is downloaded",
+            "from this stick's copy of macOS {build} in {}; nothing is downloaded",
             medium.directory().display()
         ),
         Source::Remote { .. } => format!(
@@ -275,7 +275,7 @@ pub(super) fn describe(source: &Source, lookup: &Lookup<'_>) -> String {
              have)",
             remote_text(source, build),
             match lookup.need {
-                Need::BootFiles => "USB or this ",
+                Need::BootFiles => "stick or this ",
                 Need::WholeImage | Need::Pieces => "",
             }
         ),
@@ -296,11 +296,11 @@ fn remote_text(source: &Source, build: &str) -> String {
     match (boot, pieces) {
         // No boot bundle is prepared: the image's pieces alone.
         (0, _) if pieces == whole => {
-            format!("{total} from Apple: the whole macOS {build} image straight onto the USB")
+            format!("{total} from Apple: the whole macOS {build} image straight onto the stick")
         }
         (0, _) => format!(
-            "{total} from Apple: the pieces of the macOS {build} image this USB's copy lacks, \
-             straight onto the USB; the pieces it holds are checked and kept"
+            "{total} from Apple: the pieces of the macOS {build} image this stick's copy lacks, \
+             straight onto the stick; the pieces it holds are checked and kept"
         ),
         (_, 0) => format!(
             "{total} of the macOS {build} image's {} from Apple: its boot files, read by range",
@@ -308,12 +308,12 @@ fn remote_text(source: &Source, build: &str) -> String {
         ),
         _ if pieces == whole => format!(
             "{total} from Apple: the macOS {build} image's boot files, read by range, then the \
-             whole image, {}, straight onto the USB",
+             whole image, {}, straight onto the stick",
             bytes_text(whole)
         ),
         _ => format!(
             "{total} from Apple: the macOS {build} image's boot files, read by range, then the \
-             {} of it this USB's copy lacks, straight onto the USB; the pieces it holds are \
+             {} of it this stick's copy lacks, straight onto the stick; the pieces it holds are \
              checked and kept",
             bytes_text(pieces)
         ),
@@ -362,7 +362,7 @@ pub(super) fn obtain(
             let temporary = temporary_in(&lookup.download_dir(environment))?;
             let path = temporary.path().join("boot.ipsw");
             eprintln!(
-                "Reading the boot files of macOS {} from this USB",
+                "Reading the boot files of macOS {} from this stick",
                 lookup.build
             );
             // The members a download reads, and no more.
@@ -375,7 +375,7 @@ pub(super) fn obtain(
                     &mut archive,
                     &names,
                     &path,
-                    "Reading boot files from the USB",
+                    "Reading boot files from the stick",
                     None,
                 )
             })()
