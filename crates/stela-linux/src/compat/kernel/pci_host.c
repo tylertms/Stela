@@ -128,6 +128,36 @@ static void free_coherent(struct device *dev, size_t size, void *cpu, dma_addr_t
 	__free_pages(virt_to_page(cpu), (unsigned int)get_order(size));
 }
 
+/* Linux dma_alloc_pages, which dma_alloc_noncoherent uses: pages the device
+ * reaches through the same mapping a coherent allocation gets. x86 caches
+ * snoop DMA, so a noncoherent buffer needs no more than the coherent path.
+ * Without this every PCI function's dma_alloc_noncoherent returns NULL, which
+ * nouveau's nvkm_firmware_ctor (NVKM_FIRMWARE_IMG_DMA) then hands to
+ * sg_init_one before it checks, and virt_to_page traps on. */
+static struct page *alloc_noncoherent_pages(struct device *dev, size_t size,
+					    dma_addr_t *address, enum dma_data_direction direction,
+					    gfp_t gfp)
+{
+	unsigned int order = (unsigned int)get_order(size);
+	struct page *page = alloc_pages(gfp | __GFP_ZERO, order);
+
+	if (!page)
+		return NULL;
+	*address = map_phys(dev, page_to_phys(page), size, direction, 0);
+	if (*address == DMA_MAPPING_ERROR) {
+		__free_pages(page, order);
+		return NULL;
+	}
+	return page;
+}
+
+static void free_noncoherent_pages(struct device *dev, size_t size, struct page *page,
+				   dma_addr_t address, enum dma_data_direction direction)
+{
+	unmap_phys(dev, address, size, direction, 0);
+	__free_pages(page, (unsigned int)get_order(size));
+}
+
 /* The device reaches whatever its owner hands it: its addresses, not physical
  * memory, are what a mask must cover. */
 static int mask_supported(struct device *dev, u64 mask)
@@ -142,6 +172,8 @@ static const struct dma_map_ops mapping_ops = {
 	.unmap_sg = unmap_scatter,
 	.alloc = alloc_coherent,
 	.free = free_coherent,
+	.alloc_pages_op = alloc_noncoherent_pages,
+	.free_pages = free_noncoherent_pages,
 	.dma_supported = mask_supported,
 };
 
