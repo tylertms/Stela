@@ -17,6 +17,8 @@ use {
     stela_soc_data::board::assigned::StartResource, stela_soc_data::pmgr::coverage::DomainId,
 };
 
+mod t8112_pmgr;
+
 fn cpuid_identity(maximum: u32, vendor: [u32; 3]) -> native::Cpuid {
     native::Cpuid {
         leaf: 0,
@@ -429,6 +431,7 @@ fn source<'a>(tree: &DeviceTree, nodes: &'a [NodeBinding<'a>]) -> SourceBindings
         counts: &COUNT_FIELDS,
         references: &[],
         cpu_ids: CpuIdRecipe::Preserve,
+        harvesting: None,
     }
 }
 fn captured_live_tree(mut tree: DeviceTree, command: &str) -> LiveTree {
@@ -502,7 +505,7 @@ fn captured_live_tree(mut tree: DeviceTree, command: &str) -> LiveTree {
 }
 #[test]
 #[ignore = "oracle: STELA_TEST_CPU_DT_DIR"]
-fn original_t8112_adapter_joins_dense_driver_ids_to_physical_first_p_resources() {
+fn original_t8112_adapter_projects_dense_driver_ids_for_every_worker_count() {
     use stela_soc_data::board;
     let file = std::path::PathBuf::from(std::env::var("STELA_TEST_CPU_DT_DIR").unwrap())
         .join("DeviceTree.j473ap.adt");
@@ -561,28 +564,35 @@ fn original_t8112_adapter_joins_dense_driver_ids_to_physical_first_p_resources()
     let source = Source::t8112(&original, &live, identity, 0x100).unwrap();
     let capture = capture();
     let roster = BspRoster::observed(&capture, 0, 42).unwrap();
-    let prepared = source.prepare(&roster, profile.clone()).unwrap();
-    assert_eq!(prepared.plan.pes().len(), 1);
-    assert_eq!(prepared.profile.processors.len(), 1);
-    let join = prepared.join(0x100).unwrap();
-    assert_eq!((join.logical, join.worker, join.apic), (0, 0, 42));
-    assert_eq!(
-        (join.enable_core.argument, join.error_interrupt),
-        (0x10, 0x66)
-    );
-    assert_eq!((join.core_power.device, join.cluster_power.device), (5, 10));
-    assert_eq!(word(&prepared.tree, "/cpus/cpu4", "cpu-id"), Ok(0));
-    assert_eq!(word(&prepared.tree, "/cpus/cpu4", "reg"), Ok(0x100));
-    assert_eq!(word(&prepared.tree, "/cpus", "max_cpus"), Ok(1));
-    assert_eq!(prepared.receipt.cpu_ids[0].original_id, 4);
-    assert_eq!(
-        prepared.tree.node("/arm-io/pmgr"),
-        tree.node("/arm-io/pmgr")
+    // P cpu4 alone would be kernel cluster 0 while the PMGR's first complex
+    // is the E one; the harvested constructor cannot bind that roster.
+    assert!(
+        source
+            .prepare(&roster, profile.clone())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("keep a prefix of the original clusters")
     );
     assert_eq!(source.resources.source(), original);
     // Construction fixture only: exercise the selected-source to
     // loader cache-interval/watchdog/profile projection boundary at every
-    // admitted cardinality. This does not create an AP executor.
+    // admitted cardinality, booting from the first CPU. This does not create
+    // an AP executor.
+    let mut first = tree.clone();
+    for cpu in &mut first.node_mut("/cpus").unwrap().children {
+        let running = cpu.name() == Some("cpu0");
+        cpu.set_property(
+            "state",
+            if running {
+                b"running\0".to_vec()
+            } else {
+                b"waiting\0".to_vec()
+            },
+        )
+        .unwrap();
+    }
+    let first = captured_live_tree(first, "-v");
     struct Roster(Vec<AssignedCore>);
     impl RetainedRoster for Roster {
         fn revision(&self) -> u64 {
@@ -604,7 +614,7 @@ fn original_t8112_adapter_joins_dense_driver_ids_to_physical_first_p_resources()
                 })
                 .collect(),
         );
-        let selected = Source::t8112_assigned(&original, &live, identity, 0x100, count).unwrap();
+        let selected = Source::t8112_assigned(&original, &first, identity, 0, count).unwrap();
         let prepared = selected.prepare(&roster, profile.clone()).unwrap();
         let board = board::board(&prepared.tree.serialize()).unwrap();
         assert_eq!(board.boot_processor.unwrap().cpu, 0);
@@ -619,9 +629,10 @@ fn original_t8112_adapter_joins_dense_driver_ids_to_physical_first_p_resources()
                 .iter()
                 .map(|node| node.property("reg").unwrap().as_u32().unwrap())
                 .collect::<Vec<_>>(),
-            [0x100, 0x101, 0x102, 0x103, 0, 1, 2, 3][..count]
+            [0, 1, 2, 3, 0x100, 0x101, 0x102, 0x103][..count]
         );
         assert_eq!(prepared.receipt.cpu_ids.len(), count);
+        assert_eq!(prepared.receipt.harvesting, (count < 8).then_some(1));
     }
     let override_live = captured_live_tree(tree, "-v acc-harvesting=0");
     assert!(

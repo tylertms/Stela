@@ -14,7 +14,10 @@ use stela_contracts::refuse;
 use stela_engine::machine::CpuProfile;
 use stela_loader::apple_device_tree::{
     DeviceTree,
-    assigned::{Count, CountField, CpuIdRecipe, NodeBinding, Projection, Receipt, SourceBindings},
+    assigned::{
+        Count, CountField, CpuIdRecipe, HarvestingField, NodeBinding, Projection, Receipt,
+        SourceBindings,
+    },
 };
 use stela_soc_data::board::assigned::AssignedCore;
 use stela_soc_data::board::assigned::Assignment;
@@ -56,6 +59,16 @@ pub const COUNT_FIELDS: [CountField<'static>; 4] = [
         count: Count::Pes,
     },
 ];
+
+/// ApplePMGR's harvesting mode. A reduced roster declares mode 1, in which
+/// the PMGR binds its complexes and cores to the kernel's clusters instead
+/// of numbering every original core record (see the loader's projection).
+/// The physical record-to-PE association stays the original tree's: Stela's
+/// PMGR resolver reads the complete original graph in its own mode.
+pub const PMGR_HARVESTING: HarvestingField<'static> = HarvestingField {
+    path: "/arm-io/pmgr",
+    property: "acc-harvesting",
+};
 
 /// Keeps the immutable pre-EBS observation. Only the executing BSP is
 /// started by this adapter. Captured AP observations do not imply AP startup.
@@ -491,6 +504,7 @@ impl<'a> Source<'a> {
                 },
                 None => CpuIdRecipe::Preserve,
             },
+            harvesting: Some(PMGR_HARVESTING),
         };
         prepare_assigned(
             roster,

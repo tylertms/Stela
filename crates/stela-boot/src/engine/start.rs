@@ -1920,13 +1920,17 @@ fn assigned_board(
         output::fatal("assigned boot identity differs from the original source handoff");
     }
     output::arguments(format_args!(
-        "NATIVE ASSIGNMENT original_boot={} assigned_boot={} physical_cores={} PEs={} boot_path={} removed={}\n",
+        "NATIVE ASSIGNMENT original_boot={} assigned_boot={} physical_cores={} PEs={} boot_path={} removed={} pmgr_harvesting={}\n",
         boot_processor,
         boot.cpu,
         handoff.native_resources.cores,
         assigned.joins.len(),
         assigned.receipt.boot_path,
-        assigned.receipt.removed.len()
+        assigned.receipt.removed.len(),
+        match assigned.receipt.harvesting {
+            Some(mode) => alloc::format!("{mode}"),
+            None => "source".into(),
+        }
     ));
     parsed
 }

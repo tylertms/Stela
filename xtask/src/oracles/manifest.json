@@ -19,13 +19,23 @@
   },
   {
     "package": "stela-boot-core",
-    "test": "original_t8112_adapter_joins_dense_driver_ids_to_physical_first_p_resources",
+    "test": "original_t8112_adapter_projects_dense_driver_ids_for_every_worker_count",
     "source": "crates/stela-boot-core/src/assigned_topology/tests.rs",
     "kind": "oracle",
     "inputs": [
       "STELA_TEST_CPU_DT_DIR"
     ],
     "reason": "requires pinned original J473 ADT in STELA_TEST_CPU_DT_DIR"
+  },
+  {
+    "package": "stela-boot-core",
+    "test": "original_j475d_reduced_rosters_keep_the_harvested_pmgr_shape",
+    "source": "crates/stela-boot-core/src/assigned_topology/tests/t8112_pmgr.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_TEST_J475D_DIR"
+    ],
+    "reason": "requires the prepared original J475d boot files in STELA_TEST_J475D_DIR"
   },
   {
     "package": "stela-boot-core",

@@ -314,6 +314,7 @@ impl Fixture {
             counts: &self.counts,
             references: &[],
             cpu_ids: CpuIdRecipe::Preserve,
+            harvesting: None,
         }
     }
     fn plan(&self) -> Plan<'_> {
@@ -966,6 +967,7 @@ fn original_j473_first_p_projection_keeps_source_fields_and_absent_coordinates()
         counts: &counts,
         references: &[],
         cpu_ids: CpuIdRecipe::Preserve,
+        harvesting: None,
     };
     let receipt = Projection::prepare(&plan, &tree, &source)
         .unwrap()
@@ -1201,6 +1203,7 @@ fn original_j314s_subsets_roundtrip_without_firmware_id_or_resource_extrapolatio
             counts: &counts,
             references: &[],
             cpu_ids: CpuIdRecipe::Preserve,
+            harvesting: None,
         };
         let mut projected = tree.clone();
         let receipt = Projection::prepare(&plan, &projected, &source)
@@ -1229,4 +1232,135 @@ fn original_j314s_subsets_roundtrip_without_firmware_id_or_resource_extrapolatio
             }
         }
     }
+}
+
+const PMGR: HarvestingField<'static> = HarvestingField {
+    path: "/arm-io/pmgr",
+    property: "acc-harvesting",
+};
+/// The fixture with a PMGR and the listed slots, in this order, the first
+/// booting, on as many host workers.
+fn harvesting_fixture(slots: &[u32], mode: Option<&[u8]>) -> Fixture {
+    let mut f = Fixture::new();
+    let mut io = Node::named("arm-io").unwrap();
+    let mut pmgr = Node::named("pmgr").unwrap();
+    if let Some(mode) = mode {
+        pmgr.set_property("acc-harvesting", mode.to_vec()).unwrap();
+    }
+    io.children.push(pmgr);
+    f.tree.root.children.push(io);
+    f.host.cores = (0..slots.len())
+        .map(|i| AssignedCore {
+            worker: 80 + i * 10,
+            package: 0,
+            core: 4 + i as u32,
+            apic: 20 + 2 * i as u32,
+            started: true,
+        })
+        .collect();
+    f.assignments = slots
+        .iter()
+        .enumerate()
+        .map(|(i, &slot)| Assignment {
+            worker: 80 + i * 10,
+            slot: GuestSlotId(slot),
+            boot: i == 0,
+        })
+        .collect();
+    f
+}
+fn harvest(f: &Fixture) -> Result<(Receipt, DeviceTree)> {
+    let plan = f.plan();
+    let mut source = f.source();
+    source.harvesting = Some(PMGR);
+    let mut tree = f.tree.clone();
+    let receipt = Projection::prepare(&plan, &tree, &source)?.apply(&mut tree)?;
+    Ok((receipt, tree))
+}
+
+#[test]
+fn reduced_rosters_declare_the_harvested_pmgr_and_keep_its_complex_shape() {
+    // Slots 7, 8 are E cpu0, cpu1 (cluster 10); slot 9 is P cpu2 (cluster 11).
+    for slots in [&[7, 8][..], &[7, 9], &[7]] {
+        let f = harvesting_fixture(slots, None);
+        let (receipt, tree) = harvest(&f).unwrap();
+        assert_eq!(receipt.harvesting, Some(HARVESTED), "{slots:?}");
+        assert_eq!(
+            tree.property(PMGR.path, PMGR.property).unwrap().as_u32(),
+            Some(HARVESTED)
+        );
+        assert!(f.tree.property(PMGR.path, PMGR.property).is_none());
+    }
+    // An explicit constructor default becomes the harvested mode; mode 1 stays.
+    for mode in [0u32, 1] {
+        let f = harvesting_fixture(&[7, 8], Some(&mode.to_le_bytes()));
+        let (receipt, tree) = harvest(&f).unwrap();
+        assert_eq!(receipt.harvesting, Some(HARVESTED));
+        assert_eq!(
+            tree.property(PMGR.path, PMGR.property).unwrap().as_u32(),
+            Some(HARVESTED)
+        );
+    }
+    // A complete roster keeps the source mode, absent or present.
+    for mode in [None, Some(&0u32.to_le_bytes()[..])] {
+        let f = harvesting_fixture(&[7, 8, 9], mode);
+        let (receipt, tree) = harvest(&f).unwrap();
+        assert_eq!(receipt.harvesting, None);
+        assert_eq!(
+            tree.node(PMGR.path),
+            f.tree.node(PMGR.path),
+            "complete roster changed the PMGR"
+        );
+    }
+}
+
+#[test]
+fn reduced_rosters_the_harvested_pmgr_cannot_bind_refuse_atomically() {
+    for (slots, reason) in [
+        // Kernel cluster 0 would be P while PMGR complex 0 is E.
+        (&[9][..], "prefix of the original clusters"),
+        (&[8, 9], "first CPUs of each kept cluster"),
+        (&[8], "first CPUs of each kept cluster"),
+        // The PMGR numbers cores in original record order.
+        (&[9, 7], "original CPU order"),
+        (&[8, 7], "original CPU order"),
+    ] {
+        let f = harvesting_fixture(slots, None);
+        let error = harvest(&f).unwrap_err().to_string();
+        assert!(error.contains(reason), "{slots:?}: {error}");
+    }
+    for mode in [
+        2u32.to_le_bytes().to_vec(),
+        vec![1],
+        1u64.to_le_bytes().to_vec(),
+    ] {
+        let f = harvesting_fixture(&[7, 8], Some(&mode));
+        assert!(
+            harvest(&f)
+                .unwrap_err()
+                .to_string()
+                .contains("unqualified harvesting mode"),
+            "{mode:?}"
+        );
+    }
+    let mut f = harvesting_fixture(&[7, 8], None);
+    f.tree
+        .root
+        .children
+        .retain(|node| node.name() != Some("arm-io"));
+    assert!(
+        harvest(&f)
+            .unwrap_err()
+            .to_string()
+            .contains("needs the PMGR")
+    );
+    // A source mode the caller does not list is an unchecked consumer.
+    let f = harvesting_fixture(&[7, 8, 9], Some(&1u32.to_le_bytes()));
+    let plan = f.plan();
+    assert!(
+        Projection::prepare(&plan, &f.tree, &f.source())
+            .unwrap_err()
+            .to_string()
+            .contains("unqualified CPU consumer")
+    );
 }

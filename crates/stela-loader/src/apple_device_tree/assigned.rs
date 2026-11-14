@@ -17,6 +17,8 @@
 //! explain these interfaces; that distinct release is not the binary's source.
 //! The fixed cluster-count producer alone does not check reduced-cluster
 //! consumer semantics: callers must supply checked field rules explicitly.
+//! A caller that names the PMGR's harvesting property gets the reduced-roster
+//! shape and PMGR mode that ApplePMGR's CPU constructor binds (`harvesting`).
 //!
 //! This module does not admit the supplied source/resource bindings or create
 //! additional hardware slots, native workers or initial lifecycle permission.
@@ -30,7 +32,9 @@ use stela_soc_data::board::assigned::{
 };
 use stela_soc_data::pmgr::coverage::DomainId;
 mod cpu_ids;
+mod harvesting;
 pub use cpu_ids::{CpuIdMapping, CpuIdRecipe, WatchdogProjection};
+pub use harvesting::{HARVESTED, HarvestingField};
 
 const CPUS: &str = "/cpus";
 const RUNNING: &[u8] = b"running\0";
@@ -94,6 +98,10 @@ pub struct SourceBindings<'a> {
     /// Explicitly checked coordinated consumer recipe; ordinary projections
     /// preserve source IDs and cannot opt into renumbering implicitly.
     pub cpu_ids: CpuIdRecipe<'a>,
+    /// The PMGR's CPU-harvesting mode property. A reduced roster must then
+    /// have the shape the harvested PMGR constructor binds, and the property
+    /// declares that mode; a complete roster leaves it unchanged.
+    pub harvesting: Option<HarvestingField<'a>>,
 }
 
 #[derive(Debug)]
@@ -112,6 +120,8 @@ pub struct Receipt {
     pub removed: Vec<String>,
     pub cpu_ids: Vec<CpuIdMapping>,
     pub watchdog: Option<WatchdogProjection>,
+    /// The PMGR harvesting mode published for a reduced roster.
+    pub harvesting: Option<u32>,
 }
 fn canonical_path(path: &str) -> bool {
     path == "/"
@@ -479,7 +489,28 @@ impl<'p, 's> Projection<'p, 's> {
                 }
             }
         }
+        let harvesting = match source.harvesting {
+            Some(field) => {
+                require!(
+                    canonical_path(field.path) && !field.path.starts_with("/cpus"),
+                    "noncanonical PMGR harvesting path"
+                );
+                require!(
+                    locations.insert((field.path, field.property)),
+                    "duplicate CPU consumer location"
+                );
+                let kept = selected
+                    .iter()
+                    .map(|node| node.name().expect("validated original name"))
+                    .collect::<Vec<_>>();
+                harvesting::prepare(tree, &kept, field)?
+            }
+            None => None,
+        };
         projected.node_mut(CPUS).unwrap().children = selected;
+        if let (Some(field), Some(mode)) = (source.harvesting, harvesting) {
+            projected.set_property(field.path, field.property, mode.to_le_bytes().to_vec())?;
+        }
         for field in source.counts {
             require!(canonical_path(field.path), "noncanonical CPU count path");
             require!(
@@ -529,6 +560,7 @@ impl<'p, 's> Projection<'p, 's> {
                             | "cpu-mask"
                             | "cpumask"
                             | "#main-cpus"
+                            | "acc-harvesting"
                     ) {
                         require!(
                             locations.contains(&(path, p.name())),
@@ -569,6 +601,7 @@ impl<'p, 's> Projection<'p, 's> {
             removed,
             cpu_ids,
             watchdog,
+            harvesting,
         };
         plan.revalidate()?;
         Ok(Self {
