@@ -134,18 +134,36 @@ impl Turn {
     }
 }
 
-/// Whether a part that kept guest work waiting `waited` counter ticks is
-/// named in a line of its own although it took less than the slow floor:
-/// the guest's PE was out of guest code with an interrupt or timer due for
-/// longer than `floor`, which XNU on another core can time. Rate-limited as
-/// [`SlowParts::worth`] is, apart from the slow parts' own lines.
-pub fn late_worth<const N: usize>(
-    late: &SlowParts<N>,
-    part: usize,
-    waited: Option<u64>,
-    floor: u64,
-) -> bool {
-    waited.is_some_and(|waited| late.worth(part, waited, floor))
+/// What kept guest work for the serving PE waiting past the floor, as one
+/// part ends ([`blame`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Late {
+    /// Nothing waited for as long as the floor.
+    No,
+    /// The part's own time: the ticks of the wait it covered.
+    Part(u64),
+    /// Time before the part, in earlier parts or in the host's work around
+    /// the turn: the whole wait, which the turn reports once.
+    Turn(u64),
+}
+
+/// Who kept guest work waiting `waited` ticks when a part that took `took`
+/// ticks ended, both in the same unit: the part when the wait it covered,
+/// from the later of its start and the wait's, reached `floor`, else the
+/// turn when the whole wait did. A part of microseconds is never named for
+/// a wait that began before it.
+pub fn blame(waited: Option<u64>, took: u64, floor: u64) -> Late {
+    match waited {
+        Some(waited) if waited >= floor => {
+            let covered = waited.min(took);
+            if covered >= floor {
+                Late::Part(covered)
+            } else {
+                Late::Turn(waited)
+            }
+        }
+        _ => Late::No,
+    }
 }
 
 /// Where one turn of a part went: the counter ticks of each of its `N`
@@ -280,13 +298,19 @@ mod tests {
     }
 
     #[test]
-    fn a_part_that_kept_guest_work_waiting_is_named_apart_from_slow_ones() {
-        let late = SlowParts::<2>::new();
-        assert!(!late_worth(&late, 0, None, 50));
-        assert!(!late_worth(&late, 0, Some(49), 50));
-        assert!(late_worth(&late, 0, Some(60), 50));
-        assert!(!late_worth(&late, 0, Some(100), 50));
-        assert!(late_worth(&late, 1, Some(5000), 50));
+    fn a_part_is_named_only_for_the_wait_its_own_time_covered() {
+        // Nothing waited, or not for the floor.
+        assert_eq!(blame(None, 1000, 50), Late::No);
+        assert_eq!(blame(Some(49), 1000, 50), Late::No);
+        // A part of 7 ticks at whose end work had waited 101_226: the
+        // reported shape, the turn's and never the part's.
+        assert_eq!(blame(Some(101_226), 7, 50), Late::Turn(101_226));
+        assert_eq!(blame(Some(101_226), 0, 50), Late::Turn(101_226));
+        // A long part that the work waited for: the part, for what of the
+        // wait it covered.
+        assert_eq!(blame(Some(60), 1000, 50), Late::Part(60));
+        assert_eq!(blame(Some(5000), 300, 50), Late::Part(300));
+        assert_eq!(blame(Some(5000), 49, 50), Late::Turn(5000));
     }
 
     #[test]

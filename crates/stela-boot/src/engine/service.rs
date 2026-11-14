@@ -24,8 +24,12 @@
 //! the PE stays out. The turn looks for such guest work before each part
 //! after its first (`GuestWatch`, `service_watch::Turn`) and leaves the
 //! rest to a later turn, so the guest waits at most for the part that
-//! runs; a part that kept it waiting past [`LATE_MILLIS`] is named in the
-//! `HOST SERVICE SLOW` line with what waited.
+//! runs. Guest work is an interrupt the PE takes or that ends its wait, or
+//! its own timer that can fire, counted from no earlier than the moment it
+//! began to serve. A part whose own time kept that work waiting past
+//! [`LATE_MILLIS`] is named in the `HOST SERVICE SLOW` line with what
+//! waited; a wait that began before the part is the turn's, in one
+//! `HOST SERVICE LATE` line.
 use super::{bluetooth, host, input, network, nor, output, parallel, power, restore, usb};
 use alloc::{format, string::String, vec::Vec};
 use core::{
@@ -33,10 +37,10 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use stela_boot_core::{
-    service_watch::{SlowParts, Turn, late_worth},
+    service_watch::{Late, SlowParts, Turn, blame},
     shutdown::{Mode as Shutdown, Requests as ShutdownRequests},
 };
-use stela_engine::machine::engine::GuestWatch;
+use stela_engine::machine::engine::{GuestWatch, Pending};
 
 static SHUTDOWN: ShutdownRequests = ShutdownRequests::new();
 
@@ -463,6 +467,7 @@ impl Service {
             power.disks().report(*tsc_hz);
             *reported = stamp;
         }
+        lap.end_turn(now);
         match turn.ended() {
             Some((part, _)) => {
                 *next = part;
@@ -516,18 +521,26 @@ static SLOW: SlowParts<PARTS> = SlowParts::new();
 /// line of its own: a fifth of what XNU's watchdog allows one exit.
 const SLOW_MILLIS: u64 = 100;
 
-/// The parts that kept guest work waiting for their PE past [`LATE_MILLIS`],
-/// each reported a few times a boot at most, apart from the slow ones.
+/// The parts whose own time kept guest work waiting for their PE past
+/// [`LATE_MILLIS`], each reported a few times a boot at most, apart from
+/// the slow ones.
 static LATE: SlowParts<PARTS> = SlowParts::new();
 
-/// How long guest work (an interrupt or timer for the serving PE) may wait
-/// for one part before the part is named although it was not slow: the
-/// stall limit after which the shared count holds for that PE (`clock`).
+/// The turns at whose parts' ends guest work had waited past
+/// [`LATE_MILLIS`] although no part's own time covered it: the wait began
+/// in the host's work before them. Reported as [`LATE`] is.
+static LATE_TURNS: SlowParts<1> = SlowParts::new();
+
+/// How long guest work (an interrupt the serving PE takes, or its own
+/// timer that can fire) may wait for one part before the part is named
+/// although it was not slow: the stall limit after which the shared count
+/// holds for that PE (`clock`).
 const LATE_MILLIS: u64 = 50;
 
 /// When the running part started, and this core's posted pumps' ticks then
 /// (`gpu::posted_ticks_here`), in a turn of the kind [`serve`] was asked for,
-/// on the PE `watch` looks after.
+/// on the PE `watch` looks after; the longest wait of guest work no part's
+/// own time covered in this turn.
 struct Lap<'a> {
     started: u64,
     pumped: u64,
@@ -535,6 +548,7 @@ struct Lap<'a> {
     boot: bool,
     step: bool,
     watch: &'a GuestWatch,
+    turn_late: Option<(Pending, u64)>,
 }
 
 impl<'a> Lap<'a> {
@@ -546,7 +560,31 @@ impl<'a> Lap<'a> {
             boot,
             step,
             watch,
+            turn_late: None,
         }
+    }
+
+    /// The turn that began at TSC `began` ends: a wait of guest work that
+    /// no part's own time covered is reported once for the turn, with the
+    /// turn's length, so a wait longer than the turn shows that it began in
+    /// the host's work around it.
+    fn end_turn(&self, began: u64) {
+        let Some((pending, waited)) = self.turn_late else {
+            return;
+        };
+        if !LATE_TURNS.worth(0, waited, host::COUNTER_HZ / 1000 * LATE_MILLIS) {
+            return;
+        }
+        let turn = host::rdtsc().wrapping_sub(began);
+        output::arguments(format_args!(
+            "HOST SERVICE LATE turn_us={} boot={} step={} pe={} guest={} late_us={}\n",
+            u128::from(turn) * 1_000_000 / u128::from(self.tsc_hz.max(1)),
+            self.boot,
+            self.step,
+            self.watch.pe(),
+            pending.name(),
+            u128::from(waited) * 1_000_000 / u128::from(host::COUNTER_HZ),
+        ));
     }
 
     fn part(&mut self, part: Part) {
@@ -563,17 +601,36 @@ impl<'a> Lap<'a> {
         let took = now.wrapping_sub(self.started).saturating_sub(pumped);
         LONGEST[part as usize].fetch_max(took, Ordering::Relaxed);
         TOTAL[part as usize].fetch_add(took, Ordering::Relaxed);
-        // The guest work that waited for this PE while the part ran: the
-        // part is named when it was slow, or when it kept that work waiting
-        // past the stall limit, with what waited and how long.
+        // The guest work that waited for this PE as the part ended: the part
+        // is named when it was slow, or when its own time kept that work
+        // waiting past the stall limit, with what waited and how long. A
+        // wait its time did not cover goes to the turn's line
+        // ([`Self::end_turn`]).
         let waited = self.watch.waited(host::fresh_counter());
         let slow = SLOW.worth(part as usize, took, self.tsc_hz / 1000 * SLOW_MILLIS);
-        let late = late_worth(
-            &LATE,
-            part as usize,
-            waited.and_then(|(_, ticks)| ticks),
-            host::COUNTER_HZ / 1000 * LATE_MILLIS,
-        );
+        let took_counts = (u128::from(took) * u128::from(host::COUNTER_HZ)
+            / u128::from(self.tsc_hz.max(1))) as u64;
+        let late = match (
+            waited,
+            blame(
+                waited.and_then(|(_, ticks)| ticks),
+                took_counts,
+                host::COUNTER_HZ / 1000 * LATE_MILLIS,
+            ),
+        ) {
+            (_, Late::Part(covered)) => LATE.worth(
+                part as usize,
+                covered,
+                host::COUNTER_HZ / 1000 * LATE_MILLIS,
+            ),
+            (Some((pending, _)), Late::Turn(ticks)) => {
+                if self.turn_late.is_none_or(|(_, longest)| ticks > longest) {
+                    self.turn_late = Some((pending, ticks));
+                }
+                false
+            }
+            _ => false,
+        };
         if slow || late {
             let guest = match waited {
                 None => String::from(" guest=-"),
@@ -597,7 +654,8 @@ impl<'a> Lap<'a> {
         // A posted GPU call waits for the boot CPU, not for the remaining
         // parts; the pump's time is no part's.
         super::gpu::pump_posted();
-        *self = Self::new(self.tsc_hz, self.boot, self.step, self.watch);
+        self.started = host::rdtsc();
+        self.pumped = super::gpu::posted_ticks_here();
     }
 }
 
