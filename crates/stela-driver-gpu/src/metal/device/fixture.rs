@@ -205,6 +205,10 @@ pub(crate) struct MockBackend {
     /// The bytes of each host image copy into an image, which copies out
     /// of it read back.
     pub(crate) image_bytes: BTreeMap<u64, Vec<u8>>,
+    /// The host's view of each memory mapped through `host_bytes`, which a
+    /// submitted copy of an image to its buffer fills from `image_bytes`,
+    /// as the GPU would.
+    pub(crate) host: BTreeMap<u64, Box<[u8]>>,
 }
 
 impl MockBackend {
@@ -483,6 +487,20 @@ impl Backend for MockBackend {
     ) -> Option<core::ptr::NonNull<core::sync::atomic::AtomicU32>> {
         self.marker.as_deref().map(core::ptr::NonNull::from)
     }
+    fn host_bytes(
+        &mut self,
+        memory: Memory,
+        offset: u64,
+        length: u64,
+    ) -> Option<core::ptr::NonNull<u8>> {
+        let end = usize::try_from(offset.checked_add(length)?).ok()?;
+        let bytes = self
+            .host
+            .entry(memory.0)
+            .or_insert_with(|| alloc::vec![0; end].into_boxed_slice());
+        let place = bytes.get_mut(offset as usize..end)?;
+        core::ptr::NonNull::new(place.as_mut_ptr())
+    }
     fn write_memory(&mut self, memory: Memory, offset: u64, bytes: &[u8]) -> Result<()> {
         if let Some(error) = self.write_error.take() {
             return Err(error);
@@ -595,6 +613,19 @@ impl Backend for MockBackend {
                         outstanding.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
                     }
                 }
+            }
+        }
+        // A buffer and its memory share an id: a copy of an image the host
+        // wrote to a mapped buffer lands where the host reads it.
+        for command in segments.iter().flat_map(|segment| &segment.commands) {
+            if let crate::metal::vulkan::command::Command::CopyImageToBuffer { src, dst, region } =
+                command
+                && let (Some(written), Some(host)) =
+                    (self.image_bytes.get(&src.0), self.host.get_mut(&dst.0))
+                && let Some(place) = host.get_mut(region.buffer_offset as usize..)
+            {
+                let count = written.len().min(place.len());
+                place[..count].copy_from_slice(&written[..count]);
             }
         }
         self.submissions.push(segments.to_vec());

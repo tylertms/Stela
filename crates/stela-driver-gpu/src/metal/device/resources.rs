@@ -45,8 +45,10 @@ use core::{num::NonZeroU64, ops::Range};
 use stela_contracts::gate::MemoryRange;
 
 mod extended_planes;
+mod read_back;
 pub(super) use extended_planes::PlaneActions;
 pub use extended_planes::PlaneChanges;
+pub use read_back::ReadBack;
 
 const TEXTURE_ARRAYS: [HeapArray; 2] = [HeapArray::SampledImages, HeapArray::StorageImages];
 const TEXEL_BUFFER_ARRAYS: [HeapArray; 2] = [

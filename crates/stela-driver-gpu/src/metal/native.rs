@@ -2923,6 +2923,11 @@ impl Backend for NativeBackend {
         (mapped.coherent && aligned).then(|| mapped.pointer.cast())
     }
 
+    fn host_bytes(&mut self, memory: Memory, offset: u64, length: u64) -> Option<NonNull<u8>> {
+        let mapped = self.mapping(memory, offset, length).ok()?;
+        mapped.coherent.then_some(mapped.pointer)
+    }
+
     fn write_memory(&mut self, memory: Memory, offset: u64, bytes: &[u8]) -> Result<()> {
         let mapped = self.mapping(memory, offset, bytes.len() as u64)?;
         // SAFETY: `mapped` covers the range and the slice is disjoint from

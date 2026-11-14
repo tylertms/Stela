@@ -1647,6 +1647,17 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .map_or(self.submitted, |flight| flight.serial - 1)
     }
 
+    /// Whether command buffer `serial` was submitted and completed, after
+    /// a [`Self::poll`], whatever completed before it.
+    pub fn serial_complete(&self, serial: u64) -> bool {
+        serial <= self.submitted
+            && !self
+                .queue
+                .in_flight
+                .iter()
+                .any(|flight| flight.serial == serial && flight.track != Track::Done)
+    }
+
     /// Whether some connection's completion differs from the device's:
     /// work is held, or completes on the late timeline.
     pub fn holds(&self) -> bool {

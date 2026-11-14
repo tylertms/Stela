@@ -333,6 +333,19 @@ pub trait Backend {
     ) -> Option<core::ptr::NonNull<core::sync::atomic::AtomicU32>> {
         None
     }
+    /// The host's view of `length` bytes at `offset` of mapped,
+    /// host-coherent `memory`, valid until the memory is freed and readable
+    /// from any processor once the GPU's writes to it completed: where the
+    /// CPU reads what a GPU copy wrote, outside the device's lock. `None`
+    /// when the memory is not mapped coherently there.
+    fn host_bytes(
+        &mut self,
+        _memory: Memory,
+        _offset: u64,
+        _length: u64,
+    ) -> Option<core::ptr::NonNull<u8>> {
+        None
+    }
     /// Copies into mapped memory and flushes it.
     fn write_memory(&mut self, memory: Memory, offset: u64, bytes: &[u8]) -> Result<()>;
     /// Invalidates mapped memory and copies out of it.

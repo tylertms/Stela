@@ -529,6 +529,26 @@ impl CommandBuffer {
         Ok(())
     }
 
+    /// Copies `region` of `image`, in the encoding the image stores, to
+    /// `buffer` as `region` lays it out, and makes the copy visible to the
+    /// host once the command buffer completes: a CPU read of a texture
+    /// through host memory rather than through the image's own.
+    pub(crate) fn read_back(
+        &mut self,
+        image: Image,
+        buffer: Buffer,
+        region: BufferImageCopy,
+    ) -> Result<()> {
+        self.blit()?;
+        self.recorder.access(TRANSFER);
+        self.recorder.push(Command::CopyImageToBuffer {
+            src: image,
+            dst: buffer,
+            region,
+        });
+        self.synchronize()
+    }
+
     /// `synchronizeTexture:slice:level:` for a managed texture whose CPU copy
     /// is a staging buffer: the region is copied there, then published.
     pub fn synchronize_texture(
