@@ -1092,8 +1092,14 @@ impl Request {
     }
 
     /// Put this stela's stela.efi on the stick of `record`, preparing its
-    /// boot files again when they are of another generation.
-    fn update_stela(&self, environment: &Environment<'_>, record: Record) -> Result<String> {
+    /// boot files again when they are of another generation; `allowed`
+    /// when this run already asked to change a newer Stela's stick.
+    fn update_stela(
+        &self,
+        environment: &Environment<'_>,
+        record: Record,
+        allowed: bool,
+    ) -> Result<String> {
         let image = match &self.efi {
             Some(path) => path.clone(),
             None => assets::resolve()?,
@@ -1111,7 +1117,7 @@ impl Request {
                 ipsw: self.ipsw.as_deref().filter(|_| self.macos.is_none()),
                 download_dir: self.download_dir.as_deref(),
                 dry_run: self.dry_run,
-                yes: self.yes,
+                yes: self.yes || allowed,
             },
         )
     }
@@ -1190,19 +1196,37 @@ impl Request {
         match action {
             // An interrupted first setup is finished as it began.
             Action::Repair if !record.complete => self.finish_create(environment, &record),
-            // A macOS switch that removed the old copy for room goes on. The
-            // repair names no download: a large one is asked about, unless
-            // the menu's choice named its size.
-            Action::Repair if record.replacing.is_some() => Request {
-                build: record.replacing.clone().unwrap_or_default(),
-                ..self
+            // A macOS switch that removed the old copy for room goes on,
+            // after what `status` names `update` for: the switch prepares
+            // bundles of this stela's revision. The repair names no
+            // download: a large one is asked about, unless the menu's
+            // choice named its size.
+            Action::Repair if record.replacing.is_some() => {
+                let build = record.replacing.clone().unwrap_or_default();
+                let mut text = String::new();
+                let record = match needs_update(environment, &record) {
+                    false => record,
+                    true => {
+                        // The question above asked to change a newer stick.
+                        text = self.update_stela(environment, record, true)?;
+                        if self.dry_run {
+                            text.push_str(&format!(
+                                "  then          the switch to macOS {build} goes on once this \
+                                 stela.efi is in place\n"
+                            ));
+                            return Ok(text);
+                        }
+                        read_record(environment, &self.usb)?
+                    }
+                };
+                text.push_str(&Request { build, ..self }.update_os(environment, record, false)?);
+                Ok(text)
             }
-            .update_os(environment, record, false),
             // What `status` names `update` for (`needs_update`) is put
             // right as `update` does it, and the repair goes on with the
             // rest.
             Action::Repair if needs_update(environment, &record) => {
-                let mut text = self.update_stela(environment, record)?;
+                let mut text = self.update_stela(environment, record, false)?;
                 match self.dry_run {
                     true => text.push_str(
                         "  then          the repair checks the rest once this stela.efi is in place\n",
@@ -1217,7 +1241,7 @@ impl Request {
             Action::RestoreState(path) => state::restore(environment, &record, &self, &path),
             Action::BootLog => state::boot_log(environment, &record, &self),
             Action::UpdateStela => {
-                let mut text = self.update_stela(environment, record)?;
+                let mut text = self.update_stela(environment, record, false)?;
                 if let Some(build) = self.macos.take() {
                     let next = Request {
                         action: Action::UpdateOs,

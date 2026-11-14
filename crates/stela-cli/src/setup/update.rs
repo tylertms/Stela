@@ -60,22 +60,29 @@ fn activate_build(record: &mut Record, build: &str) -> Result<()> {
 }
 
 /// Remove the bundles and media of everything but the active build and
-/// generation.
+/// generation, and the build a stopped macOS switch moves to: its part of
+/// a new copy stays for the switch to go on from.
 pub(super) fn prune(record: &mut Record) -> Result<()> {
-    let (build, generation) = (record.build.clone(), record.generation());
+    let generation = record.generation();
+    let kept: Vec<String> = std::iter::once(record.build.clone())
+        .chain(record.replacing.clone())
+        .collect();
     let (active, stale): (Vec<_>, Vec<_>) = record
         .bundles
         .drain(..)
-        .partition(|b| b.build == build && b.generation() == generation);
+        .partition(|b| kept.contains(&b.build) && b.generation() == generation);
     record.bundles = active;
     super::remove_bundles(record, &stale)?;
     for build in stale.iter().map(|b| &b.build) {
         let directory = bundle::build_directory(&record.volume, build);
-        if *build != record.build && directory.is_dir() {
+        if !kept.contains(build) && directory.is_dir() {
             fs::remove_dir_all(directory)?;
         }
     }
-    let (active, stale): (Vec<_>, Vec<_>) = record.media.drain(..).partition(|m| m.build == build);
+    let (active, stale): (Vec<_>, Vec<_>) = record
+        .media
+        .drain(..)
+        .partition(|m| kept.contains(&m.build));
     record.media = active;
     for medium in stale {
         remove_medium(&medium)?;

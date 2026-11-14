@@ -3065,6 +3065,62 @@ fn an_interrupted_copy_replacement_is_named_and_finished_by_the_same_update() {
 }
 
 #[test]
+fn a_stopped_switch_finishes_after_a_bundle_revision_change_and_keeps_its_new_copy() {
+    let (f, newer, old_bytes) = one_copy_setup();
+    // Stopped after the old copy went, by a stela of the previous bundle
+    // revision.
+    let mut stopped = record(&f);
+    let old = stopped.active_medium().unwrap().clone();
+    stopped.replacing = Some("STELA2".into());
+    stopped.media.clear();
+    stopped.bundle_revision -= 1;
+    publish(&mut stopped).unwrap();
+    write_record(&f.esp, &stopped).unwrap();
+    fs::remove_dir_all(old.directory()).unwrap();
+    f.host.freed.set(old_bytes);
+    // A dry run says what it does, and changes nothing.
+    let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
+    let mut dry = os_update(&f, &newer);
+    dry.action = Action::Repair;
+    dry.dry_run = true;
+    let plan = dry.dispatch(&environment(&f.host)).unwrap();
+    assert!(
+        plan.contains("the switch to macOS STELA2 goes on"),
+        "{plan}"
+    );
+    assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
+    // The repair the menu's Finish the switch runs prepares the bundles of
+    // this revision first, then finishes the switch.
+    let mut repair = os_update(&f, &newer);
+    repair.action = Action::Repair;
+    repair.dispatch(&environment(&f.host)).unwrap();
+    let finished = record(&f);
+    assert_eq!(
+        (finished.build.as_str(), finished.replacing.as_deref()),
+        ("STELA2", None)
+    );
+    assert_eq!(finished.bundle_revision, current().revision);
+    assert!(
+        rerun(&f, |c| c.action = Action::Status)
+            .unwrap()
+            .contains("No problems found.")
+    );
+    // What a stopped switch wrote of its new copy stays when an update
+    // removes the rest.
+    let mut switching = record(&f);
+    let copy = switching.active_medium().unwrap().clone();
+    let mut partial = copy.clone();
+    partial.build = "STELA3".into();
+    copy_tree(&copy.directory(), &partial.directory());
+    switching.replacing = Some("STELA3".into());
+    switching.media.push(partial.clone());
+    update::prune(&mut switching).unwrap();
+    assert!(switching.media.iter().any(|m| m.build == "STELA3"));
+    assert!(partial.directory().is_dir());
+    assert!(copy.directory().is_dir());
+}
+
+#[test]
 fn stela_updates_remove_the_previous_bundles() {
     let mut f = fixture(64 * GIB, false);
     add_stela(&mut f);
