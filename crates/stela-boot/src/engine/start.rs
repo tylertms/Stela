@@ -645,9 +645,10 @@ fn open_storage(handoff: &'static Handoff, options: &Options, host: &mut OpenedH
             "Opening the machine state on {}",
             device.identity().model
         ));
-        let opened = nor::HostNor::open(device);
+        let mut opened = nor::HostNor::open(device);
         crate::status::done("");
         bundle_repair::nvram(&opened.2.proxy);
+        bundle_repair::take(&mut opened.0, &mut opened.1, &mut opened.2);
         opened
     });
     let (host_nor, nor_image, nvram, sep_state, board_flash) = match nor {

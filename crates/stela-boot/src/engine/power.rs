@@ -287,8 +287,14 @@ impl HostPowerControl {
         pressed
     }
 
-    /// Restart the host machine.
+    /// Restart the host machine, unless the stop could not store the
+    /// Metal plugin repair's record: a restart that does not know it could
+    /// repeat this boot at every start, so the PC stops with the reason
+    /// (`bundle_repair::restart_refusal`).
     pub fn restart(&self) -> ! {
+        if let Some(reason) = super::bundle_repair::restart_refusal() {
+            output::fatal(reason);
+        }
         match crate::stop_record::return_at_restart() {
             Some(entry) => output::arguments(format_args!(
                 "POWER the firmware starts its entry Boot{entry:04X} again after the restart\n"

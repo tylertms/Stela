@@ -782,3 +782,60 @@ fn an_attempt_another_stela_version_made_lets_this_one_repair_once() {
         .unwrap();
     assert!(!again(&mut vars).unwrap());
 }
+
+#[test]
+fn a_repair_boot_whose_take_was_not_saved_takes_it_by_the_loaders_rule() {
+    // Only a repair boot still holding a request has an unsaved take.
+    for record in [Record::Pending, Record::Retry, Record::Installed] {
+        assert!(untaken(Boot::Repair, record));
+        assert!(!untaken(Boot::Normal, record));
+        assert!(!untaken(Boot::SingleUser, record));
+    }
+    for record in [
+        Record::None,
+        Record::Attempted,
+        Record::Retried,
+        Record::Outdated,
+    ] {
+        assert!(!untaken(Boot::Repair, record));
+    }
+    // The same records the loader writes, the last result removed, and the
+    // other one-shot variables left as the failed save left them.
+    for (value, taken) in [
+        (BUNDLE_REPAIR_PENDING, Record::Attempted),
+        (BUNDLE_REPAIR_RETRY, Record::Retried),
+        (BUNDLE_REPAIR_INSTALLED, Record::None),
+    ] {
+        let mut vars = variables(Some(value));
+        vars.set(Partition::System, BUNDLE_REPAIR_RESULT, b"step 3 exited")
+            .unwrap();
+        vars.set(Partition::System, b"auto-boot-once", b"true")
+            .unwrap();
+        let mut loader = vars.clone();
+        let selection = stela_loader::boot_selection::select(&loader).unwrap();
+        stela_loader::boot_selection::consume(&mut loader, &selection).unwrap();
+        assert!(take(&mut vars).unwrap());
+        assert_eq!(Record::read(&vars), taken);
+        assert_eq!(Record::read(&vars), Record::read(&loader));
+        assert_eq!(result(&vars), None);
+        assert_eq!(
+            lookup(&vars, BUNDLE_REPAIR_VERSION),
+            lookup(&loader, BUNDLE_REPAIR_VERSION)
+        );
+        assert_eq!(lookup(&vars, b"auto-boot-once"), Some(&b"true"[..]));
+        // Taken once, NVRAM selects no repair boot any more.
+        assert!(take(&mut vars).is_err());
+        assert!(!untaken(Boot::Repair, Record::read(&vars)));
+    }
+}
+
+#[test]
+fn a_record_the_disk_did_not_store_stops_with_its_reason() {
+    let text = unstored_reason("Request", "the store did not complete within 5000 ms");
+    assert!(text.contains("(Request)"), "{text}");
+    assert!(text.contains("within 5000 ms"), "{text}");
+    assert!(text.contains("instead of restarting"), "{text}");
+    let text = untaken_reason(Record::Pending, "the store did not complete");
+    assert!(text.contains("(pending)"), "{text}");
+    assert!(text.contains("would repeat at every start"), "{text}");
+}

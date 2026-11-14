@@ -198,7 +198,8 @@ impl Service {
             if let Some(anchor) = anchor {
                 nor.keep_anchor(anchor);
             }
-            nor.finish();
+            let durable = nor.finish();
+            super::bundle_repair::stored(&durable);
         }
         #[cfg(feature = "nvk")]
         super::gpu::gate::stop(|| self.devices.serve(|devices| devices.stop_gpu_gates()));

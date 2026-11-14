@@ -247,32 +247,39 @@ impl HostNor {
     }
 
     /// Complete every store, the caller waiting at most [`NOR_STOP_MILLIS`]
-    /// and [`ANCHOR_STOP_MILLIS`]: at the stop. A disk that never completes
-    /// is reported once and the restart or power-off goes on; the sectors
-    /// it did not store are lost, as the line says.
-    pub fn finish(&mut self) {
+    /// and [`ANCHOR_STOP_MILLIS`]: at the stop, and for a record that must
+    /// be durable before the guest starts. A disk that never completes is
+    /// reported once and the caller goes on; the sectors it did not store
+    /// are lost, as the line says. `Ok` once every NOR store is durable,
+    /// else why not, for a caller whose record must not be lost
+    /// (`bundle_repair::stored`).
+    pub fn finish(&mut self) -> Result<(), alloc::string::String> {
         let limit = super::host::COUNTER_HZ / 1000 * NOR_STOP_MILLIS;
-        match self.stores.finish(
+        let finished = match self.stores.finish(
             &mut *self.device,
             super::host::fresh_counter,
             limit,
             core::hint::spin_loop,
         ) {
-            Ok(persist::Finish::Done) => {}
+            Ok(persist::Finish::Done) => Ok(()),
             Ok(persist::Finish::TimedOut { waited, sectors }) => {
+                let waited = waited / (super::host::COUNTER_HZ / 1000);
                 output::arguments(format_args!(
-                    "NOR refusal: store at stop timed out after {} ms; {sectors} sectors not stored\n",
-                    waited / (super::host::COUNTER_HZ / 1000)
+                    "NOR refusal: store at stop timed out after {waited} ms; {sectors} sectors not stored\n",
                 ));
+                Err(format!(
+                    "the disk did not complete the store within {waited} ms"
+                ))
             }
             Err(error) => {
                 output::fatal(format_args!("a NOR sector could not be stored: {error}"));
             }
-        }
+        };
         AnchorStore::advance(
             &mut self.anchor,
             Some(super::host::COUNTER_HZ / 1000 * ANCHOR_STOP_MILLIS),
         );
+        finished
     }
 
     /// The PMU upcount's anchor this boot starts from: `None` on a new

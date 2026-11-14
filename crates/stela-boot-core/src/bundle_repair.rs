@@ -255,6 +255,55 @@ pub fn again(variables: &mut Variables) -> Result<bool, String> {
     }
 }
 
+/// Whether a `boot` whose machine state opened with `record` is a repair
+/// boot the loader's take was not saved for: the loader leaves the bank
+/// without the request for Stela's drivers to save, and when that save
+/// fails the disk still holds the request, which would make every start a
+/// repair boot. The engine then saves the take itself ([`take`]).
+pub fn untaken(boot: Boot, record: Record) -> bool {
+    boot == Boot::Repair && matches!(record, Record::Pending | Record::Retry | Record::Installed)
+}
+
+/// Make the loader's take of the repair request in `variables`, by the
+/// loader's own rule (`boot_selection::select` and `consume`), limited to
+/// the repair's variables: the other one-shot variables the loader
+/// consumed stay as the failed save left them. Whether `variables`
+/// changed.
+pub fn take(variables: &mut Variables) -> Result<bool, String> {
+    let mut selection =
+        stela_loader::boot_selection::select(variables).map_err(|error| format!("{error}"))?;
+    if !selection.bundle_repair {
+        return Err("NVRAM no longer selects the repair boot".into());
+    }
+    let repair = [BUNDLE_REPAIR, BUNDLE_REPAIR_RESULT, BUNDLE_REPAIR_VERSION];
+    selection.assigned.retain(|(name, _)| repair.contains(name));
+    selection.consumed.retain(|name| repair.contains(name));
+    stela_loader::boot_selection::consume(variables, &selection).map_err(|error| format!("{error}"))
+}
+
+/// The stop's reason for a repair boot whose take of `record` could not
+/// be stored (`why`): a repair boot now would repeat at every start.
+pub fn untaken_reason(record: Record, why: &str) -> String {
+    format!(
+        "the Metal plugin repair's request ({}) could not be marked as taken in the machine \
+         state on the PC's disk: {why}. A repair boot now would repeat at every start, so Stela \
+         stopped before it; stela log saves the boot logs for a report",
+        record.name()
+    )
+}
+
+/// The stop's reason for a restart whose change to the repair's record
+/// (`what`, as the engine logs it) is not durable (`why`): the next start
+/// would not know it and could repeat this boot, a repair request lost at
+/// every restart looping through full boots.
+pub fn unstored_reason(what: &str, why: &str) -> String {
+    format!(
+        "the Metal plugin repair's record ({what}) could not be stored in the machine state on \
+         the PC's disk: {why}. A restart would not know it and could repeat this boot, so Stela \
+         stopped instead of restarting; stela log saves the boot logs for a report"
+    )
+}
+
 /// What the engine does with a report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
