@@ -19,6 +19,7 @@ use core::{
 use stela_contracts::refuse;
 
 mod mailbox;
+mod park;
 
 const STARTING: u8 = 0;
 const READY: u8 = 1;
@@ -673,6 +674,18 @@ pub(crate) unsafe fn start(
         // their mailbox loop, answering shootdowns, and run no PE.
         processors.retain(|processor| processor.slot < *first);
     }
+    // SAFETY: every started AP is ready, or failed and then nothing starts
+    // from the page again; the memory types are the BSP's, checked above.
+    unsafe {
+        park::park(
+            handoff,
+            capture,
+            &sender,
+            &memory_types,
+            effective_pat,
+            failure.is_some(),
+        )
+    };
     Ok(Executors {
         processors,
         failure: failure.map(|(_, error)| error),

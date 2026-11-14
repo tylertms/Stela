@@ -64,6 +64,7 @@ pub mod options;
 pub mod page_window;
 pub mod paging_controls;
 pub mod panic_region;
+pub mod parking;
 pub mod passthrough;
 pub mod pe;
 pub mod pm_timer;
