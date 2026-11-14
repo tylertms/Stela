@@ -578,6 +578,51 @@ fn feature_quirks_leave_fua_and_write_zeroes_out() {
     assert!(no_zeroes.fua && no_zeroes.discard.is_some());
 }
 
+/// Bus mastering comes between the stop and the start: CC is cleared and
+/// CSTS.RDY seen clear first, CC.EN set only after; a controller that never
+/// stops is never given it.
+#[test]
+fn bus_mastering_is_enabled_only_once_the_controller_stopped() {
+    let _clock = crate::test_clock::virtualize();
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    c.clock = Clock {
+        ticks_per_microsecond: 1,
+    };
+    c.registers
+        .write64(CAPABILITIES, 15 | 1 << 24 | 1 << 37)
+        .unwrap();
+    // As the firmware left it: enabled and ready.
+    c.registers
+        .write32(CONFIGURATION, CONFIGURATION_VALUE)
+        .unwrap();
+    c.registers.write32(STATUS, READY).unwrap();
+    let mut seen = None;
+    let observe = |c: &Controller| {
+        (
+            c.registers.read32(CONFIGURATION).unwrap(),
+            c.registers.read32(STATUS).unwrap(),
+        )
+    };
+    let started = start_after_stop(&mut c, |c| {
+        seen = Some(observe(c));
+        Ok(false)
+    });
+    assert_eq!(seen, None, "a controller that never stopped got DMA");
+    assert_eq!(started, Err(BlockError::Timeout.at(DISABLE_WAIT)));
+
+    c.registers.write32(STATUS, 0).unwrap();
+    let started = start_after_stop(&mut c, |c| {
+        seen = Some(observe(c));
+        Ok(true)
+    });
+    assert_eq!(seen, Some((0, 0)));
+    // The fixture never sets CSTS.RDY again.
+    assert_eq!(started, Err(BlockError::Timeout.at(ENABLE_WAIT)));
+    assert_eq!(c.registers.read32(CONFIGURATION).unwrap() & ENABLE, ENABLE);
+    assert!(c.signalled);
+}
+
 #[test]
 fn submission_publication_keeps_the_whole_wire_entry_and_rings_its_queue() {
     let fixture = Fixture::new();

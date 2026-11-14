@@ -1011,6 +1011,21 @@ impl<C: ConfigSpace> Function<C> {
     /// Enable a polling driver. A failed prefix stays contained with its owner;
     /// no later MSI/MSI-X/command write is issued after the first access denial.
     pub fn enable_polled(&mut self) -> Result<(), BlockError> {
+        self.enable_polled_with(regs::COMMAND_MASTER)
+    }
+    /// [`Self::enable_polled`] with bus mastering left as it is, off after
+    /// the device start: for a driver that first stops an engine the
+    /// firmware left running, then calls [`Self::enable_bus_master`].
+    pub fn enable_polled_decode(&mut self) -> Result<(), BlockError> {
+        self.enable_polled_with(0)
+    }
+    pub fn enable_bus_master(&mut self) -> Result<(), BlockError> {
+        let mut config = transaction::Transaction::new(&mut self.config);
+        let command = config.read16(regs::COMMAND)?;
+        config.write16(regs::COMMAND, command | regs::COMMAND_MASTER)?;
+        Ok(())
+    }
+    fn enable_polled_with(&mut self, master: u16) -> Result<(), BlockError> {
         let interrupts = self.interrupts()?;
         let mut config = transaction::Transaction::new(&mut self.config);
         if let Some(msi) = interrupts.msi {
@@ -1026,7 +1041,7 @@ impl<C: ConfigSpace> Function<C> {
         let command = config.read16(regs::COMMAND)?;
         config.write16(
             regs::COMMAND,
-            command | regs::COMMAND_MEMORY | regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE,
+            command | regs::COMMAND_MEMORY | master | regs::COMMAND_INTX_DISABLE,
         )?;
         Ok(())
     }

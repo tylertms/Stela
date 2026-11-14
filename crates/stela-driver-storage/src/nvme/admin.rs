@@ -45,7 +45,17 @@ impl Controller {
         Ok(ready_wait_us(timeout))
     }
 
+    /// Stop the controller, then start it ([`Self::stop`],
+    /// [`Self::start_admin`]).
     pub(super) fn initialize(&mut self) -> Result<(), BlockError> {
+        self.stop()?;
+        self.start_admin()
+    }
+
+    /// Take the controller's capabilities and stop it, as Linux's
+    /// `nvme_pci_configure_admin_queue` does before it sets up the admin
+    /// queue: CC cleared, CSTS.RDY clear.
+    pub(super) fn stop(&mut self) -> Result<(), BlockError> {
         if let Some(owner) = self.owned.as_mut() {
             // An attempted prepare may have effects without establishing D0.
             // Only success authorizes NVMe MMIO; uncertain failure quarantines.
@@ -97,8 +107,12 @@ impl Controller {
         if capabilities & CAPABILITY_COMMAND_SETS != 0 {
             self.configuration |= COMMAND_SETS_ALL;
         }
-        self.stop_and_wait()
-            .map_err(|error| error.at(DISABLE_WAIT))?;
+        self.stop_and_wait().map_err(|error| error.at(DISABLE_WAIT))
+    }
+
+    /// Point the stopped controller at the admin queue, give it DMA where
+    /// its owner holds it, and enable it.
+    pub(super) fn start_admin(&mut self) -> Result<(), BlockError> {
         self.configure_admin()?;
         if let Some(owner) = self.owned.as_mut() {
             owner.lifecycle.enable_dma()?;

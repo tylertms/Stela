@@ -934,25 +934,21 @@ pub fn attach(
     function.power_up(minimum)?;
     let bars = function.bars()?;
     let registers = RegisterIo::Legacy(registers(handoff, bars[0], 0, 0x2000)?);
-    function.enable_polled()?;
-    let signalled = match (handoff.completion, function.interrupts()?.msix) {
-        (Some(message), Some(msix)) => {
-            let table = crate::registers(
+    // Memory decode only: bus mastering stays off, as the device start left
+    // it, until the controller stopped ([`start_after_stop`]).
+    function.enable_polled_decode()?;
+    let msix = match (handoff.completion, function.interrupts()?.msix) {
+        (Some(message), Some(msix)) => Some((
+            message,
+            msix,
+            crate::registers(
                 handoff,
                 bars[usize::from(msix.table_bar)],
                 u64::from(msix.table_offset),
                 MSIX_ENTRY_BYTES,
-            )?;
-            function.enable_msix(msix, || {
-                table.write32(0, message.address as u32);
-                table.write32(4, (message.address >> 32) as u32);
-                table.write32(8, message.data);
-                table.write32(12, 0);
-                Ok(())
-            })?;
-            true
-        }
-        _ => false,
+            )?,
+        )),
+        _ => None,
     };
     let mut controller = Controller {
         registers,
@@ -964,7 +960,7 @@ pub fn attach(
         held: (0..DEPTH).map(|_| Vec::new()).collect(),
         tags: (0..DEPTH).map(|_| Tag::Free).collect(),
         recovery: None,
-        signalled,
+        signalled: false,
         owed: false,
         max_transfer: BOUNCE_BYTES,
         max_command_bytes: MAX_COMMAND_BYTES,
@@ -993,8 +989,37 @@ pub fn attach(
         quirks: Quirks::for_device(function.vendor, function.device)
             | Quirks::for_platform(function.vendor, function.device, platform),
     };
-    controller.initialize()?;
+    start_after_stop(&mut controller, |_| {
+        function.enable_bus_master()?;
+        let Some((message, msix, table)) = msix else {
+            return Ok(false);
+        };
+        function.enable_msix(msix, || {
+            table.write32(0, message.address as u32);
+            table.write32(4, (message.address >> 32) as u32);
+            table.write32(8, message.data);
+            table.write32(12, 0);
+            Ok(())
+        })?;
+        Ok(true)
+    })?;
     discover(controller, format!("{}", function.address), &mut { dma })
+}
+
+/// Stop the controller, then `enable_dma`, then start it with its admin
+/// queue: a controller the firmware left enabled may still post to the
+/// firmware's queues or host memory buffer, pages Stela owns after the
+/// firmware exits, until CSTS.RDY clears, so bus mastering (and the MSI-X
+/// message, whose answer says whether completions are signalled) comes
+/// only after. Linux enables bus mastering first; the owned path's
+/// lifecycle orders it the same way as this.
+fn start_after_stop(
+    controller: &mut Controller,
+    enable_dma: impl FnOnce(&Controller) -> Result<bool, BlockError>,
+) -> Result<(), BlockError> {
+    controller.stop()?;
+    controller.signalled = enable_dma(controller)?;
+    controller.start_admin()
 }
 
 /// Linux `nvme_wait_ready`'s bound for a ready timeout in 500 ms units:
