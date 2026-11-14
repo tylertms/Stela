@@ -340,6 +340,9 @@ fn stale_sparse_binding_cannot_touch_current_native_dma_or_consume_its_completio
     let commands = peer.borrow().seen.clone();
     let last = old.last_report().to_vec();
     trap.set(true);
+    // The owner finds its device gone and releases the key it held, once,
+    // without hardware access.
+    assert_eq!(old.poll_hid().inputs, [key(4, false)]);
     assert!(old.poll_hid().inputs.is_empty());
     assert!(old.stop_hid().is_err());
     assert!(old.restart().is_err());
@@ -349,7 +352,7 @@ fn stale_sparse_binding_cannot_touch_current_native_dma_or_consume_its_completio
     trap.set(false);
     assert_eq!(current.poll_hid().inputs, [key(4, true)]);
     old.controller = original;
-    assert_eq!(old.stop_hid().unwrap().inputs, [key(4, false)]);
+    assert!(old.stop_hid().unwrap().inputs.is_empty());
     current.stop_hid().unwrap();
 }
 

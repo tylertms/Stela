@@ -427,13 +427,17 @@ impl UsbInput {
     /// Same HID service pass, with opt-in complete hybrid frames. Use
     /// this method to consume assembled output; `poll_hid` keeps raw output.
     pub fn poll_touch_hid(&mut self) -> TouchPoll {
-        if self
-            .controller
-            .borrow()
-            .validate_device_id(self.id)
-            .is_err()
-        {
+        let gone = self.controller.borrow().validate_device_id(self.id).err();
+        if let Some(error) = gone {
             self.invalidate_touch();
+            // Linux input_disconnect_device: a device that went away, as
+            // behind a KVM switch, releases what it held, once.
+            if self.state == State::Running {
+                let (releases, events) = self.translator.release();
+                self.pending.hid.inputs.extend(releases);
+                self.pending.hid.events.extend(events);
+                self.fault(error);
+            }
         }
         let now = self.controller.borrow().clock.now_us();
         if self.state != State::Running || self.retry.is_some_and(|retry| now < retry.at_us) {
