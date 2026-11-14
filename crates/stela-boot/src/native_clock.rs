@@ -197,8 +197,7 @@ unsafe impl Cpu for RootCpu {
         self.now().unwrap_or_else(|error| self.fatal(error))
     }
     fn fatal(&self, error: WorkError) -> ! {
-        crate::output::arguments(format_args!("NATIVE CLOCK FATAL {error:?}\n"));
-        crate::output::fatal("native clock/root contract failed")
+        crate::output::fatal(format_args!("native clock/root contract failed: {error:?}"))
     }
 }
 

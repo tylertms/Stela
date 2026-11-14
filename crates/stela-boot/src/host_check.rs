@@ -207,8 +207,7 @@ pub fn boot(options: Vec<u8>) -> ! {
         // Configure it before the table owner seals its CR4 snapshot.
         interrupts::enable_avx();
         machine.active_tables = Some(paging::activate(tables).unwrap_or_else(|error| {
-            output::arguments(format_args!("native table activation refused: {error}"));
-            output::fatal("native table activation failed");
+            output::fatal(format_args!("native table activation failed: {error}"));
         }));
         asm!(
             "mov rsp, {top}",
@@ -298,8 +297,9 @@ fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
 extern "sysv64" fn run(machine: &mut Machine) -> ! {
     match machine.active_tables.as_ref() {
         Some(tables) => tables.check_current().unwrap_or_else(|error| {
-            output::arguments(format_args!("activated native root refused: {error}\n"));
-            output::fatal("activated native root is unavailable");
+            output::fatal(format_args!(
+                "activated native root is unavailable: {error}"
+            ));
         }),
         None => output::fatal("actual activated native table owner is missing"),
     }

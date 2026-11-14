@@ -431,8 +431,9 @@ pub(super) fn report_source_observations<H: Host>(home: &Machine<H, Board>) {
 
 /// A PE's machine stopped, which only the home machine may: the board stops.
 fn stopped(pe: usize, stop: Stop) -> ! {
-    output::arguments(format_args!("PARALLEL PE {pe} stopped: {stop:?}\n"));
-    output::fatal("a PE on its own host core stopped")
+    output::fatal(format_args!(
+        "PE {pe} on its own host core stopped: {stop:?}"
+    ))
 }
 
 /// Each PE's counts: the home machine's own, and those every other PE's

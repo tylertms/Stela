@@ -31,8 +31,9 @@ use {
 pub fn split(partition: Box<dyn BlockDevice>) -> (Box<dyn BlockDevice>, Box<dyn BlockDevice>) {
     let (namespace, state, layout) =
         machine_state::split_device(partition).unwrap_or_else(|error| {
-            output::arguments(format_args!("MACHINE STATE refusal: {error}\n"));
-            output::fatal("the --storage partition cannot also hold the machine state")
+            output::fatal(format_args!(
+                "the --storage partition cannot also hold the machine state: {error}"
+            ))
         });
     output::arguments(format_args!(
         "MACHINE STATE in the target's last {:#x} bytes (from {:#x}); the ANS2 namespace holds \
@@ -182,8 +183,9 @@ impl HostNor {
                 .expect("the partition holds the NOR image"),
         );
         let (image, fresh) = persist::load(&mut *device).unwrap_or_else(|error| {
-            output::arguments(format_args!("NOR refusal: {error}\n"));
-            output::fatal("the NOR partition could not be loaded")
+            output::fatal(format_args!(
+                "the NOR partition could not be loaded: {error}"
+            ))
         });
         let (bank, proxy) = image
             .boot_bank()
@@ -258,10 +260,7 @@ impl HostNor {
                     }
                     None => return,
                     Some(Err(error)) => {
-                        output::arguments(format_args!(
-                            "NOR refusal: NOR partition store: {error}\n"
-                        ));
-                        output::fatal("a NOR sector could not be stored");
+                        output::fatal(format_args!("a NOR sector could not be stored: {error}"));
                     }
                     Some(Ok(_)) => self.running = None,
                 }
@@ -281,8 +280,7 @@ impl HostNor {
             match store {
                 Ok(store) => self.running = Some(store),
                 Err(error) => {
-                    output::arguments(format_args!("NOR refusal: {error}\n"));
-                    output::fatal("a NOR sector could not be stored");
+                    output::fatal(format_args!("a NOR sector could not be stored: {error}"));
                 }
             }
         }

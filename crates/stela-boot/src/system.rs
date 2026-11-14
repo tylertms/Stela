@@ -944,8 +944,9 @@ fn load(
     } {
         Ok(deliveries) => deliveries,
         Err(error) => {
-            output::arguments(format_args!("NATIVE FIRMWARE INIT refused: {error:?}\n"));
-            output::fatal("firmware processor handoff refused before memory reuse");
+            output::fatal(format_args!(
+                "firmware processor handoff refused before memory reuse: {error:?}"
+            ));
         }
     };
     output::arguments(format_args!(

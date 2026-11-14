@@ -538,7 +538,7 @@ impl Prepared {
                         "STORAGE REFUSED {}:{} {error}\n",
                         target.serial, target.partition
                     ));
-                    output::fatal("storage target refused")
+                    output::fatal(format_args!("storage target refused: {error}"))
                 }
             };
             let disk = partition.disk().clone();
@@ -571,7 +571,7 @@ impl Prepared {
                         "STORAGE ERROR {}:{} {error}\n",
                         target.serial, target.partition
                     ));
-                    output::fatal("storage check failed")
+                    output::fatal(format_args!("storage check failed: {error}"))
                 }
             }
         }

@@ -45,8 +45,7 @@ pub(super) fn load(
         let loaded = match loaded {
             Ok(loaded) => loaded,
             Err(error) => {
-                output::arguments(format_args!("bundle refusal: {error}\n"));
-                output::fatal("the boot bundle could not be loaded")
+                output::fatal(format_args!("the boot bundle could not be loaded: {error}"))
             }
         };
         output::arguments(format_args!(

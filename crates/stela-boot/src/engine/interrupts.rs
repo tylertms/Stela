@@ -443,8 +443,9 @@ pub(crate) unsafe fn install_on(tables: &'static mut Tables, handler: Handler) {
     // SAFETY: install_on owns this CPU and permanently pinned Tables,
     // including both distinct IST arrays, before HostOwner or AP READY.
     let owner = unsafe { super::xstate::XstateOwner::capture() }.unwrap_or_else(|error| {
-        output::arguments(format_args!("native xstate entry refused: {error:?}\n"));
-        output::fatal("native IRQ state contract unavailable")
+        output::fatal(format_args!(
+            "native IRQ state contract unavailable: {error:?}"
+        ))
     });
     for stack in [&tables.fault_stack, &tables.fatal_stack] {
         let bottom = stack.as_mut_ptr().addr();

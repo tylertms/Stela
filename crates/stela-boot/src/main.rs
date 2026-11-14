@@ -333,8 +333,7 @@ fn main() -> Status {
     unsafe {
         asm!("cli", options(nomem, nostack));
         handoff.active_tables = Some(paging::activate(tables).unwrap_or_else(|error| {
-            output::arguments(format_args!("native table activation refused: {error}"));
-            output::fatal("native table activation failed");
+            output::fatal(format_args!("native table activation failed: {error}"));
         }));
         asm!(
             "mov rsp, {top}",
@@ -355,8 +354,9 @@ extern "sysv64" fn run(handoff: &mut firmware::Handoff) -> ! {
         .as_ref()
         .unwrap_or_else(|| output::fatal("actual activated native table owner is missing"));
     root.check_current().unwrap_or_else(|error| {
-        output::arguments(format_args!("activated native root refused: {error}\n"));
-        output::fatal("activated native root is unavailable");
+        output::fatal(format_args!(
+            "activated native root is unavailable: {error}"
+        ));
     });
     if let Some(storage) = handoff.storage.take() {
         storage.run(

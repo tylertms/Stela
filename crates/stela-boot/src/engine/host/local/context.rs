@@ -227,8 +227,7 @@ impl RootIdentity {
     }
 
     pub(crate) fn fatal(&self, error: WorkError) -> ! {
-        crate::output::arguments(format_args!("NATIVE ROOT FATAL {error:?}\n"));
-        crate::output::fatal("native root contract failed")
+        crate::output::fatal(format_args!("native root contract failed: {error:?}"))
     }
     pub(crate) fn root_pages(&self) -> &[u64] {
         self.roots.roots()

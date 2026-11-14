@@ -115,8 +115,9 @@ fn from_disk(
         bundle::from_disk(partition, &request, &defaults)
     };
     let files = result.unwrap_or_else(|error| {
-        output::arguments(format_args!("preboot refusal: {error}\n"));
-        output::fatal("no boot bundle could be built from the Preboot volume")
+        output::fatal(format_args!(
+            "no boot bundle could be built from the Preboot volume: {error}"
+        ))
     });
     let bytes: usize = files.iter().map(|(_, contents)| contents.len()).sum();
     crate::status::done(&format!("{} MB", bytes.div_ceil(1 << 20)));
@@ -451,8 +452,9 @@ fn open_host(
     if options.bundle || built.is_some() {
         let files = &handoff.files[..handoff.file_count];
         let manifest = bundle::manifest(files, built.as_deref()).unwrap_or_else(|error| {
-            output::arguments(format_args!("bundle refusal: {error}\n"));
-            output::fatal("the boot bundle's manifest could not be read")
+            output::fatal(format_args!(
+                "the boot bundle's manifest could not be read: {error}"
+            ))
         });
         options.development_board = manifest
             .target
@@ -551,8 +553,9 @@ fn open_storage(handoff: &'static Handoff, options: &Options, host: &mut OpenedH
         let bytes = options.storage_ram?;
         let disk = stela_drivers::block::Volatile::new("STELARAM", bytes, RAM_STORAGE_LIMIT)
             .unwrap_or_else(|error| {
-                output::arguments(format_args!("RAM storage refusal: {error}\n"));
-                output::fatal("the RAM-backed storage could not be made")
+                output::fatal(format_args!(
+                    "the RAM-backed storage could not be made: {error}"
+                ))
             });
         output::arguments(format_args!(
             "STORAGE volatile: {bytes:#x} bytes of engine memory back the ANS namespaces, \
@@ -598,8 +601,9 @@ fn open_storage(handoff: &'static Handoff, options: &Options, host: &mut OpenedH
     }
     .map(|source| {
         source.unwrap_or_else(|error| {
-            output::arguments(format_args!("restore source refusal: {error}\n"));
-            output::fatal("the restore source could not be opened")
+            output::fatal(format_args!(
+                "the restore source could not be opened: {error}"
+            ))
         })
     });
     let (backing, nor) = match backing {
@@ -684,14 +688,15 @@ fn start_processors(boot: Boot<'_>, host: &mut OpenedHost) -> Processors {
         )
     }
     .unwrap_or_else(|error| {
-        output::arguments(format_args!("native executor refusal: {error:?}\n"));
-        output::fatal("owned native AP bootstrap refused")
+        output::fatal(format_args!("owned native AP bootstrap refused: {error:?}"))
     });
     match executors.failure() {
         Some(failure) => {
             output::arguments(format_args!("NATIVE AP startup failed: {failure:?}\n"));
             if options.native_bootstrap_check || options.native_shared_check {
-                output::fatal("owned native AP bootstrap refused");
+                output::fatal(format_args!(
+                    "owned native AP bootstrap refused: {failure:?}"
+                ));
             }
             crate::status::warn(&alloc::format!(
                 "{} of {} cores started; macOS runs on {}",
@@ -1076,8 +1081,7 @@ fn model_board(
     }
     let board = source_tree.map(|tree| {
         board::board(tree).unwrap_or_else(|error| {
-            output::arguments(format_args!("board refusal: {error}\n"));
-            output::fatal("the board could not be modeled")
+            output::fatal(format_args!("the board could not be modeled: {error}"))
         })
     });
     let boot_processor = match board.as_ref() {
@@ -1258,8 +1262,9 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
         // The workers are held for good, and their cores run PEs instead.
         // SAFETY: as for `run_serialized` below.
         if let Err(stop) = unsafe { machine.hold_serialized() } {
-            output::arguments(format_args!("PARALLEL refused: {stop:?}\n"));
-            output::fatal("the serial workers could not be held");
+            output::fatal(format_args!(
+                "the serial workers could not be held: {stop:?}"
+            ));
         }
         machine
             .enter_parallel(hub)
@@ -1580,10 +1585,9 @@ fn place_devices(
         memory,
     ) {
         Ok(devices) => devices,
-        Err(error) => {
-            output::arguments(format_args!("device refusal: {error}\n"));
-            output::fatal("the board devices could not be placed")
-        }
+        Err(error) => output::fatal(format_args!(
+            "the board devices could not be placed: {error}"
+        )),
     };
     if let (Some(flash), Some(board)) = (&mut board_flash, board) {
         let images: Vec<_> = board
@@ -1758,8 +1762,9 @@ fn check_processors(
         }
         .unwrap_or_else(|error| output::fatal(error))
         .unwrap_or_else(|error| {
-            output::arguments(format_args!("CHECK native-shootdown FAIL {error:?}\n"));
-            output::fatal("the MMIO aperture's shootdown failed")
+            output::fatal(format_args!(
+                "the MMIO aperture's shootdown failed: {error:?}"
+            ))
         });
         output::arguments(format_args!(
             "CHECK native-shootdown PASS generation={generation} processors={} waiter=driver-lock-if0\n",
@@ -1924,8 +1929,9 @@ fn admit_board(
         let unavailable = states
             .apply_admission(tree, hidden_devices)
             .unwrap_or_else(|error| {
-                output::arguments(format_args!("PMGR admission refusal: {error}\n"));
-                output::fatal("the PMGR resource admission evidence is inconsistent")
+                output::fatal(format_args!(
+                    "the PMGR resource admission evidence is inconsistent: {error}"
+                ))
             });
         output::arguments(format_args!(
             "DEVICES pmgr unavailable-resources={unavailable}\n"
@@ -2177,10 +2183,7 @@ fn prepare_restore(
             signing_network: matches!(host_network, Some(Ok(_))),
         },
     )
-    .unwrap_or_else(|error| {
-        output::arguments(format_args!("restore preparation refusal: {error}\n"));
-        output::fatal("restore preparation failed")
-    })
+    .unwrap_or_else(|error| output::fatal(format_args!("restore preparation failed: {error}")))
 }
 
 /// The boot processor's installed host, with what the later phases need.
@@ -2385,7 +2388,7 @@ fn start_platform(
         // the entry. The sole BSP owns both resources before other devices.
         unsafe { check_audio(handoff, host_owner, source, mode) }.unwrap_or_else(|error| {
             output::arguments(format_args!("AUDIO CHECK failed: {error}\n"));
-            output::fatal("the audio check failed")
+            output::fatal(format_args!("the audio check failed: {error}"))
         });
     }
     // Without an invariant TSC the HPET is the drivers' minimum delays and
