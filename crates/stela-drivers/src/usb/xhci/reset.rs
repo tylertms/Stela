@@ -9,6 +9,8 @@ use super::*;
 pub(super) const DISABLE_SLOT: u32 = 10;
 pub(super) const PORT_STATUS_CHANGE: u32 = 34;
 const POST_RESET_US: u64 = 50_000;
+/// Linux `PORT_RESET_TRIES`: resets one port reset request may take.
+const PORT_RESET_TRIES: usize = 5;
 pub(super) const EXHAUSTED: &str = "xHCI slot budget exhausted";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,7 +152,11 @@ impl Controller {
             "observe reset device physical ancestry",
             // Preflight requires a leaf. Its device status cannot supply a
             // hub power contract; observe the root and every parent.
-            self.observe_current_ancestors_for(device.id, false),
+            if attachment.parent.is_none() {
+                self.observe_reset_root(device.id, attachment.root_port)
+            } else {
+                self.observe_current_ancestors_for(device.id, false)
+            },
         )?;
         let parent = attachment
             .parent
@@ -268,7 +274,7 @@ impl Controller {
         }
         during(
             "observe reusable root ancestry",
-            self.observe_current_ancestors_for(device.id, false),
+            self.observe_reset_root(device.id, attachment.root_port),
         )?;
         let consumer = self.slots[usize::from(device.slot)]
             .as_ref()
@@ -451,13 +457,21 @@ impl Controller {
         }
         Ok(())
     }
+    /// Linux `hub_port_reset` for a root port's device: a hot reset (PR),
+    /// or a warm reset (WPR) where the USB 3 link sits in SS.Inactive or
+    /// Compliance Mode or never trained (`hub_port_warm_reset_required`),
+    /// as a device whose link failed after it hung needs. Up to
+    /// [`PORT_RESET_TRIES`] resets run; one that ends with the link needing a
+    /// warm reset is followed by one. The port must come back enabled at the
+    /// device's speed, a USB 3 link in U0.
     pub(super) fn reset_root_device(&mut self, attachment: Attachment) -> Result<(), BlockError> {
         self.check_minimum()?;
         let port = attachment.root_port;
         self.validate_current_graph(port)?;
         let at = self.port_offset(port);
         let before = self.registers.read32(at);
-        if before & (CCS | PP) != CCS | PP {
+        let mut warm = self.warm_reset_required(port, before);
+        if before & PP == 0 || before & CCS == 0 && !warm {
             return Err(BlockError::Unsupported(
                 "USB reset root device is disconnected or unpowered",
             ));
@@ -465,15 +479,48 @@ impl Controller {
         // usb_reset_and_verify_device turns hardware LPM off first; a
         // failure is ignored, as in Linux.
         let _ = self.disable_usb2_lpm(port);
-        // Clear all prior change bits to establish a fresh PRC/event transition.
-        self.write_port(port, before & PORT_CHANGES);
-        self.drain();
-        if self.registers.read32(at) & PORT_CHANGES != 0 {
-            return Err(BlockError::Unsupported(
-                "USB reset could not acknowledge previous port changes",
-            ));
+        let superspeed = matches!(attachment.speed, SUPER_SPEED | SUPER_SPEED_PLUS);
+        for _ in 0..PORT_RESET_TRIES {
+            // Clear all prior change bits to establish a fresh PRC/event
+            // transition.
+            let current = self.registers.read32(at);
+            self.write_port(port, current & PORT_CHANGES);
+            self.drain();
+            if self.registers.read32(at) & PORT_CHANGES != 0 {
+                return Err(BlockError::Unsupported(
+                    "USB reset could not acknowledge previous port changes",
+                ));
+            }
+            self.write_port(port, if warm { WPR } else { PR });
+            let portsc = self.root_reset_done(port)?;
+            self.write_port(port, portsc & PORT_CHANGES);
+            if portsc & (CCS | PED) == CCS | PED
+                && (portsc >> PORT_SPEED_SHIFT & PORT_SPEED_FIELD) as u8 == attachment.speed
+                && (!superspeed || portsc & PLS == 0)
+            {
+                self.minimum_wait(POST_RESET_US)?;
+                self.current_port_reset(None, port)?;
+                return Ok(());
+            }
+            let needs_warm = self.warm_reset_required(port, portsc);
+            // hub_port_reset: a reset that leaves no connection ends it.
+            if portsc & CCS == 0 && !needs_warm {
+                return Err(BlockError::Unsupported(
+                    "USB root reset left the port without its device",
+                ));
+            }
+            warm |= needs_warm;
         }
-        self.write_port(port, PR);
+        Err(BlockError::Unsupported(
+            "USB root reset did not restore the original enabled link",
+        ))
+    }
+
+    /// The root port's status once the reset written to it ended: its
+    /// port status event, Port Reset clear, and Port Reset Change or Warm
+    /// Port Reset Change set.
+    fn root_reset_done(&mut self, port: u8) -> Result<u32, BlockError> {
+        let at = self.port_offset(port);
         let deadline = self.clock.deadline(PORT_RESET_US);
         let mut acknowledged_event = false;
         loop {
@@ -497,20 +544,8 @@ impl Controller {
             }
             self.publish_events();
             let portsc = self.registers.read32(at);
-            if acknowledged_event && portsc & PRC != 0 && portsc & PR == 0 {
-                if portsc & (CCS | PED) != CCS | PED
-                    || (portsc >> 10 & 15) as u8 != attachment.speed
-                    || matches!(attachment.speed, SUPER_SPEED | SUPER_SPEED_PLUS)
-                        && portsc & PLS != 0
-                {
-                    return Err(BlockError::Unsupported(
-                        "USB root reset did not restore the original enabled link",
-                    ));
-                }
-                self.write_port(port, portsc & PORT_CHANGES);
-                self.minimum_wait(POST_RESET_US)?;
-                self.current_port_reset(None, port)?;
-                return Ok(());
+            if acknowledged_event && portsc & (PRC | WRC) != 0 && portsc & PR == 0 {
+                return Ok(portsc);
             }
             if deadline.passed() {
                 return Err(BlockError::Timeout);
@@ -518,6 +553,26 @@ impl Controller {
             crate::waiting();
             core::hint::spin_loop();
         }
+    }
+
+    /// The root port a reset device is on still holds it, before its slot
+    /// is retired: its power and current as [`Self::observe_current_ancestors_for`]
+    /// reads them, or, for a USB 3 link that only a warm reset brings back,
+    /// power without over-current, as its connection and speed are unknown
+    /// until that reset.
+    fn observe_reset_root(&mut self, id: SlotId, port: u8) -> Result<(), BlockError> {
+        self.validate_current_graph(port)?;
+        let portsc = self.registers.read32(self.port_offset(port));
+        if !self.warm_reset_required(port, portsc) {
+            return self.observe_current_ancestors_for(id, false);
+        }
+        self.validate_ancestry(id)?;
+        if portsc & PP == 0 || portsc & OVER_CURRENT != 0 {
+            return Err(BlockError::Unsupported(
+                "USB root port power absent or over-current",
+            ));
+        }
+        Ok(())
     }
 }
 

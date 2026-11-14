@@ -210,3 +210,44 @@ fn a_hung_stick_behind_a_hub_is_reset_by_the_storage_service_and_found() {
         assert_eq!(read, payload);
     }
 }
+
+/// The same hung stick on a root port: its port reset reuses the old
+/// binding's storage and runs at once from the storage owner. A device
+/// whose firmware hung may drop its USB 3 link to SS.Inactive, showing a
+/// connection or not, where a hot reset cannot retrain it: as Linux's
+/// `hub_port_reset`, the reset is then a warm one, where the in-place reset
+/// refused the port and the stick was lost for the boot.
+#[test]
+fn a_hung_stick_on_a_root_port_is_reset_in_place_and_found() {
+    use crate::block::BlockDevice;
+    let _clock = crate::test_clock::virtualize();
+    for (speed, link) in [
+        (HIGH_SPEED, None),
+        (SUPER_SPEED, None),
+        (SUPER_SPEED, Some(true)),
+        (SUPER_SPEED, Some(false)),
+    ] {
+        let mut dma = TestRegion::new(1024 * 1024 * 8);
+        let (mut controller, hardware) =
+            hub::tests::controller(&mut dma, 64, BTreeMap::from([(0, Node::bot_disk(speed))]));
+        hardware.borrow_mut().root_status =
+            Some(PP | CCS | PED | u32::from(speed) << PORT_SPEED_SHIFT);
+        let mut failures = Vec::new();
+        let devices = controller.enumerate(&mut dma, &mut failures);
+        assert!(failures.is_empty(), "{failures:?}");
+        let stick = devices[0].clone();
+        let shared = Rc::new(RefCell::new(controller));
+        hardware.borrow_mut().nodes.get_mut(&0).unwrap().wedge_bot();
+        hardware.borrow_mut().wedge_drops_root_link = link;
+        let mut found = Found::default();
+        bind::bind(&shared, stick.clone(), &mut dma, &mut found);
+        assert!(!hardware.borrow().nodes[&0].bot_wedged(), "{link:?}");
+        assert_eq!(found.disks.len(), 1, "{link:?} {:?}", found.failures);
+        assert_eq!(hardware.borrow().root_status.unwrap() & PLS, 0);
+        let payload = [0x5d; 512];
+        found.disks[0].write(4, &payload).unwrap();
+        let mut read = [0; 512];
+        found.disks[0].read(4, &mut read).unwrap();
+        assert_eq!(read, payload);
+    }
+}

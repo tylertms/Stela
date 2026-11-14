@@ -389,6 +389,10 @@ pub(in super::super) struct Hardware {
     pub root_status: Option<u32>,
     /// A warm reset of the root port leaves its link untrained.
     pub root_untrainable: bool,
+    /// A wedged BOT peer on the root port drops its link to SS.Inactive,
+    /// showing a connection or not, as a device whose firmware hung may;
+    /// then only a warm reset retrains it.
+    pub wedge_drops_root_link: Option<bool>,
     pub notification_override: Option<u32>,
     pending_interrupts: BTreeMap<(u8, u8), (u64, u64, usize)>,
     /// Bulk TDs a wedged BOT peer never completes; a Stop Endpoint ends them.
@@ -431,6 +435,7 @@ impl Hardware {
             failed_configuration: None,
             root_status: None,
             root_untrainable: false,
+            wedge_drops_root_link: None,
             notification_override: None,
             pending_interrupts: BTreeMap::new(),
             withheld: BTreeMap::new(),
@@ -1026,6 +1031,16 @@ impl Hardware {
             {
                 if disk.wedged {
                     assert!(self.withheld.insert((slot, dci), trb).is_none());
+                    if self.routes[&slot] == 0
+                        && let Some(connected) = self.wedge_drops_root_link
+                        && let Some(status) = self.root_status.as_mut()
+                    {
+                        // PLS Inactive with Port Link State Change.
+                        *status = *status & !(CCS | PED | PLS)
+                            | u32::from(connected)
+                            | LINK_INACTIVE << PLS_SHIFT
+                            | 1 << 22;
+                    }
                     return;
                 }
                 disk.transfer(dci & 1 != 0, buffer, length as usize);
@@ -1152,7 +1167,11 @@ impl Registers for RegistersModel {
             let untrainable = state.root_untrainable;
             if let Some(status) = state.root_status.as_mut() {
                 *status &= !(value & PORT_CHANGES);
-                if value & PR != 0 {
+                if value & PR != 0 && *status >> PLS_SHIFT & PLS_FIELD == LINK_INACTIVE {
+                    // A hot reset cannot retrain an SS.Inactive link: it
+                    // completes with the port still disabled.
+                    *status = *status & !PR | PRC;
+                } else if value & PR != 0 {
                     // The device handshake determines speed when reset enables
                     // the port; its pre-reset speed field may be undefined.
                     *status = *status & !(PR | (PORT_SPEED_FIELD << PORT_SPEED_SHIFT))
