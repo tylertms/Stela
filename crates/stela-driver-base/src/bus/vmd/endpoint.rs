@@ -139,6 +139,11 @@ impl FirmwareBar {
         })
     }
 
+    /// The function this BAR belongs to.
+    pub fn child(&self) -> Address {
+        self.child
+    }
+
     /// Map the whole BAR uncached from the original parent reservation.
     pub fn map(&self, authority: &Authority) -> Result<Mapping, Error> {
         let physical = self.window.translate(self.bus_start, self.bytes)?;
@@ -187,15 +192,42 @@ enum Phase {
     Quarantined,
 }
 
-/// The consumed host and the selected endpoint's hierarchy, run through the
-/// endpoint driver's prepare, DMA enable/disable and release. Any failed
-/// effect quarantines it: the host and domain are then kept, never dropped.
-pub struct Endpoint<R: Registers = NativeRegisters> {
+/// The consumed host and its hierarchy, which every endpoint admitted below
+/// it shares. Any failed effect quarantines it: the host and domain are then
+/// kept, never dropped.
+struct Shared<R: Registers> {
     host: Option<Host<R>>,
     returned: Rc<RefCell<Returned<R>>>,
     hierarchy: Option<Hierarchy>,
     domain: Option<Arc<dyn DmaDomain>>,
     minimum: Option<Rc<dyn crate::bus::pci::power::Timer>>,
+    quarantined: bool,
+    retired: bool,
+}
+impl<R: Registers> Drop for Shared<R> {
+    fn drop(&mut self) {
+        if !self.retired {
+            if let Some(host) = self.host.take() {
+                core::mem::forget(host);
+            }
+            if let Some(domain) = self.domain.take() {
+                core::mem::forget(domain);
+            }
+            if let Some(minimum) = self.minimum.take() {
+                core::mem::forget(minimum);
+            }
+        }
+    }
+}
+
+/// One endpoint below an owned VMD hierarchy, run through the endpoint
+/// driver's prepare, DMA enable/disable and release. Every endpoint admitted
+/// below one host shares its hierarchy: the host retires and publishes its
+/// original owners once the last of them released.
+pub struct Endpoint<R: Registers = NativeRegisters> {
+    shared: Rc<RefCell<Shared<R>>>,
+    /// The endpoint's id in the hierarchy, once discovered or admitted.
+    id: Option<usize>,
     phase: Phase,
 }
 impl<R: Registers> Endpoint<R> {
@@ -209,27 +241,59 @@ impl<R: Registers> Endpoint<R> {
     ) -> (Self, RetiredHierarchy<R>) {
         let returned = Rc::new(RefCell::new(Returned(None)));
         let handle = RetiredHierarchy(Rc::clone(&returned));
-        let endpoint = Self {
+        let shared = Shared {
             host: Some(host),
             returned,
             hierarchy: None,
             domain: Some(domain),
             minimum: Some(minimum),
+            quarantined: false,
+            retired: false,
+        };
+        let endpoint = Self {
+            shared: Rc::new(RefCell::new(shared)),
+            id: None,
             phase: Phase::Claimed,
         };
         (endpoint, handle)
     }
 
     /// Capture the hierarchy above `bar`'s function, which must be of
-    /// `class`, refusing any foreign or active sibling. Every other function
-    /// below this host, of any class, stays stopped.
+    /// `class`, refusing any foreign or active sibling, and make that
+    /// function this endpoint. Every function no endpoint is admitted for
+    /// stays stopped. A refusal for this BAR alone leaves the host as it was
+    /// for another discovery.
     pub fn discover(&mut self, bar: &FirmwareBar, class: [u8; 3]) -> Result<(), Error> {
-        if self.phase != Phase::Claimed || self.hierarchy.is_some() {
+        let mut shared = self.shared.borrow_mut();
+        if self.phase != Phase::Claimed || self.id.is_some() || shared.hierarchy.is_some() {
             return Err(Error::ActiveChild);
         }
-        let host = self.host.as_mut().ok_or(Error::Quarantined)?;
-        self.hierarchy = Some(Hierarchy::discover(host, bar, class)?);
+        if shared.quarantined {
+            return Err(Error::Quarantined);
+        }
+        let host = shared.host.as_mut().ok_or(Error::Quarantined)?;
+        shared.hierarchy = Some(Hierarchy::discover(host, bar, class)?);
+        self.id = Some(0);
         Ok(())
+    }
+
+    /// Admit `bar`'s function, which must be of `class`, as another endpoint
+    /// of the hierarchy this one discovered, with its own lifecycle: a
+    /// second NVMe controller behind the same VMD, which Linux's VMD driver
+    /// attaches as it does the first. Nothing is written; a refusal leaves
+    /// that function stopped and this hierarchy as it was.
+    pub fn admit(&self, bar: &FirmwareBar, class: [u8; 3]) -> Result<Self, Error> {
+        let mut shared = self.shared.borrow_mut();
+        if shared.quarantined || shared.retired {
+            return Err(Error::Quarantined);
+        }
+        let hierarchy = shared.hierarchy.as_mut().ok_or(Error::ActiveChild)?;
+        let id = hierarchy.admit(bar, class)?;
+        Ok(Self {
+            shared: Rc::clone(&self.shared),
+            id: Some(id),
+            phase: Phase::Claimed,
+        })
     }
 
     fn transition(
@@ -238,18 +302,30 @@ impl<R: Registers> Endpoint<R> {
             &mut Host<R>,
             &mut Hierarchy,
             &dyn crate::bus::pci::power::Timer,
+            usize,
         ) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        if self.phase == Phase::Quarantined || self.phase == Phase::Released {
+        let mut shared = self.shared.borrow_mut();
+        if self.phase == Phase::Quarantined || self.phase == Phase::Released || shared.quarantined {
+            self.phase = Phase::Quarantined;
             return Err(Error::Quarantined);
         }
+        let id = self.id.ok_or(Error::InvalidResource)?;
+        let Shared {
+            host,
+            hierarchy,
+            minimum,
+            ..
+        } = &mut *shared;
         let result = effect(
-            self.host.as_mut().ok_or(Error::Quarantined)?,
-            self.hierarchy.as_mut().ok_or(Error::InvalidResource)?,
-            self.minimum.as_deref().ok_or(Error::Quarantined)?,
+            host.as_mut().ok_or(Error::Quarantined)?,
+            hierarchy.as_mut().ok_or(Error::InvalidResource)?,
+            minimum.as_deref().ok_or(Error::Quarantined)?,
+            id,
         );
         if result.is_err() {
             self.phase = Phase::Quarantined;
+            shared.quarantined = true;
         }
         result
     }
@@ -259,7 +335,7 @@ impl<R: Registers> Endpoint<R> {
         if self.phase != Phase::Claimed {
             return Err(Error::ActiveChild);
         }
-        self.transition(|host, hierarchy, minimum| hierarchy.prepare(host, minimum))?;
+        self.transition(|host, hierarchy, minimum, id| hierarchy.prepare(host, minimum, id))?;
         self.phase = Phase::Prepared;
         Ok(())
     }
@@ -271,12 +347,13 @@ impl<R: Registers> Endpoint<R> {
         if !matches!(self.phase, Phase::Prepared | Phase::Disabled) {
             return Err(Error::ActiveChild);
         }
-        self.transition(|host, hierarchy, _| hierarchy.enable(host))?;
+        self.transition(|host, hierarchy, _, id| hierarchy.enable(host, id))?;
         self.phase = Phase::Enabled;
         Ok(())
     }
 
-    /// Clear bus mastering along the path and read it back.
+    /// Clear bus mastering along the path, where no other endpoint still
+    /// masters through it, and read it back.
     pub fn disable_dma(&mut self) -> Result<(), Error> {
         if !matches!(
             self.phase,
@@ -284,13 +361,14 @@ impl<R: Registers> Endpoint<R> {
         ) {
             return Err(Error::Quarantined);
         }
-        self.transition(|host, hierarchy, _| hierarchy.disable(host))?;
+        self.transition(|host, hierarchy, _, id| hierarchy.disable(host, id))?;
         self.phase = Phase::Disabled;
         Ok(())
     }
 
-    /// Recheck the stopped hierarchy, stop the host and publish its original
-    /// owners to the [`RetiredHierarchy`].
+    /// Recheck the stopped hierarchy and retire this endpoint. The last
+    /// endpoint to retire stops the host and publishes its original owners
+    /// to the [`RetiredHierarchy`].
     ///
     /// # Safety
     /// The endpoint driver stopped the device, drained this same domain and
@@ -300,30 +378,55 @@ impl<R: Registers> Endpoint<R> {
         if self.phase != Phase::Disabled {
             return Err(Error::ActiveChild);
         }
-        self.transition(|host, hierarchy, _| hierarchy.recheck(host, false))?;
-        let host = self.host.take().ok_or(Error::Quarantined)?;
+        let last = {
+            let shared = self.shared.borrow();
+            let id = self.id.ok_or(Error::InvalidResource)?;
+            shared
+                .hierarchy
+                .as_ref()
+                .is_some_and(|hierarchy| hierarchy.endpoints_except(id).all(|released| released))
+        };
+        if !last {
+            self.transition(|host, hierarchy, _, id| hierarchy.retire(host, id))?;
+            self.phase = Phase::Released;
+            return Ok(());
+        }
+        self.transition(|host, hierarchy, _, _| hierarchy.recheck(host))?;
+        let mut shared = self.shared.borrow_mut();
+        let host = shared.host.take().ok_or(Error::Quarantined)?;
         self.phase = Phase::Quarantined;
+        shared.quarantined = true;
         // SAFETY: the caller stopped and drained the endpoint and retired its
-        // mappings; this polled profile has no IRQ registrations.
+        // mappings, and every other endpoint already did so and released;
+        // this polled profile has no IRQ registrations.
         let registers = unsafe { host.retire() }?;
-        self.returned.borrow_mut().0 = Some(registers);
+        shared.returned.borrow_mut().0 = Some(registers);
+        if let Some(hierarchy) = shared.hierarchy.as_mut()
+            && let Some(id) = self.id
+        {
+            hierarchy.release_last(id);
+        }
         self.phase = Phase::Released;
-        self.domain = None;
+        shared.retired = true;
+        shared.domain = None;
         Ok(())
     }
 }
 impl<R: Registers> Drop for Endpoint<R> {
     fn drop(&mut self) {
-        if self.phase != Phase::Released {
-            if let Some(host) = self.host.take() {
-                core::mem::forget(host);
+        let Ok(mut shared) = self.shared.try_borrow_mut() else {
+            return;
+        };
+        match (self.phase, self.id) {
+            // No effect was made for it: it stays a stopped function.
+            (Phase::Claimed, Some(id)) => {
+                if let Some(hierarchy) = shared.hierarchy.as_mut() {
+                    hierarchy.abandon(id);
+                }
             }
-            if let Some(domain) = self.domain.take() {
-                core::mem::forget(domain);
-            }
-            if let Some(minimum) = self.minimum.take() {
-                core::mem::forget(minimum);
-            }
+            (Phase::Claimed, None) | (Phase::Released, _) => {}
+            // An endpoint dropped mid-lifecycle keeps the whole hierarchy.
+            _ => shared.quarantined = true,
         }
     }
 }

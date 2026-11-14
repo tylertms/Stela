@@ -18,6 +18,10 @@ pub const ROOT: usize = 1 << 15;
 pub const BRIDGE: usize = 1 << 20;
 pub const NVME: usize = 2 << 20;
 pub const NVME_BASE: u64 = 0x8000_4000;
+/// A second NVMe controller's slot behind the same bridge, and its BAR0,
+/// for models that add one ([`State::second_nvme`]).
+pub const NVME2: usize = NVME + (1 << 15);
+pub const NVME2_BASE: u64 = 0x8000_8000;
 pub const COMMAND_OFFSET: usize = regs::COMMAND as usize;
 
 // The same finite counter scale as the shared independent NVMe peer. This is
@@ -138,6 +142,11 @@ impl State {
         self.set(base + 0x20, 4, 0x8000_8000);
         self.set(base + 0x24, 4, 0x0000_fff0); // Disabled prefetch window.
     }
+    /// A second NVMe controller at [`NVME2`], its BAR0 at [`NVME2_BASE`].
+    pub fn second_nvme(&mut self) {
+        self.add_function(NVME2, 0x0108_0200, 0, 0);
+        self.set(NVME2 + 0x10, 4, NVME2_BASE as u32 | 4);
+    }
 }
 pub struct Model {
     pub state: Arc<Mutex<State>>,
@@ -237,7 +246,7 @@ unsafe impl Registers for Model {
             && posted_width == width
         {
             state.pending = None;
-            if [ROOT, BRIDGE, NVME]
+            if [ROOT, BRIDGE, NVME, NVME2]
                 .into_iter()
                 .any(|base| posted == base + COMMAND_OFFSET)
                 && (state.child(posted, posted_width) | value) & u32::from(regs::COMMAND_MASTER)
@@ -246,7 +255,7 @@ unsafe impl Registers for Model {
                 state.drained = false;
             }
             let mut value = value;
-            if [ROOT, BRIDGE, NVME]
+            if [ROOT, BRIDGE, NVME, NVME2]
                 .into_iter()
                 .any(|base| posted == base + 0x84)
             {
@@ -337,4 +346,25 @@ pub fn fixture(model: Model) -> (Host<Model>, FirmwareBar) {
         })),
     };
     (host, bar)
+}
+
+/// The firmware BAR0 of the second controller [`State::second_nvme`] adds.
+pub fn second_bar(host: &Host<Model>) -> FirmwareBar {
+    FirmwareBar {
+        domain: host.domain,
+        child: Address {
+            domain: host.domain,
+            bus: 2,
+            device: 1,
+            function: 0,
+        },
+        low: NVME2_BASE as u32 | 4,
+        high: 0,
+        bus_start: NVME2_BASE,
+        bytes: 8192,
+        window: host.windows[0],
+        resource: Resource::new(Box::new(Backing {
+            owner: Arc::new(()),
+        })),
+    }
 }
