@@ -443,7 +443,10 @@ fn disabled_and_unhealthy_aps_cannot_supply_guest_capacity() {
     cores[1].flags = HEALTHY;
     cores[2].flags = ENABLED;
     assert_eq!(select(&cores), Ok(alloc::vec![0]));
+    // The health bit is advisory for the bootstrap processor alone.
     cores[0].flags = BSP | ENABLED;
+    assert_eq!(select(&cores), Ok(alloc::vec![0]));
+    cores[0].flags = BSP | HEALTHY;
     assert_eq!(select(&cores), Err(Refusal::BootstrapUnavailable));
 }
 
@@ -1039,5 +1042,62 @@ fn a_missing_floor_names_each_feature() {
         refusal(changed).refusal().to_string(),
         "this PC's CPU lacks SSE and a valid PAT setting; Stela needs an x86-64-v2 CPU (Intel Nehalem, AMD \
          Bulldozer or newer)"
+    );
+}
+
+#[test]
+fn an_unhealthy_bootstrap_processor_still_leads_and_unhealthy_aps_run_no_pe() {
+    let mut processors = [
+        processor(0, 0, 0, 0),
+        processor(1, 0, 1, 0),
+        processor(2, 0, 2, 0),
+    ];
+    processors[0].flags = BSP | ENABLED;
+    processors[2].flags = ENABLED;
+    assert_eq!(select(&processors), Ok(alloc::vec![0, 1]));
+    processors[0].flags = BSP;
+    assert_eq!(select(&processors), Err(Refusal::BootstrapUnavailable));
+}
+
+#[test]
+fn an_ap_that_cannot_be_observed_is_left_out_and_its_sibling_takes_its_place() {
+    // Two cores of two threads; the first core's second thread fails.
+    let mut processors = [
+        processor(0, 0, 0, 0),
+        processor(1, 0, 0, 1),
+        processor(2, 0, 1, 0),
+        processor(3, 0, 1, 1),
+    ];
+    processors[0].flags |= BSP;
+    let mut calls = alloc::vec::Vec::new();
+    let selected = select_observed(
+        &mut processors,
+        |slot, index, _| {
+            calls.push((slot, index));
+            Ok::<_, Refusal>(index != 2)
+        },
+        |refusal| refusal,
+    )
+    .unwrap();
+    assert_eq!(selected, [0, 3, 1]);
+    // Each processor is observed once; the one left out is unavailable now,
+    // so the inventory selects the same order again.
+    assert_eq!(calls, [(0, 0), (1, 2), (2, 1), (3, 3)]);
+    assert!(!processors[2].available());
+    assert_eq!(select(&processors), Ok(selected));
+    // The bootstrap processor cannot be left out, and errors stop.
+    let mut fresh = [processor(0, 0, 0, 0), processor(1, 0, 1, 0)];
+    fresh[0].flags |= BSP;
+    assert_eq!(
+        select_observed(&mut fresh, |_, index, _| Ok(index != 0), |refusal| refusal),
+        Err(Refusal::BootstrapUnavailable)
+    );
+    assert_eq!(
+        select_observed(
+            &mut fresh,
+            |_, _, _| Err(Refusal::InvalidAssignment),
+            |refusal| refusal
+        ),
+        Err(Refusal::InvalidAssignment)
     );
 }

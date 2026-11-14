@@ -65,8 +65,12 @@ pub struct Processor {
 }
 
 impl Processor {
+    /// Enabled, and healthy unless it is the bootstrap processor: the
+    /// processor this code runs on works, whatever its firmware health bit
+    /// says (Linux reads no health bit at all). An AP marked unhealthy, or
+    /// left out by [`select_observed`], runs no PE.
     pub fn available(self) -> bool {
-        self.flags & (ENABLED | HEALTHY) == ENABLED | HEALTHY
+        self.flags & ENABLED != 0 && self.flags & (HEALTHY | BSP) != 0
     }
 }
 
@@ -748,6 +752,41 @@ pub fn select(processors: &[Processor]) -> Result<Vec<usize>, Refusal> {
     }
     ranked.sort_by_key(|&(rank, index, location, order)| (index != bsp, rank, location, order));
     Ok(ranked.into_iter().map(|(_, index, _, _)| index).collect())
+}
+
+/// [`select`], observing each processor among the first [`MAX_CORES`] of its
+/// order once with `observe(slot, index, processor)`: `Ok(true)` keeps it,
+/// `Ok(false)` leaves that AP out (its health bit is cleared, so that it
+/// runs no PE and a later [`select`] of the same inventory agrees) and the
+/// order is taken
+/// again, observing those that moved into it. A bootstrap processor that
+/// cannot be observed, and every `Err`, refuse.
+pub fn select_observed<E>(
+    processors: &mut [Processor],
+    mut observe: impl FnMut(usize, usize, Processor) -> Result<bool, E>,
+    refused: impl Fn(Refusal) -> E,
+) -> Result<Vec<usize>, E> {
+    let mut observed = alloc::vec![false; processors.len()];
+    loop {
+        let logical = select(processors).map_err(&refused)?;
+        let mut left_out = false;
+        for (slot, &index) in logical.iter().take(MAX_CORES).enumerate() {
+            if observed[index] {
+                continue;
+            }
+            if observe(slot, index, processors[index])? {
+                observed[index] = true;
+            } else if slot == 0 {
+                return Err(refused(Refusal::BootstrapUnavailable));
+            } else {
+                processors[index].flags &= !HEALTHY;
+                left_out = true;
+            }
+        }
+        if !left_out {
+            return Ok(logical);
+        }
+    }
 }
 
 /// Distinct physical cores among the enabled, healthy logical processors.

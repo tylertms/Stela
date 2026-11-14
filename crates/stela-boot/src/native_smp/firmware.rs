@@ -60,7 +60,7 @@ impl Error {
                     "native processor topology is ambiguous: firmware marks more than one bootstrap processor"
                 }
                 topology::Refusal::BootstrapUnavailable => {
-                    "native processor topology is ambiguous: firmware marks the bootstrap processor disabled or unhealthy"
+                    "native processor topology is ambiguous: firmware marks the bootstrap processor disabled"
                 }
                 topology::Refusal::InvalidTopology => {
                     "native processor topology is ambiguous: a processor has an unknown topology version"
@@ -483,6 +483,17 @@ pub(crate) fn capture(requested: usize) -> Result<Region, Error> {
         }
         if info.is_healthy() {
             flags |= topology::HEALTHY;
+        } else if info.is_enabled() {
+            // Linux reads no health bit; Stela runs no PE on such an AP
+            // (`Processor::available`).
+            crate::output::arguments(format_args!(
+                "HOST PROCESSOR {number} {}\n",
+                if info.is_bsp() {
+                    "is the bootstrap processor and marked unhealthy by the firmware: used anyway"
+                } else {
+                    "left out: the firmware marks it unhealthy"
+                }
+            ));
         }
         let (location, thread) = if extended {
             let value = info.extended_information;
@@ -527,49 +538,54 @@ pub(crate) fn capture(requested: usize) -> Result<Region, Error> {
             processors.len()
         ));
     }
-    let logical = topology::select(&processors).map_err(Error::Topology)?;
+    let bsp = topology::select(&processors).map_err(Error::Topology)?[0];
+    if mp.who_am_i().map_err(|_| Error::WrongBootstrapProcessor)?
+        != processors[bsp].processor_number as usize
+    {
+        return Err(Error::WrongBootstrapProcessor);
+    }
+    // Each selected processor's own observation, by inventory index. An AP
+    // that does not answer, or answers with another identity, is left out
+    // with a line, as Linux carries on with an APIC ID mismatch.
+    let mut observations: Vec<Option<Snapshot>> = alloc::vec![None; processors.len()];
+    let logical = topology::select_observed(
+        &mut processors,
+        |slot, index, processor| {
+            let snapshot = if slot == 0 {
+                // SAFETY: UEFI executes the loader at CPL0 on the recorded BSP.
+                unsafe { observe() }?
+            } else {
+                match observe_one(&mp, processor) {
+                    Ok(snapshot) => snapshot,
+                    Err(reason @ (Error::SnapshotTimeout | Error::SnapshotCallback)) => {
+                        left_out(processor, reason);
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            if !snapshot.matches(processor) {
+                if slot == 0 {
+                    return Err(Error::ProcessorIdentity);
+                }
+                left_out(processor, Error::ProcessorIdentity);
+                return Ok(false);
+            }
+            observations[index] = Some(snapshot);
+            Ok(true)
+        },
+        Error::Topology,
+    )?;
     let assignable =
         topology::assignment_count(None, logical.len()).map_err(|_| Error::CoreCount)?;
     if requested == 0 || requested > assignable {
         return Err(Error::CoreCount);
     }
     let selected = &logical[..assignable];
-    if mp.who_am_i().map_err(|_| Error::WrongBootstrapProcessor)?
-        != processors[selected[0]].processor_number as usize
-    {
-        return Err(Error::WrongBootstrapProcessor);
-    }
-    let mut snapshots = Vec::with_capacity(selected.len());
-    for (slot, &index) in selected.iter().enumerate() {
-        let snapshot = if slot == 0 {
-            // SAFETY: UEFI executes the loader at CPL0 on the recorded BSP.
-            unsafe { observe() }?
-        } else {
-            let mut callback = Callback {
-                observation: UnsafeCell::new(None),
-                complete: AtomicBool::new(false),
-            };
-            mp.startup_this_ap(
-                processors[index].processor_number as usize,
-                observe_ap,
-                (&raw mut callback).cast(),
-                None,
-                Some(Duration::from_millis(500)),
-            )
-            .map_err(|_| Error::SnapshotTimeout)?;
-            if !callback.complete.load(Ordering::Acquire) {
-                return Err(Error::SnapshotCallback);
-            }
-            callback
-                .observation
-                .into_inner()
-                .ok_or(Error::SnapshotCallback)??
-        };
-        if !snapshot.matches(processors[index]) {
-            return Err(Error::ProcessorIdentity);
-        }
-        snapshots.push(snapshot);
-    }
+    let snapshots: Vec<Snapshot> = selected
+        .iter()
+        .map(|&index| observations[index].ok_or(Error::SnapshotCallback))
+        .collect::<Result<_, _>>()?;
     let pages = record_pages(processors.len()).ok_or(Error::Memory)?;
     let memory = crate::firmware::any_pages(pages).map_err(|_| Error::Memory)?;
     // SAFETY: fresh owned firmware pages; all-zero is valid for this closed
@@ -594,6 +610,43 @@ pub(crate) fn capture(requested: usize) -> Result<Region, Error> {
         physical: memory.as_ptr() as u64,
         bytes: (pages * PAGE as usize) as u64,
     })
+}
+
+/// Run Stela's observation on the AP at `processor` through MP Services,
+/// bounded at 500 ms.
+fn observe_one(mp: &MpServices, processor: Processor) -> Result<Snapshot, Error> {
+    let mut callback = Callback {
+        observation: UnsafeCell::new(None),
+        complete: AtomicBool::new(false),
+    };
+    mp.startup_this_ap(
+        processor.processor_number as usize,
+        observe_ap,
+        (&raw mut callback).cast(),
+        None,
+        Some(Duration::from_millis(500)),
+    )
+    .map_err(|_| Error::SnapshotTimeout)?;
+    if !callback.complete.load(Ordering::Acquire) {
+        return Err(Error::SnapshotCallback);
+    }
+    callback
+        .observation
+        .into_inner()
+        .ok_or(Error::SnapshotCallback)?
+}
+
+/// Report an AP left out of the PEs, once each.
+fn left_out(processor: Processor, reason: Error) {
+    crate::output::arguments(format_args!(
+        "HOST PROCESSOR {} left out: {}\n",
+        processor.processor_number,
+        match reason {
+            Error::SnapshotTimeout => "it did not run Stela's check within 500 ms",
+            Error::SnapshotCallback => "Stela's check on it did not finish",
+            _ => "its APIC ID differs from the one the firmware lists",
+        }
+    ));
 }
 
 /// Whole pages holding a record of `processors` inventory entries.
