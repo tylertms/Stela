@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 12:00:00 +0000
+Subject: [PATCH] fix(nouveau): turn the display off and free every channel
+ before GSP unloads at power-off, and unload at level 0 as upstream does on
+ removal
+
+---
+ drivers/gpu/drm/nouveau/nouveau_drm.c          | 33 +++++++++++++++++++++++++++++++++
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c  | 13 ++++++-------
+ 2 files changed, 39 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nouveau_drm.c b/drivers/gpu/drm/nouveau/nouveau_drm.c
+index 0be9cfe7c8457000615bbb16da7a76e6d440bf61..3904878fca1d8296bade3f246a3291b8cdf8dbeb 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_drm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_drm.c
+@@ -1083,6 +1083,38 @@ nouveau_pmops_resume(struct device *dev)
+ 	return ret;
+ }
+ 
++/*
++ * What nouveau_drm_device_fini() ends before GSP unloads on driver removal,
++ * in its order, without the memory teardown a power-off does not need (no
++ * buffer is evicted or freed): every display head off, then each client's
++ * channels and objects, then the kernel's channels. GSP-RM then gets the
++ * unload upstream sends on removal, a transition to level 0, with no
++ * display, channel or engine object of this driver left in use. User
++ * channels go before the kernel's, as their fence contexts use the kernel's
++ * fence state. Files still open keep their clients; nothing serves them
++ * after a power-off.
++ */
++static void
++nouveau_drm_shutdown_engines(struct nouveau_drm *drm)
++{
++	struct drm_device *dev = drm->dev;
++	struct nouveau_cli *cli;
++
++	if (dev->mode_config.num_crtc)
++		nouveau_display_fini(dev, false, false);
++
++	mutex_lock(&drm->clients_lock);
++	list_for_each_entry(cli, &drm->clients, head) {
++		mutex_lock(&cli->mutex);
++		if (cli->abi16)
++			nouveau_abi16_fini(cli->abi16);
++		mutex_unlock(&cli->mutex);
++	}
++	mutex_unlock(&drm->clients_lock);
++
++	nouveau_accel_fini(drm);
++}
++
+ static void
+ nouveau_drm_shutdown(struct pci_dev *pdev)
+ {
+@@ -1101,6 +1133,7 @@ nouveau_drm_shutdown(struct pci_dev *pdev)
+ 	 * once it has served work. Waits for GSP are short from here on.
+ 	 */
+ 	nvkm_gsp_stopping(nvxx_device(drm)->gsp);
++	nouveau_drm_shutdown_engines(drm);
+ 	nvkm_device_fini(nvxx_device(drm), NVKM_POWEROFF);
+ 	pci_disable_device(pdev);
+ }
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+index f6348e09a6e26e95b901ce397637ac0efeaf719b..5b053d3ae4cd94cac1e46543814cf1dad74ef327 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+@@ -1901,14 +1901,13 @@ r535_gsp_fini(struct nvkm_gsp *gsp, enum nvkm_suspend_state suspend)
+ 		return -ENODEV;
+ 
+ 	/*
+-	 * A power-off unloads as a PM transition to level 3, the arguments
+-	 * nouveau's shutdown sent through nouveau_do_suspend() before it
+-	 * unloaded at power-off directly; nothing is saved to resume from.
+-	 * GSP-RM never answered a level-0 unload sent with the device and its
+-	 * channels still initialised (level 0 is what upstream sends only on
+-	 * driver removal, after every engine and client is torn down).
++	 * A suspend saved GSP-RM's state above and tells it so, a transition to
++	 * level 3. A power-off saves nothing and unloads as upstream does on
++	 * driver removal, a transition to level 0, which nouveau's shutdown
++	 * sends only after its display, channels and engine objects are torn
++	 * down (nouveau_drm_shutdown_engines()).
+ 	 */
+-	ret = r535_gsp_rpc_unloading_guest_driver(gsp, true);
++	ret = r535_gsp_rpc_unloading_guest_driver(gsp, suspend);
+ 	if (WARN_ON(ret))
+ 		return ret;
+ 
