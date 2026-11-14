@@ -25,16 +25,19 @@
 //!
 //! Each device's first polling and LED failure is reported once. A device
 //! that stops is reported and dropped, so re-plugged keyboards do not pile
-//! up as stopped devices polled for the rest of the boot.
+//! up as stopped devices polled for the rest of the boot, and the guest
+//! gets a release of every key and button it held ([`HeldInputs`]).
 use super::storage::{Inputs, RestoreRoot};
 use crate::output;
 use alloc::vec::Vec;
-use stela_drivers::input::{Input, InputDevice};
+use stela_drivers::input::{HeldInputs, Input, InputDevice};
 use stela_soc::machine::AppleDevices;
 
 /// What was reported of one device, each kind once, and when it was read.
 #[derive(Clone, Copy, Default)]
 struct Reported {
+    /// The device's identity while it is read ([`HeldInputs`]).
+    id: u64,
     failed: bool,
     leds: bool,
     /// The keyboard LEDs last wanted have not reached the device yet.
@@ -111,6 +114,10 @@ pub struct HostInput {
     wanted_leds: Option<u8>,
     /// The counter at the last poll-time report.
     reported_times: u64,
+    /// What each device holds down, released when it stops.
+    held: HeldInputs,
+    /// The next device's identity.
+    next_id: u64,
 }
 
 impl HostInput {
@@ -123,13 +130,21 @@ impl HostInput {
                 "INPUT no host keyboard or pointer: the peripheral stays idle\n"
             ));
         }
+        let reported = (0..inputs.devices.len() as u64)
+            .map(|id| Reported {
+                id,
+                ..Reported::default()
+            })
+            .collect();
         Self {
-            reported: alloc::vec![Reported::default(); inputs.devices.len()],
+            next_id: inputs.devices.len() as u64,
+            reported,
             inputs,
             refused: false,
             leds: None,
             wanted_leds: None,
             reported_times: 0,
+            held: HeldInputs::new(),
         }
     }
 
@@ -138,7 +153,11 @@ impl HostInput {
         for device in devices {
             output::arguments(format_args!("INPUT host device {}\n", device.name()));
             self.inputs.devices.push(device);
-            self.reported.push(Reported::default());
+            self.reported.push(Reported {
+                id: self.next_id,
+                ..Reported::default()
+            });
+            self.next_id += 1;
         }
     }
 
@@ -249,6 +268,7 @@ impl HostInput {
                 entered = super::host::fresh_counter();
                 device.poll(&mut pending)
             };
+            self.held.polled(reported.id, &mut pending, before);
             let times = &mut reported.times;
             let (waited, took) = (
                 entered.wrapping_sub(entering),
@@ -275,7 +295,7 @@ impl HostInput {
             super::gpu::pump_posted();
         }
         if stopped {
-            self.remove_stopped();
+            self.remove_stopped(&mut pending);
         }
         if now.wrapping_sub(self.reported_times) >= super::host::COUNTER_HZ * TIMES_SECONDS {
             self.reported_times = now;
@@ -309,16 +329,19 @@ impl HostInput {
         output::arguments(format_args!("{line}\n"));
     }
 
-    /// Report and drop every device that stopped. Dropping one can stop its
-    /// transfers, so it runs in the loader's root as a poll does; a device
-    /// a busy lock keeps is dropped at a later turn, unpolled meanwhile.
-    fn remove_stopped(&mut self) {
+    /// Report and drop every device that stopped, appending to `pending` a
+    /// release of every key and button it held, at once even while a busy
+    /// lock keeps the device. Dropping one can stop its transfers, so it
+    /// runs in the loader's root as a poll does; a device a busy lock keeps
+    /// is dropped at a later turn, unpolled meanwhile.
+    fn remove_stopped(&mut self, pending: &mut Vec<Input>) {
         let mut index = 0;
         while index < self.inputs.devices.len() {
             if !self.inputs.devices[index].stopped() {
                 index += 1;
                 continue;
             }
+            self.held.stopped(self.reported[index].id, pending);
             // SAFETY: the loader root `storage::open` captured, which maps
             // this device; the processor's pinned record is active.
             let Some(root) = (unsafe { RestoreRoot::try_enter(self.inputs.root) }) else {
