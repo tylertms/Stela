@@ -7508,3 +7508,178 @@ fn enter_at_every_question_never_erases_and_a_drive_is_typed_back() {
         assert!(text.contains("--confirm-disk"), "{what}:\n{text}");
     }
 }
+
+thread_local! {
+    /// The command each `Request::dispatch` on this thread ran, in order.
+    pub(super) static DISPATCHED: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The command a user types for `action`.
+pub(super) fn command_of(action: &Action) -> &'static str {
+    match action {
+        Action::Home => "stela",
+        Action::Create => "create",
+        Action::Status => "status",
+        Action::Repair => "repair",
+        Action::UpdateStela => "update",
+        Action::UpdateOs => "update --macos",
+        Action::Uninstall => "uninstall",
+        Action::NextBoot(_) => "nvram next-boot",
+        Action::ResetNvram => "nvram reset",
+        Action::BackupState(_) => "state backup",
+        Action::RestoreState(_) => "state restore",
+        Action::BootLog => "log",
+        Action::Configure => "settings",
+        Action::HostFirmwareInstall(_) => "firmware install",
+    }
+}
+
+/// The command a choice of plain `stela`'s menu runs, by its label; `None`
+/// for Quit, which runs none.
+fn command_of_choice(label: &str) -> Option<&'static str> {
+    Some(match label {
+        "Quit" => return None,
+        "Finish it" | "Finish the create" | "Repair" => "repair",
+        label if label.starts_with("Finish the switch to macOS") => "repair",
+        "Update" => "update",
+        label if label.starts_with("Update to Stela") => "update",
+        label if label.starts_with("Use macOS") => "update --macos",
+        "Change Wi-Fi or network settings" => "settings",
+        "Check every file" | "Show status" => "status",
+        "Save the boot logs for a bug report" => "log",
+        "Start over" | "Erase it and make a new installer" => "create",
+        other => panic!("no command known for the choice {other:?}"),
+    })
+}
+
+/// Every stick state plain `stela` tells apart, each on its own computer.
+fn every_stick_state() -> Vec<(&'static str, Fixture)> {
+    let switching = || {
+        let f = made_by(Some(release::CURRENT));
+        let mut switching = record(&f);
+        switching.replacing = Some("STELA2".into());
+        record::write_record(&f.esp, &switching).unwrap();
+        f
+    };
+    let interrupted = || {
+        let mut f = fixture(64 * GIB, false);
+        add_stela(&mut f);
+        setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+        interrupt_setup(&f);
+        f
+    };
+    let damaged = || {
+        let f = made_by(Some(release::CURRENT));
+        fs::remove_file(f.esp.join(LOADER_PATH)).unwrap();
+        f
+    };
+    let unreadable = || {
+        let f = made_by(Some(release::CURRENT));
+        fs::write(f.esp.join(RECORD), "{\"kind\": ").unwrap();
+        f
+    };
+    vec![
+        ("blank", fixture(64 * GIB, false)),
+        ("Stela current", made_by(Some(release::CURRENT))),
+        ("Stela current, Online", made_online()),
+        ("older", made_by(None)),
+        ("newer", made_by(Some("99.0.0"))),
+        ("interrupted create", interrupted()),
+        ("stopped switch", switching()),
+        ("damaged", damaged()),
+        ("unreadable record", unreadable()),
+    ]
+}
+
+/// Everything on `f`'s stick and the disks it can reach.
+fn everything(f: &Fixture) -> Vec<BTreeMap<PathBuf, Vec<u8>>> {
+    let mut all = vec![snapshot(&f.esp), snapshot(&f.data)];
+    if stela_volume(f).exists() {
+        all.push(snapshot(&stela_volume(f)));
+    }
+    all
+}
+
+/// Plain `stela --dry-run` on `f`'s computer, answered by `answers` and
+/// then Enter at whatever else it asks: what it showed and the commands it
+/// ran.
+fn dry_plain_stela(f: &Fixture, answers: &[&str]) -> (String, Vec<&'static str>) {
+    let mut answers = answers.to_vec();
+    answers.extend([ui::tests::ENTER; 8]);
+    let person = ui::tests::Scripted::new(&answers);
+    let environment = Environment {
+        ui: &person,
+        builds: builds::SUPPORTED,
+        ..environment(&f.host)
+    };
+    let request = Request {
+        efi: Some(f.efi.clone()),
+        ..Request::home(command::Global {
+            dry_run: true,
+            ..command::Global::default()
+        })
+    };
+    DISPATCHED.take();
+    // A run may end in an error, such as a dry run without an image to
+    // read; it ends all the same.
+    let _ = home::run(&environment, request);
+    (person.transcript(), DISPATCHED.take())
+}
+
+#[test]
+fn every_choice_of_plain_stela_for_every_stick_state_runs_its_command_and_a_dry_run_writes_nothing()
+{
+    for (state, f) in every_stick_state() {
+        let before = everything(&f);
+        // The rows of each question: the state's first question, if it asks
+        // one, and Other choices.
+        let (shown, _) = dry_plain_stela(&f, &[]);
+        let mut walks: Vec<Vec<String>> = Vec::new();
+        if state == "blank" {
+            // A blank stick goes straight to the wizard.
+            assert!(shown.contains("? Installer"), "{state}:\n{shown}");
+            walks.push(vec!["Offline".into(), "Erase and create".into()]);
+        } else {
+            let first = last_rows(&shown);
+            assert_eq!(first.last().map(String::as_str), Some("Quit"), "{state}");
+            for row in first.iter().filter(|row| *row != "Other choices") {
+                walks.push(vec![row.clone()]);
+            }
+            if first.iter().any(|row| row == "Other choices") {
+                let (shown, _) = dry_plain_stela(&f, &["Other choices", "Quit"]);
+                for row in last_rows(&shown) {
+                    walks.push(vec!["Other choices".into(), row]);
+                }
+            }
+        }
+        assert!(walks.len() > 1 || state == "blank", "{state}: {walks:?}");
+        for walk in walks {
+            let label = walk.last().unwrap().clone();
+            let mut answers: Vec<&str> = walk.iter().map(String::as_str).collect();
+            let expected = match state {
+                "blank" => Some("create"),
+                _ => command_of_choice(&label),
+            };
+            // The wizard a choice that erases opens: to its last question,
+            // and its erase.
+            if state != "blank" && expected == Some("create") {
+                answers.extend(["Offline", "Erase and create"]);
+            }
+            let (shown, ran) = dry_plain_stela(&f, &answers);
+            assert_eq!(
+                ran.first().copied(),
+                expected,
+                "{state}, {label}: ran {ran:?}\n{shown}"
+            );
+            assert_eq!(everything(&f), before, "{state}, {label} wrote:\n{shown}");
+            assert!(f.host.erased.borrow().is_empty(), "{state}, {label}");
+            assert!(f.host.unmounted.borrow().is_empty(), "{state}, {label}");
+            assert!(
+                !Path::new(&crate::boot_log::default_output()).exists()
+                    || label != "Save the boot logs for a bug report",
+                "{state}: a dry run saved the boot logs"
+            );
+        }
+    }
+}

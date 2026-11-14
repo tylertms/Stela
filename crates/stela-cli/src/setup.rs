@@ -1231,6 +1231,8 @@ impl Request {
 
     fn dispatch(mut self, environment: &Environment<'_>) -> Result<String> {
         let action = std::mem::take(&mut self.action);
+        #[cfg(test)]
+        tests::DISPATCHED.with_borrow_mut(|done| done.push(tests::command_of(&action)));
         match action {
             Action::Create => return self.create(environment),
             Action::Status => return doctor::status(environment, &self.usb, self.full),

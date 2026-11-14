@@ -781,7 +781,7 @@ fn run_choice(
             },
         ),
         Choice::Status => perform(environment, maintenance(Action::Status)),
-        Choice::Logs => perform(environment, log_request(&volume)),
+        Choice::Logs => perform(environment, log_request(&volume, request.dry_run)),
         Choice::Erase => create(environment, request, stick),
         Choice::Other | Choice::Quit => quit(environment.ui),
     }
@@ -917,12 +917,13 @@ fn change_macos(
     )
 }
 
-/// `log` of the stick at `volume`, saved to a file in this folder.
-fn log_request(volume: &Path) -> Request {
+/// `log` of the stick at `volume`, saved to a file in this folder; shown
+/// instead in a dry run, which writes no file.
+fn log_request(volume: &Path, dry_run: bool) -> Request {
     Request {
         action: Action::BootLog,
         usb: volume.to_path_buf(),
-        output: Some(crate::boot_log::default_output()),
+        output: (!dry_run).then(crate::boot_log::default_output),
         ..Request::default()
     }
 }
