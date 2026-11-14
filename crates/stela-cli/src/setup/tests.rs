@@ -4006,11 +4006,18 @@ fn set_bundle_repair(f: &Fixture, value: &[u8]) {
     };
     let mut variables =
         Variables::parse(image.bank(image.current_bank().unwrap()).unwrap()).unwrap();
+    use stela_loader::boot_selection::{
+        BUNDLE_REPAIR, BUNDLE_REPAIR_VERSION, BUNDLE_REPAIR_VERSION_VALUE,
+    };
+    variables
+        .set(Partition::System, BUNDLE_REPAIR, value)
+        .unwrap();
+    // As this Stela's loader takes a request.
     variables
         .set(
             Partition::System,
-            stela_loader::boot_selection::BUNDLE_REPAIR,
-            value,
+            BUNDLE_REPAIR_VERSION,
+            BUNDLE_REPAIR_VERSION_VALUE,
         )
         .unwrap();
     image.save_bank(&variables.encode().unwrap()).unwrap();
@@ -4070,12 +4077,23 @@ fn repair_lets_an_automatic_metal_plugin_repair_that_did_not_help_run_again() {
         let report = rerun(&f, |c| c.action = Action::Repair).unwrap();
         assert!(!report.contains("Metal plugin"), "{report}");
     }
+    // An attempt an older Stela made names no version: the next boot
+    // repairs by itself, and repair need not ask.
+    set_bundle_repair(&f, stela_loader::boot_selection::BUNDLE_REPAIR_ATTEMPTED);
+    let mut variables = nvram(&f);
+    variables.remove(
+        stela_soc_data::nor::nvram::Partition::System,
+        stela_loader::boot_selection::BUNDLE_REPAIR_VERSION,
+    );
+    assert_eq!(Record::read(&variables), Record::Outdated);
 }
 
 #[test]
 fn repair_lets_a_chosen_disks_metal_plugin_repair_run_again_on_the_pc() {
     use stela_boot_core::bundle_repair::{self, Record};
-    use stela_loader::boot_selection::{BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED};
+    use stela_loader::boot_selection::{
+        BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED, BUNDLE_REPAIR_VERSION, BUNDLE_REPAIR_VERSION_VALUE,
+    };
     use stela_runtime::pc::machine_state;
     use stela_soc_data::nor::{CAPACITY, Image, nvram::Partition as NvramPartition};
     let mut f = fixture(64 * GIB, false);
@@ -4118,6 +4136,13 @@ fn repair_lets_a_chosen_disks_metal_plugin_repair_run_again_on_the_pc() {
             NvramPartition::System,
             BUNDLE_REPAIR,
             BUNDLE_REPAIR_ATTEMPTED,
+        )
+        .unwrap();
+    variables
+        .set(
+            NvramPartition::System,
+            BUNDLE_REPAIR_VERSION,
+            BUNDLE_REPAIR_VERSION_VALUE,
         )
         .unwrap();
     bundle_repair::store_result(&mut variables, reported).unwrap();

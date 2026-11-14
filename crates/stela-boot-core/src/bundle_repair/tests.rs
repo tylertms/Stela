@@ -1,11 +1,19 @@
 use super::*;
 use stela_soc_data::nor::nvram::empty_bank;
 
+/// NVRAM with `record`, as this Stela's loader left it.
 fn variables(record: Option<&[u8]>) -> Variables {
     let mut variables = Variables::parse(&empty_bank()).unwrap();
     if let Some(value) = record {
         variables
             .set(Partition::System, BUNDLE_REPAIR, value)
+            .unwrap();
+        variables
+            .set(
+                Partition::System,
+                BUNDLE_REPAIR_VERSION,
+                BUNDLE_REPAIR_VERSION_VALUE,
+            )
             .unwrap();
     }
     variables
@@ -729,4 +737,48 @@ fn the_stop_names_the_repairs_result_and_advice_the_cli_can_follow() {
     for reason in [silent, unread, untaken] {
         assert!(!reason.contains("--single-user"), "{reason}");
     }
+}
+
+#[test]
+fn an_attempt_another_stela_version_made_lets_this_one_repair_once() {
+    use stela_loader::boot_selection::{consume, select};
+    // 0.4.1 and older left no version; another version names its own.
+    let mut old = Variables::parse(&empty_bank()).unwrap();
+    old.set(Partition::System, BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED)
+        .unwrap();
+    let mut other = variables(Some(BUNDLE_REPAIR_RETRIED));
+    other
+        .set(Partition::System, BUNDLE_REPAIR_VERSION, b"0.0.1")
+        .unwrap();
+    for mut vars in [old, other] {
+        assert_eq!(Record::read(&vars), Record::Outdated);
+        assert_eq!(
+            decide(Report::Missing, Boot::Normal, Record::Outdated, true),
+            Decision::Repair
+        );
+        // The request, taken by this version's loader, is this version's
+        // attempt: the next missing plugin stops as usual.
+        assert!(Change::Request.apply(&mut vars).unwrap());
+        let selection = select(&vars).unwrap();
+        assert!(selection.bundle_repair);
+        consume(&mut vars, &selection).unwrap();
+        assert_eq!(Record::read(&vars), Record::Attempted);
+        assert_eq!(
+            decide(Report::Missing, Boot::Normal, Record::read(&vars), true),
+            Decision::StopMissing { attempted: true }
+        );
+        // An installed plugin forgets the version with the record.
+        assert!(Change::Forget.apply(&mut vars).unwrap());
+        assert_eq!(lookup(&vars, BUNDLE_REPAIR_VERSION), None);
+    }
+    // Without NVRAM to write, nothing can be asked for, and `stela repair`
+    // need not ask: the next boot does.
+    assert_eq!(
+        decide(Report::Missing, Boot::Normal, Record::Outdated, false),
+        Decision::StopMissing { attempted: false }
+    );
+    let mut vars = variables(None);
+    vars.set(Partition::System, BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED)
+        .unwrap();
+    assert!(!again(&mut vars).unwrap());
 }

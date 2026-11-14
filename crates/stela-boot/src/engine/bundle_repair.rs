@@ -25,13 +25,14 @@ static OUTCOME: AtomicU64 = AtomicU64::new(0);
 static REPORTED: output::Global<Option<String>> = output::Global(RefCell::new(None));
 
 const BOOTS: [Boot; 3] = [Boot::Normal, Boot::SingleUser, Boot::Repair];
-const RECORDS: [Record; 7] = [
+const RECORDS: [Record; 8] = [
     Record::None,
     Record::Pending,
     Record::Attempted,
     Record::Installed,
     Record::Retry,
     Record::Retried,
+    Record::Outdated,
     Record::Other,
 ];
 

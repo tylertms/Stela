@@ -520,6 +520,11 @@ fn metal_plugin_status(report: &mut Report, variables: &stela_soc_data::nor::nvr
             "Metal plugin",
             "the automatic repair runs at the next start",
         ),
+        Record::Outdated => report.line(
+            "Metal plugin",
+            "another Stela version's automatic repair did not install it; this version's runs \
+             at the next start",
+        ),
         Record::None => {}
     }
 }

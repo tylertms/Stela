@@ -31,7 +31,9 @@
 //! [`store_result`]). A boot that finds the plugin installed removes the
 //! record; one that finds it missing after an attempt stops ([`decide`]),
 //! naming that result ([`stop_reason`]), and `stela repair` turns the
-//! attempt back into a request ([`again`]). The manual single-user remedy
+//! attempt back into a request ([`again`]). An attempt another Stela version
+//! made ([`Record::Outdated`]) does not stop: the new version repairs once
+//! by itself, as it may carry the fix. The manual single-user remedy
 //! is no advice: the guest's console takes input only from the PC's COM1,
 //! which most PCs lack, and no `stela` command asks for that boot.
 //!
@@ -62,7 +64,8 @@ use alloc::{
 };
 use stela_loader::boot_selection::{
     BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED, BUNDLE_REPAIR_INSTALLED, BUNDLE_REPAIR_PENDING,
-    BUNDLE_REPAIR_RESULT, BUNDLE_REPAIR_RETRIED, BUNDLE_REPAIR_RETRY, lookup,
+    BUNDLE_REPAIR_RESULT, BUNDLE_REPAIR_RETRIED, BUNDLE_REPAIR_RETRY, BUNDLE_REPAIR_VERSION,
+    BUNDLE_REPAIR_VERSION_VALUE, lookup,
 };
 use stela_soc_data::nor::nvram::{Partition, Variables};
 
@@ -111,15 +114,20 @@ pub enum Record {
     Retry,
     /// The loader took [`Record::Retry`]: the second and last attempt.
     Retried,
+    /// An attempt another Stela version took, or one that names no version
+    /// as 0.4.1 and older left: this version repairs once by itself, as a
+    /// fix may have come with it.
+    Outdated,
     /// A value Stela never writes.
     Other,
 }
 
 impl Record {
     pub fn read(variables: &Variables) -> Self {
-        match lookup(variables, BUNDLE_REPAIR)
-            .map(|value| value.strip_suffix(b"\0").unwrap_or(value))
-        {
+        fn strip(value: &[u8]) -> &[u8] {
+            value.strip_suffix(b"\0").unwrap_or(value)
+        }
+        let record = match lookup(variables, BUNDLE_REPAIR).map(strip) {
             None => Self::None,
             Some(BUNDLE_REPAIR_PENDING) => Self::Pending,
             Some(BUNDLE_REPAIR_ATTEMPTED) => Self::Attempted,
@@ -127,6 +135,13 @@ impl Record {
             Some(BUNDLE_REPAIR_RETRY) => Self::Retry,
             Some(BUNDLE_REPAIR_RETRIED) => Self::Retried,
             Some(_) => Self::Other,
+        };
+        let version = lookup(variables, BUNDLE_REPAIR_VERSION).map(strip);
+        match record {
+            Self::Attempted | Self::Retried if version != Some(BUNDLE_REPAIR_VERSION_VALUE) => {
+                Self::Outdated
+            }
+            record => record,
         }
     }
 
@@ -139,6 +154,7 @@ impl Record {
             Self::Installed => "installed",
             Self::Retry => "retry",
             Self::Retried => "retried",
+            Self::Outdated => "attempted by another Stela version",
             Self::Other => "a value Stela never writes",
         }
     }
@@ -200,7 +216,7 @@ impl Change {
             Self::Forget => {
                 let mut changed = false;
                 for partition in [Partition::System, Partition::Common] {
-                    for name in [BUNDLE_REPAIR, BUNDLE_REPAIR_RESULT] {
+                    for name in [BUNDLE_REPAIR, BUNDLE_REPAIR_RESULT, BUNDLE_REPAIR_VERSION] {
                         changed |= variables.remove(partition, name).is_some();
                     }
                 }
@@ -233,7 +249,9 @@ pub fn retry(record: Record) -> Option<Change> {
 pub fn again(variables: &mut Variables) -> Result<bool, String> {
     match Record::read(variables) {
         Record::Attempted | Record::Retried | Record::Other => Change::Request.apply(variables),
-        Record::None | Record::Pending | Record::Installed | Record::Retry => Ok(false),
+        Record::None | Record::Pending | Record::Installed | Record::Retry | Record::Outdated => {
+            Ok(false)
+        }
     }
 }
 
@@ -263,12 +281,15 @@ pub fn decide(report: Report, boot: Boot, record: Record, persistent: bool) -> D
         (Report::Missing | Report::Failed, Boot::SingleUser | Boot::Repair) => Decision::Log,
         (Report::Failed, Boot::Normal) => Decision::StopFailed,
         (Report::Missing, Boot::Normal) => match record {
-            Record::None | Record::Other if persistent => Decision::Repair,
+            Record::None | Record::Other | Record::Outdated if persistent => Decision::Repair,
             // A request this boot did not take means NVRAM was not read
             // for it; another request would loop.
-            Record::None | Record::Other | Record::Pending | Record::Installed | Record::Retry => {
-                Decision::StopMissing { attempted: false }
-            }
+            Record::None
+            | Record::Other
+            | Record::Outdated
+            | Record::Pending
+            | Record::Installed
+            | Record::Retry => Decision::StopMissing { attempted: false },
             Record::Attempted | Record::Retried => Decision::StopMissing { attempted: true },
         },
     }
