@@ -820,16 +820,25 @@ fn ax179_aliases_use_shared_dma_and_quarantine() {
     }
 }
 
-/// An ASIX link through carrier, a frame each way, a lost link and its
-/// return, its calls bounded by [`ethernet::tests::stepped::Calls`]; what
-/// the device saw, apart from the control writes `ignored` keeps out.
-fn asix_link_through_loss(
-    late: bool,
-    legacy: bool,
-    ignored: impl Fn(&[u8; 8]) -> bool,
-) -> ethernet::tests::stepped::Effects {
-    use crate::net::{Link, LinkError};
-    use ethernet::tests::stepped::{Calls, effects};
+/// Bring an ASIX link's PHY up or down on the model.
+fn set_asix_link(model: &mut CancelModel, up: bool) {
+    match &mut model.asix_legacy {
+        Some(legacy) => legacy.link = up,
+        None => {
+            let status = if up { 0xa400 } else { 0 };
+            model
+                .asix
+                .as_mut()
+                .unwrap()
+                .phy
+                .insert((0, 0, 0x11), status);
+        }
+    }
+}
+
+/// An AX88179 link, or an AX88772A one when `legacy`, bound on the
+/// cancellation model, its minimum waits on the controller clock.
+pub(crate) fn asix_fixture(legacy: bool) -> ethernet::tests::stepped::Fixture {
     let mut dma = TestRegion::new(128 * 1024 * 8);
     let value = if legacy { 9 } else { 7 };
     let (mut controller, model) = unconfigured_cancellation_controller_with_configurations(
@@ -868,25 +877,27 @@ fn asix_link_through_loss(
         "{:?}",
         found.vendor_failures
     );
-    let mut link = found.vendor_links.pop().unwrap();
-    let clock = shared.borrow().clock;
+    let link = found.vendor_links.pop().unwrap();
+    ethernet::tests::stepped::Fixture::new(link, model, shared, dma, set_asix_link)
+}
+
+/// An ASIX link through carrier, a frame each way, a lost link and its
+/// return, its calls bounded by [`ethernet::tests::stepped::Calls`]; what
+/// the device saw, apart from the control writes `ignored` keeps out.
+fn asix_link_through_loss(
+    late: bool,
+    legacy: bool,
+    ignored: impl Fn(&[u8; 8]) -> bool,
+) -> ethernet::tests::stepped::Effects {
+    use crate::net::{Link, LinkError};
+    use ethernet::tests::stepped::{Calls, effects};
+    let mut fixture = asix_fixture(legacy);
+    let model = fixture.model.clone();
+    let clock = fixture.clock();
+    let link = &mut fixture.link;
     let mut calls = Calls::new(model.clone(), clock, late);
     let not_busy = |result: &Result<(), LinkError>| result != &Err(LinkError::Busy);
-    let set_link = |up: bool| {
-        let mut model = model.borrow_mut();
-        match &mut model.asix_legacy {
-            Some(legacy) => legacy.link = up,
-            None => {
-                let status = if up { 0xa400 } else { 0 };
-                model
-                    .asix
-                    .as_mut()
-                    .unwrap()
-                    .phy
-                    .insert((0, 0, 0x11), status);
-            }
-        }
-    };
+    let set_link = |up: bool| set_asix_link(&mut model.borrow_mut(), up);
 
     calls.until(|| link.carrier(), |up| *up);
     calls

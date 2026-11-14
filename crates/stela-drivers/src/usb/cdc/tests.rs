@@ -715,6 +715,8 @@ fn ecm_link_calls_never_wait_when_the_device_answers_late() {
     );
 }
 
+use crate::usb::ethernet::tests::stepped::{DEVICE_TIMEOUT_US, Sequenced};
+
 /// An ECM link bound on the cancellation model. The link drops first,
 /// while the controller and DMA it uses still live.
 struct Ecm {
@@ -743,8 +745,186 @@ fn ecm() -> Ecm {
     }
 }
 
+/// An ECM link's endpoint resets, each from the state before it.
+#[derive(Clone, Copy, Debug)]
+enum Reset {
+    /// A STALLed IN transfer's reset and halt clear.
+    Input,
+    /// A STALLed OUT transfer's reset and halt clear.
+    Output,
+    /// An OUT transfer past its deadline, cancelled.
+    Late,
+    /// A STALLed notification transfer's reset and halt clear.
+    Notify,
+}
+
 const NOTIFY: usize = 3;
 const OUTPUT: usize = 4;
+const INPUT: usize = 5;
+
+/// One endpoint reset on a fresh ECM link whose device answers late, with
+/// `fault`; every call is bounded, and the reset either ends as a healthy
+/// device lets it, the link working again, or fails.
+fn ecm_reset(reset: Reset, fault: crate::usb::ethernet::tests::stepped::Fault) -> Sequenced {
+    use crate::net::{Link, LinkError};
+    use crate::usb::ethernet::tests::stepped::{Calls, Fault};
+    let mut fixture = ecm();
+    let model = fixture.model.clone();
+    let shared = fixture.shared.clone();
+    let link = &mut fixture.link;
+    let clock = shared.borrow().clock;
+    let mut calls = Calls::new(model.clone(), clock, true);
+    let not_busy = |result: &Result<(), LinkError>| result != &Err(LinkError::Busy);
+    if !matches!(reset, Reset::Notify) {
+        assert!(calls.call(|| link.carrier()));
+    }
+    let (controls, commands) = {
+        let model = model.borrow();
+        (model.setup.len(), model.seen.len())
+    };
+    match fault {
+        Fault::Control(index) => model.borrow_mut().silence_control_from = Some(controls + index),
+        Fault::Command(kind) => model.borrow_mut().silence = Some(kind),
+        _ => {}
+    }
+    let started = clock.now_us();
+    match reset {
+        Reset::Input => {
+            model.borrow_mut().halt_transfer = Some(INPUT);
+            assert_eq!(calls.call(|| link.receive()), Ok(None));
+        }
+        Reset::Output => {
+            model.borrow_mut().halt_transfer = Some(OUTPUT);
+            assert_eq!(calls.call(|| link.transmit(&[0x5a; 60])), Ok(()));
+        }
+        Reset::Late => {
+            model.borrow_mut().silence_transfer = Some(OUTPUT);
+            assert_eq!(calls.call(|| link.transmit(&[0x5a; 60])), Ok(()));
+            calls.wait(SEND_US);
+            model.borrow_mut().silence_transfer = None;
+            assert_eq!(
+                calls.call(|| link.transmit(&[0x6a; 60])),
+                Err(LinkError::Busy)
+            );
+        }
+        Reset::Notify => {
+            model.borrow_mut().halt_transfer = Some(NOTIFY);
+            assert!(calls.call(|| link.carrier()));
+        }
+    }
+    model.borrow_mut().halt_transfer = None;
+    assert!(link.resetting.is_some(), "{reset:?} {fault:?}");
+    let mut taken = 0;
+    let ended = loop {
+        match fault {
+            Fault::Removed(at) if at == taken => {
+                let id = link.id;
+                shared.borrow_mut().device(id).unwrap().quarantine();
+            }
+            Fault::Died(at) if at == taken => model.borrow_mut().host_system_error(),
+            _ => {}
+        }
+        let result = calls.call(|| link.advance());
+        taken += 1;
+        if result != Ok(false) {
+            break result;
+        }
+        assert!(taken < 20_000, "{reset:?} {fault:?} never ended");
+    };
+    let sequenced = {
+        let model = model.borrow();
+        Sequenced {
+            controls: model.setup.len() - controls,
+            commands: model.seen[commands..].to_vec(),
+            calls: taken,
+        }
+    };
+    if let Fault::Control(_) | Fault::Command(_) = fault {
+        // The silent transfer or command failed at its own time, not before.
+        assert!(
+            clock.now_us() - started >= DEVICE_TIMEOUT_US,
+            "{reset:?} {fault:?}"
+        );
+    }
+    match fault {
+        Fault::None => {
+            assert_eq!(ended, Ok(true), "{reset:?}");
+            match reset {
+                Reset::Input => assert_eq!(link.rx_dropped(), 1),
+                Reset::Output | Reset::Late => {
+                    let failed = calls.call(|| link.transmit(&[0x7a; 60]));
+                    assert!(matches!(failed, Err(LinkError::Adapter(_))), "{failed:?}");
+                    calls
+                        .until(|| link.transmit(&[0x8a; 60]), not_busy)
+                        .unwrap();
+                }
+                Reset::Notify => {
+                    // usbnet's intr_complete: the endpoint takes the next
+                    // notification, which sets the carrier.
+                    assert!(calls.call(|| link.carrier()));
+                    assert!(link.notify_queued.is_some());
+                    model
+                        .borrow_mut()
+                        .push_event(vec![0xa1, 0, 0, 0, 0, 0, 0, 0]);
+                    assert!(!calls.call(|| link.carrier()));
+                }
+            }
+        }
+        // A controller that died at the reset's last call may let it end
+        // before the death shows; either way the link refuses frames from
+        // here on, and its carrier drops once a status read sees it.
+        Fault::Removed(_) | Fault::Died(_) => {
+            assert!(
+                ended.is_err() || matches!(fault, Fault::Died(_)),
+                "{reset:?} {fault:?}"
+            );
+            assert!(calls.call(|| link.transmit(&[0x9a; 60])).is_err());
+            assert!(calls.call(|| link.receive()).is_err());
+            calls.until(|| link.carrier(), |up| !up);
+        }
+        _ => assert!(ended.is_err(), "{reset:?} {fault:?}"),
+    }
+    {
+        let mut model = model.borrow_mut();
+        model.silence_control_from = None;
+        model.silence = None;
+    }
+    calls.answer_at_once();
+    sequenced
+}
+
+/// Each ECM endpoint reset against a device that answers late: healthy,
+/// with each of its control transfers and command types timing out in
+/// turn, and with the device taken away and the controller dying at its
+/// first, middle and last call, every call within its bound.
+#[test]
+fn ecm_endpoint_resets_end_or_fail_on_every_fault_within_each_call() {
+    use crate::usb::ethernet::tests::stepped::{Fault, during};
+    for reset in [Reset::Input, Reset::Output, Reset::Late, Reset::Notify] {
+        let healthy = ecm_reset(reset, Fault::None);
+        assert!(healthy.calls > 0, "{reset:?}");
+        // A halt clear sends CLEAR_FEATURE; every reset issues commands.
+        assert_eq!(
+            healthy.controls,
+            usize::from(!matches!(reset, Reset::Late)),
+            "{reset:?}"
+        );
+        assert!(!healthy.commands.is_empty(), "{reset:?}");
+        for index in 0..healthy.controls {
+            ecm_reset(reset, Fault::Control(index));
+        }
+        let mut kinds = healthy.commands.clone();
+        kinds.sort_unstable();
+        kinds.dedup();
+        for kind in kinds {
+            ecm_reset(reset, Fault::Command(kind));
+        }
+        for at in during(healthy.calls) {
+            ecm_reset(reset, Fault::Removed(at));
+            ecm_reset(reset, Fault::Died(at));
+        }
+    }
+}
 
 /// A STALLed OUT transfer also clears the device's halt, as usbnet's
 /// EVENT_TX_HALT does and as the vendor adapters' links do; one past its

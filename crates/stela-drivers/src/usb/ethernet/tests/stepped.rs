@@ -2,7 +2,7 @@
 //! Link calls against a device that answers late, after the call that asked
 //! returned: each call stays within its step's bound on the model clock, and
 //! the device sees what a device that answers at once sees.
-use super::super::UsbEthernet;
+use super::super::{LINK_POLL_US, TRANSMIT_US, UsbEthernet};
 use crate::bus::dma::TestRegion;
 use crate::usb::xhci::{Shared, model::CancelModel};
 use crate::{Clock, test_clock};
@@ -137,4 +137,263 @@ fn an_unplugged_adapter_stops_with_the_host_side_cancellation_alone() {
     assert!(model.active[3].is_none() && model.active[4].is_none());
     drop(model);
     assert!(fixture.link.transmit(&[0x6a; 60]).is_err());
+}
+
+/// The link's work in steps, each from the state before it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Sequence {
+    /// The first carrier check, which sets the MAC up for the link.
+    Carrier,
+    /// The lost link's check, quiesce and MAC stop.
+    LinkDown,
+    /// A STALLed receive transfer's endpoint reset and halt clear.
+    ClearInput,
+    /// A STALLed transmit transfer's endpoint reset and halt clear.
+    ClearOutput,
+    /// A transmit transfer past its deadline, cancelled.
+    CancelOutput,
+}
+
+const SEQUENCES: [Sequence; 5] = [
+    Sequence::Carrier,
+    Sequence::LinkDown,
+    Sequence::ClearInput,
+    Sequence::ClearOutput,
+    Sequence::CancelOutput,
+];
+
+/// What goes wrong in the middle of a sequence.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Fault {
+    None,
+    /// The device stops answering EP0 from the sequence's control transfer
+    /// at this index on.
+    Control(usize),
+    /// The controller never completes a command of this type.
+    Command(u32),
+    /// The adapter is unplugged before this call of the sequence.
+    Unplugged(usize),
+    /// The device is taken away, its slot retiring, before this call.
+    Removed(usize),
+    /// The controller dies before this call.
+    Died(usize),
+}
+
+/// What a sequence did: its control transfers, its commands and the calls
+/// it took.
+pub(crate) struct Sequenced {
+    pub(crate) controls: usize,
+    pub(crate) commands: Vec<u32>,
+    pub(crate) calls: usize,
+}
+
+const INPUT: usize = 3;
+const OUTPUT: usize = 4;
+/// xHCI's time for a control transfer and for a command.
+pub(crate) const DEVICE_TIMEOUT_US: u64 = 5_000_000;
+
+/// Fault calls past a sequence's start, where it is under way: the first,
+/// the middle and the last of the `calls` a healthy run took.
+pub(crate) fn during(calls: usize) -> Vec<usize> {
+    let mut at = alloc::vec![0, calls / 2, calls.saturating_sub(1)];
+    at.dedup();
+    at
+}
+
+/// One sequence on a fresh link whose device answers late, with `fault`;
+/// every call is bounded, and the link either ends the work as a healthy
+/// device lets it or closes.
+fn sequence(build: fn() -> Fixture, sequence: Sequence, fault: Fault) -> Sequenced {
+    use crate::net::{Link, LinkError};
+    let mut fixture = build();
+    let model = fixture.model.clone();
+    let clock = fixture.clock();
+    let mut calls = Calls::new(model.clone(), clock, true);
+    let link = &mut fixture.link;
+    if sequence != Sequence::Carrier {
+        calls.until(|| link.carrier(), |up| *up);
+    }
+    let (controls, commands) = {
+        let model = model.borrow();
+        (model.setup.len(), model.seen.len())
+    };
+    match fault {
+        Fault::Control(index) => model.borrow_mut().silence_control_from = Some(controls + index),
+        Fault::Command(kind) => model.borrow_mut().silence = Some(kind),
+        _ => {}
+    }
+    let started = clock.now_us();
+    match sequence {
+        Sequence::Carrier => {}
+        Sequence::LinkDown => {
+            (fixture.set_link)(&mut model.borrow_mut(), false);
+            calls.wait(LINK_POLL_US);
+        }
+        Sequence::ClearInput => {
+            model.borrow_mut().halt_transfer = Some(INPUT);
+            assert_eq!(calls.call(|| link.receive()), Ok(None));
+            model.borrow_mut().halt_transfer = None;
+        }
+        Sequence::ClearOutput => {
+            model.borrow_mut().halt_transfer = Some(OUTPUT);
+            assert_eq!(calls.call(|| link.transmit(&[0x5a; 60])), Ok(()));
+            model.borrow_mut().halt_transfer = None;
+        }
+        Sequence::CancelOutput => {
+            model.borrow_mut().silence_transfer = Some(OUTPUT);
+            assert_eq!(calls.call(|| link.transmit(&[0x5a; 60])), Ok(()));
+            calls.wait(TRANSMIT_US);
+            model.borrow_mut().silence_transfer = None;
+            // A carrier check that came due runs first; then a transmit
+            // finds the TD past its deadline and starts its cancellation.
+            for _ in 0..1_000 {
+                assert_eq!(
+                    calls.call(|| link.transmit(&[0x6a; 60])),
+                    Err(LinkError::Busy)
+                );
+                if matches!(
+                    &link.running,
+                    Some(super::super::Running {
+                        work: super::super::Work::ResetOutput,
+                        ..
+                    })
+                ) {
+                    break;
+                }
+            }
+        }
+    }
+    let mut taken = 0;
+    let ended = loop {
+        match fault {
+            Fault::Unplugged(at) if at == taken => model.borrow_mut().connected = false,
+            Fault::Removed(at) if at == taken => {
+                let id = link.id;
+                fixture.shared.borrow_mut().device(id).unwrap().quarantine();
+            }
+            Fault::Died(at) if at == taken => model.borrow_mut().host_system_error(),
+            _ => {}
+        }
+        let result = calls.call(|| link.update_carrier());
+        taken += 1;
+        if result.is_err() || link.running.is_none() {
+            break result;
+        }
+        assert!(taken < 20_000, "{sequence:?} {fault:?} never ended");
+    };
+    let sequenced = {
+        let model = model.borrow();
+        Sequenced {
+            controls: model.setup.len() - controls,
+            commands: model.seen[commands..].to_vec(),
+            calls: taken,
+        }
+    };
+    if let Fault::Control(_) | Fault::Command(_) = fault {
+        // The silent transfer or command failed at its own time, not before.
+        assert!(
+            clock.now_us() - started >= DEVICE_TIMEOUT_US,
+            "{sequence:?} {fault:?}"
+        );
+    }
+    let healthy = matches!(fault, Fault::None);
+    if healthy {
+        assert_eq!(ended, Ok(()), "{sequence:?}");
+        match sequence {
+            Sequence::Carrier => assert!(link.carrier),
+            Sequence::LinkDown => {
+                assert!(!link.carrier && !link.closed);
+                assert!(model.borrow().active[INPUT].is_none());
+            }
+            Sequence::ClearInput => assert_eq!(link.rx_dropped(), 1),
+            Sequence::ClearOutput | Sequence::CancelOutput => {
+                // The failure is reported once, after any carrier check
+                // that came due meanwhile, then frames go out again.
+                let not_busy = |result: &Result<(), LinkError>| result != &Err(LinkError::Busy);
+                let failed = calls.until(|| link.transmit(&[0x7a; 60]), not_busy);
+                assert!(matches!(failed, Err(LinkError::Adapter(_))), "{failed:?}");
+                calls
+                    .until(|| link.transmit(&[0x8a; 60]), not_busy)
+                    .unwrap();
+            }
+        }
+    } else {
+        // The work ended in failure, or, for a controller that died at its
+        // last call, ended before the death showed: either way the link is
+        // down and refuses frames from here on.
+        assert!(
+            ended.is_err() || matches!(fault, Fault::Died(_)),
+            "{sequence:?} {fault:?}"
+        );
+        assert!(!calls.call(|| link.carrier()), "{sequence:?} {fault:?}");
+        let refused = calls.call(|| link.transmit(&[0x9a; 60]));
+        assert!(
+            matches!(refused, Err(LinkError::Adapter(_))),
+            "{sequence:?} {fault:?} {refused:?}"
+        );
+        assert!(calls.call(|| link.receive()).is_err());
+    }
+    {
+        let mut model = model.borrow_mut();
+        model.silence_control_from = None;
+        model.silence = None;
+    }
+    calls.answer_at_once();
+    if let Fault::Unplugged(_) = fault {
+        // An unplugged adapter's stop is the host side's cancellation
+        // alone, within a call's bound.
+        assert_eq!(calls.call(|| link.stop()), Ok(()));
+        assert!(model.borrow().active[INPUT].is_none());
+        assert!(model.borrow().active[OUTPUT].is_none());
+    }
+    sequenced
+}
+
+/// Every sequence of the link `build` makes against a device that answers
+/// late: healthy, with each of its control transfers and command types
+/// timing out in turn, and with the adapter unplugged, the device taken
+/// away and the controller dying at its first, middle and last call.
+pub(crate) fn every_fault(build: fn() -> Fixture) {
+    for each in SEQUENCES {
+        let healthy = sequence(build, each, Fault::None);
+        assert!(healthy.calls > 0, "{each:?}");
+        // Each sequence's faults are its own transfers and commands, with
+        // any carrier check that comes due meanwhile.
+        let (controls, commands) = match each {
+            Sequence::Carrier => (true, false),
+            Sequence::LinkDown | Sequence::ClearInput | Sequence::ClearOutput => (true, true),
+            Sequence::CancelOutput => (false, true),
+        };
+        assert!(!controls || healthy.controls > 0, "{each:?}");
+        assert!(!commands || !healthy.commands.is_empty(), "{each:?}");
+        for index in 0..healthy.controls {
+            sequence(build, each, Fault::Control(index));
+        }
+        let mut kinds = healthy.commands.clone();
+        kinds.sort_unstable();
+        kinds.dedup();
+        for kind in kinds {
+            sequence(build, each, Fault::Command(kind));
+        }
+        for at in during(healthy.calls) {
+            sequence(build, each, Fault::Unplugged(at));
+            sequence(build, each, Fault::Removed(at));
+            sequence(build, each, Fault::Died(at));
+        }
+    }
+}
+
+#[test]
+fn rtl8152_sequences_end_or_close_on_every_fault_within_each_call() {
+    every_fault(super::super::rtl815x::tests::rtl8152_fixture);
+}
+
+#[test]
+fn ax88179_sequences_end_or_close_on_every_fault_within_each_call() {
+    every_fault(|| super::super::asix::tests::asix_fixture(false));
+}
+
+#[test]
+fn ax88772_sequences_end_or_close_on_every_fault_within_each_call() {
+    every_fault(|| super::super::asix::tests::asix_fixture(true));
 }

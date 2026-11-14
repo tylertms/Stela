@@ -421,4 +421,4 @@ impl<C: Control> Device<C> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

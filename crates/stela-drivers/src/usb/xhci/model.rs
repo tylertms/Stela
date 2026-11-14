@@ -381,6 +381,9 @@ pub(crate) struct CancelModel {
     pub(crate) control_replies: alloc::collections::VecDeque<([u8; 8], Vec<u8>)>,
     pub(crate) stall_control: Option<u8>,
     pub(crate) silence_control: Option<u8>,
+    /// The device stops answering EP0 from the control transfer at this
+    /// index of [`Self::setup`] on, though it still takes each request.
+    pub(crate) silence_control_from: Option<usize>,
     pub(crate) short_bulk_out: bool,
     pub(crate) ethernet: Option<ethernet::rtl815x::tests::Model>,
     pub(crate) ethernet_upload: Option<ethernet::rtl815x::FirmwareModel>,
@@ -429,6 +432,10 @@ impl CancelModel {
                 .write_volatile(1 << 24 | u32::from(dci) << 16 | kind << 10 | cycle);
         }
         self.event_index += 1;
+    }
+    /// The controller reports a Host System Error from here on.
+    pub(crate) fn host_system_error(&mut self) {
+        self.fatal_status = HSE;
     }
     /// Post the events held while [`Self::late`].
     pub(crate) fn release(&mut self) {
@@ -780,7 +787,13 @@ impl CancelModel {
                 self.event(at, STALL, TRANSFER_EVENT, dci as u8, 0);
                 return;
             }
-            if self.silence_transfer == Some(dci) || self.silence_control == Some(request[1]) {
+            let silent_from = self
+                .silence_control_from
+                .is_some_and(|from| self.setup.len() > from);
+            if self.silence_transfer == Some(dci)
+                || self.silence_control == Some(request[1])
+                || silent_from
+            {
                 self.active[dci] = Some((at, 0, length));
             } else {
                 if received < length {
@@ -1015,6 +1028,7 @@ fn cancellation_controller_with_context(
         control_replies: Default::default(),
         stall_control: None,
         silence_control: None,
+        silence_control_from: None,
         short_bulk_out: false,
         ethernet: None,
         ethernet_upload: None,
