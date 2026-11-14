@@ -556,6 +556,9 @@ pub fn plan(
     if class[0] == 0x03 {
         return Cow::Borrowed("GPU");
     }
+    if display_audio(class, function.address, displays) {
+        return Cow::Owned(alloc::format!("unsupported: {DISPLAY_AUDIO}"));
+    }
     #[cfg(feature = "native-acpi")]
     if smbus::matches_identity(function) {
         return Cow::Borrowed("i801 SMBus");
@@ -615,17 +618,30 @@ pub fn plan(
 
 /// An HD Audio function beside a display controller's function 0 is that
 /// GPU's HDMI/DP audio, as Linux `get_bound_vga` finds it. No HDMI/DP codec
-/// profile here serves one outside the admitted identities.
-const DISPLAY_AUDIO: &str = "HDMI/DP audio controller of a GPU outside the supported HD Audio identities (its outputs carry no audio)";
+/// profile here serves one, whatever its identity.
+const DISPLAY_AUDIO: &str = "HDMI/DP audio controller of a GPU: not driven, left parked for the GPU's start (its outputs carry no audio)";
+
+/// Whether the function of `class` at `address` is the HDMI/DP audio of a
+/// GPU, given the slots whose function 0 is a display controller.
+///
+/// The scan never claims one: no driver here serves GPU audio, and a claim
+/// takes the function out of the parked fabric, where the GPU's cold start
+/// needs it for a Secondary Bus Reset of the GPU's bus (a GPU without a
+/// function-local reset on a machine without DMA translation has no other
+/// reset). That reset contains the function and parks it again, quiesced.
+fn display_audio(class: [u8; 3], address: Address, displays: &[Address]) -> bool {
+    class[..2] == [0x04, 0x03]
+        && address.function != 0
+        && displays.iter().any(|display| {
+            (display.segment, display.bus, display.device)
+                == (address.segment, address.bus, address.device)
+        })
+}
 
 /// Why no driver here takes `class` at `address`, given the slots whose
 /// function 0 is a display controller.
 fn unclaimed(class: [u8; 3], address: Address, displays: &[Address]) -> Option<&'static str> {
-    let beside_display = displays.iter().any(|display| {
-        (display.segment, display.bus, display.device)
-            == (address.segment, address.bus, address.device)
-    });
-    if class[..2] == [0x04, 0x03] && address.function != 0 && beside_display {
+    if display_audio(class, address, displays) {
         return Some(DISPLAY_AUDIO);
     }
     unsupported(class)
@@ -1727,6 +1743,12 @@ pub unsafe fn probe_observed(
             }
             if let Some(adapter) = gpu::Adapter::discover(&function) {
                 devices.gpus.push(adapter);
+                continue;
+            }
+            if display_audio(function.class, address, &displays) {
+                devices
+                    .unsupported
+                    .push((address, function.class, DISPLAY_AUDIO));
                 continue;
             }
             crate::working(&alloc::format!("PCI {address}"));
@@ -3102,6 +3124,10 @@ mod tests {
         let hdmi = identity(1, 1, 0x1234, 0x0001, 0x04_03_00);
         assert!(plan(&hdmi, &displays).starts_with("unsupported: HDMI/DP audio"));
         assert!(plan(&hdmi, &[]).starts_with("unsupported: HD Audio controller"));
+        // An admitted HD Audio identity beside a GPU is left parked too.
+        let nvidia = identity(1, 1, 0x10de, 0x22e9, 0x04_03_00);
+        assert!(plan(&nvidia, &displays).starts_with("unsupported: HDMI/DP audio"));
+        assert_eq!(plan(&nvidia, &[]), "HD Audio");
     }
 
     #[test]
@@ -3474,6 +3500,74 @@ mod tests {
         assert!(!observer.seen.is_empty() && observer.seen.iter().all(|&forwarded| forwarded));
         assert_eq!(ecam[1] & 0xffff, 0x0006);
         assert_eq!(ecam[(1 << 15) / 4 + 1] & 0xffff, 0x0006);
+    }
+
+    /// A GPU's HDMI/DP audio function is recorded as not driven and never
+    /// prepared, so it stays parked for the GPU's Secondary Bus Reset.
+    #[test]
+    fn a_gpus_audio_function_is_never_prepared() {
+        let mut ecam = alloc::vec![u32::MAX; (1 << 20) / 4];
+        // 00:00.0 a multi-function NVIDIA display controller, 00:00.1 its
+        // HD Audio function, whose identity the HD Audio driver admits.
+        for (function, id, class, header) in [
+            (0, 0x10de_2c02u32, 0x0300_0000u32, 0x0080_0000u32),
+            (1, 0x10de_22e9, 0x0403_0000, 0x0080_0000),
+        ] {
+            let start = function * 4096 / 4;
+            let page = &mut ecam[start..start + 4096 / 4];
+            page.fill(0);
+            page[0] = (id & 0xffff) << 16 | id >> 16;
+            page[2] = class;
+            page[3] = header;
+        }
+        let window = EcamWindow {
+            base: ecam.as_mut_ptr() as u64,
+            segment: 0,
+            start_bus: 0,
+            end_bus: 0,
+        };
+        let handoff = Handoff {
+            ecam: alloc::vec![window],
+            mapped: alloc::vec![window.range()],
+            dma: 0..0,
+            clock: Clock {
+                ticks_per_microsecond: 1,
+            },
+            firmware: None,
+            completion: None,
+        };
+        let services = services::tests::Refusing::minimum_only();
+        // SAFETY: no DMA pages, only the synthetic ECAM mapped, and every
+        // native grant refused.
+        let mut dma = unsafe { crate::bus::dma::RegionAllocator::new(0..0) };
+        // SAFETY: as above.
+        let devices = unsafe {
+            probe_with_provider(
+                &handoff,
+                PlatformCaptures::default(),
+                &mut dma,
+                handoff_provider(&handoff),
+                Some(&services),
+                None,
+            )
+        };
+        let audio = Address {
+            segment: 0,
+            bus: 0,
+            device: 0,
+            function: 1,
+        };
+        assert!(services.preparations.borrow().is_empty());
+        assert!(services.requests.borrow().is_empty());
+        assert!(devices.failures.iter().all(|(at, _)| *at != audio));
+        assert!(
+            devices
+                .unsupported
+                .iter()
+                .any(|&(at, _, why)| at == audio && why == DISPLAY_AUDIO),
+            "{:?}",
+            devices.unsupported
+        );
     }
 
     /// Every function a driver here claims ends its probe with a record:
