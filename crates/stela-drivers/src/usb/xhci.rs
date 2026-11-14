@@ -1244,6 +1244,9 @@ pub struct Found {
     pub controller_firmware: Option<renesas::Receipt>,
     /// How long each root port took to debounce, reset and enumerate.
     pub probes: Vec<PortProbe>,
+    /// Bulk-Only interfaces configured and waiting out their settle time,
+    /// discovered by the device start or the [`Host`] that bound them.
+    pub(crate) settling: Vec<bind::Settling>,
 }
 /// What an xHCI controller was doing when it stopped answering commands:
 /// the command left unanswered and the registers read before the halt.
@@ -1517,6 +1520,8 @@ impl Started {
         for device in &devices {
             bind_with_provider(&shared, device.clone(), dma, &mut found, firmware);
         }
+        let mut settling = core::mem::take(&mut found.settling);
+        bind::settle(&shared, &mut settling, dma, &mut found, true);
         found
             .hosts
             .push(Host::new(shared, &devices, dma, &mut found.failures));

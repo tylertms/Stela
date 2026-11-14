@@ -245,6 +245,8 @@ impl Host {
                 self.roots[usize::from(port - 1)] = c.read_suspend_port(port);
             }
         }
+        // The old generation's interfaces never settle.
+        self.settling.clear();
         let added = changes.added.devices.clone();
         self.register_hubs(&added, dma, &mut changes.added.failures);
         for device in &added {
@@ -258,6 +260,7 @@ impl Host {
         }
         self.devices.extend(added);
         self.sleep = Sleep::Awake;
+        self.settle(&mut changes, dma);
         changes
     }
 

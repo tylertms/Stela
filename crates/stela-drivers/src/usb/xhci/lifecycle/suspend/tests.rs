@@ -76,6 +76,7 @@ impl RegisterIo for Registers {
 
 #[test]
 fn usb2_root_resume_preserves_source_forty_millisecond_signal_before_u0() {
+    let _clock = crate::test_clock::virtualize();
     for speed in [HIGH_SPEED, SUPER_SPEED] {
         let mut memory = vec![0u64; 512 * 1024];
         let (mut host, devices, hardware, state, mut dma) = fixture_with_leaf_at_clock(
@@ -100,7 +101,7 @@ fn usb2_root_resume_preserves_source_forty_millisecond_signal_before_u0() {
             "{:?}",
             suspended.added.failures
         );
-        let mut resumed = host.resume(&mut dma, &crate::firmware::HandoffProvider::new(None));
+        let resumed = host.resume(&mut dma, &crate::firmware::HandoffProvider::new(None));
         assert!(
             resumed.added.failures.is_empty(),
             "{:?}",
@@ -112,6 +113,8 @@ fn usb2_root_resume_preserves_source_forty_millisecond_signal_before_u0() {
             state.borrow().resume_durations.len(),
             usize::from(speed == HIGH_SPEED)
         );
+        assert!(resumed.added.disks.is_empty());
+        let mut resumed = host.settled(&mut dma);
         assert_eq!(resumed.added.disks.len(), 1);
         let mut actual = [0; 512];
         resumed.added.disks[0].read(2, &mut actual).unwrap();
@@ -191,6 +194,7 @@ fn missing_root_u0_acknowledgement_keeps_fenced_original_consumers() {
 
 #[test]
 fn unavailable_resume_timing_keeps_private_snapshot_without_an_extra_consumer_fence() {
+    let _clock = crate::test_clock::virtualize();
     for rate in [0, u64::MAX] {
         let mut memory = vec![0u64; 512 * 1024];
         let (mut host, devices, hardware, state, mut dma) =
@@ -249,7 +253,7 @@ fn unavailable_resume_timing_keeps_private_snapshot_without_an_extra_consumer_fe
         assert_eq!(current_slots, prior_slots);
         assert_eq!(state.borrow().restore, 0);
         host.controller.borrow_mut().clock.ticks_per_microsecond = 1;
-        let mut resumed = host.resume(&mut dma, &crate::firmware::HandoffProvider::new(None));
+        let resumed = host.resume(&mut dma, &crate::firmware::HandoffProvider::new(None));
         assert!(
             resumed.added.failures.is_empty(),
             "{:?}",
@@ -257,6 +261,8 @@ fn unavailable_resume_timing_keeps_private_snapshot_without_an_extra_consumer_fe
         );
         assert!(host.sleep.awake());
         assert_eq!(state.borrow().restore, 1);
+        assert!(resumed.added.disks.is_empty());
+        let mut resumed = host.settled(&mut dma);
         assert_eq!(resumed.added.disks.len(), 1);
         let mut actual = [0; 512];
         resumed.added.disks[0].read(3, &mut actual).unwrap();
@@ -456,6 +462,7 @@ impl RawConsumer {
 
 #[test]
 fn topology_suspend_uses_real_hub_links_and_controller_save_then_fresh_owners() {
+    let _clock = crate::test_clock::virtualize();
     for speed in [HIGH_SPEED, SUPER_SPEED] {
         let mut memory = vec![0u64; 1024 * 1024];
         let (mut host, old, hardware, state, mut dma) =
@@ -531,7 +538,7 @@ fn topology_suspend_uses_real_hub_links_and_controller_save_then_fresh_owners() 
                 .devices
                 .is_empty()
         );
-        let mut added = host.resume(&mut dma, &crate::firmware::HandoffProvider::new(None));
+        let added = host.resume(&mut dma, &crate::firmware::HandoffProvider::new(None));
         assert!(
             added.added.failures.is_empty(),
             "{:?}",
@@ -545,6 +552,8 @@ fn topology_suspend_uses_real_hub_links_and_controller_save_then_fresh_owners() 
         for fresh in &added.added.devices {
             assert!(host.controller.borrow_mut().device(fresh.id).is_ok());
         }
+        assert!(added.added.storage.is_empty());
+        let mut added = host.settled(&mut dma);
         assert_eq!(added.added.storage.len(), 1);
         assert_eq!(added.added.disks.len(), 1);
         let disk = &mut added.added.disks[0];

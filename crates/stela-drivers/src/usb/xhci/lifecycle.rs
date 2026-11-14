@@ -65,6 +65,9 @@ pub struct Host {
     /// The failures the last poll found, each reported then. One that
     /// stands from poll to poll is reported once, until it changes or ends.
     standing: Vec<(String, BlockError)>,
+    /// Bound Bulk-Only interfaces waiting out their settle time, each
+    /// discovered by the first poll after it.
+    settling: Vec<bind::Settling>,
 }
 impl Host {
     /// Whether the controller stopped answering commands (Linux
@@ -124,6 +127,7 @@ impl Host {
             roots,
             sleep: suspend::Sleep::default(),
             standing: Vec::new(),
+            settling: Vec::new(),
         };
         host.register_hubs(devices, dma, failures);
         host
@@ -328,7 +332,38 @@ impl Host {
             );
         }
         self.devices.extend(added);
+        self.settle(&mut changes, dma);
         changes
+    }
+
+    /// The first poll once the Bulk-Only interfaces bound before have
+    /// settled, on a virtual clock: until then, no poll is due for them.
+    #[cfg(test)]
+    pub(crate) fn settled(&mut self, dma: &mut dyn DmaAllocator) -> Changes {
+        assert!(!self.settling.is_empty() && !self.attachment_due());
+        let clock = self.controller.borrow().clock;
+        crate::test_clock::advance(clock, bind::STORAGE_SETTLE_US);
+        assert!(self.attachment_due());
+        let changes = self.poll(dma, &crate::firmware::HandoffProvider::new(None));
+        assert!(self.settling.is_empty());
+        changes
+    }
+
+    /// Keep the interfaces this poll bound until their settle time, and
+    /// discover those whose time passed. One whose device left the
+    /// inventory, removed or reset, is dropped.
+    pub(super) fn settle(&mut self, changes: &mut Changes, dma: &mut dyn DmaAllocator) {
+        self.settling.append(&mut changes.added.settling);
+        let devices = &self.devices;
+        self.settling
+            .retain(|entry| devices.iter().any(|device| device.id == entry.id()));
+        bind::settle(
+            &self.controller,
+            &mut self.settling,
+            dma,
+            &mut changes.added,
+            false,
+        );
     }
 
     /// Service one class's `usb_queue_reset_device`. A device already gone
@@ -777,6 +812,7 @@ impl Host {
     /// disconnected, suspended ones included. No command can disable their
     /// slots, so each stays quarantined with every original allocation.
     fn hc_died(&mut self, changes: &mut Changes) {
+        self.settling.clear();
         let mut c = self.controller.borrow_mut();
         for slot in 1..c.slots.len() {
             if let Some(state) = c.slots[slot].as_mut() {
