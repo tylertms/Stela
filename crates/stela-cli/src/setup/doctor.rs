@@ -444,7 +444,7 @@ fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Re
 /// (`disk.cfg`, `SERIAL:GUID`), as `stela.efi` searches for it
 /// (`chosen_disk::Search`); `None` when the record cannot be read or this
 /// computer cannot list its disks.
-fn chosen_search(host: &dyn Host, chosen: &str) -> Option<Search> {
+fn chosen_search(host: &dyn Host, chosen: &str) -> Option<Result<String, Search>> {
     let (serial, guid) = chosen.trim().rsplit_once(':')?;
     let disks = host.disks().ok().filter(|disks| !disks.is_empty())?;
     let with_serial: Vec<_> = disks
@@ -452,12 +452,12 @@ fn chosen_search(host: &dyn Host, chosen: &str) -> Option<Search> {
         .filter(|d| host.serial(&d.identifier).ok().flatten().as_deref() == Some(serial))
         .collect();
     let disk = match with_serial[..] {
-        [] => return Some(Search::NoDisk),
+        [] => return Some(Err(Search::NoDisk)),
         [disk] => disk,
-        _ => return Some(Search::SeveralDisks),
+        _ => return Some(Err(Search::SeveralDisks)),
     };
     if disk.partitions.is_empty() {
-        return Some(Search::NoTable);
+        return Some(Err(Search::NoTable));
     }
     let matching: Vec<_> = disk
         .partitions
@@ -468,11 +468,60 @@ fn chosen_search(host: &dyn Host, chosen: &str) -> Option<Search> {
         })
         .collect();
     Some(match matching[..] {
-        [] => Search::NoPartition,
-        [partition] if partition.content == "EFI" => Search::EspPartition,
-        [_] => Search::Found,
-        _ => Search::SeveralPartitions,
+        [] => Err(Search::NoPartition),
+        [partition] if partition.content == "EFI" => Err(Search::EspPartition),
+        [partition] => Ok(partition.identifier.clone()),
+        _ => Err(Search::SeveralPartitions),
     })
+}
+
+/// The partition Install macOS chose (`EFI/stela/disk.cfg`), when it is on
+/// this computer.
+fn chosen_partition(host: &dyn Host, record: &Record) -> Option<String> {
+    let chosen = fs::read_to_string(record.esp.join("EFI/stela/disk.cfg")).ok()?;
+    chosen_search(host, &chosen)?.ok()
+}
+
+/// The machine state of `install`, which a chosen disk has only where this
+/// computer holds that disk; `None` then.
+fn install_state_area(
+    host: &dyn Host,
+    record: &Record,
+    install: &machines::Install,
+) -> Result<Option<installed::StateArea>> {
+    if !install.disk.is_chosen() {
+        return installed::state_area(host, &install.disk, None).map(Some);
+    }
+    chosen_partition(host, record)
+        .map(|partition| installed::chosen_state_area(host, &partition))
+        .transpose()
+}
+
+/// The automatic Metal plugin repair's record and the last attempt's
+/// result in `variables`, for status.
+fn metal_plugin_status(report: &mut Report, variables: &stela_soc_data::nor::nvram::Variables) {
+    use stela_boot_core::bundle_repair::{self, Record};
+    let reported = bundle_repair::result(variables);
+    match Record::read(variables) {
+        Record::Attempted | Record::Retried | Record::Other => {
+            let fix = report.fix("repair");
+            report.line(
+                "Metal plugin",
+                format!(
+                    "the automatic repair ran and did not install it; {fix} lets it run again \
+                     at the next start"
+                ),
+            );
+            if let Some(reported) = reported {
+                report.line("", format!("its boot reported: {reported}"));
+            }
+        }
+        Record::Pending | Record::Installed | Record::Retry => report.line(
+            "Metal plugin",
+            "the automatic repair runs at the next start",
+        ),
+        Record::None => {}
+    }
 }
 
 /// The partition Install macOS chose, when it chose one: one that is not
@@ -484,8 +533,19 @@ fn chosen_status(host: &dyn Host, record: &Record, report: &mut Report) {
         return;
     };
     match chosen_search(host, &chosen) {
-        Some(Search::Found) => report.line("", "the chosen disk is in this computer"),
-        Some(search) => {
+        Some(Ok(partition)) => {
+            report.line("", "the chosen disk is in this computer");
+            // Its NVRAM, for the Metal plugin repair this computer can
+            // let run again; the rest of its state is the PC's.
+            let nvram = installed::chosen_state_area(host, &partition)
+                .and_then(|area| area.read(host, 0, CAPACITY));
+            if let Ok(bytes) = nvram
+                && let state::Nvram::Valid(variables) = state::nvram(&bytes)
+            {
+                metal_plugin_status(report, &variables);
+            }
+        }
+        Some(Err(search)) => {
             if let Some(stale) = Stale::of(search) {
                 report.line(
                     "",
@@ -622,24 +682,7 @@ fn install_status(
         state::Nvram::Blank => report.line("NVRAM", "blank"),
         state::Nvram::Valid(variables) => {
             report.line("next boot", state::next_boot(&variables));
-            use stela_boot_core::bundle_repair::Record;
-            match Record::read(&variables) {
-                Record::Attempted | Record::Retried | Record::Other => {
-                    let fix = report.fix("repair");
-                    report.line(
-                        "Metal plugin",
-                        format!(
-                            "the automatic repair ran and did not install it; {fix} lets it \
-                             run again at the next start"
-                        ),
-                    )
-                }
-                Record::Pending | Record::Installed | Record::Retry => report.line(
-                    "Metal plugin",
-                    "the automatic repair runs at the next start",
-                ),
-                Record::None => {}
-            }
+            metal_plugin_status(report, &variables);
             for name in [
                 boot_selection::OTA_RESULT,
                 boot_selection::OTA_FAILURE_REASON,
@@ -1195,10 +1238,16 @@ fn repair_steps(environment: &Environment<'_>, command: &Request) -> Result<Stri
     }
     // An automatic Metal plugin repair that ran and did not install the
     // plugin runs again at the install's next start, as the stop it left
-    // asks; a PC without a serial console has no other way.
+    // asks; a PC without a serial console has no other way. A chosen disk's
+    // is reached where this computer holds that disk: the PC itself.
     let mut bundle_repairs = Vec::new();
     for install in &record.installs {
-        match installed::bundle_repair_again(environment.host, &install.disk) {
+        let again = install_state_area(environment.host, &record, install).and_then(|area| {
+            area.map(|area| installed::bundle_repair_again(environment.host, area))
+                .transpose()
+                .map(Option::flatten)
+        });
+        match again {
             Ok(Some(again)) => {
                 writeln!(
                     text,

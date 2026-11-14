@@ -922,19 +922,28 @@ impl BundleRepairAgain {
     }
 }
 
-/// What lets `disk`'s automatic Metal plugin repair run again: an attempt
-/// that did not install the plugin becomes a request for the next macOS
-/// start, as a boot that finds the plugin missing makes. None when its
-/// NVRAM holds no finished attempt, or is blank or unreadable, which
-/// status and `--initialize-nor` handle.
+/// The machine state of the partition `stela.efi`'s Install macOS chose,
+/// `identifier` on this computer: its tail, as the boot splits it
+/// (`pc::machine_state`).
+pub(super) fn chosen_state_area(host: &dyn Host, identifier: &str) -> Result<StateArea> {
+    let bytes = host.partition(identifier)?.bytes;
+    let layout = machine_state::split(bytes).map_err(|e| anyhow::anyhow!("{identifier}: {e}"))?;
+    Ok(StateArea {
+        identifier: identifier.into(),
+        offset: layout.state_offset(),
+        bytes: layout.state_bytes,
+    })
+}
+
+/// What lets the automatic Metal plugin repair of the install whose
+/// machine state is `area` run again: an attempt that did not install the
+/// plugin becomes a request for the next macOS start, as a boot that finds
+/// the plugin missing makes. None when its NVRAM holds no finished attempt,
+/// or is blank or unreadable, which status and `--initialize-nor` handle.
 pub(super) fn bundle_repair_again(
     host: &dyn Host,
-    disk: &InstalledDisk,
+    area: StateArea,
 ) -> Result<Option<BundleRepairAgain>> {
-    if disk.is_chosen() {
-        return Ok(None);
-    }
-    let area = state_area(host, disk, None)?;
     let Ok(mut image) = Image::from_bytes(area.read(host, 0, CAPACITY)?) else {
         return Ok(None);
     };

@@ -4073,6 +4073,104 @@ fn repair_lets_an_automatic_metal_plugin_repair_that_did_not_help_run_again() {
 }
 
 #[test]
+fn repair_lets_a_chosen_disks_metal_plugin_repair_run_again_on_the_pc() {
+    use stela_boot_core::bundle_repair::{self, Record};
+    use stela_loader::boot_selection::{BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED};
+    use stela_runtime::pc::machine_state;
+    use stela_soc_data::nor::{CAPACITY, Image, nvram::Partition as NvramPartition};
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    assert!(record(&f).installs[0].disk.is_chosen());
+    // The PC's partition Install macOS chose, with the machine state in its
+    // tail, as `stela log` finds it there.
+    const GUID: &str = "5e1a0000-0000-4000-8000-0000000000c1";
+    const BYTES: u64 = 64 << 20;
+    let image = f._dir.path().join("disk0s2.img");
+    fs::File::create(&image).unwrap().set_len(BYTES).unwrap();
+    f.host.serials.insert("disk0".into(), "HOSTDISK".into());
+    f.host.partitions.insert(
+        "disk0s2".into(),
+        (
+            PartitionInfo {
+                identifier: "disk0s2".into(),
+                disk: "disk0".into(),
+                guid: GUID.into(),
+                bytes: BYTES,
+                content: "Apple_APFS".into(),
+                mount: None,
+                container: None,
+            },
+            image.clone(),
+        ),
+    );
+    fs::write(
+        f.esp.join("EFI/stela/disk.cfg"),
+        format!("HOSTDISK:{GUID}\n"),
+    )
+    .unwrap();
+    let state = machine_state::split(BYTES).unwrap().state_offset() as usize;
+    let reported = "step 3 (/sbin/mount -P 2) exited with status 66";
+    let mut nor = Image::fresh();
+    let mut variables = Variables::parse(nor.bank(nor.current_bank().unwrap()).unwrap()).unwrap();
+    variables
+        .set(
+            NvramPartition::System,
+            BUNDLE_REPAIR,
+            BUNDLE_REPAIR_ATTEMPTED,
+        )
+        .unwrap();
+    bundle_repair::store_result(&mut variables, reported).unwrap();
+    nor.save_bank(&variables.encode().unwrap()).unwrap();
+    let mut bytes = fs::read(&image).unwrap();
+    bytes[state..state + CAPACITY].copy_from_slice(nor.bytes());
+    fs::write(&image, &bytes).unwrap();
+    let tail = || {
+        let bytes = fs::read(&image).unwrap()[state..state + CAPACITY].to_vec();
+        let nor = Image::from_bytes(bytes).unwrap();
+        Variables::parse(nor.bank(nor.current_bank().unwrap()).unwrap()).unwrap()
+    };
+    let status = rerun(&f, |c| c.action = Action::Status).unwrap();
+    assert!(
+        status.contains("the chosen disk is in this computer"),
+        "{status}"
+    );
+    assert!(
+        status.contains("the automatic repair ran and did not install it"),
+        "{status}"
+    );
+    assert!(
+        status.contains(&format!("its boot reported: {reported}")),
+        "{status}"
+    );
+    let report = rerun(&f, |c| c.action = Action::Repair).unwrap();
+    assert!(
+        report.contains("the automatic repair runs again at the next start"),
+        "{report}"
+    );
+    assert_eq!(Record::read(&tail()), Record::Pending);
+    // Away from the PC the chosen disk is out of reach and left alone.
+    fs::write(f.esp.join("EFI/stela/disk.cfg"), format!("GONE:{GUID}\n")).unwrap();
+    let mut variables = tail();
+    variables
+        .set(
+            NvramPartition::System,
+            BUNDLE_REPAIR,
+            BUNDLE_REPAIR_ATTEMPTED,
+        )
+        .unwrap();
+    let mut nor =
+        Image::from_bytes(fs::read(&image).unwrap()[state..state + CAPACITY].to_vec()).unwrap();
+    nor.save_bank(&variables.encode().unwrap()).unwrap();
+    let mut bytes = fs::read(&image).unwrap();
+    bytes[state..state + CAPACITY].copy_from_slice(nor.bytes());
+    fs::write(&image, &bytes).unwrap();
+    let report = rerun(&f, |c| c.action = Action::Repair).unwrap();
+    assert!(!report.contains("Metal plugin"), "{report}");
+    assert_eq!(Record::read(&tail()), Record::Attempted);
+}
+
+#[test]
 fn repair_restores_recorded_state() {
     let mut f = fixture(64 * GIB, false);
     add_installed_disk(&mut f, &[], &[]);
