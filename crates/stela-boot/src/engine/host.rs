@@ -67,7 +67,7 @@ use faults::*;
 pub(crate) use faults::{native_exception, page_fault};
 pub(crate) use signals::{
     clear_interrupted, completion_signal, device_signals, doorbell_counter, doorbells,
-    in_interrupt, interrupted, join_shootdown, ring, root_irq_active, shootdown,
+    in_interrupt, interrupted, join_shootdown, nmi, ring, root_irq_active, shootdown,
     shootdown_interrupt, signal_interrupt, sleep_for, undelivered_doorbells, wake_interrupt,
 };
 pub use signals::{spurious_interrupt, stray_interrupt, timer_interrupt};

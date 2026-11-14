@@ -301,6 +301,8 @@ impl Pe {
                 stop => stopped(pe, stop),
             }
             hub.publish(pe, machine.counts());
+            // Whether the boot processor's Linux step returns.
+            super::step_watchdog::look();
             if machine.step_timing().is_some() {
                 hub.add_system_exits(pe, &machine.take_system_exits());
                 if machine.has_hot_samples() {

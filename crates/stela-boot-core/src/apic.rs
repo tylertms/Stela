@@ -35,6 +35,7 @@ const ICR_LOW: u32 = 0x300;
 const ICR_HIGH: u32 = 0x310;
 const ICR_PENDING: u32 = 1 << 12;
 const ICR_LEVEL_ASSERT: u32 = 1 << 14;
+const ICR_NMI: u32 = 4 << 8;
 const ICR_INIT: u32 = 5 << 8;
 const ICR_STARTUP: u32 = 6 << 8;
 /// The INIT settling and STARTUP acceptance delays of the MP specification,
@@ -385,6 +386,17 @@ impl Apic {
         self.command(destination, u32::from(vector))
     }
 
+    /// Send one physical NMI, without waiting to see it delivered, as
+    /// [`Self::notify`] sends a doorbell.
+    ///
+    /// # Safety
+    /// The destination's NMI gate is live and stops or handles it. The
+    /// caller exclusively owns the local ICR with interrupts disabled.
+    pub unsafe fn notify_nmi(&self, destination: u32, tsc_hz: u64) -> Result<(), StartupError> {
+        self.wait_delivery(tsc_hz)?;
+        self.command(destination, ICR_NMI)
+    }
+
     /// Mask the legacy PICs, enable the APIC with `spurious` as its
     /// spurious vector and LINT0 masked, and measure its timer against the
     /// TSC running at `tsc_hz`, with `timer` masked. Returns the timer's
@@ -475,6 +487,14 @@ mod tests {
         assert_eq!(
             icr_write(true, 0x23, command),
             Ok(IcrWrite::X2(0x23 << 32 | u64::from(command)))
+        );
+        // An NMI: delivery mode 100b, fixed physical destination, no vector.
+        assert_eq!(
+            icr_write(false, 0x02, ICR_NMI),
+            Ok(IcrWrite::X {
+                high: 0x02 << 24,
+                low: 0x400
+            })
         );
     }
 

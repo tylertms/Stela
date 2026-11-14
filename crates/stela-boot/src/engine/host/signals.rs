@@ -138,6 +138,19 @@ pub(crate) fn ring(destination: u32) {
     }
 }
 
+/// Send an NMI to the processor whose APIC ID is `destination`, through
+/// this processor's own local APIC: the step watchdog's, to the boot
+/// processor stuck in a Linux step (`step_watchdog::look`).
+pub(crate) fn nmi(destination: u32) {
+    let state = state();
+    // SAFETY: interrupts are off in the engine, so nothing else on this
+    // processor writes its ICR meanwhile; every installed host's NMI gate
+    // stops the boot with the step watchdog's reason.
+    if unsafe { state.apic.notify_nmi(destination, state.tsc_hz) }.is_err() {
+        UNDELIVERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The doorbells left undelivered since the last call.
 pub(crate) fn undelivered_doorbells() -> u64 {
     UNDELIVERED.swap(0, core::sync::atomic::Ordering::Relaxed)

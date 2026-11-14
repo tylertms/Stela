@@ -1,7 +1,7 @@
 //! The Linux task step watchdog (`stela_boot_core::step_watchdog`) on the
 //! boot processor, while it is the only processor running: the GPU's start
 //! and every other Linux or foreground work segment before the other host
-//! processors start. A core cycle counter, armed for each segment
+//! processors start, and from the other processors once they run. A core cycle counter, armed for each segment
 //! ([`enter`]) and put back once a second at most by every step that
 //! returns (`step_counts::WATCH`), overflows only when nothing returned for
 //! the whole limit; the local APIC delivers that overflow as an NMI, whose
@@ -13,11 +13,17 @@
 //! (`step_counts`), and a second of steps one counter write; a segment
 //! costs a few model-specific register writes at its ends, before the other
 //! processors start only. Once they run ([`retire`]) the counter stays off,
-//! as `--profile` may then use it, and segments cost one load.
-use super::host::pmu;
+//! as `--profile` may then use it, and segments cost one load. The other
+//! processors then watch the boot processor's steps ([`look`]): one relaxed
+//! load between two of their guest slices while no step runs, and while
+//! one does a clock read and a compare; a step they see run for the whole
+//! limit gets the boot processor an NMI, the same terminal handler's stop.
+//! Without another processor (every PE on the boot processor) nothing
+//! watches then.
+use super::host::{self, pmu};
 use crate::output;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use stela_boot_core::step_watchdog::{self as decide, Observation};
+use stela_boot_core::step_watchdog::{self as decide, Look, Observation, Sighting};
 use stela_drivers::platform::work::step_counts::{RUNNING, WATCH};
 
 /// Which counter overflows into the NMI.
@@ -40,6 +46,17 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 static ARMED_AT: AtomicU64 = AtomicU64::new(0);
 /// The local APIC's performance counter entry before [`install`].
 static SAVED_LVT: AtomicU32 = AtomicU32::new(0);
+
+/// The boot processor's APIC ID, which the other processors' NMI goes to
+/// once they run ([`retire`]); `u32::MAX` before.
+static TARGET: AtomicU32 = AtomicU32::new(u32::MAX);
+/// The step a watcher last saw (its start, 0 for none), when one first saw
+/// it, by the shared count, and one look at a time.
+static SEEN_BEGAN: AtomicU64 = AtomicU64::new(0);
+static SEEN_AT: AtomicU64 = AtomicU64::new(0);
+static LOOKING: AtomicBool = AtomicBool::new(false);
+/// The start of the step a watcher sent the NMI for; 0 while none was.
+static SENT: AtomicU64 = AtomicU64::new(0);
 
 /// What the boot is doing, for the stop's reason.
 static STAGE: AtomicPtr<&'static str> = AtomicPtr::new(core::ptr::null_mut());
@@ -197,6 +214,7 @@ fn interrupt(counter: u8) -> bool {
 /// start, with nothing else using its performance counters or its local
 /// APIC's performance counter entry.
 pub(super) unsafe fn install(tsc_hz: u64) {
+    TSC_HZ.store(tsc_hz, Ordering::Relaxed);
     let found = probe().and_then(|(counter, width)| {
         let start = decide::start_value(tsc_hz, width).ok_or("the limit does not fit its width")?;
         // A counter a hypervisor accepts but never advances raises nothing.
@@ -224,7 +242,6 @@ pub(super) unsafe fn install(tsc_hz: u64) {
             SAVED_LVT.store(apic.read(LVT_PERFORMANCE), Ordering::Relaxed);
             apic.write(LVT_PERFORMANCE, LVT_NMI);
             START.store(start, Ordering::Relaxed);
-            TSC_HZ.store(tsc_hz, Ordering::Relaxed);
             PROCESSOR.store(super::host::local::processor(), Ordering::Relaxed);
             COUNTER.store(counter, Ordering::Release);
             output::arguments(format_args!(
@@ -245,20 +262,72 @@ pub(super) unsafe fn install(tsc_hz: u64) {
     }
 }
 
-/// The other processors start: the counter goes off for good, and the APIC
-/// entry back to what it was.
+/// The other processors start, on the boot processor: the counter goes off
+/// for good, and the APIC entry back to what it was. From now on the other
+/// processors watch its steps ([`look`]), with or without a counter.
 pub(super) fn retire() {
     let counter = COUNTER.swap(NONE, Ordering::AcqRel);
-    if counter == NONE {
+    if counter != NONE {
+        WATCH.disarm();
+        ARMED.store(false, Ordering::Relaxed);
+        stop(counter);
+        apic().write(
+            LVT_PERFORMANCE,
+            SAVED_LVT.load(Ordering::Relaxed) | crate::apic::LVT_MASKED,
+        );
+    }
+    // Only after `install`: without Linux's work there is nothing to watch.
+    if TSC_HZ.load(Ordering::Relaxed) == 0 {
         return;
     }
-    WATCH.disarm();
-    ARMED.store(false, Ordering::Relaxed);
-    stop(counter);
-    apic().write(
-        LVT_PERFORMANCE,
-        SAVED_LVT.load(Ordering::Relaxed) | crate::apic::LVT_MASKED,
-    );
+    PROCESSOR.store(host::local::processor(), Ordering::Relaxed);
+    TARGET.store(apic().id(), Ordering::Release);
+    output::arguments(format_args!(
+        "STEP WATCHDOG the other processors watch the boot processor's Linux steps: one that \
+         does not return within {} s stops the boot\n",
+        decide::LIMIT_SECONDS
+    ));
+}
+
+/// Look at the boot processor's step, from another processor between two
+/// of its guest slices: send the NMI once a step has run for the whole
+/// limit by the looks' own count. Never to a boot processor that runs no
+/// step, as one running guest code or parked does not.
+pub(super) fn look() {
+    let began = RUNNING.began.load(Ordering::Relaxed);
+    if began == 0 {
+        return;
+    }
+    let target = TARGET.load(Ordering::Acquire);
+    if target == u32::MAX || LOOKING.swap(true, Ordering::Acquire) {
+        return;
+    }
+    let last = match SEEN_BEGAN.load(Ordering::Relaxed) {
+        0 => None,
+        began => Some(Sighting {
+            began,
+            seen_at: SEEN_AT.load(Ordering::Relaxed),
+        }),
+    };
+    match decide::look(last, began, host::fresh_counter(), host::COUNTER_HZ) {
+        Look::New(sighting) => {
+            SEEN_AT.store(sighting.seen_at, Ordering::Relaxed);
+            SEEN_BEGAN.store(sighting.began, Ordering::Relaxed);
+        }
+        Look::Overdue { .. } => {
+            // One NMI, for the first step found stuck: its handler stops
+            // the boot. Nothing printed here: the stuck processor may hold
+            // the output.
+            if SENT
+                .compare_exchange(0, began, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                host::nmi(target);
+            }
+        }
+        Look::Idle | Look::Running => {}
+    }
+    LOOKING.store(false, Ordering::Release);
 }
 
 /// Name what the boot is doing for a stop inside the segments that follow.
@@ -346,7 +415,7 @@ pub(super) fn nmi_reason() -> Option<alloc::string::String> {
     if PROCESSOR.load(Ordering::Relaxed) != super::host::local::processor() {
         return None;
     }
-    let stuck = decide::attribute(&Observation {
+    let observation = Observation {
         armed: ARMED.load(Ordering::Relaxed),
         armed_at: ARMED_AT.load(Ordering::Relaxed),
         step_began: RUNNING.began.load(Ordering::Relaxed),
@@ -354,9 +423,13 @@ pub(super) fn nmi_reason() -> Option<alloc::string::String> {
         sequence: RUNNING.sequence.load(Ordering::Relaxed),
         now: crate::apic::rdtsc(),
         tsc_hz: TSC_HZ.load(Ordering::Relaxed),
-    })?;
+    };
     let stage = STAGE.load(Ordering::Relaxed);
     // SAFETY: `stage` stores only references to statics.
     let stage = unsafe { stage.as_ref() }.copied().unwrap_or(DRIVER_WORK);
+    if let Some(caught) = decide::caught(SENT.load(Ordering::Acquire), &observation) {
+        return Some(decide::caught_message(stage, &caught));
+    }
+    let stuck = decide::attribute(&observation)?;
     Some(decide::message(stage, &stuck))
 }

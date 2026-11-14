@@ -13,6 +13,17 @@
 //! clock: [`start_value`] counts [`CLOCK_FACTOR`] times the time-stamp
 //! counter's rate, so the NMI never comes before the limit, and comes at
 //! most `CLOCK_FACTOR` times later on a core that runs at its base clock.
+//!
+//! Once the other processors run, the counter is off (`--profile` may use
+//! it) and they watch instead: each of them, between two slices of its
+//! guest code, reads which step the boot processor runs ([`look`]). A step
+//! that every look finds running for the whole limit, by the watcher's own
+//! clock (the processors' time-stamp counters may differ by seconds), is
+//! stuck: the watcher sends the boot processor an NMI, whose handler names
+//! the step ([`caught`]) with the instruction pointer it interrupted. The
+//! boot processor itself pays nothing more than the step's own stores: no
+//! NMI goes to a processor that runs no Linux step, as a guest's or a
+//! parked one does not.
 use alloc::{format, string::String};
 
 /// How long no step may return before the watchdog stops the boot: half of
@@ -117,6 +128,107 @@ pub fn attribute(observation: &Observation) -> Option<Stuck> {
     })
 }
 
+/// What the watching processors last saw of the boot processor's step: the
+/// step's own start, by the boot processor's counter, which identifies it,
+/// and when a watcher first saw it, by the watchers' shared count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sighting {
+    pub began: u64,
+    pub seen_at: u64,
+}
+
+/// What one look finds ([`look`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Look {
+    /// No step runs, or the count's rate is unknown.
+    Idle,
+    /// A step no look saw before: remember it.
+    New(Sighting),
+    /// The step the last look saw, still within the limit.
+    Running,
+    /// The step the last look saw, running for the whole limit since: send
+    /// the NMI.
+    Overdue { quiet_ms: u64 },
+}
+
+/// One watcher's look at the boot processor's step (`began`, 0 between
+/// steps) at `now` of a count at `counter_hz`, given the `last` sighting.
+/// Each step has its own start, so an unchanged one is the same step.
+pub fn look(last: Option<Sighting>, began: u64, now: u64, counter_hz: u64) -> Look {
+    if began == 0 || counter_hz == 0 {
+        return Look::Idle;
+    }
+    match last {
+        Some(last) if last.began == began => {
+            let quiet = now.saturating_sub(last.seen_at);
+            if quiet >= counter_hz.saturating_mul(LIMIT_SECONDS) {
+                Look::Overdue {
+                    quiet_ms: millis(quiet, counter_hz),
+                }
+            } else {
+                Look::Running
+            }
+        }
+        _ => Look::New(Sighting {
+            began,
+            seen_at: now,
+        }),
+    }
+}
+
+/// What the boot processor's NMI handler finds once a watcher sent the NMI
+/// for the step that began at `sent` ([`caught`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Caught {
+    /// The step still runs: it never returned.
+    Stuck(Stuck),
+    /// The step returned between the watcher's look and the NMI, after
+    /// running for the whole limit: the guest's processors waited for the
+    /// boot processor all that time, so the boot stops all the same.
+    Returned,
+}
+
+/// Whether an NMI on the boot processor is the watchers': one was sent
+/// (`sent`, the step's start, 0 when none was), and what the step running
+/// now (`observation`, read on the boot processor's own counter) says.
+pub fn caught(sent: u64, observation: &Observation) -> Option<Caught> {
+    if sent == 0 {
+        return None;
+    }
+    let Observation {
+        step_began,
+        task,
+        sequence,
+        now,
+        tsc_hz,
+        ..
+    } = *observation;
+    if step_began != sent {
+        return Some(Caught::Returned);
+    }
+    let running = millis(now.saturating_sub(step_began), tsc_hz);
+    Some(Caught::Stuck(Stuck {
+        quiet_ms: running,
+        step: Some(Step {
+            task,
+            sequence,
+            running_ms: running,
+        }),
+    }))
+}
+
+/// The stop's reason for a watchers' NMI ([`caught`]).
+pub fn caught_message(stage: &str, caught: &Caught) -> String {
+    match caught {
+        Caught::Stuck(stuck) => message(stage, stuck),
+        Caught::Returned => format!(
+            "a Linux task step ran past {LIMIT_SECONDS} s ({stage}) and returned only as the \
+             step watchdog's NMI came, the guest's processors waiting for this one all that \
+             time; the step watchdog stopped it"
+        ),
+    }
+}
+
 /// The stop's reason, before the handler's instruction pointer and stack:
 /// what the boot was doing (`stage`) and the step that never returned.
 pub fn message(stage: &str, stuck: &Stuck) -> String {
@@ -211,6 +323,87 @@ mod tests {
                 step: None,
             })
         );
+    }
+
+    #[test]
+    fn another_processor_finds_a_step_stuck_once_it_saw_it_run_for_the_limit() {
+        const COUNT_HZ: u64 = 1_000_000_000;
+        let at = |seconds: u64| 5 * COUNT_HZ + seconds * COUNT_HZ;
+        // Nothing runs: nothing to watch, whatever was seen before.
+        assert_eq!(look(None, 0, at(0), COUNT_HZ), Look::Idle);
+        let seen = Sighting {
+            began: 77,
+            seen_at: at(0),
+        };
+        assert_eq!(look(Some(seen), 0, at(40), COUNT_HZ), Look::Idle);
+        assert_eq!(look(None, 77, at(0), 0), Look::Idle);
+        // A step first seen is remembered, by the watcher's own count.
+        assert_eq!(look(None, 77, at(0), COUNT_HZ), Look::New(seen));
+        // The same step, within the limit, and past it.
+        assert_eq!(
+            look(Some(seen), 77, at(LIMIT_SECONDS) - 1, COUNT_HZ),
+            Look::Running
+        );
+        assert_eq!(
+            look(Some(seen), 77, at(LIMIT_SECONDS + 2), COUNT_HZ),
+            Look::Overdue {
+                quiet_ms: (LIMIT_SECONDS + 2) * 1000
+            }
+        );
+        // Another step since, however long the watch: a new sighting.
+        assert_eq!(
+            look(Some(seen), 78, at(LIMIT_SECONDS + 2), COUNT_HZ),
+            Look::New(Sighting {
+                began: 78,
+                seen_at: at(LIMIT_SECONDS + 2)
+            })
+        );
+        // A count that went back (another watcher's earlier reading) is
+        // no overdue.
+        assert_eq!(
+            look(Some(seen), 77, at(0) - COUNT_HZ, COUNT_HZ),
+            Look::Running
+        );
+    }
+
+    #[test]
+    fn only_an_nmi_a_watcher_sent_is_attributed_and_a_late_return_still_stops() {
+        let observation = observed(0, Some(LIMIT_SECONDS + 1));
+        // No NMI sent: a platform's, with the plain exception report.
+        assert_eq!(caught(0, &observation), None);
+        let stuck = caught(observation.step_began, &observation).unwrap();
+        assert_eq!(
+            stuck,
+            Caught::Stuck(Stuck {
+                quiet_ms: (LIMIT_SECONDS + 1) * 1000,
+                step: Some(Step {
+                    task: 7,
+                    sequence: 42,
+                    running_ms: (LIMIT_SECONDS + 1) * 1000
+                }),
+            })
+        );
+        let text = caught_message("Linux driver work", &stuck);
+        assert!(text.contains("(Linux driver work)"), "{text}");
+        assert!(text.contains("task 7 job 42 ran 31000 ms"), "{text}");
+        // The step returned between the look and the NMI, or another runs.
+        let returned = Observation {
+            step_began: 0,
+            ..observation
+        };
+        assert_eq!(
+            caught(observation.step_began, &returned),
+            Some(Caught::Returned)
+        );
+        let next = Observation {
+            step_began: observation.step_began + 5,
+            ..observation
+        };
+        assert_eq!(
+            caught(observation.step_began, &next),
+            Some(Caught::Returned)
+        );
+        assert!(caught_message("x", &Caught::Returned).contains("returned only as"));
     }
 
     #[test]
