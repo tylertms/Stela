@@ -16,6 +16,12 @@ sudo ./stela update
 
 On Windows, open Terminal with Run as administrator and write `.\stela.exe` in place of `sudo ./stela`.
 
+On macOS, stela is not notarized. If macOS says it cannot be opened, run this once in the unpacked folder:
+
+```
+xattr -d com.apple.quarantine stela
+```
+
 Then boot the PC from the stick.
 
 ## Changes
