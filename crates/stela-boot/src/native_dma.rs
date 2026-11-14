@@ -16,6 +16,13 @@ pub(crate) struct FirmwareUnits {
     complete: bool,
 }
 
+impl FirmwareUnits {
+    /// The DMAR's flags, 0 without a DMAR (`Units::dmar_flags`).
+    pub(crate) fn dmar_flags(&self) -> u8 {
+        self.units.dmar_flags
+    }
+}
+
 /// The complete original IOMMU inventory at firmware exit, twice: `found`
 /// when every unit was observed inactive as the firmware left it, which
 /// the proof for requesters that start blocked needs, and `off` when every

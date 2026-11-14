@@ -904,6 +904,7 @@ fn load(
     // identity map is loaded and no Stela driver has started.
     unsafe { usb_legacy.take(tsc_hz) };
     crate::status::progress("the firmware's DMA remapping");
+    let dmar_flags = remapping.dmar_flags();
     // SAFETY: the firmware's identity map is still loaded, the APs idle in
     // firmware code, and no Stela driver or memory reuse has started.
     let inactive_firmware_units =
@@ -923,20 +924,28 @@ fn load(
     // guest RAM, including workers that will later receive their owned SIPI.
     // The BSP alone sends ICR commands, with firmware IRQ handlers excluded.
     unsafe { asm!("cli", options(nomem, nostack)) };
-    // x2APIC whenever CPUID offers it, from here on: the firmware no longer
-    // runs on this processor, and every later APIC handle is made from the
-    // base returned here (the handoff's) or read afresh. The APs take the
-    // same mode as they enter Stela (`native_smp::executor`).
+    // x2APIC whenever CPUID offers it and the firmware's DMAR does not opt
+    // out, from here on: the firmware no longer runs on this processor, and
+    // every later APIC handle is made from the base returned here (the
+    // handoff's) or read afresh. The APs take the same mode as they enter
+    // Stela (`native_smp::executor`).
     crate::status::progress("the local APIC");
+    let keep_xapic = crate::apic::honours_x2apic_opt_out(
+        dmar_flags,
+        capture.processors[..capture.processor_count as usize]
+            .iter()
+            .filter(|processor| processor.flags & stela_boot_core::topology::ENABLED != 0)
+            .map(|processor| processor.apic_id),
+    );
     // SAFETY: CPL0, interrupts masked, no APIC handle of this processor made.
-    let apic_base = unsafe { crate::apic::prefer_x2apic() };
+    let apic_base = unsafe { crate::apic::choose_mode(keep_xapic) };
     let sender = crate::apic::Apic::new(apic_base, apic_base & crate::apic::BASE_ADDRESS);
     output::arguments(format_args!(
         "HOST APIC {}\n",
-        if sender.is_x2apic() {
-            "x2APIC"
-        } else {
-            "xAPIC (no x2APIC offered)"
+        match (sender.is_x2apic(), keep_xapic) {
+            (true, _) => "x2APIC",
+            (false, true) => "xAPIC (the firmware's DMAR opts out of x2APIC)",
+            (false, false) => "xAPIC (no x2APIC offered)",
         }
     ));
     crate::status::progress("stopping the firmware's processors");
