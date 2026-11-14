@@ -15,30 +15,6 @@ fn audio_unsupported<'a>(
     })
 }
 
-/// usb-storage's `delay_use`: Linux sends a Bulk-Only device its first
-/// class request (GET_MAX_LUN, from `usb_stor_scan_dwork`) one second after
-/// the probe that configured it, as some devices fail requests before.
-/// UAS has no such wait.
-pub(crate) const STORAGE_SETTLE_US: u64 = 1_000_000;
-
-/// A configured Bulk-Only interface whose discovery waits out
-/// [`STORAGE_SETTLE_US`] from its configuration.
-pub(crate) struct Settling {
-    device: Device,
-    binding: storage::Binding,
-    location: String,
-    due: Deadline,
-}
-
-impl Settling {
-    pub(super) fn due(&self) -> bool {
-        self.due.passed()
-    }
-    pub(super) fn id(&self) -> SlotId {
-        self.device.id
-    }
-}
-
 /// Binds every interface of `device` a driver here takes: one
 /// configuration, its endpoints configured together. A Bulk-Only disk is
 /// discovered after its settle time, waited for here.
@@ -51,59 +27,10 @@ pub(crate) fn bind(shared: &Shared, device: Device, dma: &mut dyn DmaAllocator, 
         found,
         &crate::firmware::HandoffProvider::new(None),
     );
-    let mut settling = core::mem::take(&mut found.settling);
-    if !settling.is_empty() && crate::test_clock::read().is_some() {
-        crate::test_clock::advance(shared.borrow().clock, STORAGE_SETTLE_US);
+    if !found.settling.is_empty() && crate::test_clock::read().is_some() {
+        crate::test_clock::advance(shared.borrow().clock, settle::SETTLE_US);
     }
-    settle(shared, &mut settling, dma, found, true);
-}
-
-/// Discover the settling interfaces whose settle time passed; with `wait`,
-/// first wait until every one's has, which only the device start may do,
-/// once for all the devices it bound. An interface whose device is gone
-/// meanwhile is dropped: the topology reports the removal.
-pub(crate) fn settle(
-    shared: &Shared,
-    settling: &mut Vec<Settling>,
-    dma: &mut dyn DmaAllocator,
-    found: &mut Found,
-    wait: bool,
-) {
-    // Bounded by the settle time, or the device start budget's end.
-    while wait && settling.iter().any(|entry| !entry.due()) {
-        crate::waiting();
-        core::hint::spin_loop();
-    }
-    let mut at = 0;
-    while let Some(entry) = settling.get(at) {
-        if !entry.due() {
-            at += 1;
-            continue;
-        }
-        let entry = settling.remove(at);
-        if shared.borrow().validate_device_id(entry.device.id).is_err() {
-            continue;
-        }
-        crate::working(&entry.location);
-        if let Err(error) = discover(shared, &entry.device, entry.binding, dma, found) {
-            found.failures.push((entry.location, error));
-        }
-    }
-}
-
-fn discover(
-    shared: &Shared,
-    device: &Device,
-    binding: storage::Binding,
-    dma: &mut dyn DmaAllocator,
-    found: &mut Found,
-) -> Result<(), BlockError> {
-    storage::discover_binding(shared.clone(), device, binding, dma, &mut found.failures).map(
-        |(owner, disks)| {
-            found.storage.push(owner);
-            found.disks.extend(disks);
-        },
-    )
+    found.settle(dma);
 }
 
 #[expect(
@@ -196,26 +123,34 @@ pub(crate) fn bind_with_provider(
         ));
         return;
     }
-    // A clock that cannot time the settle has refused every deadline of
-    // this controller already; its disks are discovered at once.
-    let settled = shared.borrow().clock.try_deadline(STORAGE_SETTLE_US).ok();
+    let configured = settle::configured(shared.borrow().clock);
     let mut hid_inputs = Vec::new();
     for (interface, plan) in plans {
         let location = format!("{} interface {}", device.location, interface.number);
         crate::working(&location);
         let result = match plan {
-            Plan::Storage(binding) => match settled.filter(|_| !binding.uas()) {
-                Some(due) => {
-                    found.settling.push(Settling {
-                        device: device.clone(),
-                        binding,
-                        location: location.clone(),
-                        due,
-                    });
-                    Ok(())
-                }
-                None => discover(shared, &device, binding, dma, found),
-            },
+            // UAS has no settle time.
+            Plan::Storage(binding) if binding.uas() => storage::discover_binding(
+                shared.clone(),
+                &device,
+                binding,
+                dma,
+                &mut found.failures,
+            )
+            .map(|(owner, disks)| {
+                found.storage.push(owner);
+                found.disks.extend(disks);
+            }),
+            Plan::Storage(binding) => {
+                let interface = settle::Configured::Xhci {
+                    shared: shared.clone(),
+                    device: device.clone(),
+                    binding,
+                };
+                let entry = settle::Settling::new(configured, location.clone(), interface);
+                found.settling.push(entry);
+                Ok(())
+            }
             Plan::Hid(endpoint, _) => {
                 hid::UsbInput::new(shared.clone(), &device, &interface, endpoint, dma).map(
                     |input| match input {

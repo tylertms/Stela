@@ -20,7 +20,7 @@ use crate::{
             CONFIGURATION_DESCRIPTOR, DEVICE_DESCRIPTOR, DEVICE_TO_HOST, GET_DESCRIPTOR, Interface,
             STRING_DESCRIPTOR, TYPE_CLASS, interfaces, setup,
         },
-        storage::{self, UsbDisk, UsbStorage},
+        storage::{self, UsbDisk, UsbStorage, settle},
     },
 };
 use alloc::{format, rc::Rc, string::String, vec::Vec};
@@ -54,6 +54,17 @@ pub struct Found {
     pub failures: Vec<(String, BlockError)>,
     /// Boot keyboards and mice.
     pub inputs: Vec<input::BootInput>,
+    /// Bulk-Only interfaces configured and waiting out their settle time:
+    /// see [`enumerate_unsettled`].
+    pub(crate) settling: Vec<settle::Settling>,
+}
+
+impl Found {
+    /// The Bulk-Only interfaces still settling, for a caller that waits
+    /// once for those of every controller it started ([`settle::settle`]).
+    pub fn take_settling(&mut self) -> Vec<settle::Settling> {
+        core::mem::take(&mut self.settling)
+    }
 }
 
 /// A root's device, reset, addressed and described.
@@ -196,8 +207,22 @@ fn string(controller: &mut Controller, id: &DeviceId, index: u8) -> Option<Strin
     (!text.is_empty()).then_some(text)
 }
 
-/// Bring up every connected root of `controller` and bind its storage.
+/// Bring up every connected root of `controller` and bind its storage,
+/// waiting out the Bulk-Only settle time.
 pub fn enumerate(controller: &Shared, location: &str, clock: Clock) -> Found {
+    let mut found = enumerate_unsettled(controller, location, clock);
+    let mut settling = found.take_settling();
+    let settled = settle::settle(&mut settling, None, true);
+    found.storage.extend(settled.storage);
+    found.disks.extend(settled.disks);
+    found.failures.extend(settled.failures);
+    found
+}
+
+/// [`enumerate`] with the Bulk-Only interfaces left settling, each from
+/// its own configuration, for the caller to discover with every other
+/// controller's ([`settle::settle`]), so the waits overlap.
+pub fn enumerate_unsettled(controller: &Shared, location: &str, clock: Clock) -> Found {
     let mut found = Found::default();
     let ports = controller.borrow().ports();
     for port in 1..=ports {
@@ -217,7 +242,13 @@ pub fn enumerate(controller: &Shared, location: &str, clock: Clock) -> Found {
 
 /// What a device's configuration is bound to.
 enum Prepared {
-    Storage(Interface, Option<String>, Vec<super::BulkPipe>),
+    /// With the end of its settle time, taken at its configuration.
+    Storage(
+        Interface,
+        Option<String>,
+        Vec<super::BulkPipe>,
+        Option<crate::Deadline>,
+    ),
     Input(Vec<Interface>),
 }
 
@@ -253,7 +284,8 @@ fn bind(
         };
         let serial = string(&mut c, &id, descriptor[16]);
         let pipes = c.configure(&id, 0)?;
-        Ok(Some(Prepared::Storage(setting, serial, pipes)))
+        let configured = settle::configured(clock);
+        Ok(Some(Prepared::Storage(setting, serial, pipes, configured)))
     })();
     match prepared {
         Ok(Some(Prepared::Input(interfaces))) => {
@@ -272,16 +304,17 @@ fn bind(
                 }
             }
         }
-        Ok(Some(Prepared::Storage(setting, serial, pipes))) => {
+        Ok(Some(Prepared::Storage(setting, serial, pipes, configured))) => {
             let serial = serial.unwrap_or_else(|| at.clone());
             let io = storage::EhciBulk::new(controller.clone(), id, pipes, clock, descriptor);
-            match storage::discover_ehci(io, &setting, at.clone(), serial, &mut found.failures) {
-                Ok((kept, disks)) => {
-                    found.storage.push(kept);
-                    found.disks.extend(disks);
-                }
-                Err(error) => found.failures.push((at, error)),
-            }
+            let interface = settle::Configured::Ehci {
+                io,
+                setting,
+                serial,
+            };
+            found
+                .settling
+                .push(settle::Settling::new(configured, at, interface));
         }
         Ok(None) => found.unused.push((at, NO_DRIVER)),
         Err(error) => found.failures.push((at, storage::ehci_error(error))),

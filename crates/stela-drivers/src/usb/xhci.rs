@@ -47,7 +47,7 @@
 //! Controller save/restore requires observed U3 roots and acknowledged CSS/CRS;
 //! reset-on-resume profiles require fresh lifecycle publication. Hub over-current
 //! recovery remains a separate topology operation.
-use super::{audio, bluetooth, cdc, ethernet, hid, storage};
+use super::{audio, bluetooth, cdc, ethernet, hid, storage, storage::settle};
 use crate::{
     Clock, Deadline, Handoff,
     block::BlockError,
@@ -1246,7 +1246,7 @@ pub struct Found {
     pub probes: Vec<PortProbe>,
     /// Bulk-Only interfaces configured and waiting out their settle time,
     /// discovered by the device start or the [`Host`] that bound them.
-    pub(crate) settling: Vec<bind::Settling>,
+    pub(crate) settling: Vec<settle::Settling>,
 }
 /// What an xHCI controller was doing when it stopped answering commands:
 /// the command left unanswered and the registers read before the halt.
@@ -1284,6 +1284,20 @@ impl core::fmt::Display for Death {
 }
 
 impl Found {
+    /// Take what settled interfaces' discovery found.
+    pub(crate) fn absorb_settled(&mut self, settled: settle::Settled) {
+        self.storage.extend(settled.storage);
+        self.disks.extend(settled.disks);
+        self.failures.extend(settled.failures);
+    }
+
+    /// Wait until the interfaces still settling have, then discover them.
+    pub(crate) fn settle(&mut self, dma: &mut dyn DmaAllocator) {
+        let mut settling = core::mem::take(&mut self.settling);
+        let settled = settle::settle(&mut settling, Some(dma), true);
+        self.absorb_settled(settled);
+    }
+
     /// What the controller that died while its devices started was doing.
     pub fn controller_death(&self) -> Option<Death> {
         self.hosts.iter().find_map(Host::death)
@@ -1500,7 +1514,8 @@ pub struct Started {
 }
 
 impl Started {
-    /// Enumerate the controller's devices and bind the class drivers.
+    /// Enumerate the controller's devices and bind the class drivers,
+    /// waiting out the Bulk-Only settle time.
     pub fn finish(
         self,
         dma: &mut dyn DmaAllocator,
@@ -1520,8 +1535,7 @@ impl Started {
         for device in &devices {
             bind_with_provider(&shared, device.clone(), dma, &mut found, firmware);
         }
-        let mut settling = core::mem::take(&mut found.settling);
-        bind::settle(&shared, &mut settling, dma, &mut found, true);
+        found.settle(dma);
         found
             .hosts
             .push(Host::new(shared, &devices, dma, &mut found.failures));

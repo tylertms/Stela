@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! A class's queued reset serviced by the topology owner, on the
-//! command/context/port model.
+//! A class's queued reset serviced by the topology owner, and the
+//! Bulk-Only settle time around it, on the command/context/port model.
 use super::super::*;
 use crate::block::BlockDevice;
 use crate::bus::dma::TestRegion;
 use alloc::collections::BTreeMap;
 use hub::model::{Hardware, Node, RegistersModel};
 
-/// A Bulk-Only disk on a root port, enumerated, under its topology owner.
-fn bot_disk(dma: &mut TestRegion) -> (Host, Shared, Rc<RefCell<Hardware>>, Vec<Device>) {
+/// A controller with a Bulk-Only disk on its root port, not enumerated.
+fn bot_controller(dma: &mut TestRegion) -> (Controller, Rc<RefCell<Hardware>>) {
     let nodes = BTreeMap::from([(0, Node::bot_disk(HIGH_SPEED))]);
     let hardware = Rc::new(RefCell::new(Hardware::new(64, nodes)));
     hardware.borrow_mut().root_status =
         Some(PP | CCS | PED | u32::from(HIGH_SPEED) << PORT_SPEED_SHIFT);
-    let mut c = Controller::new(
+    let c = Controller::new(
         Box::new(RegistersModel(hardware.clone())),
         Clock {
             ticks_per_microsecond: 1,
@@ -25,6 +25,12 @@ fn bot_disk(dma: &mut TestRegion) -> (Host, Shared, Rc<RefCell<Hardware>>, Vec<D
         }),
     )
     .unwrap();
+    (c, hardware)
+}
+
+/// A Bulk-Only disk on a root port, enumerated, under its topology owner.
+fn bot_disk(dma: &mut TestRegion) -> (Host, Shared, Rc<RefCell<Hardware>>, Vec<Device>) {
+    let (mut c, hardware) = bot_controller(dma);
     let mut failures = Vec::new();
     let devices = c.enumerate(dma, &mut failures);
     let shared = Rc::new(RefCell::new(c));
@@ -114,7 +120,7 @@ fn a_bulk_only_disk_gets_its_first_class_request_a_second_after_its_configuratio
         assert!(configured.added.storage.is_empty() && configured.added.disks.is_empty());
         assert_eq!(max_lun(), before);
         let clock = shared.borrow().clock;
-        crate::test_clock::advance(clock, bind::STORAGE_SETTLE_US / 2);
+        crate::test_clock::advance(clock, storage::settle::SETTLE_US / 2);
         assert!(!host.attachment_due());
         let start = Clock::ticks();
         let early = host.poll(&mut dma, &firmware);
@@ -127,7 +133,7 @@ fn a_bulk_only_disk_gets_its_first_class_request_a_second_after_its_configuratio
             let gone = host.poll(&mut dma, &firmware);
             assert_eq!(gone.removed.len(), 1);
             assert!(gone.added.failures.is_empty(), "{:?}", gone.added.failures);
-            crate::test_clock::advance(clock, bind::STORAGE_SETTLE_US);
+            crate::test_clock::advance(clock, storage::settle::SETTLE_US);
             assert!(!host.attachment_due());
             let late = host.poll(&mut dma, &firmware);
             assert!(late.added.storage.is_empty() && late.added.disks.is_empty());

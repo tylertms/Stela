@@ -67,7 +67,7 @@ pub struct Host {
     standing: Vec<(String, BlockError)>,
     /// Bound Bulk-Only interfaces waiting out their settle time, each
     /// discovered by the first poll after it.
-    settling: Vec<bind::Settling>,
+    settling: Vec<storage::settle::Settling>,
 }
 impl Host {
     /// Whether the controller stopped answering commands (Linux
@@ -342,7 +342,7 @@ impl Host {
     pub(crate) fn settled(&mut self, dma: &mut dyn DmaAllocator) -> Changes {
         assert!(!self.settling.is_empty() && !self.attachment_due());
         let clock = self.controller.borrow().clock;
-        crate::test_clock::advance(clock, bind::STORAGE_SETTLE_US);
+        crate::test_clock::advance(clock, storage::settle::SETTLE_US);
         assert!(self.attachment_due());
         let changes = self.poll(dma, &crate::firmware::HandoffProvider::new(None));
         assert!(self.settling.is_empty());
@@ -355,15 +355,13 @@ impl Host {
     pub(super) fn settle(&mut self, changes: &mut Changes, dma: &mut dyn DmaAllocator) {
         self.settling.append(&mut changes.added.settling);
         let devices = &self.devices;
-        self.settling
-            .retain(|entry| devices.iter().any(|device| device.id == entry.id()));
-        bind::settle(
-            &self.controller,
-            &mut self.settling,
-            dma,
-            &mut changes.added,
-            false,
-        );
+        self.settling.retain(|entry| {
+            entry
+                .xhci_device()
+                .is_some_and(|id| devices.iter().any(|device| device.id == id))
+        });
+        let settled = storage::settle::settle(&mut self.settling, Some(dma), false);
+        changes.added.absorb_settled(settled);
     }
 
     /// Service one class's `usb_queue_reset_device`. A device already gone

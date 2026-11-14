@@ -37,6 +37,7 @@ const SD_MAX_RETRIES: u32 = 5;
 const SD_RUNTIME_US: u64 = (SD_MAX_RETRIES as u64 + 1) * 30_000_000;
 
 mod binding;
+pub mod settle;
 pub use binding::Binding;
 pub(super) use binding::discover as discover_binding;
 
