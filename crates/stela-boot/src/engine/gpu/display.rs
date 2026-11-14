@@ -15,7 +15,8 @@
 //! Hot-plug: once a second the same flush on the boot CPU reads the
 //! connectors as the driver last detected them, which its hot-plug
 //! interrupts keep current. A display taken at start is set again when it
-//! returns after being unplugged. When the firmware's screen is gone and no
+//! returns after being unplugged, and shows on an output connected later
+//! when that output has its size. When the firmware's screen is gone and no
 //! display was taken, the bound GPUs are looked on until one shows a display
 //! in the guest's mode, and probed anew every [`PROBE_LOOKS`] looks, as
 //! Linux's output polling and fbdev helper take a display that appears late.
@@ -186,13 +187,7 @@ impl KmsScanout {
         self.looks = self.looks.wrapping_add(1);
         match &mut self.display {
             Some((name, display)) => match display.watch() {
-                Ok(Watched::Unchanged) => {}
-                Ok(Watched::Lost) => {
-                    output::arguments(format_args!("GPU {name}: display disconnected\n"));
-                }
-                Ok(Watched::Restored) => {
-                    output::arguments(format_args!("GPU {name}: display connected again\n"));
-                }
+                Ok(watched) => report_watched(name, display, watched),
                 Err(error) => {
                     if !core::mem::replace(&mut self.reported, true) {
                         output::arguments(format_args!(
@@ -223,6 +218,7 @@ impl KmsScanout {
             ) {
                 Ok(display) if display.size() == wanted => {
                     output::arguments(format_args!("GPU {name}: display detected after start\n"));
+                    report_outputs(name, &display);
                     let screen = screen(&display);
                     match self.presented {
                         // The guest's next frame shows here, and a stop's
@@ -260,6 +256,40 @@ impl KmsScanout {
                 }
             }
         }
+    }
+}
+
+/// What a look read of `display`'s connectors, one line for each change.
+fn report_watched(name: &str, display: &Display<Node>, watched: Watched) {
+    let lines = [
+        (watched.lost, "display disconnected"),
+        (watched.restored, "display connected again"),
+        (watched.joined, "display added on a new output"),
+        (
+            watched.unshown,
+            "new output has no free mode or controller in the display's size",
+        ),
+    ];
+    for (count, what) in lines {
+        if count != 0 {
+            output::arguments(format_args!(
+                "GPU {name}: {what} ({count}); {} outputs run it\n",
+                display.outputs()
+            ));
+        }
+    }
+}
+
+/// How many outputs show `display` and how many connected ones cannot,
+/// when that is more than the one output.
+fn report_outputs(name: &str, display: &Display<Node>) {
+    let (shown, unshown) = (display.outputs(), display.unshown());
+    if shown > 1 || unshown != 0 {
+        let (width, height) = display.size();
+        output::arguments(format_args!(
+            "GPU {name}: display on {shown} outputs, {unshown} connected without a free \
+             {width}x{height} mode or controller\n"
+        ));
     }
 }
 
@@ -379,6 +409,7 @@ pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>) {
                     "GPU {name}: display runs {width}x{height} at {} mHz\n",
                     display.refresh_millihertz()
                 ));
+                report_outputs(name, &display);
                 crate::status::take_screen(Some(screen(&display)));
                 for (_, fd) in waiting.drain(..) {
                     client::close_descriptor(fd);

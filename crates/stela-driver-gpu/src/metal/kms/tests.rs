@@ -1,6 +1,7 @@
 use super::*;
 use alloc::{vec, vec::Vec};
 
+mod outputs;
 mod scanout;
 
 fn mode(width: u16, height: u16, kind: u32) -> ModeInfo {
@@ -31,14 +32,33 @@ fn a_modes_refresh_is_its_clock_over_its_totals() {
     assert_eq!(refresh(&mode(1280, 800, 0)), 60_000);
 }
 
-/// A GPU of two connectors, the second connected with `modes`.
+/// A GPU of two connectors and two controllers: connector 50 on encoder 61,
+/// which reaches both controllers, and connector 51, connected with
+/// `modes`, on encoder 60, which reaches the second. Controller 40 runs
+/// only connector 50 and 41 only 51.
 struct Card {
     modes: Vec<ModeInfo>,
     possible_crtcs: u32,
-    /// The mode and framebuffer the controller was set to.
+    /// The mode and framebuffer controller 41 was set to.
     set: Option<(ModeInfo, u32)>,
-    /// Requests to answer `EBUSY` before a flip succeeds.
+    /// Requests to answer `EBUSY` before a flip on controller 41 succeeds.
     busy: u32,
+    /// The first connector's modes, whether it has a display, and what its
+    /// encoder reaches.
+    first: Vec<ModeInfo>,
+    first_connected: bool,
+    first_crtcs: u32,
+    /// The first connector lists encoder 60, the second's.
+    shared_encoder: bool,
+    /// The connector the driver read back as lit, with a current encoder.
+    lit: u32,
+    /// Controller 40's mode and framebuffer, its flips, and the requests to
+    /// answer `EBUSY` before one succeeds.
+    set_40: Option<(ModeInfo, u32)>,
+    flips_40: Vec<u32>,
+    busy_40: u32,
+    /// A controller whose mode sets are refused.
+    refused_crtc: Option<u32>,
     flip_error: Option<i64>,
     /// Whether a request completes on the processor making it.
     immediate: bool,
@@ -74,6 +94,15 @@ impl Card {
             possible_crtcs: 0b10,
             set: None,
             busy: 0,
+            first: Vec::new(),
+            first_connected: false,
+            first_crtcs: 0b11,
+            shared_encoder: false,
+            lit: 0,
+            set_40: None,
+            flips_40: Vec::new(),
+            busy_40: 0,
+            refused_crtc: None,
             flip_error: None,
             immediate: true,
             flip_requests: 0,
@@ -127,9 +156,17 @@ unsafe impl Drm for &mut Card {
                 }
                 GET_CONNECTOR => {
                     let connector = &mut *argument.cast::<Connector>();
-                    let connected = connector.id == 51 && self.connected;
+                    let (connected, listed, encoder) = match connector.id {
+                        50 => (
+                            self.first_connected,
+                            &self.first,
+                            if self.shared_encoder { 60 } else { 61 },
+                        ),
+                        _ => (self.connected, &self.modes, 60),
+                    };
                     connector.connection = if connected { CONNECTED } else { 2 };
-                    let modes: &[ModeInfo] = if connected { &self.modes } else { &[] };
+                    connector.encoder = if connector.id == self.lit { encoder } else { 0 };
+                    let modes: &[ModeInfo] = if connected { listed } else { &[] };
                     self.probes += u32::from(connector.mode_count == 0);
                     // Linux fills a list only when all of it fits.
                     if connector.mode_count as usize >= modes.len() && connector.mode_count != 0 {
@@ -137,7 +174,7 @@ unsafe impl Drm for &mut Card {
                         ptr::copy_nonoverlapping(modes.as_ptr(), list, modes.len());
                     }
                     if connector.encoder_count != 0 {
-                        (connector.encoders as *mut u32).write(60);
+                        (connector.encoders as *mut u32).write(encoder);
                     }
                     connector.mode_count = modes.len() as u32;
                     connector.encoder_count = 1;
@@ -148,8 +185,11 @@ unsafe impl Drm for &mut Card {
                 }
                 GET_ENCODER => {
                     let encoder = &mut *argument.cast::<Encoder>();
-                    assert_eq!(encoder.id, 60);
-                    encoder.possible_crtcs = self.possible_crtcs;
+                    encoder.possible_crtcs = match encoder.id {
+                        60 => self.possible_crtcs,
+                        61 => self.first_crtcs,
+                        other => panic!("encoder {other}"),
+                    };
                 }
                 CREATE_DUMB => {
                     let dumb = &mut *argument.cast::<CreateDumb>();
@@ -174,13 +214,20 @@ unsafe impl Drm for &mut Card {
                 MAP_DUMB => (*argument.cast::<MapDumb>()).offset = 0x1000,
                 SET_CRTC => {
                     let crtc = &*argument.cast::<Crtc>();
-                    assert_eq!(crtc.id, 41);
+                    let (runs, set) = match crtc.id {
+                        40 => (50, &mut self.set_40),
+                        41 => (51, &mut self.set),
+                        other => panic!("controller {other}"),
+                    };
                     self.mode_sets += 1;
                     if let Some(error) = self.set_error.take() {
                         return error;
                     }
-                    self.set = (crtc.connector_count != 0).then(|| {
-                        assert_eq!((crtc.connectors as *const u32).read(), 51);
+                    if self.refused_crtc == Some(crtc.id) {
+                        return -22;
+                    }
+                    *set = (crtc.connector_count != 0).then(|| {
+                        assert_eq!((crtc.connectors as *const u32).read(), runs);
                         (crtc.mode, crtc.framebuffer)
                     });
                 }
@@ -190,11 +237,17 @@ unsafe impl Drm for &mut Card {
                     if let Some(error) = self.flip_error.take() {
                         return error;
                     }
-                    if self.busy != 0 {
-                        self.busy -= 1;
+                    let flip = *argument.cast::<PageFlip>();
+                    let (busy, flips) = match flip.crtc {
+                        40 => (&mut self.busy_40, &mut self.flips_40),
+                        41 => (&mut self.busy, &mut self.flips),
+                        other => panic!("controller {other}"),
+                    };
+                    if *busy != 0 {
+                        *busy -= 1;
                         return BUSY;
                     }
-                    self.flips.push((*argument.cast::<PageFlip>()).framebuffer);
+                    flips.push(flip.framebuffer);
                 }
                 REMOVE_FB => self.removed.push(*argument.cast::<u32>()),
                 DESTROY_DUMB => self
@@ -497,19 +550,28 @@ fn an_output_that_returns_gets_a_full_mode_set_on_the_buffer_on_screen() {
     {
         let mut display = Display::take(&mut card, (2, 2)).unwrap();
         front = display.buffers[0].framebuffer;
-        assert_eq!(display.watch(), Ok(Watched::Unchanged));
+        let unchanged = Watched::default();
+        assert_eq!(display.watch(), Ok(unchanged));
         display.drm.connected = false;
-        assert_eq!(display.watch(), Ok(Watched::Lost));
-        assert_eq!(display.watch(), Ok(Watched::Unchanged));
+        let lost = Watched {
+            lost: 1,
+            ..unchanged
+        };
+        assert_eq!(display.watch(), Ok(lost));
+        assert_eq!(display.watch(), Ok(unchanged));
         // Where a request must wait, nothing is read.
         display.drm.connected = true;
         display.drm.immediate = false;
-        assert_eq!(display.watch(), Ok(Watched::Unchanged));
+        assert_eq!(display.watch(), Ok(unchanged));
         display.drm.immediate = true;
         let probes = display.drm.probes;
-        assert_eq!(display.watch(), Ok(Watched::Restored));
+        let restored = Watched {
+            restored: 1,
+            ..unchanged
+        };
+        assert_eq!(display.watch(), Ok(restored));
         assert_eq!(display.drm.probes, probes);
-        assert_eq!(display.watch(), Ok(Watched::Unchanged));
+        assert_eq!(display.watch(), Ok(unchanged));
     }
     // The first set, then off and on again.
     assert_eq!(card.mode_sets, 3);

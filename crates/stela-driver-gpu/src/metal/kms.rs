@@ -2,10 +2,18 @@
 //!
 //! Binding a GPU ends what the firmware left: its framebuffer sits behind a
 //! BAR the driver remaps, and its display engine is the driver's to program.
-//! [`Display`] takes the first connected output and scans out one of three
-//! linear buffers of video memory, each a DRM dumb buffer: the one a flip last
-//! named, the one before it, which shows until that flip lands, and the one a
-//! frame fills.
+//! [`Display`] scans out one of three linear buffers of video memory, each a
+//! DRM dumb buffer: the one a flip last named, the one before it, which shows
+//! until that flip lands, and the one a frame fills.
+//!
+//! Several connected outputs show the same picture, as Linux's fbdev helper
+//! clones them: one size that most of them run ([`plan`]), each output on its
+//! own controller in its own mode of that size, all scanning out the same
+//! buffers. The guest has one display, so an output with no mode of that size
+//! stays dark; no scaler exists. The output the firmware lit, which the driver
+//! reads back as the connector's current encoder, wins ties, then DRM's
+//! order. The first output paces the flips; the others follow it to the
+//! newest buffer, and one that lags a frame may show a frame being filled.
 //!
 //! NVIDIA's display engine reads only video memory, so a guest surface in
 //! guest RAM cannot be scanned out in place: frames copy in, top to bottom,
@@ -24,7 +32,7 @@
 //! hot-plug interrupt keeps current, is read with no probe ([`detected`]).
 //! An output that returns after it was seen disconnected gets its mode set
 //! again ([`Display::watch`]), as Linux's fbdev helper does on a hot-plug
-//! event.
+//! event, and one connected after the take joins the picture if it can.
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ops::Range;
@@ -240,11 +248,25 @@ struct Buffer {
     bytes: usize,
 }
 
-/// The output a [`Display`] runs.
+/// One output showing the picture: its controller, connector and mode.
+#[derive(Debug)]
+struct Head {
+    crtc: u32,
+    connector: u32,
+    /// The connector's encoders, which no other head may use.
+    encoders: Vec<u32>,
+    mode: ModeInfo,
+    /// The connector was last read disconnected ([`Display::watch`]).
+    lost: bool,
+    /// Not the first head: its flip to the newest buffer is still to be
+    /// requested.
+    behind: bool,
+}
+
+/// The outputs a [`Display`] runs.
 #[derive(Debug)]
 pub struct Display<D> {
     drm: D,
-    crtc: u32,
     width: u32,
     height: u32,
     /// The mode's refresh in millihertz.
@@ -261,22 +283,28 @@ pub struct Display<D> {
     queued: bool,
     /// The row a producer fills before it is copied to video memory.
     row: Vec<u8>,
-    /// The connector and mode the controller runs.
-    connector: u32,
-    mode: ModeInfo,
-    /// The connector was last read disconnected ([`Self::watch`]).
-    lost: bool,
+    /// The outputs showing the picture; the first paces the flips and
+    /// gives the refresh.
+    heads: Vec<Head>,
+    /// Every controller of the card.
+    crtcs: Vec<u32>,
+    /// The connectors not shown, each with whether it was read connected
+    /// and tried since it was last read disconnected.
+    others: Vec<(u32, bool)>,
 }
 
-/// What [`Display::watch`] read of the output's connector.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Watched {
-    /// As at the last read.
-    Unchanged,
-    /// Disconnected since the last read.
-    Lost,
-    /// Connected again, and its mode set again.
-    Restored,
+/// What [`Display::watch`] read of the connectors since the last read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Watched {
+    /// Shown outputs disconnected.
+    pub lost: u32,
+    /// Shown outputs connected again, their modes set again.
+    pub restored: u32,
+    /// Outputs connected that now show the picture too.
+    pub joined: u32,
+    /// Outputs connected that cannot show it: no mode of its size, or no
+    /// free controller or encoder.
+    pub unshown: u32,
 }
 
 // SAFETY: the buffers' mappings go with the display, which one PE uses at a
@@ -346,6 +374,9 @@ struct Output {
     /// `DRM_MODE_CONNECTOR_*` and the connector's number among its kind.
     kind: u32,
     index: u32,
+    /// The connector has a current encoder: a controller runs it, as the
+    /// driver read back what the firmware lit before any mode set here.
+    lit: bool,
 }
 
 /// One connector as the driver reports it, for the report of a GPU whose
@@ -478,29 +509,50 @@ fn output<D: Drm>(drm: &mut D, id: u32) -> Result<Output, Error> {
             encoders,
             kind: described.kind,
             index: described.kind_id,
+            lit: described.encoder != 0,
         });
     }
     Err(Error::Changed)
 }
 
-/// The first of `crtcs` one of `encoders` can drive.
-fn controller<D: Drm>(drm: &mut D, encoders: &[u32], crtcs: &[u32]) -> Result<Option<u32>, Error> {
+/// The controllers one of `encoders` can drive, a bit for each of the
+/// first 32 of the card's `crtcs`.
+fn reach<D: Drm>(drm: &mut D, encoders: &[u32], crtcs: &[u32]) -> Result<u32, Error> {
+    let present = match crtcs.len() {
+        count if count >= u32::BITS as usize => u32::MAX,
+        count => (1 << count) - 1,
+    };
+    let mut reach = 0;
     for &id in encoders {
         let mut encoder = Encoder {
             id,
             ..Encoder::default()
         };
         call(drm, GET_ENCODER, &mut encoder)?;
-        let reachable = crtcs
-            .iter()
-            .take(u32::BITS as usize)
-            .enumerate()
-            .find(|(index, _)| encoder.possible_crtcs >> index & 1 != 0);
-        if let Some((_, &crtc)) = reachable {
-            return Ok(Some(crtc));
-        }
+        reach |= encoder.possible_crtcs;
     }
-    Ok(None)
+    Ok(reach & present)
+}
+
+/// The first of `crtcs` in `reach` that no head runs.
+fn free_crtc(reach: u32, crtcs: &[u32], heads: &[Head]) -> Option<u32> {
+    crtcs
+        .iter()
+        .take(u32::BITS as usize)
+        .enumerate()
+        .find(|&(index, crtc)| {
+            reach >> index & 1 != 0 && heads.iter().all(|head| head.crtc != *crtc)
+        })
+        .map(|(_, &crtc)| crtc)
+}
+
+/// Whether an output of `encoders` can join `heads` without taking an
+/// encoder one of them may use: the driver would move it, and that output
+/// would go dark.
+fn encoders_free(encoders: &[u32], heads: &[Head]) -> bool {
+    heads
+        .iter()
+        .all(|head| head.encoders.iter().all(|used| !encoders.contains(used)))
 }
 
 /// Whether whoever shows the output's picture to the guest can describe a
@@ -519,38 +571,85 @@ pub enum Wanted {
     Size((u32, u32)),
 }
 
-/// The mode [`Wanted`] names that `fits`, else its second choice if that
-/// fits, else the first that does. Linux lists an output's preferred mode
-/// first and then the faster of each size first, so a size's mode is its
-/// fastest the guest can be told of. A monitor's fastest mode may not fit,
-/// as 2560x1440 at 180 Hz. With no mode that fits, the same choice among
-/// all of them.
-fn choose(modes: &[ModeInfo], wanted: Wanted, fits: Fits<'_>) -> Option<ModeInfo> {
-    let size = |mode: &ModeInfo| (u32::from(mode.hdisplay), u32::from(mode.vdisplay));
-    let pick = |fits: Fits<'_>| {
-        let fitting = |mode: &&ModeInfo| {
-            let (width, height) = size(mode);
-            fits(width, height, refresh(mode))
-        };
-        let sized = |wanted: (u32, u32)| {
-            modes
-                .iter()
-                .filter(fitting)
-                .find(|mode| size(mode) == wanted)
-        };
-        // The fastest fitting mode of the preferred mode's size.
-        let preferred = || {
-            let native = modes.iter().find(|mode| mode.kind & PREFERRED != 0)?;
-            sized(size(native))
-        };
-        match wanted {
-            Wanted::Native(otherwise) => preferred().or_else(|| sized(otherwise)),
-            Wanted::Size(wanted) => sized(wanted).or_else(preferred),
-        }
-        .or_else(|| modes.iter().find(fitting))
-        .copied()
+fn size_of_mode(mode: &ModeInfo) -> (u32, u32) {
+    (u32::from(mode.hdisplay), u32::from(mode.vdisplay))
+}
+
+/// `modes`' mode of `size` that `fits`, else its first of that size. Linux
+/// lists the faster of each size first, so this is the size's fastest mode
+/// the guest can be told of. A monitor's fastest mode may not fit, as
+/// 2560x1440 at 180 Hz.
+fn mode_of(modes: &[ModeInfo], size: (u32, u32), fits: Fits<'_>) -> Option<ModeInfo> {
+    let mut sized = modes.iter().filter(|mode| size_of_mode(mode) == size);
+    let fitting = sized
+        .clone()
+        .find(|mode| fits(size.0, size.1, refresh(mode)));
+    fitting.or_else(|| sized.next()).copied()
+}
+
+/// The size the connected `outputs`, each its modes, show the picture in,
+/// and which of them gives the mode the guest is told of.
+///
+/// The sizes in order: for [`Wanted::Native`] each output's preferred size,
+/// then the firmware's, then every listed size; for [`Wanted::Size`] that
+/// size first. A size with a mode the guest can be told of beats one
+/// without. Then [`Wanted::Size`]'s size wins, as only it is shown; for
+/// [`Wanted::Native`] the size most outputs run wins, so every monitor
+/// shows the picture where they share a size, as Linux's fbdev helper
+/// clones in a common mode. Earlier sizes win ties. The output that gives
+/// the mode is the first with a fitting mode of the size, else the first
+/// with one at all.
+fn plan(outputs: &[&[ModeInfo]], wanted: Wanted, fits: Fits<'_>) -> Option<((u32, u32), usize)> {
+    let preferred = outputs.iter().filter_map(|modes| {
+        let native = modes.iter().find(|mode| mode.kind & PREFERRED != 0)?;
+        Some(size_of_mode(native))
+    });
+    let listed = outputs
+        .iter()
+        .flat_map(|modes| modes.iter().map(size_of_mode));
+    let sizes: Vec<(u32, u32)> = match wanted {
+        Wanted::Native(firmware) => preferred.chain([firmware]).chain(listed).collect(),
+        Wanted::Size(size) => [size].into_iter().chain(preferred).chain(listed).collect(),
     };
-    pick(fits).or_else(|| pick(&|_, _, _| true))
+    let fitting = |modes: &[ModeInfo], size: (u32, u32)| {
+        modes
+            .iter()
+            .any(|mode| size_of_mode(mode) == size && fits(size.0, size.1, refresh(mode)))
+    };
+    let covered = |size: (u32, u32)| {
+        outputs
+            .iter()
+            .filter(|modes| modes.iter().any(|mode| size_of_mode(mode) == size))
+            .count()
+    };
+    let (_, &size) = sizes
+        .iter()
+        .enumerate()
+        .filter(|&(_, &size)| covered(size) != 0)
+        .max_by_key(|&(order, &size)| {
+            let told = outputs.iter().any(|modes| fitting(modes, size));
+            let rank = match wanted {
+                Wanted::Native(_) => (told, false, covered(size)),
+                Wanted::Size(only) => (told, size == only, 0),
+            };
+            (rank, core::cmp::Reverse(order))
+        })?;
+    let gives = outputs
+        .iter()
+        .position(|modes| fitting(modes, size))
+        .or_else(|| {
+            outputs
+                .iter()
+                .position(|modes| modes.iter().any(|mode| size_of_mode(mode) == size))
+        })?;
+    Some((size, gives))
+}
+
+/// The mode one output with `modes` runs: [`plan`] for it alone.
+#[cfg(test)]
+fn choose(modes: &[ModeInfo], wanted: Wanted, fits: Fits<'_>) -> Option<ModeInfo> {
+    let (size, _) = plan(&[modes], wanted, fits)?;
+    mode_of(modes, size, fits)
 }
 
 /// One buffer of the mode's size, with its framebuffer and mapping. A
@@ -677,35 +776,79 @@ fn resources<D: Drm>(drm: &mut D) -> Result<(Vec<u32>, Vec<u32>), Error> {
 }
 
 impl<D: Drm> Display<D> {
-    /// Takes the first connected output of `drm`, showing a black frame in
-    /// the mode of `wanted` pixels if it has one, as the firmware's did.
+    /// Takes the connected outputs of `drm`, showing a black frame in the
+    /// mode of `wanted` pixels where they have one, as the firmware's did.
     pub fn take(drm: D, wanted: (u32, u32)) -> Result<Self, Error> {
         Self::take_fitting(drm, Wanted::Size(wanted), &|_, _, _| true)
     }
 
-    /// [`Self::take`] in the mode [`Wanted`] names that `fits`, where the
-    /// output has one.
+    /// [`Self::take`] in the size [`plan`] picks for [`Wanted`] and `fits`.
+    /// Every connected output with a mode of that size, a controller no
+    /// other output runs and encoders of its own shows the picture; the
+    /// output that gives the guest's mode is set first, and its refusal
+    /// stops the take. A refusal of another leaves it dark.
     pub fn take_fitting(mut drm: D, wanted: Wanted, fits: Fits<'_>) -> Result<Self, Error> {
         let (crtcs, connectors) = resources(&mut drm)?;
+        let mut usable = Vec::new();
+        let mut others = Vec::new();
         for &id in &connectors {
             let found = output(&mut drm, id)?;
-            let Some(mode) = choose(&found.modes, wanted, fits).filter(|_| found.connected) else {
-                continue;
+            let reach = match found.connected && !found.modes.is_empty() {
+                true => reach(&mut drm, &found.encoders, &crtcs)?,
+                false => 0,
             };
-            if let Some(crtc) = controller(&mut drm, &found.encoders, &crtcs)? {
-                let display = Self::run(drm, crtc, id, mode)?;
-                let [width, height] = found.size_mm;
-                return Ok(Self {
-                    size_mm: (width != 0 && height != 0).then_some((width, height)),
-                    ..display
-                });
+            match reach {
+                0 => others.push((id, found.connected)),
+                _ => usable.push((id, found, reach)),
             }
         }
-        Err(Error::NoOutput)
+        // What the firmware lit first, then DRM's order.
+        usable.sort_by_key(|(_, found, _)| !found.lit);
+        let modes: Vec<&[ModeInfo]> = usable.iter().map(|(_, found, _)| &*found.modes).collect();
+        let Some((size, first)) = plan(&modes, wanted, fits) else {
+            return Err(Error::NoOutput);
+        };
+        let first = usable.remove(first);
+        let [width, height] = first.1.size_mm;
+        let mut heads = Vec::new();
+        for (id, found, reach) in core::iter::once(first).chain(usable) {
+            let fitting: Fits<'_> = match heads.is_empty() {
+                true => fits,
+                false => &|_, _, _| true,
+            };
+            let crtc =
+                free_crtc(reach, &crtcs, &heads).filter(|_| encoders_free(&found.encoders, &heads));
+            match (mode_of(&found.modes, size, fitting), crtc) {
+                (Some(mode), Some(crtc)) => heads.push(Head {
+                    crtc,
+                    connector: id,
+                    encoders: found.encoders,
+                    mode,
+                    lost: false,
+                    behind: false,
+                }),
+                _ => others.push((id, true)),
+            }
+        }
+        let display = Self::run(drm, heads, crtcs, others)?;
+        Ok(Self {
+            size_mm: (width != 0 && height != 0).then_some((width, height)),
+            ..display
+        })
     }
 
-    fn run(mut drm: D, crtc: u32, connector: u32, mode: ModeInfo) -> Result<Self, Error> {
-        let (width, height) = (u32::from(mode.hdisplay), u32::from(mode.vdisplay));
+    /// Set the first of `heads`, then the others, on the first of three
+    /// new buffers of the first's size.
+    fn run(
+        mut drm: D,
+        mut heads: Vec<Head>,
+        crtcs: Vec<u32>,
+        mut others: Vec<(u32, bool)>,
+    ) -> Result<Self, Error> {
+        let Some(mode) = heads.first().map(|head| head.mode) else {
+            return Err(Error::NoOutput);
+        };
+        let (width, height) = size_of_mode(&mode);
         let mut made = Vec::new();
         for _ in 0..3 {
             match buffer(&mut drm, width, height) {
@@ -719,9 +862,9 @@ impl<D: Drm> Display<D> {
         let Ok(buffers) = <[Buffer; 3]>::try_from(made) else {
             return Err(Error::Allocation);
         };
+        let rest = heads.split_off(1);
         let mut display = Self {
             drm,
-            crtc,
             width,
             height,
             refresh: refresh(&mode),
@@ -731,61 +874,140 @@ impl<D: Drm> Display<D> {
             stale: [0..height as usize, 0..height as usize, 0..height as usize],
             queued: false,
             row: Vec::new(),
-            connector,
-            mode,
-            lost: false,
+            heads,
+            crtcs,
+            others: Vec::new(),
         };
-        if let Err(error) = display.set_mode() {
+        if let Err(error) = display.set_mode(0) {
             release_all(&mut display.drm, &display.buffers);
             return Err(error);
         }
+        for head in rest {
+            display.heads.push(head);
+            let last = display.heads.len() - 1;
+            if display.set_mode(last).is_err() {
+                let head = display.heads.remove(last);
+                others.push((head.connector, true));
+            }
+        }
+        display.others = others;
         Ok(display)
     }
 
-    /// Run the controller in the mode on the connector, showing the buffer
-    /// on screen.
-    fn set_mode(&mut self) -> Result<(), Error> {
-        let mut connectors = self.connector;
+    /// Run head `index`'s controller in its mode on its connector, showing
+    /// the buffer on screen.
+    fn set_mode(&mut self, index: usize) -> Result<(), Error> {
+        let head = &self.heads[index];
+        let mut connectors = head.connector;
         let mut set = Crtc {
             connectors: ptr::from_mut(&mut connectors) as u64,
             connector_count: 1,
-            id: self.crtc,
+            id: head.crtc,
             framebuffer: self.buffers[0].framebuffer,
             mode_valid: 1,
-            mode: self.mode,
+            mode: head.mode,
             ..Crtc::default()
         };
         call(&mut self.drm, SET_CRTC, &mut set)
     }
 
-    /// Read the output's connector as the driver last detected it, with no
-    /// probe, where a request completes now. Once it is connected again
-    /// after a read found it disconnected, the controller is turned off and
-    /// set again on the buffer on screen: a full mode set, which trains a
-    /// DisplayPort link anew, where an unchanged one would change nothing.
-    /// A refused mode set leaves it lost, to be tried at the next read.
+    /// Read the connectors as the driver last detected them, with no probe,
+    /// where a request completes now.
+    ///
+    /// A shown output connected again after a read found it disconnected
+    /// has its controller turned off and set again on the buffer on screen:
+    /// a full mode set, which trains a DisplayPort link anew, where an
+    /// unchanged one would change nothing. A refused mode set leaves it
+    /// lost, to be tried at the next read.
+    ///
+    /// An output not shown, connected since it was last read disconnected
+    /// or since the take, is probed once and joins the picture in its mode
+    /// of the display's size on a free controller, else stays dark until it
+    /// is connected again.
     pub fn watch(&mut self) -> Result<Watched, Error> {
+        let mut watched = Watched::default();
         if !self.drm.immediate() {
-            return Ok(Watched::Unchanged);
+            return Ok(watched);
         }
-        let connected = detected_on(&mut self.drm, self.connector)?;
-        match (connected, self.lost) {
-            (false, false) => {
-                self.lost = true;
-                Ok(Watched::Lost)
+        for index in 0..self.heads.len() {
+            let connected = detected_on(&mut self.drm, self.heads[index].connector)?;
+            match (connected, self.heads[index].lost) {
+                (false, false) => {
+                    self.heads[index].lost = true;
+                    watched.lost += 1;
+                }
+                (true, true) => {
+                    let mut off = Crtc {
+                        id: self.heads[index].crtc,
+                        ..Crtc::default()
+                    };
+                    call(&mut self.drm, SET_CRTC, &mut off)?;
+                    self.set_mode(index)?;
+                    self.heads[index].lost = false;
+                    watched.restored += 1;
+                }
+                _ => {}
             }
-            (true, true) => {
-                let mut off = Crtc {
-                    id: self.crtc,
-                    ..Crtc::default()
-                };
-                call(&mut self.drm, SET_CRTC, &mut off)?;
-                self.set_mode()?;
-                self.lost = false;
-                Ok(Watched::Restored)
-            }
-            _ => Ok(Watched::Unchanged),
         }
+        let mut index = 0;
+        while let Some(&(id, tried)) = self.others.get(index) {
+            index += 1;
+            if !detected_on(&mut self.drm, id)? {
+                self.others[index - 1].1 = false;
+                continue;
+            }
+            if tried {
+                continue;
+            }
+            self.others[index - 1].1 = true;
+            match self.join(id)? {
+                true => {
+                    self.others.remove(index - 1);
+                    index -= 1;
+                    watched.joined += 1;
+                }
+                false => watched.unshown += 1,
+            }
+        }
+        Ok(watched)
+    }
+
+    /// Show the picture on connector `id` as well, where it has a mode of
+    /// the display's size, a free controller and encoders of its own.
+    fn join(&mut self, id: u32) -> Result<bool, Error> {
+        let found = output(&mut self.drm, id)?;
+        let reach = reach(&mut self.drm, &found.encoders, &self.crtcs)?;
+        let mode = mode_of(&found.modes, (self.width, self.height), &|_, _, _| true);
+        let crtc = free_crtc(reach, &self.crtcs, &self.heads)
+            .filter(|_| encoders_free(&found.encoders, &self.heads));
+        let (Some(mode), Some(crtc), true) = (mode, crtc, found.connected) else {
+            return Ok(false);
+        };
+        self.heads.push(Head {
+            crtc,
+            connector: id,
+            encoders: found.encoders,
+            mode,
+            lost: false,
+            behind: false,
+        });
+        let last = self.heads.len() - 1;
+        if self.set_mode(last).is_err() {
+            self.heads.remove(last);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// How many outputs show the picture.
+    pub fn outputs(&self) -> usize {
+        self.heads.len()
+    }
+
+    /// How many connected outputs do not show it: no mode of its size, or
+    /// no free controller or encoder, or a refused mode set.
+    pub fn unshown(&self) -> usize {
+        self.others.iter().filter(|(_, tried)| *tried).count()
     }
 
     /// Pixels across and down.
@@ -871,37 +1093,66 @@ impl<D: Drm> Display<D> {
     }
 
     /// Whether a frame waits in the hidden buffer for its flip to be
-    /// requested ([`Self::flush`]).
+    /// requested, or an output that follows the first waits for its flip
+    /// to the newest buffer ([`Self::flush`]).
     pub fn queued(&self) -> bool {
-        self.queued
+        self.queued || self.heads.iter().any(|head| head.behind)
     }
 
-    /// Request the queued frame's flip, if this processor may now. A flip
-    /// the engine is still busy with leaves the frame queued for the next
-    /// flush. A refused flip drops the request, reported here; the frame
-    /// stays in the hidden buffer and shows with the next one.
+    /// Request the queued frame's flip on the first output, if this
+    /// processor may now, then each other output's flip to the newest
+    /// buffer. A flip the engine is still busy with stays queued for the
+    /// next flush. A refused flip drops the request, reported here: on the
+    /// first output the frame stays in the hidden buffer and shows with the
+    /// next one; another output keeps its picture until the next frame.
     pub fn flush(&mut self) -> Result<(), Error> {
-        if !self.queued || !self.drm.immediate() {
+        if !self.queued() || !self.drm.immediate() {
             return Ok(());
         }
-        let mut flip = PageFlip {
-            crtc: self.crtc,
-            framebuffer: self.buffers[2].framebuffer,
-            ..PageFlip::default()
-        };
-        match self.drm.control(PAGE_FLIP, ptr::from_mut(&mut flip).cast()) {
-            0 => {
-                self.queued = false;
-                self.buffers.rotate_right(1);
-                self.stale.rotate_right(1);
-                Ok(())
-            }
-            BUSY => Ok(()),
-            error => {
-                self.queued = false;
-                Err(Error::Request(error))
+        let mut flushed = Ok(());
+        if self.queued {
+            match self.flip(0, self.buffers[2].framebuffer) {
+                0 => {
+                    self.queued = false;
+                    self.buffers.rotate_right(1);
+                    self.stale.rotate_right(1);
+                    for head in &mut self.heads[1..] {
+                        head.behind = true;
+                    }
+                }
+                BUSY => {}
+                error => {
+                    self.queued = false;
+                    flushed = Err(Error::Request(error));
+                }
             }
         }
+        for index in 1..self.heads.len() {
+            if !self.heads[index].behind {
+                continue;
+            }
+            match self.flip(index, self.buffers[0].framebuffer) {
+                BUSY => {}
+                result => {
+                    self.heads[index].behind = false;
+                    if result != 0 && flushed.is_ok() {
+                        flushed = Err(Error::Request(result));
+                    }
+                }
+            }
+        }
+        flushed
+    }
+
+    /// Request head `index`'s flip to `framebuffer`: zero or a negative
+    /// errno.
+    fn flip(&mut self, index: usize, framebuffer: u32) -> i64 {
+        let mut flip = PageFlip {
+            crtc: self.heads[index].crtc,
+            framebuffer,
+            ..PageFlip::default()
+        };
+        self.drm.control(PAGE_FLIP, ptr::from_mut(&mut flip).cast())
     }
 
     fn queue(&mut self) -> Result<(), Error> {
