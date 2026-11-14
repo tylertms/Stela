@@ -1,6 +1,6 @@
 //! Buffers, textures, samplers and heaps.
 use super::{
-    Call, Object, Service, boolean, region,
+    Call, Object, Service, StartedReadBack, boolean, region,
     wire::{
         AUTOMATIC, BufferRangeRequest, BufferResponse, Empty, Fault, FormatAlignmentsResponse,
         Handle, HeapBufferSizeRequest, HeapDescriptorRecord, HeapUsageRequest, HeapUsageResponse,
@@ -209,7 +209,32 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 bytes: transfer.bands.iter().map(|(_, span)| span.length).sum(),
             },
         );
-        for (region, span) in transfer.bands {
+        // The bands before it were copied to the caller already.
+        let (from, count) = (
+            self.read_back_from.take().unwrap_or(0),
+            transfer.bands.len(),
+        );
+        for (band, (region, span)) in transfer.bands.into_iter().enumerate().skip(from) {
+            if self.reads_back {
+                let length = usize::try_from(span.length)
+                    .map_err(|_| Fault::malformed("span length").value(span.length))?;
+                let started = self.device.begin_read_back(
+                    call.connection.get(),
+                    transfer.texture,
+                    &region,
+                    transfer.strides,
+                    length,
+                )?;
+                if let Some(read_back) = started {
+                    self.read_back_started = Some(StartedReadBack {
+                        read_back,
+                        band,
+                        span,
+                        last: band + 1 == count,
+                    });
+                    return Err(Fault::new(Status::Pending, ""));
+                }
+            }
             let start = self.device.timing().now();
             let mut bytes = call.memory.read(span)?;
             self.device.timing().since(Phase::BytesRead, start);

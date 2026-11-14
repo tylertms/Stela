@@ -1229,3 +1229,121 @@ fn a_held_library_is_shared_without_a_block_of_its_size() {
     assert_eq!(call.status, Status::OutOfMemory.raw());
     assert_ne!(refused, 0);
 }
+
+/// A texture only host image copies reach is read by a GPU copy into host
+/// memory: the call's turn starts each band's copy and answers `Pending`,
+/// and the call made again copies the band to its caller from the published
+/// completion, holding no turn, while another call holds the service.
+#[test]
+fn a_texture_read_waits_for_its_gpu_copy_and_copies_out_holding_no_turn() {
+    use crate::metal::{
+        abi::StorageMode,
+        device::resources::CPU_BAND_BYTES,
+        service::wire::{Empty, RegionRecord, TextureBytesRequest, TextureResponse},
+        vulkan::backend::Object,
+    };
+    let shared = SharedService::new(service(), HOST);
+    let connection = connect(&mut shared.try_turn().unwrap());
+    let mut memory = Memory::default();
+    let texture: TextureResponse = super::call(
+        &mut shared.try_turn().unwrap(),
+        connection,
+        Operation::NewTexture,
+        &super::texture(StorageMode::Shared),
+        &mut memory,
+    )
+    .unwrap();
+    // Two rows of eight texels, written whole. The test's GPU copies an
+    // image from its start, so the rows are alike; each band's copy names
+    // its own row.
+    let written: alloc::vec::Vec<u8> = (0..64).map(|byte| byte % 32).collect();
+    let region = RegionRecord {
+        slice: 0,
+        level: 0,
+        origin: [0; 3],
+        size: [8, 2, 1],
+    };
+    let replace = TextureBytesRequest {
+        texture: texture.handle,
+        region,
+        bytes: memory.put(&written),
+        bytes_per_row: 32,
+        bytes_per_image: 0,
+    };
+    let _: Empty = super::call(
+        &mut shared.try_turn().unwrap(),
+        connection,
+        Operation::ReplaceRegion,
+        &replace,
+        &mut memory,
+    )
+    .unwrap();
+    // Rows a band apart: each is a band of its own.
+    let apart = CPU_BAND_BYTES as usize;
+    let read = TextureBytesRequest {
+        bytes: memory.put(&alloc::vec![0xee; apart + 32]),
+        bytes_per_row: CPU_BAND_BYTES,
+        ..replace
+    };
+    let record = gate_call(&mut memory, Operation::GetBytes, wire::bytes(&read), 0);
+    let serve = |memory: &mut Memory| {
+        GateService::serve(&shared, connection, record, memory).unwrap();
+        completed(memory, record).status
+    };
+    // `HOST.relax` panics: a call that waited for the holder would fail.
+    let serve_held = |memory: &mut Memory| {
+        let held = shared.try_turn().unwrap();
+        let status = serve(memory);
+        drop(held);
+        status
+    };
+    let finish = || {
+        shared.try_turn().unwrap().device().backend().finish();
+        shared.interrupted();
+    };
+    // The first band's turn starts its copy.
+    assert_eq!(serve(&mut memory), Status::Pending.raw());
+    assert_eq!(serve_held(&mut memory), Status::Pending.raw(), "copy runs");
+    finish();
+    // Copied out, and the next band's copy starts in the call's turn.
+    assert_eq!(serve(&mut memory), Status::Pending.raw());
+    let bytes = GuestMemory::read(&mut memory, read.bytes).unwrap();
+    assert_eq!(bytes[..32], written[..32]);
+    assert_eq!(serve_held(&mut memory), Status::Pending.raw(), "copy runs");
+    finish();
+    // The last band is copied out holding no turn.
+    assert_eq!(serve_held(&mut memory), Status::Ok.raw());
+    let rows: alloc::vec::Vec<(i32, [u32; 3])> = shared
+        .try_turn()
+        .unwrap()
+        .device()
+        .backend()
+        .submissions
+        .iter()
+        .flatten()
+        .flat_map(|segment| &segment.commands)
+        .filter_map(|command| match command {
+            crate::metal::vulkan::command::Command::CopyImageToBuffer { region, .. } => {
+                Some((region.offset[1], region.extent))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows, [(0, [8, 1, 1]), (1, [8, 1, 1])]);
+    let bytes = GuestMemory::read(&mut memory, read.bytes).unwrap();
+    assert_eq!(bytes[..32], written[..32]);
+    assert_eq!(bytes[32..apart], alloc::vec![0xee; apart - 32][..]);
+    assert_eq!(bytes[apart..], written[32..]);
+    // The memory copied out of is freed by the next turn.
+    GateService::disconnect(&shared, connection);
+    let freed = shared
+        .try_turn()
+        .unwrap()
+        .device()
+        .backend()
+        .destroyed
+        .iter()
+        .filter(|object| matches!(object, Object::Buffer(_)))
+        .count();
+    assert_eq!(freed, 2, "both bands' host memory");
+}
