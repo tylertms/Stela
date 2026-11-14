@@ -357,7 +357,7 @@ fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Re
     }
     if let Some(next) = &record.replacing {
         report.problem(format!(
-            "the update to macOS {next} stopped before its copy was complete, so this USB cannot \
+            "the switch to macOS {next} stopped before its copy was complete, so this stick cannot \
              install macOS until it is: {} finishes it",
             report.fix("repair")
         ));

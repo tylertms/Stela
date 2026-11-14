@@ -340,8 +340,8 @@ fn ask(environment: &Environment<'_>, command: &mut Request, stick: &Stick) -> R
             // The command its state calls for, if any: a stick that needs
             // nothing is kept by not erasing it.
             let keep = match stick.next(true) {
-                Some(command) => format!("choose Cancel and run `{command}`"),
-                None => "choose Cancel".into(),
+                Some(command) => format!("choose Quit and run `{command}`"),
+                None => "choose Quit".into(),
             };
             ui.warning(&format!(
                 "This stick holds Stela with macOS {}: a new installer replaces it. To keep it, \
@@ -354,7 +354,7 @@ fn ask(environment: &Environment<'_>, command: &mut Request, stick: &Stick) -> R
             0 => "Erase and create".to_owned(),
             bytes => format!("Erase and create (downloads {})", host::size_text(bytes)),
         };
-        let rows = ui::rows(&[(&create, ""), ("Change something", ""), ("Cancel", "")]);
+        let rows = ui::rows(&[(&create, ""), ("Change something", ""), ("Quit", "")]);
         match ui.select("Create the installer?", &rows, 0)? {
             0 => {
                 if matches!(usb.removal, Removal::Typed | Removal::Unsure) {

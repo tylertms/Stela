@@ -2962,7 +2962,14 @@ fn an_interrupted_copy_replacement_is_named_and_finished_by_the_same_update() {
     let status = rerun(&f, |c| c.action = Action::Status)
         .unwrap_err()
         .to_string();
-    assert!(status.contains("cannot install macOS"), "{status}");
+    // Named as plain stela names it.
+    assert!(
+        status.contains(
+            "the switch to macOS STELA2 stopped before its copy was complete, so this stick \
+             cannot install macOS"
+        ),
+        "{status}"
+    );
     assert!(
         status.contains(&format!("{} finishes it", fix(&f.esp, "repair"))),
         "{status}"
@@ -6256,7 +6263,7 @@ fn journey_a_blank_stick_walks_through_the_wizard_and_cancel_changes_nothing() {
             "Change something",
             "Installer",
             "Offline",
-            "Cancel",
+            "Quit",
         ],
         &[],
     );
@@ -6291,7 +6298,7 @@ fn journey_a_blank_stick_walks_through_the_wizard_and_cancel_changes_nothing() {
 #[test]
 fn review_and_status_show_the_wifi_country() {
     let f = fixture(64 * GIB, false);
-    let person = ui::tests::Scripted::new(&["Online", "Home", "correct horse", "Cancel"]);
+    let person = ui::tests::Scripted::new(&["Online", "Home", "correct horse", "Quit"]);
     let networks = || vec!["Home".to_owned()];
     let country = || Some("DE".to_owned());
     let environment = Environment {
@@ -6347,10 +6354,10 @@ fn journey_b_a_stick_with_stela_is_not_treated_as_blank() {
     assert!(shown.ends_with("■ Nothing was changed."), "{shown}");
     assert_eq!(shown.matches("Nothing was changed.").count(), 1, "{shown}");
     assert_eq!(stick_files(&f), before);
-    // Erasing it from the menu warns that it holds Stela; Cancel keeps it.
+    // Erasing it from the menu warns that it holds Stela; Quit keeps it.
     let (shown, result, done) = plain_stela(
         &f,
-        &["Erase it and make a new installer", "Offline", "Cancel"],
+        &["Erase it and make a new installer", "Offline", "Quit"],
         &[],
     );
     result.unwrap();
@@ -6378,11 +6385,11 @@ fn erasing_a_stela_stick_names_the_command_that_keeps_it_for_its_state() {
     let f = made_by(Some(release::CURRENT));
     let (shown, result, _) = plain_stela(
         &f,
-        &["Erase it and make a new installer", "Offline", "Cancel"],
+        &["Erase it and make a new installer", "Offline", "Quit"],
         &[],
     );
     result.unwrap();
-    assert_eq!(keep(&shown), "choose Cancel.");
+    assert_eq!(keep(&shown), "choose Quit.");
     // An older one is updated.
     let f = made_by(None);
     let (shown, result, _) = plain_stela(
@@ -6391,13 +6398,13 @@ fn erasing_a_stela_stick_names_the_command_that_keeps_it_for_its_state() {
             "Other choices",
             "Erase it and make a new installer",
             "Offline",
-            "Cancel",
+            "Quit",
         ],
         &[],
     );
     result.unwrap();
     let update = format!(
-        "choose Cancel and run `stela update {}disk5`.",
+        "choose Quit and run `stela update {}disk5`.",
         host::DISK_PREFIX
     );
     assert_eq!(keep(&shown), update);
@@ -6406,10 +6413,10 @@ fn erasing_a_stela_stick_names_the_command_that_keeps_it_for_its_state() {
     add_stela(&mut f);
     setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
     interrupt_setup(&f);
-    let (shown, result, _) = plain_stela(&f, &["Start over", "Offline", "Cancel"], &[]);
+    let (shown, result, _) = plain_stela(&f, &["Start over", "Offline", "Quit"], &[]);
     result.unwrap();
     let repair = format!(
-        "choose Cancel and run `stela repair {}disk5`.",
+        "choose Quit and run `stela repair {}disk5`.",
         host::DISK_PREFIX
     );
     assert_eq!(keep(&shown), repair);
@@ -6794,7 +6801,7 @@ fn journey_settings_change_the_wifi_and_cancel_changes_nothing() {
             "Home",
             "correct horse",
             "Automatic",
-            "Cancel",
+            "Quit",
         ],
         &["Home"],
     );

@@ -42,7 +42,7 @@ pub(super) fn ask(
     let result = (|| -> Result<bool> {
         wizard::choose_wifi(environment, request)?;
         addresses::choose(ui, request)?;
-        let rows = ui::rows(&[("Save", ""), ("Cancel", "")]);
+        let rows = ui::rows(&[("Save", ""), ("Quit", "")]);
         Ok(ui.select("Save these settings?", &rows, 0)? == 0)
     })();
     let save = match result {
