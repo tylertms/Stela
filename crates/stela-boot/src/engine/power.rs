@@ -28,6 +28,7 @@
 use super::host;
 use crate::output;
 use core::arch::asm;
+use stela_boot_core::power_button::{FORCE_WINDOW_MILLIS, Press, Presses};
 use stela_runtime::pc::power::{HostPower, POWER_BUTTON, SCI_ENABLE};
 use stela_soc::machine::AppleDevices;
 
@@ -145,8 +146,9 @@ pub struct HostPowerControl {
     button: bool,
     /// The guest refused the button once; reported once.
     refused: bool,
-    /// The host's button was pressed before, which the next press holds.
-    pressed_before: bool,
+    /// The last press that may still be pending: a second one soon after
+    /// stands for a hold ([`stela_boot_core::power_button`]).
+    presses: Presses,
     /// When the PM1 status registers were last read.
     looked: u64,
 }
@@ -175,7 +177,7 @@ impl HostPowerControl {
             disks,
             button: false,
             refused: false,
-            pressed_before: false,
+            presses: Presses::new(),
             looked: 0,
         };
         control.button = control.arm_button();
@@ -221,11 +223,24 @@ impl HostPowerControl {
 
     /// Give the guest a press and a release of its power button, for a
     /// press of the host's ([`Self::pressed`]). A host button has no hold a
-    /// PC reports, so a second press is one: the Mac turns off however the
+    /// PC reports, so a second press within a few seconds, with the guest
+    /// not asleep since, stands for one: the Mac turns off however the
     /// guest fares, and the run's translations are kept as at any power-off.
+    /// Any later press, or one after a sleep, is a new request.
     pub fn press(&mut self, devices: &mut AppleDevices) {
-        let result = if core::mem::replace(&mut self.pressed_before, true) {
-            output::arguments(format_args!("POWER host button held\n"));
+        // The service moves between cores: the corrected count, not a core's
+        // raw TSC.
+        let window = host::COUNTER_HZ / 1000 * FORCE_WINDOW_MILLIS;
+        let press = self.presses.press(
+            host::fresh_counter(),
+            window,
+            devices.sleeps(),
+            devices.asleep(),
+        );
+        let result = if press == Press::ForceOff {
+            output::arguments(format_args!(
+                "POWER host button pressed twice within {FORCE_WINDOW_MILLIS} ms: held\n"
+            ));
             devices.power_button_held()
         } else {
             devices

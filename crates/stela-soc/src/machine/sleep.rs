@@ -54,6 +54,8 @@ pub(super) struct SocSleep {
     /// The PEs out of reset and not powered down.
     powered: BTreeSet<usize>,
     pub(super) asleep: bool,
+    /// The times the SoC went to sleep since the boot.
+    sleeps: u64,
     /// The AOP wake masks and `SMC.CPUWakeupAP`'s source number.
     pub(super) wake_masks: Option<(DeviceId, Option<u8>)>,
     /// The primary PMU's interrupt output, and its level when last seen.
@@ -68,6 +70,7 @@ impl SocSleep {
             boot,
             powered: BTreeSet::from([boot]),
             asleep: false,
+            sleeps: 0,
             wake_masks: None,
             pmu: None,
             pmu_seen: false,
@@ -87,6 +90,12 @@ impl AppleDevices {
     /// Whether the SoC sleeps.
     pub fn asleep(&self) -> bool {
         self.sleep.asleep
+    }
+
+    /// The times the SoC went to sleep since the boot: a host power button
+    /// press after one is a new request, whatever came before it.
+    pub fn sleeps(&self) -> u64 {
+        self.sleep.sleeps
     }
 
     /// The next step of the SoC's sleep, for the host's log.
@@ -131,6 +140,7 @@ impl AppleDevices {
         }
         self.smc().expect("the SMC took slpa").enter_sleep();
         self.sleep.asleep = true;
+        self.sleep.sleeps += 1;
         self.sleep.log.push_back(PowerLog::Sleep);
     }
 
@@ -298,9 +308,11 @@ mod tests {
         assert!(!devices.processor_running(0));
         assert!(devices.processor_running(3));
         unmask_smc_wake(&mut devices);
+        assert_eq!(devices.sleeps(), 0);
         system_event(&mut devices, b"slpa");
         devices.processor_power(3, false);
         assert!(devices.asleep());
+        assert_eq!(devices.sleeps(), 1, "each sleep is counted");
         assert_eq!(devices.take_power_log(), Some(PowerLog::Sleep));
         devices.power_button(true).unwrap();
         assert!(!devices.asleep());

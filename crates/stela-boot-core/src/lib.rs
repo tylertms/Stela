@@ -66,6 +66,7 @@ pub mod passthrough;
 pub mod pe;
 pub mod pm_timer;
 pub mod poll_timer;
+pub mod power_button;
 pub mod ram;
 pub mod random;
 pub mod record;
