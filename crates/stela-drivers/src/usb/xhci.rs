@@ -1298,6 +1298,13 @@ impl Found {
         self.absorb_settled(settled);
     }
 
+    /// The Bulk-Only interfaces still settling, for a caller that waits
+    /// once for those of every controller it started: see
+    /// [`Started::finish_unsettled`].
+    pub fn take_settling(&mut self) -> Vec<settle::Settling> {
+        core::mem::take(&mut self.settling)
+    }
+
     /// What the controller that died while its devices started was doing.
     pub fn controller_death(&self) -> Option<Death> {
         self.hosts.iter().find_map(Host::death)
@@ -1521,6 +1528,20 @@ impl Started {
         dma: &mut dyn DmaAllocator,
         firmware: &dyn crate::firmware::Provider,
     ) -> Found {
+        let mut found = self.finish_unsettled(dma, firmware);
+        found.settle(dma);
+        found
+    }
+
+    /// [`Self::finish`] with the Bulk-Only interfaces left settling, each
+    /// from its own configuration: the caller takes them
+    /// ([`Found::take_settling`]) and discovers them with every other
+    /// controller's ([`settle::settle`]), so the waits overlap.
+    pub fn finish_unsettled(
+        self,
+        dma: &mut dyn DmaAllocator,
+        firmware: &dyn crate::firmware::Provider,
+    ) -> Found {
         let Self {
             mut controller,
             controller_firmware,
@@ -1535,7 +1556,6 @@ impl Started {
         for device in &devices {
             bind_with_provider(&shared, device.clone(), dma, &mut found, firmware);
         }
-        found.settle(dma);
         found
             .hosts
             .push(Host::new(shared, &devices, dma, &mut found.failures));

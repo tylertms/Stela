@@ -714,6 +714,10 @@ pub struct Devices {
     pub ahci_hosts: Vec<ahci::Host>,
     /// Storage class owners remain available for explicit media rescan.
     pub usb_storage: Vec<crate::usb::storage::UsbStorage>,
+    /// Bulk-Only interfaces of the controllers started after the scan,
+    /// each settling from its own configuration, discovered together once
+    /// the latest has ([`Self::settle_usb`]).
+    pub(crate) usb_settling: Vec<crate::usb::storage::settle::Settling>,
     /// USB HCI transports with kept device-specific initialization results.
     /// Historical evidence does not establish radio or guest readiness.
     pub bluetooth: Vec<UsbHci>,
@@ -994,6 +998,7 @@ impl Devices {
         self.usb_devices.extend(found.devices);
         self.usb_hosts.extend(found.hosts);
         self.usb_storage.extend(found.storage);
+        self.usb_settling.extend(found.settling);
         self.audio.extend(found.audio);
         self.bluetooth_bootloaders.extend(found.bootloaders);
         for mut device in found.bluetooth {
@@ -1018,6 +1023,21 @@ impl Devices {
             self.usb_port_probes
                 .extend(found.probes.into_iter().map(|probe| (address, probe)));
         }
+    }
+
+    /// Wait once until every settling Bulk-Only interface's second has
+    /// passed, then discover them all: the controllers started after the
+    /// scan wait together, not one after another.
+    fn settle_usb(&mut self, dma: &mut dyn DmaAllocator) {
+        let settled = crate::usb::storage::settle::settle(&mut self.usb_settling, Some(dma), true);
+        self.disks.extend(
+            settled
+                .disks
+                .into_iter()
+                .map(|disk| Box::new(disk) as Box<dyn BlockDevice>),
+        );
+        self.usb_storage.extend(settled.storage);
+        self.usb_failures.extend(settled.failures);
     }
 
     /// Failures from attempted native vendor initialization, USB and PCIe,
@@ -2158,8 +2178,9 @@ pub unsafe fn probe_observed(
             continue;
         }
         let mut start = DeviceStart::begin(address, handoff.clock, &mut abandoned);
+        // Its Bulk-Only disks settle with every later controller's.
         absorb_xhci(
-            Ok(started.finish(dma, firmware)),
+            Ok(started.finish_unsettled(dma, firmware)),
             &mut function,
             &XhciInputs {
                 handoff,
@@ -2196,6 +2217,7 @@ pub unsafe fn probe_observed(
     // its PCI fixups.
     #[cfg(feature = "native-acpi")]
     attach_platform(services, smbus_functions, &bridges, handoff, &mut devices);
+    devices.settle_usb(dma);
     devices
 }
 
@@ -2679,11 +2701,12 @@ fn attach_ehci_hosts(
                 continue;
             }
         };
-        let found = usb::ehci::host::enumerate(
+        let mut found = usb::ehci::host::enumerate_unsettled(
             &controller,
             &alloc::format!("{address} EHCI"),
             handoff.clock,
         );
+        devices.usb_settling.append(&mut found.take_settling());
         devices.disks.extend(
             found
                 .disks

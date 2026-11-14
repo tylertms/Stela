@@ -6,6 +6,7 @@ use crate::block::BlockDevice;
 use crate::bus::dma::TestRegion;
 use alloc::collections::BTreeMap;
 use hub::model::{Hardware, Node, RegistersModel};
+use storage::settle::{self, SETTLE_US};
 
 /// A controller with a Bulk-Only disk on its root port, not enumerated.
 fn bot_controller(dma: &mut TestRegion) -> (Controller, Rc<RefCell<Hardware>>) {
@@ -150,4 +151,63 @@ fn a_bulk_only_disk_gets_its_first_class_request_a_second_after_its_configuratio
             assert_eq!(max_lun(), before + 1);
         }
     }
+}
+
+/// Two controllers started one after another, a stick on each: each
+/// stick's second runs from its own configuration and one wait covers
+/// both, so together they cost about one second, not two.
+#[test]
+fn bulk_only_disks_on_two_controllers_settle_in_one_second_together() {
+    let _clock = crate::test_clock::virtualize();
+    let mut dma = TestRegion::new(1024 * 1024 * 8);
+    let firmware = crate::firmware::HandoffProvider::new(None);
+    let (first, first_bus) = bot_controller(&mut dma);
+    let (second, second_bus) = bot_controller(&mut dma);
+    let clock = first.clock;
+    let start = Clock::ticks();
+    let mut found = vec![
+        Started {
+            controller: first,
+            controller_firmware: None,
+        }
+        .finish_unsettled(&mut dma, &firmware),
+    ];
+    // Other devices start between the two controllers.
+    crate::test_clock::advance(clock, SETTLE_US / 4);
+    found.push(
+        Started {
+            controller: second,
+            controller_firmware: None,
+        }
+        .finish_unsettled(&mut dma, &firmware),
+    );
+    let configured = Clock::ticks();
+    let max_lun = |bus: &Rc<RefCell<Hardware>>| {
+        let get_max_lun = setup(0xa1, 0xfe, 0, 0, 1);
+        let bus = bus.borrow();
+        bus.requests
+            .iter()
+            .filter(|(_, _, request)| *request == get_max_lun)
+            .count()
+    };
+    let mut settling = Vec::new();
+    for found in &mut found {
+        assert!(found.failures.is_empty(), "{:?}", found.failures);
+        assert!(found.disks.is_empty() && found.storage.is_empty());
+        settling.append(&mut found.take_settling());
+    }
+    assert_eq!(settling.len(), 2);
+    assert_eq!((max_lun(&first_bus), max_lun(&second_bus)), (0, 0));
+    let settled = settle::settle(&mut settling, Some(&mut dma), true);
+    let end = Clock::ticks();
+    assert!(settled.failures.is_empty(), "{:?}", settled.failures);
+    assert_eq!(settled.disks.len(), 2);
+    assert_eq!((max_lun(&first_bus), max_lun(&second_bus)), (1, 1));
+    // The second stick's second began at its configuration, before
+    // `configured`; the first one's had begun earlier and ended before.
+    // Both discoveries follow, in tens of milliseconds of model time.
+    let after = end - configured;
+    assert!(after < SETTLE_US + SETTLE_US / 10, "{after} us");
+    assert!(end - start >= SETTLE_US + SETTLE_US / 4);
+    assert!(end - start < 2 * SETTLE_US, "{} us in all", end - start);
 }
