@@ -153,6 +153,22 @@ impl Scanout for KmsScanout {
         self.look();
         Ok(())
     }
+
+    /// Display sleep turns the outputs off, and a wake lights them again;
+    /// where a request must wait, the next flush on the boot CPU does it.
+    /// With no display taken nothing of this scanout is lit.
+    fn set_power(&mut self, on: bool) -> Result<()> {
+        let Some((_, display)) = &mut self.display else {
+            return Ok(());
+        };
+        display.set_power(on).map_err(|error| {
+            refuse!(
+                "the GPU's display refused to turn its outputs {state}: {error}",
+                state = if on { "on" } else { "off" },
+                error = format!("{error:?}")
+            )
+        })
+    }
 }
 
 impl KmsScanout {

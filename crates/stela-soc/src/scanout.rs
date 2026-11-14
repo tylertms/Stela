@@ -205,6 +205,13 @@ pub trait Scanout {
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// Turn the monitor off (`false`), as display sleep does, or on again
+    /// showing the last frame presented. A sink with no control of its
+    /// monitor's power refuses, and its picture stays lit.
+    fn set_power(&mut self, _on: bool) -> Result<()> {
+        Err(refuse!("the host scanout cannot turn its monitor off"))
+    }
 }
 
 /// The smallest range of rows holding both `a` and `b`; an empty range adds

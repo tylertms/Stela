@@ -556,6 +556,12 @@ pub struct Methods {
     last_present: Option<(u64, u32)>,
     /// The monitor's power and sleep state, shared with its IOAV controller.
     display: Rc<RefCell<DisplayState>>,
+    /// Whether the scanout's monitor is lit, as last set; it follows the
+    /// display's power and sleep state ([`Self::apply_power`]).
+    sink_powered: bool,
+    /// The scanout refused to turn its monitor off or on, which is
+    /// reported once.
+    sink_power_refused: bool,
     /// Open IOMFB clients (`first_client_open` minus `last_client_close`).
     clients: u32,
     /// The mode set by `set_digital_out_mode`, `(color, timing)`.
@@ -690,6 +696,8 @@ impl Methods {
             window_start: None,
             last_present: None,
             display,
+            sink_powered: true,
+            sink_power_refused: false,
             clients: 0,
             digital_out: None,
             config_frame: (0, 0),
@@ -854,6 +862,7 @@ impl Methods {
     pub fn refresh_deadline(&self) -> Option<u64> {
         let wanted = self.notified
             || (!self.frames.is_empty() && self.display.borrow().active())
+            || self.display.borrow().active() != self.sink_powered
             || self
                 .scanout
                 .as_ref()
@@ -873,6 +882,7 @@ impl Methods {
         if self.shut_down {
             return;
         }
+        self.apply_power();
         if let Some(scanout) = self.scanout.as_mut()
             && scanout.queued()
             && let Err(reason) = scanout.flush()
@@ -896,6 +906,31 @@ impl Methods {
             self.refresh = Some(due);
         }
         self.close_window(due);
+    }
+
+    /// Turn the scanout's monitor off or on as the display's power and sleep
+    /// state now ask, from `setPowerState`, DCPAVIPC's `SetPower` or its
+    /// display sleep: macOS's display sleep then darkens the monitor, and a
+    /// wake shows the last frame again before the next swap. While a compose
+    /// has the scanout this waits for the next look. A sink that refuses is
+    /// reported once, and its monitor keeps the last frame lit.
+    fn apply_power(&mut self) {
+        let active = self.display.borrow().active();
+        if active == self.sink_powered {
+            return;
+        }
+        let Some(scanout) = self.scanout.as_mut() else {
+            return;
+        };
+        self.sink_powered = active;
+        if let Err(reason) = scanout.set_power(active)
+            && !core::mem::replace(&mut self.sink_power_refused, true)
+        {
+            self.reported.push(format!(
+                "IOMFB display {}: {reason}; the monitor stays as it was",
+                if active { "wake" } else { "sleep" }
+            ));
+        }
     }
 
     /// The counter reads `now`: what the calls, notices and answers the link
@@ -1584,6 +1619,7 @@ impl Service for Methods {
                         );
                     }
                 });
+                self.apply_power();
                 let packed = Packed::new().u32(0).u32(IO_RETURN_SUCCESS).finish(output);
                 self.reply(tag, packed)
             }

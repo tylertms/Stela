@@ -28,6 +28,11 @@
 //! finished answers `EBUSY` and stays queued for the next flush; a newer
 //! frame meanwhile replaces the queued one in the same hidden buffer.
 //!
+//! Display sleep: [`Display::set_power`] turns every shown output's controller
+//! off, as Linux's fbdev helper does for a blanked console, and back on in its
+//! mode on the buffer on screen; like a flip, the request waits for a
+//! processor where it completes at once ([`Display::flush`]).
+//!
 //! Hot-plug: a connector's state as the driver last detected it, which its
 //! hot-plug interrupt keeps current, is read with no probe ([`detected`]).
 //! An output that returns after it was seen disconnected gets its mode set
@@ -291,6 +296,10 @@ pub struct Display<D> {
     /// The connectors not shown, each with whether it was read connected
     /// and tried since it was last read disconnected.
     others: Vec<(u32, bool)>,
+    /// Every shown output's controller is off: display sleep.
+    dark: bool,
+    /// The power [`Self::set_power`] asked for, not yet requested.
+    power: Option<bool>,
 }
 
 /// What [`Display::watch`] read of the connectors since the last read.
@@ -877,6 +886,8 @@ impl<D: Drm> Display<D> {
             heads,
             crtcs,
             others: Vec::new(),
+            dark: false,
+            power: None,
         };
         if let Err(error) = display.set_mode(0) {
             release_all(&mut display.drm, &display.buffers);
@@ -911,6 +922,65 @@ impl<D: Drm> Display<D> {
         call(&mut self.drm, SET_CRTC, &mut set)
     }
 
+    /// Turn head `index`'s controller off.
+    fn crtc_off(&mut self, index: usize) -> Result<(), Error> {
+        let mut off = Crtc {
+            id: self.heads[index].crtc,
+            ..Crtc::default()
+        };
+        call(&mut self.drm, SET_CRTC, &mut off)
+    }
+
+    /// Turn every shown output off (`false`), as display sleep does, or on
+    /// again (`true`) in its mode on the buffer on screen, the last frame
+    /// flipped to. Where a request must wait, this is left to the next
+    /// [`Self::flush`]. While off, frames still fill the hidden buffer and
+    /// queue, and the first flush after the outputs are on again flips the
+    /// newest. A refused request is answered; the other outputs are still
+    /// set, and an output that cannot be lit again is left lost for the
+    /// next [`Self::watch`] to set once more.
+    pub fn set_power(&mut self, on: bool) -> Result<(), Error> {
+        self.power = Some(on);
+        self.apply_power()
+    }
+
+    fn apply_power(&mut self) -> Result<(), Error> {
+        let Some(on) = self.power else {
+            return Ok(());
+        };
+        if !self.drm.immediate() {
+            return Ok(());
+        }
+        self.power = None;
+        if on != self.dark {
+            return Ok(());
+        }
+        self.dark = !on;
+        let mut applied = Ok(());
+        for index in 0..self.heads.len() {
+            if self.heads[index].lost {
+                continue;
+            }
+            let result = match on {
+                true => self.set_mode(index),
+                false => self.crtc_off(index),
+            };
+            if let Err(error) = result {
+                if on {
+                    self.heads[index].lost = true;
+                }
+                if applied.is_ok() {
+                    applied = Err(error);
+                }
+            }
+        }
+        // Every lit output shows the buffer on screen now.
+        for head in &mut self.heads {
+            head.behind = false;
+        }
+        applied
+    }
+
     /// Read the connectors as the driver last detected them, with no probe,
     /// where a request completes now.
     ///
@@ -936,12 +1006,10 @@ impl<D: Drm> Display<D> {
                     self.heads[index].lost = true;
                     watched.lost += 1;
                 }
-                (true, true) => {
-                    let mut off = Crtc {
-                        id: self.heads[index].crtc,
-                        ..Crtc::default()
-                    };
-                    call(&mut self.drm, SET_CRTC, &mut off)?;
+                // While the outputs are off, a returning one is lit with
+                // the others ([`Self::set_power`]), and set here after.
+                (true, true) if !self.dark => {
+                    self.crtc_off(index)?;
                     self.set_mode(index)?;
                     self.heads[index].lost = false;
                     watched.restored += 1;
@@ -956,7 +1024,7 @@ impl<D: Drm> Display<D> {
                 self.others[index - 1].1 = false;
                 continue;
             }
-            if tried {
+            if tried || self.dark {
                 continue;
             }
             self.others[index - 1].1 = true;
@@ -1096,7 +1164,7 @@ impl<D: Drm> Display<D> {
     /// requested, or an output that follows the first waits for its flip
     /// to the newest buffer ([`Self::flush`]).
     pub fn queued(&self) -> bool {
-        self.queued || self.heads.iter().any(|head| head.behind)
+        self.queued || self.power.is_some() || self.heads.iter().any(|head| head.behind)
     }
 
     /// Request the queued frame's flip on the first output, if this
@@ -1109,7 +1177,11 @@ impl<D: Drm> Display<D> {
         if !self.queued() || !self.drm.immediate() {
             return Ok(());
         }
-        let mut flushed = Ok(());
+        let mut flushed = self.apply_power();
+        // An output that is off takes no flip: the newest frame waits.
+        if self.dark {
+            return flushed;
+        }
         if self.queued {
             match self.flip(0, self.buffers[2].framebuffer) {
                 0 => {

@@ -2,6 +2,7 @@ use super::*;
 use alloc::{vec, vec::Vec};
 
 mod outputs;
+mod power;
 mod scanout;
 
 fn mode(width: u16, height: u16, kind: u32) -> ModeInfo {

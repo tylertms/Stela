@@ -107,7 +107,7 @@ pub struct DisplayState {
     default_power: bool,
     /// None until an explicit power request.
     pub(super) powered: Option<bool>,
-    asleep: bool,
+    pub(super) asleep: bool,
     hotplug_requested: bool,
 }
 

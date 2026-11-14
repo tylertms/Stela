@@ -2470,3 +2470,78 @@ fn a_refresh_that_cannot_be_advertised_is_published_at_the_usual_rate_and_said()
     );
     assert!(methods.reported.is_empty());
 }
+
+/// A screen that records each power change and each present, in order.
+#[derive(Clone, Default)]
+struct PoweredScreen(Rc<RefCell<Vec<&'static str>>>, bool);
+impl Scanout for PoweredScreen {
+    fn mode(&self) -> Mode {
+        MODE
+    }
+    fn present(&mut self, _: &[u8]) -> Result<()> {
+        self.0.borrow_mut().push("present");
+        Ok(())
+    }
+    fn set_power(&mut self, on: bool) -> Result<()> {
+        if self.1 {
+            return Err(refuse!("no power control"));
+        }
+        self.0.borrow_mut().push(if on { "on" } else { "off" });
+        Ok(())
+    }
+}
+
+#[test]
+fn display_sleep_turns_the_monitor_off_and_a_wake_lights_it_before_the_next_swap() {
+    let screen = PoweredScreen::default();
+    let events = screen.0.clone();
+    let mut methods = Methods::new(Box::new(screen), interface());
+    let period = methods.refresh_ticks;
+    let fill = |_: u64, bytes: &mut [u8]| {
+        bytes.fill(1);
+        true
+    };
+    let on = Packed::new().u64(1).finish(0x10).unwrap();
+    let off = Packed::new().u64(0).finish(0x10).unwrap();
+    // The monitor is lit from the start: turning it on changes nothing.
+    returned(methods.call(*b"A484", &on, 8));
+    assert!(events.borrow().is_empty());
+    returned(methods.call(*b"A484", &off, 8));
+    returned(methods.call(*b"A484", &off, 8));
+    assert_eq!(*events.borrow(), ["off"]);
+    // A swap while the display sleeps is not shown.
+    methods.refresh(0);
+    let id = start_swap(&mut methods);
+    returned(methods.call(*b"A407", &submission(id, &[(0, 4, 2, 0x1000)]), 0xc));
+    methods.present(period, fill).unwrap();
+    assert_eq!(*events.borrow(), ["off"]);
+    // The wake lights the monitor, then the next vblank shows the swap.
+    returned(methods.call(*b"A484", &on, 8));
+    methods.present(2 * period, fill).unwrap();
+    assert_eq!(*events.borrow(), ["off", "on", "present"]);
+    let reported = methods.take_unmodeled();
+    assert!(
+        reported
+            .iter()
+            .all(|line| !line.starts_with("IOMFB display")),
+        "{reported:?}"
+    );
+}
+
+#[test]
+fn display_sleep_follows_the_controllers_sleep_and_a_refusing_sink_is_reported_once() {
+    let screen = PoweredScreen(Rc::default(), true);
+    let events = screen.0.clone();
+    let mut methods = Methods::new(Box::new(screen), interface());
+    let display = methods.display_state();
+    // The IOAV controller's display sleep reaches the scanout at the next look.
+    display.borrow_mut().asleep = true;
+    assert!(methods.refresh_deadline().is_some());
+    methods.refresh(0);
+    display.borrow_mut().asleep = false;
+    methods.refresh(1);
+    assert!(events.borrow().is_empty());
+    let reported = methods.take_unmodeled();
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert!(reported[0].contains("no power control"), "{reported:?}");
+}
