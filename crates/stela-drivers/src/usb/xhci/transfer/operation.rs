@@ -580,6 +580,25 @@ impl Controller {
             }
         }
     }
+
+    /// [`Self::poll_operation`] for an owner that stops: a control transfer
+    /// under way has its EP0 TDs cancelled on the host side, as
+    /// usb_kill_urb unlinks an URB, and ends as `error` once the
+    /// cancellation is acknowledged; a halt clear sends no CLEAR_FEATURE
+    /// after its cancellation. A cancellation runs to its end.
+    pub(in super::super) fn abort_operation(
+        &mut self,
+        operation: &mut Operation,
+        error: BlockError,
+    ) -> Option<Result<Vec<u8>, BlockError>> {
+        match &mut operation.kind {
+            Kind::Control(control) if control.failing.is_none() => {
+                self.fail_control(control, error)
+            }
+            Kind::Clear(cancel, _) => Some(self.poll_cancel(cancel)?.and(Err(error))),
+            _ => self.poll_operation(operation),
+        }
+    }
 }
 
 const DID_NOT_STOP: BlockError = BlockError::Unsupported("xHCI endpoint did not stop");

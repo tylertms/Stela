@@ -21,6 +21,8 @@ static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// Check again at the first poll a USB microframe after a status sample,
 /// even when the caller polls too sparsely to reach the quiet drain limit.
 const TICKET_STATUS_US: u64 = 125;
+/// A control transfer its owner stopped before it ended.
+pub(crate) const STOPPED: &str = "USB control transfer stopped by its owner";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Consumer {
@@ -683,6 +685,20 @@ impl DeviceAccess<'_> {
             return Some(Err(error));
         }
         self.controller.poll_operation(operation)
+    }
+
+    /// [`Self::poll`] for an owner that stops: a control transfer under way
+    /// is cancelled on the host side and ends as stopped once that is
+    /// acknowledged, never waiting out its own deadline.
+    pub fn abort(&mut self, operation: &mut Operation) -> Option<Result<Vec<u8>, BlockError>> {
+        if operation.id != self.id {
+            return Some(Err(BlockError::Unsupported("foreign USB device operation")));
+        }
+        if let Err(error) = self.slot() {
+            return Some(Err(error));
+        }
+        self.controller
+            .abort_operation(operation, BlockError::Unsupported(STOPPED))
     }
 
     /// Quarantine this generation without asserting that DMA has stopped.

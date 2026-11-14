@@ -163,11 +163,14 @@ pub(super) struct HostControl {
     /// processor through it: off while attach runs to completion, on for
     /// the link's work in steps.
     pub(super) stepped: Rc<Cell<bool>>,
+    /// Whether the link stops: each control transfer is then given
+    /// [`STOP_US`] before it is cancelled on the host side.
+    pub(super) stopping: Rc<Cell<bool>>,
 }
 
 impl Control for HostControl {
     async fn control(&mut self, request: [u8; 8], output: &[u8]) -> Result<Vec<u8>, BlockError> {
-        operation(&self.controller, self.id, |c| {
+        stoppable(&self.controller, self.id, &self.stopping, |c| {
             if !c.connected()? {
                 return Err(BlockError::Unsupported("USB Ethernet disconnected"));
             }
@@ -226,6 +229,40 @@ pub(super) async fn operation(
     }
 }
 
+/// [`operation`] for a link that may stop: once `stopping` is set, a control
+/// transfer is given [`STOP_US`] from then, or from its start if later,
+/// before it is cancelled on the host side and ends as stopped, so a stop
+/// never waits out the transfer's own deadline.
+async fn stoppable(
+    controller: &Shared,
+    id: SlotId,
+    stopping: &Cell<bool>,
+    start: impl FnOnce(&mut DeviceAccess<'_>) -> Result<Operation, BlockError>,
+) -> Result<Vec<u8>, BlockError> {
+    let mut operation = start(&mut controller.borrow_mut().device(id)?)?;
+    let mut given: Option<Option<Deadline>> = None;
+    loop {
+        let result = {
+            let mut controller = controller.borrow_mut();
+            if stopping.get() && given.is_none() {
+                given = Some(controller.clock.try_deadline(STOP_US).ok());
+            }
+            let mut device = controller.device(id)?;
+            // A clock that keeps no deadline cancels at once.
+            match given {
+                Some(deadline) if deadline.as_ref().is_none_or(Deadline::passed) => {
+                    device.abort(&mut operation)
+                }
+                _ => device.poll(&mut operation),
+            }
+        };
+        if let Some(result) = result {
+            return result;
+        }
+        yield_now().await;
+    }
+}
+
 enum Backend {
     Realtek(Chip<HostControl>),
     Asix(asix::Device<HostControl>),
@@ -268,6 +305,12 @@ impl Backend {
         }
     }
 }
+
+/// How long a stopping link gives each control transfer before it is
+/// cancelled on the host side. usb_kill_urb waits for the unlink without a
+/// bound; a device's control transfer takes milliseconds, and an xHCI's
+/// Stop Endpoint and Set TR Dequeue microseconds.
+const STOP_US: u64 = 100_000;
 
 /// How long one transmit TD may stay outstanding before it is cancelled.
 const TRANSMIT_US: u64 = 1_000_000;
@@ -336,6 +379,8 @@ pub struct UsbEthernet {
     /// The chip, which work in steps holds while it runs.
     chip: Option<Backend>,
     running: Option<Running>,
+    /// Set while the link stops ([`HostControl::stopping`]).
+    stopping: Rc<Cell<bool>>,
     /// When the next carrier check is due; none when it is due now.
     link_due: Option<Deadline>,
     mac: Mac,
@@ -392,10 +437,12 @@ impl UsbEthernet {
             )?;
         }
         let stepped = Rc::new(Cell::new(false));
+        let stopping = Rc::new(Cell::new(false));
         let io = HostControl {
             controller: controller.clone(),
             id: device.id,
             stepped: stepped.clone(),
+            stopping: stopping.clone(),
         };
         let (chip, mac, firmware, family, firmware_skipped) = match binding.kind {
             Kind::Realtek(revision) => {
@@ -464,6 +511,7 @@ impl UsbEthernet {
             binding,
             chip: Some(chip),
             running: None,
+            stopping,
             link_due: None,
             mac,
             receive: dma.allocate(receive_bytes, receive_bytes.next_power_of_two())?,
@@ -531,8 +579,9 @@ impl UsbEthernet {
     /// for a STALL (`clear`), or only cancel its TD.
     fn begin_reset(&mut self, work: Work, endpoint: Endpoint, clear: bool) {
         let (controller, id) = (self.controller.clone(), self.id);
+        let stopping = self.stopping.clone();
         self.begin(work, move |chip| async move {
-            let result = operation(&controller, id, |c| match clear {
+            let result = stoppable(&controller, id, &stopping, |c| match clear {
                 true => c.start_clear(&endpoint),
                 false => c.start_cancel(endpoint.dci()),
             })
@@ -595,8 +644,10 @@ impl UsbEthernet {
         Ok(())
     }
 
-    /// The work under way run to its end in this call, as teardown may.
+    /// The work under way run to its end in this call, as teardown may,
+    /// each control transfer given [`STOP_US`] ([`HostControl::stopping`]).
     fn finish(&mut self) -> Result<(), BlockError> {
+        self.stopping.set(true);
         loop {
             if let Poll::Ready(result) = self.advance() {
                 return result;
@@ -627,18 +678,20 @@ impl UsbEthernet {
 
     /// Stop requires acknowledged cancellation of both bulk endpoints before
     /// the device reset; failed stops remain closed and never reuse DMA.
-    /// Work under way ends first. It runs to completion, as teardown may.
-    /// An unplugged adapter's work ends at its next control transfer, which
-    /// finds no device, and the adapter gets only the host side's
-    /// cancellation, as r8152 skips register access once RTL8152_UNPLUG is
-    /// set.
+    /// Work under way ends first, then the MAC stop runs; each control
+    /// transfer of either, the one under way included, is given
+    /// [`STOP_US`] and then cancelled on the host side, as usb_kill_urb
+    /// unlinks an URB, so a stop never waits out a transfer's own deadline.
+    /// An unplugged adapter gets only the host side's cancellation, as
+    /// r8152 skips register access once RTL8152_UNPLUG is set.
     pub fn stop(&mut self) -> Result<(), BlockError> {
         let connected = self.controller.borrow_mut().device(self.id)?.connected()?;
         if self.stopped {
             return Ok(());
         }
         self.closed = true;
-        // Work that failed left a chip or endpoint that refuses the stop.
+        // Work that failed left a chip or endpoint that refuses the stop;
+        // work still under way holds its endpoints.
         let _ = self.finish();
         self.carrier = false;
         let endpoints = [self.binding.input.dci(), self.binding.output.dci()];

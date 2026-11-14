@@ -82,6 +82,7 @@ fn actual_host_bridge_reports_retained_model_timer_failure_without_later_device_
         controller: controller.clone(),
         id: device.id,
         stepped: Default::default(),
+        stopping: Default::default(),
     });
     assert_eq!(
         block_on(control.minimum_wait(u64::MAX)),

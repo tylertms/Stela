@@ -696,6 +696,7 @@ fn rtl815x_firmware_uses_ep0_dma_wrapping_and_poison_guards() {
                 controller: shared.clone(),
                 id: shared.borrow().test_device_id(1).unwrap(),
                 stepped: Default::default(),
+                stopping: Default::default(),
             };
             let mut chip = block_on(Chip::probe(io, Revision(revision))).unwrap();
             if fail {

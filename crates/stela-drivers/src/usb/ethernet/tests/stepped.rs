@@ -116,6 +116,37 @@ impl Fixture {
     }
 }
 
+/// A stop while a control transfer is under way on a device that stopped
+/// answering gives the transfer the stop's bound and then cancels it on the
+/// host side, instead of waiting out its 5 s; the bulk endpoints are
+/// cancelled too, and the chip, whose register read failed, refuses its MAC
+/// stop as after any failed transfer.
+#[test]
+fn a_stop_cancels_a_control_transfer_under_way_instead_of_waiting_it_out() {
+    use crate::net::Link;
+    let mut fixture = super::super::rtl815x::tests::rtl8152_fixture();
+    assert!(fixture.link.settled_carrier());
+    assert_eq!(fixture.link.receive(), Ok(None));
+    let clock = fixture.clock();
+    test_clock::advance(clock, LINK_POLL_US);
+    let controls = fixture.model.borrow().setup.len();
+    fixture.model.borrow_mut().silence_control_from = Some(controls);
+    // The carrier check's PHY status read goes out and is not answered.
+    assert!(fixture.link.carrier());
+    assert!(fixture.link.running.is_some());
+    assert_eq!(fixture.model.borrow().setup.len(), controls + 1);
+    assert!(fixture.model.borrow().active[1].is_some());
+    let started = clock.now_us();
+    assert!(fixture.link.stop().is_err());
+    let took = clock.now_us() - started;
+    let bound = super::super::STOP_US;
+    assert!(took >= bound && took < 2 * bound, "{took} us");
+    let model = fixture.model.borrow();
+    assert!(model.active[1].is_none() && model.active[3].is_none());
+    // No MAC stop request followed the cancelled read.
+    assert_eq!(model.setup.len(), controls + 1);
+}
+
 /// An unplugged adapter's stop: only the host side cancels its bulk
 /// endpoints, as r8152 skips register access once RTL8152_UNPLUG is set,
 /// and the MAC stop's control transfers, which could only fail, are never
