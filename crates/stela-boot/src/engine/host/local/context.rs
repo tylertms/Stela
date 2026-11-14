@@ -17,6 +17,8 @@ use stela_drivers::{bus::mmio::owned::PhysicalSpan, platform::work::WorkError};
 
 const IF: u64 = 1 << 9;
 const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
+/// CR4.PCIDE: CR3's low twelve bits are the root's PCID.
+const CR4_PCIDE: u64 = 1 << 17;
 
 /// This processor's GS base, as its record's self pointer names it. Every
 /// owner and identity here belongs to an activated processor, whose GS base
@@ -191,7 +193,23 @@ impl RootIdentity {
     pub(crate) fn check_irq_cpu(&self) -> Result<(), WorkError> {
         self.affinity()?;
         let current = root();
-        if current & !ADDRESS != 0 || !self.roots.roots().contains(&current) {
+        // While this core's views are tagged (`host::tag_views`), its guest
+        // roots load as root | PCID, and an IRQ or a Linux call between the
+        // run's slices observes one: the base decides. CR4 is read only for
+        // such a root, not from the host's state, which an IRQ must not
+        // borrow; an untagged root needs no read.
+        let tagged = current & stela_boot_core::paging_controls::ROOT_CONTEXT != 0 && {
+            let cr4: u64;
+            // SAFETY: CPL0 control register read.
+            unsafe { asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
+            cr4 & CR4_PCIDE != 0
+        };
+        if !stela_boot_core::paging_controls::registered_root(
+            current,
+            tagged,
+            super::super::CONTEXTS,
+            self.roots.roots(),
+        ) {
             // Preserve the existing pinned guest IRQ roots above. The only
             // additional tagged root is this manager's entered loader
             // root, backed by its original allocation owner and same CPU guard.
