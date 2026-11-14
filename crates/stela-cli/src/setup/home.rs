@@ -270,7 +270,8 @@ pub(super) fn run(environment: &Environment<'_>, request: Request) -> Result<()>
     match look(environment, request) {
         // Escape at a question stops there; what ran before it stays done.
         Err(error) if super::ui::cancelled(&error) => ui.cancel("Stopped."),
-        result => result,
+        // A no to an action's own question, as a command takes it.
+        result => super::closed(ui, result),
     }
 }
 

@@ -267,8 +267,35 @@ fn consent(environment: &Environment<'_>, yes: bool, question: &str, refusal: &s
         Err(error) if ui::cancelled(&error) => false,
         answer => answer?,
     };
-    ensure!(accepted, "nothing was changed");
-    Ok(())
+    match accepted {
+        true => Ok(()),
+        false => Err(Declined.into()),
+    }
+}
+
+/// A question declined at a terminal: the person chose no, so the run
+/// stops there, having changed nothing. It is an answer, not a failure:
+/// the run closes with "Nothing was changed." and exits 0, as Quit in plain
+/// `stela` does. Without a terminal a question is refused instead, naming
+/// `--yes`, and the run fails.
+#[derive(Debug)]
+pub(super) struct Declined;
+
+impl std::fmt::Display for Declined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("nothing was changed")
+    }
+}
+
+impl std::error::Error for Declined {}
+
+/// How a run on `ui` ends: a [`Declined`] question closes with "Nothing was
+/// changed." and succeeds; anything else is the run's result.
+fn closed(ui: &dyn ui::Ui, result: Result<()>) -> Result<()> {
+    match result {
+        Err(error) if error.is::<Declined>() => ui.cancel("Nothing was changed."),
+        result => result,
+    }
 }
 
 /// A command that found problems: its whole report, which goes to standard
@@ -972,16 +999,21 @@ impl Request {
             builds: builds::SUPPORTED,
             models: SUPPORTED_MODELS,
         };
+        closed(environment.ui, self.act(&environment))
+    }
+
+    /// Run this request in `environment`, once it has the rights it needs.
+    fn act(mut self, environment: &Environment<'_>) -> Result<()> {
         let asks = environment.ui.interactive();
         let wizard = matches!(self.action, Action::Create) && self.usb.as_os_str().is_empty();
         // A stela without its stela.efi says so before anything is asked.
         if (wizard || matches!(self.action, Action::Home)) && self.efi.is_none() {
             let path = assets::resolve()?;
-            read_efi(&environment, &path)?;
+            read_efi(environment, &path)?;
             self.efi = Some(path);
         }
         match self.action {
-            Action::Home => return home::run(&environment, self),
+            Action::Home => return home::run(environment, self),
             Action::Create if wizard => {
                 ensure!(
                     asks,
@@ -989,7 +1021,7 @@ impl Request {
                      SIZE",
                     host::DISK_EXAMPLE
                 );
-                let sticks: Vec<_> = home::sticks(&environment)?
+                let sticks: Vec<_> = home::sticks(environment)?
                     .into_iter()
                     .filter(|stick| stick.disk.bytes == 0 || stick.disk.bytes >= home::NETWORK_MIN)
                     .collect();
@@ -1004,22 +1036,22 @@ impl Request {
                 let Some(stick) = stick else {
                     return environment.ui.cancel("Nothing was changed.");
                 };
-                if !wizard::configure(&environment, &mut self, &stick)? {
+                if !wizard::configure(environment, &mut self, &stick)? {
                     return Ok(());
                 }
-                return create_installer(&environment, self);
+                return create_installer(environment, self);
             }
             // Plain `stela settings` on a terminal asks for each setting.
             Action::Configure if asks && !settings::named(&self) => {
-                let record = read_record(&environment, &self.usb)?;
-                if !settings::ask(&environment, &mut self, Some(&record))? {
+                let record = read_record(environment, &self.usb)?;
+                if !settings::ask(environment, &mut self, Some(&record))? {
                     return Ok(());
                 }
             }
             _ => {}
         }
         let output = self.output.take();
-        let (report, result) = split_report(self.dispatch(&environment));
+        let (report, result) = split_report(self.dispatch(environment));
         if let Err(error) = result {
             print!("{report}");
             return Err(error);

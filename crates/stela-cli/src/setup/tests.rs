@@ -1154,8 +1154,8 @@ fn setup_erases_usb_and_refuses_internal_disk() {
             ui: &person,
             ..environment(&f.host)
         };
-        let error = setup(&environment, asked).unwrap_err().to_string();
-        assert_eq!(error, "disk5 was not erased; nothing was changed");
+        let error = setup(&environment, asked).unwrap_err();
+        assert!(error.is::<Declined>(), "{error:#}");
         assert!(
             person.transcript().starts_with("? Erase disk5 ("),
             "{}",
@@ -5992,6 +5992,65 @@ fn repair_asks_before_downloading_more_than_a_gigabyte_and_a_no_changes_nothing(
     assert!(error.contains("asked for Pieces"), "{error}");
     let error = repair(&ui::NoTerminal, true).unwrap_err().to_string();
     assert!(error.contains("asked for Pieces"), "{error}");
+}
+
+#[test]
+fn a_no_at_a_terminal_closes_the_run_and_is_no_failure_from_a_command_or_the_menu() {
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    let medium = record(&f).active_medium().cloned().unwrap();
+    let first = medium
+        .directory()
+        .join(stela_formats::payload::piece_name(0));
+    let piece = fs::read(&first).unwrap();
+    fs::write(&first, &piece[1..]).unwrap();
+    let size = |_: &str, _: &str| -> Result<(u64, u64)> { Ok((1_000_000, 3_000_000_000)) };
+    let fetch = |_: &Path, _: &str, _: &str, need: sources::Need| -> Result<sources::Fetched> {
+        anyhow::bail!("asked for {need:?}")
+    };
+    let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
+    // A command: the no is a Declined error, which the run closes.
+    let no = ui::tests::Scripted::new(&["no"]);
+    let mut request = update_request(&f, &f._dir.path().join("cache"));
+    request.action = Action::Repair;
+    let result = request.dispatch(&Environment {
+        image_size: &size,
+        fetch_image: &fetch,
+        ui: &no,
+        ..environment(&f.host)
+    });
+    let error = result.unwrap_err();
+    assert!(error.is::<Declined>(), "{error:#}");
+    closed(&no, Err(error)).unwrap();
+    assert!(
+        no.transcript().ends_with("■ Nothing was changed."),
+        "{}",
+        no.transcript()
+    );
+    // A failure stays one.
+    assert!(closed(&no, Err(anyhow::anyhow!("broken"))).is_err());
+    // The menu: the same no ends the same way.
+    let person = ui::tests::Scripted::new(&["Repair", "no"]);
+    let request = Request {
+        efi: Some(f.efi.clone()),
+        ..Request::home(command::Global::default())
+    };
+    home::run(
+        &Environment {
+            image_size: &size,
+            fetch_image: &fetch,
+            ui: &person,
+            ..environment(&f.host)
+        },
+        request,
+    )
+    .unwrap();
+    let shown = person.transcript();
+    assert!(person.done(), "{shown}");
+    assert!(shown.contains("from Apple"), "{shown}");
+    assert!(shown.ends_with("■ Nothing was changed."), "{shown}");
+    assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
 }
 
 #[test]

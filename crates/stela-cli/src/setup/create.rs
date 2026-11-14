@@ -1291,12 +1291,10 @@ fn confirm_erase(environment: &Environment<'_>, disk: &host::Disk) -> Result<()>
         Err(error) if super::ui::cancelled(&error) => false,
         answer => answer?,
     };
-    ensure!(
-        accepted,
-        "{} was not erased; nothing was changed",
-        disk.identifier
-    );
-    Ok(())
+    match accepted {
+        true => Ok(()),
+        false => Err(super::Declined.into()),
+    }
 }
 
 /// The FAT32 volume setup erases a USB into.
