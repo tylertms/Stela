@@ -36,3 +36,27 @@ enum {
 	kStelaGPUImportMemory = 1,
 	kStelaGPUSelectorCount,
 };
+
+/*
+ * The second `IOServiceOpen` type, root's alone, which opens no gate: the
+ * sandbox patcher's (guest/stela-gpu/sandbox, kext/sandbox_cache.cpp).
+ */
+enum {
+	kStelaGPUSandboxClientType = 1,
+};
+
+enum {
+	/*
+	 * Structure input: a little-endian u32 path length, the path of a WebKit
+	 * sandbox cache, then the cache's new bytes, which keep its header and
+	 * change only its compiled rules.
+	 */
+	kStelaSandboxReplaceCache = 0,
+	/*
+	 * Structure input: a WebKit sandbox cache's path; scalar output its
+	 * length; structure output its bytes. Its data vault is closed to reads
+	 * by any process, root's included.
+	 */
+	kStelaSandboxReadCache = 1,
+	kStelaSandboxSelectorCount,
+};

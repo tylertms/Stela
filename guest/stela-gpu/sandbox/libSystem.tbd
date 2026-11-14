@@ -1,0 +1,13 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-macos ]
+install-name:    '/usr/lib/libSystem.B.dylib'
+current-version: 1351
+exports:
+  - targets:         [ arm64-macos ]
+    symbols:         [ _opendir, _readdir, _closedir, _open, _read, _close,
+                       _malloc, _realloc, _free, _memcpy, _memcmp, _memmem,
+                       _strlen, _strcmp, _strncmp, _snprintf, _printf,
+                       _dlopen, _dlsym, _dlerror, _mach_task_self_, _write,
+                       ___stack_chk_fail, ___stack_chk_guard ]
+...
