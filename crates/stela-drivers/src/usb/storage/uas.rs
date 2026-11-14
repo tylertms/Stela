@@ -192,6 +192,25 @@ impl Host {
         &mut self,
         dma: &mut dyn DmaAllocator,
     ) -> Result<Self, (alloc::string::String, BlockError)> {
+        let controller = self.engine.io.controller.clone();
+        let port = controller.borrow().root_port_of(self.device.id);
+        self.reset_and_rebind_once(dma)
+            .map_err(|(operation, error)| {
+                // The port as the failed step left it.
+                match port.map(|port| controller.borrow_mut().root_port_status(port)) {
+                    Some(status) => (alloc::format!("{operation} ({status})"), error),
+                    None => (operation, error),
+                }
+            })
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+    )]
+    fn reset_and_rebind_once(
+        &mut self,
+        dma: &mut dyn DmaAllocator,
+    ) -> Result<Self, (alloc::string::String, BlockError)> {
         self.engine.poisoned = true;
         let fail = |why| {
             (

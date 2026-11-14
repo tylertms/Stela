@@ -203,6 +203,17 @@ fn a_hung_stick_behind_a_hub_is_reset_by_the_storage_service_and_found() {
         assert_eq!(found.disks.len(), 1, "{:?}", found.failures);
         assert_eq!(found.storage.len(), 1);
         assert!(shared.borrow_mut().device(stick.id).is_err());
+        // The timed-out command's line names the hub's root port as the
+        // transfer failed.
+        let (timed_out, _) = found
+            .failures
+            .iter()
+            .find(|(_, error)| *error == BlockError::Timeout)
+            .unwrap();
+        assert!(
+            timed_out.contains("LUN 0 root port 1 PORTSC=") && timed_out.ends_with("route=0x1"),
+            "{timed_out}"
+        );
         let payload = [0x3c; 512];
         found.disks[0].write(4, &payload).unwrap();
         let mut read = [0; 512];
@@ -244,10 +255,60 @@ fn a_hung_stick_on_a_root_port_is_reset_in_place_and_found() {
         assert!(!hardware.borrow().nodes[&0].bot_wedged(), "{link:?}");
         assert_eq!(found.disks.len(), 1, "{link:?} {:?}", found.failures);
         assert_eq!(hardware.borrow().root_status.unwrap() & PLS, 0);
+        // The timed-out command's line keeps the link state it failed in.
+        let (timed_out, _) = found
+            .failures
+            .iter()
+            .find(|(_, error)| *error == BlockError::Timeout)
+            .unwrap();
+        let link_state = if link.is_some() { "SS.Inactive" } else { "U0" };
+        assert!(
+            timed_out.ends_with(&format!("link={link_state}")),
+            "{timed_out}"
+        );
         let payload = [0x5d; 512];
         found.disks[0].write(4, &payload).unwrap();
         let mut read = [0; 512];
         found.disks[0].read(4, &mut read).unwrap();
         assert_eq!(read, payload);
     }
+}
+
+/// A port reset that cannot bring the hung stick back is reported with the
+/// step that failed and the port's status after it, where its failure was
+/// dropped and only the later refusal of the retired device was logged.
+#[test]
+fn a_failed_port_reset_of_a_hung_stick_is_reported_with_its_port_status() {
+    let _clock = crate::test_clock::virtualize();
+    let mut dma = TestRegion::new(1024 * 1024 * 8);
+    let (mut controller, hardware) = hub::tests::controller(
+        &mut dma,
+        64,
+        BTreeMap::from([(0, Node::bot_disk(SUPER_SPEED))]),
+    );
+    hardware.borrow_mut().root_status =
+        Some(PP | CCS | PED | u32::from(SUPER_SPEED) << PORT_SPEED_SHIFT);
+    let mut failures = Vec::new();
+    let devices = controller.enumerate(&mut dma, &mut failures);
+    assert!(failures.is_empty(), "{failures:?}");
+    let shared = Rc::new(RefCell::new(controller));
+    hardware.borrow_mut().nodes.get_mut(&0).unwrap().wedge_bot();
+    hardware.borrow_mut().wedge_drops_root_link = Some(true);
+    hardware.borrow_mut().root_untrainable = true;
+    let mut found = Found::default();
+    bind::bind(&shared, devices[0].clone(), &mut dma, &mut found);
+    assert!(found.disks.is_empty());
+    let (reset, error) = found
+        .failures
+        .iter()
+        .find(|(location, _)| location.contains("port reset after a failed command"))
+        .unwrap_or_else(|| panic!("{:?}", found.failures));
+    assert_eq!(
+        *error,
+        BlockError::Unsupported("USB root reset left the port without its device")
+    );
+    assert!(
+        reset.contains("acknowledge reusable root reset (root port 1 PORTSC="),
+        "{reset}"
+    );
 }

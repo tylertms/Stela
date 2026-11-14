@@ -230,6 +230,53 @@ impl Controller {
         }
         result
     }
+    /// The root port `id` is on and its route string, while that device
+    /// generation holds its slot.
+    pub(crate) fn root_port_of(&self, id: SlotId) -> Option<(u8, u32)> {
+        if !self.known_id(id) {
+            return None;
+        }
+        self.slots[usize::from(id.hardware_slot())]
+            .as_ref()
+            .map(|slot| (slot.attachment.root_port, slot.attachment.route))
+    }
+
+    /// A root port's status for a log line: its PORTSC and link state, and
+    /// the route of the device behind a hub on it.
+    pub(crate) fn root_port_status(&mut self, (port, route): (u8, u32)) -> String {
+        if port == 0 || port > self.max_ports {
+            return format!("root port {port} absent");
+        }
+        let portsc = self.registers.read32(self.port_offset(port));
+        let link = match portsc >> PLS_SHIFT & PLS_FIELD {
+            0 => "U0",
+            1 => "U1",
+            2 => "U2",
+            3 => "U3",
+            4 => "Disabled",
+            5 => "RxDetect",
+            LINK_INACTIVE => "SS.Inactive",
+            7 => "Polling",
+            8 => "Recovery",
+            9 => "HotReset",
+            LINK_COMPLIANCE => "Compliance",
+            11 => "TestMode",
+            15 => "Resume",
+            _ => "reserved",
+        };
+        let mut status = format!("root port {port} PORTSC={portsc:#010x} link={link}");
+        if route != 0 {
+            status.push_str(&format!(" route={route:#x}"));
+        }
+        status
+    }
+
+    /// [`Self::root_port_status`] of the root port `id` is on.
+    pub(crate) fn port_status(&mut self, id: SlotId) -> Option<String> {
+        let port = self.root_port_of(id)?;
+        Some(self.root_port_status(port))
+    }
+
     /// Whether [`Self::reset_and_reuse_root`] of `id` needs fresh rings and
     /// contexts from its allocator: a device behind a hub gets new ones, as
     /// only a root port's device reuses its own retired storage. It disables

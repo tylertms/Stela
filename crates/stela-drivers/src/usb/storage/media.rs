@@ -43,6 +43,11 @@ pub(super) struct Owner<T: Scsi> {
     /// The begun command's result, taken while a waiting command ran first
     /// ([`Self::run`]), for the next [`Scsi::end`].
     ended: Option<Result<Vec<u8>, BlockError>>,
+    /// The port's status when a command last failed in the transport
+    /// ([`Scsi::take_failure_status`]).
+    failure_status: Option<String>,
+    /// The last port reset that failed ([`Scsi::take_reset_failure`]).
+    reset_failure: Option<(String, BlockError)>,
 }
 /// A begun command and what [`Owner::run`]'s retries of it still allow.
 struct Begun<L> {
@@ -97,6 +102,8 @@ impl<T: Scsi> Owner<T> {
             rebinds: 0,
             begun: None,
             ended: None,
+            failure_status: None,
+            reset_failure: None,
         }
     }
     pub fn invalidate(&mut self) {
@@ -304,6 +311,11 @@ impl<T: Scsi> Owner<T> {
         if generation != self.transport.generation() {
             self.expecting_reset = true;
         }
+        // The port's status as the transport first failed, kept across a
+        // reset that replaces the transport.
+        if let Some(status) = self.transport.take_failure_status() {
+            self.failure_status.get_or_insert(status);
+        }
         if self.transport.poisoned() {
             self.reset_device();
         }
@@ -358,7 +370,16 @@ impl<T: Scsi> Owner<T> {
                 self.rebound = true;
                 self.rebinds += 1;
             }
-            Err(_) => self.invalidate(),
+            Err((operation, error)) => {
+                self.reset_failure = Some((
+                    format!(
+                        "{} port reset after a failed command: {operation}",
+                        self.prefix
+                    ),
+                    error,
+                ));
+                self.invalidate();
+            }
         }
     }
 
@@ -393,6 +414,13 @@ impl<T: Scsi> Scsi for Owner<T> {
     type Lun = T::Lun;
     fn take_failed_data(&mut self) -> Option<Vec<u8>> {
         self.transport.take_failed_data()
+    }
+    fn take_failure_status(&mut self) -> Option<String> {
+        let status = self.transport.take_failure_status();
+        self.failure_status.take().or(status)
+    }
+    fn take_reset_failure(&mut self) -> Option<(String, BlockError)> {
+        self.reset_failure.take()
     }
     fn command(
         &mut self,

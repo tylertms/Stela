@@ -17,7 +17,7 @@ use crate::{
         pci::power::Interval,
     },
 };
-use alloc::{boxed::Box, rc::Rc, vec::Vec};
+use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
 use core::{
     cell::Cell,
     ops::{Deref, DerefMut},
@@ -175,6 +175,10 @@ pub(super) trait Io {
     fn reset_needs_allocation(&self) -> bool {
         false
     }
+    /// The device's port status for a log line, where the host reads one.
+    fn port_status(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// A control transfer or halt clear ([`Io::begin_control`], [`Io::begin_clear`]).
@@ -240,6 +244,10 @@ impl Io for Native {
         self.controller
             .try_borrow()
             .is_ok_and(|controller| controller.reset_needs_allocation(self.id))
+    }
+
+    fn port_status(&mut self) -> Option<String> {
+        self.controller.try_borrow_mut().ok()?.port_status(self.id)
     }
 
     fn signals(&self) -> bool {
@@ -454,6 +462,8 @@ pub(super) struct Bot<I: Io> {
     /// The data a failed command's data phase moved in, until the next
     /// command: sd keeps it when the sense is RECOVERED ERROR.
     failed_data: Option<Vec<u8>>,
+    /// The port's status when a command first failed, for its log line.
+    failure_status: Option<String>,
 }
 
 /// A command between its wrapper and its status, one transfer at a time,
@@ -601,6 +611,7 @@ impl<I: Io> Bot<I> {
             recovery: None,
             begun: None,
             failed_data: None,
+            failure_status: None,
         }
     }
     /// A transport over `io` that takes this one's buffers, cleared, once a
@@ -652,6 +663,10 @@ impl<I: Io> Bot<I> {
     /// What the last command's data phase moved in before it failed.
     pub fn take_failed_data(&mut self) -> Option<Vec<u8>> {
         self.failed_data.take()
+    }
+    /// The port's status when a command last failed in its transport.
+    pub fn take_failure_status(&mut self) -> Option<String> {
+        self.failure_status.take()
     }
 
     pub fn generation(&self) -> u64 {
@@ -838,6 +853,10 @@ impl<I: Io> Bot<I> {
         }
     }
     fn failed<T>(&mut self, error: BlockError) -> Result<T, BlockError> {
+        // Read as the transfer failed, before its recovery changes it.
+        if self.failure_status.is_none() {
+            self.failure_status = self.io.port_status();
+        }
         self.recover();
         Err(self.minimum_error.clone().unwrap_or(error))
     }
@@ -1263,6 +1282,26 @@ impl Bot<Native> {
         reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
     )]
     pub fn reset_and_rebind(
+        &mut self,
+        dma: &mut dyn DmaAllocator,
+    ) -> Result<Self, (alloc::string::String, BlockError)> {
+        let port = self.io.controller.borrow().root_port_of(self.io.id);
+        self.reset_and_rebind_once(dma)
+            .map_err(|(operation, error)| {
+                // The port as the failed step left it.
+                let status =
+                    port.map(|port| self.io.controller.borrow_mut().root_port_status(port));
+                match status {
+                    Some(status) => (alloc::format!("{operation} ({status})"), error),
+                    None => (operation, error),
+                }
+            })
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+    )]
+    fn reset_and_rebind_once(
         &mut self,
         dma: &mut dyn DmaAllocator,
     ) -> Result<Self, (alloc::string::String, BlockError)> {

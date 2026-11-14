@@ -1137,6 +1137,7 @@ fn native_poison_preflight_preserves_all_buffers() {
             recovery: None,
             begun: None,
             failed_data: None,
+            failure_status: None,
         };
         assert!(
             bot.command(1, &[0x2a, 0, 0, 0, 0, 0, 0, 0, 1, 0], Data::Out(&[1, 2, 3]))
