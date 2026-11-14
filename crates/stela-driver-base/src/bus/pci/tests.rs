@@ -779,6 +779,20 @@ fn below_a_port_forwarding_ari_the_functions_follow_their_chain() {
     assert_eq!(ecam.found(), [(0, 1, 0), (1, 0, 0), (1, 1, 1)]);
 }
 
+/// A laptop's slot 3: function 0 has the multifunction bit, and functions
+/// 2 to 4, which firmware names, read all zeros.
+#[test]
+fn functions_that_read_all_zeros_are_not_functions() {
+    let mut ecam = Ecam::new();
+    ecam.present(0, 3, 0, 0x80);
+    for function in 2..=4 {
+        for offset in [0, 0x04, 0x08, 0x0c] {
+            *ecam.word(0, 3, function, offset) = 0;
+        }
+    }
+    assert_eq!(ecam.found(), [(0, 3, 0)]);
+}
+
 #[test]
 fn below_a_conventional_bridge_every_device_is_scanned() {
     let mut ecam = Ecam::new();

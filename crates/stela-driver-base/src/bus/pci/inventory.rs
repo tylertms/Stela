@@ -214,6 +214,14 @@ impl Function {
                 let config =
                     unsafe { window.config(address.bus, address.device, address.function) };
                 let function = match Self::new(address, config) {
+                    // Vendor ID 0000 is no vendor's: as Linux reads an
+                    // all-zero identity, it is no function. Firmware names
+                    // such functions, as ACPI does a multifunction device's
+                    // absent ones, and the native census leaves them out.
+                    Ok(function) if function.vendor == 0 => {
+                        drop(function);
+                        return Ok(None);
+                    }
                     Ok(function) => function,
                     Err(refused) => match refused.reason {
                         FunctionError::Absent | FunctionError::ConfigurationRetry => {
