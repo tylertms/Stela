@@ -68,6 +68,8 @@ pub(super) struct FakeHost {
     /// Bytes every volume has free beyond its declared free space, as
     /// removing files frees them.
     pub(super) freed: std::cell::Cell<u64>,
+    /// The whole disks `erase` was asked to erase, which it refuses.
+    pub(super) erased: std::cell::RefCell<Vec<String>>,
 }
 
 impl FakeHost {
@@ -85,6 +87,7 @@ impl FakeHost {
             mountable: BTreeMap::new(),
             nvidia_gpus: Default::default(),
             freed: Default::default(),
+            erased: Default::default(),
         }
     }
 
@@ -178,6 +181,10 @@ impl Host for FakeHost {
     }
     fn disks(&self) -> Result<Vec<Disk>> {
         Ok(self.disks.clone())
+    }
+    fn erase(&self, disk: &str, _: &str) -> Result<()> {
+        self.erased.borrow_mut().push(disk.into());
+        anyhow::bail!("the test host erases no disk")
     }
 }
 
@@ -6183,7 +6190,7 @@ fn finishing_a_create_asks_before_downloading_more_than_a_gigabyte() {
     let shown = person.transcript();
     assert!(person.done(), "{shown}");
     assert!(
-        shown.contains("● Finish it · Keeps what is written, checks it, and writes the rest"),
+        shown.contains("○ Finish it · Keeps what is written, checks it, and writes the rest"),
         "{shown}"
     );
     assert!(
@@ -6284,7 +6291,8 @@ fn journey_a_blank_stick_walks_through_the_wizard_and_cancel_changes_nothing() {
         "? Wi-Fi during installation",
         "◇ Review",
         "? Change what?",
-        "● Erase and create",
+        "○ Erase and create",
+        "● Quit",
         "■ Nothing was changed.",
     ] {
         assert!(shown.contains(line), "{line:?} missing:\n{shown}");
@@ -6545,8 +6553,9 @@ fn journey_e_an_interrupted_create_offers_to_finish_it() {
     for line in [
         "▲ A create stopped part way: continuing the Offline installer",
         "? Finish the create?",
-        "● Finish it · Keeps what is written, checks it, and writes the rest",
+        "○ Finish it · Keeps what is written, checks it, and writes the rest",
         "○ Start over · Erases the stick",
+        "● Quit",
         "■ Nothing was changed.",
     ] {
         assert!(shown.contains(line), "{line:?} missing:\n{shown}");
@@ -6565,7 +6574,7 @@ fn journey_f_an_interrupted_macos_switch_offers_to_finish_it() {
     result.unwrap();
     assert!(done, "{shown}");
     assert!(
-        shown.contains("● Finish the switch to macOS STELA2"),
+        shown.contains("○ Finish the switch to macOS STELA2"),
         "{shown}"
     );
     assert!(
@@ -6976,4 +6985,73 @@ fn home_create_dispatches_create_after_wizard_confirmation() {
     );
     assert_eq!(stick_files(&f), before);
     assert!(f.host.unmounted.borrow().is_empty());
+}
+
+#[test]
+fn enter_at_every_question_never_erases_and_a_drive_is_typed_back() {
+    use ui::tests::ENTER;
+    // The only USB disk, holding mounted volumes: a stick, a 2 TB disk, and
+    // a drive that reports fixed media.
+    for what in ["stick", "2 TB disk", "drive"] {
+        let mut f = fixture(64 * GIB, false);
+        let usb = f
+            .host
+            .disks
+            .iter_mut()
+            .find(|d| d.identifier == "disk5")
+            .unwrap();
+        match what {
+            "2 TB disk" => usb.bytes = 2_000_000_000_000,
+            "drive" => usb.removal = host::Removal::Drive,
+            _ => {}
+        }
+        let size = host::size_text(usb.bytes);
+        f.host.serials.insert("disk5".into(), "TESTSERIAL".into());
+        let before = stick_files(&f);
+        // Enter at the installer, Enter at the last question.
+        let (shown, result, done) = plain_stela(&f, &[ENTER, ENTER], &[]);
+        result.unwrap();
+        assert!(done, "{what}:\n{shown}");
+        // The one candidate is named with its size, and its serial before
+        // the erase question, with what is on it.
+        assert!(
+            shown.contains(&format!("● Disk disk5 · {size}")),
+            "{what}:\n{shown}"
+        );
+        assert!(shown.contains("· serial TESTSERIAL"), "{what}:\n{shown}");
+        assert!(
+            shown.contains(&format!(
+                "▲ Everything on Disk disk5 ({size}) will be erased: 2 partitions, mounted at"
+            )),
+            "{what}:\n{shown}"
+        );
+        assert!(shown.contains("○ Erase and create"), "{what}:\n{shown}");
+        assert!(
+            shown.ends_with("■ Nothing was changed."),
+            "{what}:\n{shown}"
+        );
+        assert!(f.host.erased.borrow().is_empty(), "{what}");
+        assert_eq!(stick_files(&f), before, "{what}");
+        // Erasing a disk that is not a stick needs its model or size typed
+        // back, saying why; Escape there changes nothing.
+        if what != "stick" {
+            let (shown, result, done) =
+                plain_stela(&f, &[ENTER, "Erase and create", "cancel"], &[]);
+            result.unwrap();
+            assert!(done, "{what}:\n{shown}");
+            assert!(
+                shown.contains("? Type its model or size to erase it"),
+                "{what}:\n{shown}"
+            );
+            assert!(
+                shown.ends_with("■ Nothing was changed."),
+                "{what}:\n{shown}"
+            );
+            assert!(f.host.erased.borrow().is_empty(), "{what}");
+            assert_eq!(stick_files(&f), before, "{what}");
+        }
+        // Without a terminal, the create named for it types the disk back.
+        let (text, _) = home::report(&home::sticks(&environment(&f.host)).unwrap());
+        assert!(text.contains("--confirm-disk"), "{what}:\n{text}");
+    }
 }

@@ -179,12 +179,16 @@ pub(super) mod tests {
     /// What happens on the computer once a question is answered.
     type Hook<'a> = Option<Box<dyn Fn(&str) + 'a>>;
 
+    /// The answer that presses Enter.
+    pub(crate) const ENTER: &str = "Enter";
+
     /// A person at a terminal who gives these answers in order, and what
     /// they saw: each prompt as `? prompt`, each choice as `● label · hint`
     /// for the one chosen first and `○ label · hint` for the others
     /// (`(unavailable)` when greyed out), each message as it was shown.
     /// Answers name a choice by its label, or are the text typed, or `yes`
-    /// and `no`; `cancel` presses Escape.
+    /// and `no`; `cancel` presses Escape and [`ENTER`] takes what the
+    /// question offers first: the marked choice, the filled-in text, no.
     pub(crate) struct Scripted<'a> {
         answers: RefCell<VecDeque<String>>,
         pub(crate) shown: RefCell<Vec<String>>,
@@ -287,6 +291,10 @@ pub(super) mod tests {
                 self.show(line);
             }
             let answer = self.answer(prompt)?;
+            // Enter takes the choice marked first.
+            if answer == ENTER {
+                return Ok(first.expect("a menu has an enabled choice"));
+            }
             let item = items
                 .iter()
                 .find(|item| item.label == answer)
@@ -300,9 +308,12 @@ pub(super) mod tests {
             );
             Ok(item.value)
         }
-        fn input(&self, prompt: &str, _: &str, _: &str, valid: Validate) -> Result<String> {
+        fn input(&self, prompt: &str, _: &str, default: &str, valid: Validate) -> Result<String> {
             self.show(format!("? {prompt}"));
-            let answer = self.answer(prompt)?;
+            let mut answer = self.answer(prompt)?;
+            if answer == ENTER {
+                answer = default.into();
+            }
             valid(&answer).unwrap_or_else(|why| panic!("{answer:?} refused: {why}"));
             Ok(answer)
         }

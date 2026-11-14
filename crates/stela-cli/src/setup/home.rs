@@ -556,11 +556,13 @@ fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<
         ui.info(&details)?;
     }
     let offers = Offers::of(environment, &stick);
-    // The question a state asks first, and its choices.
+    // The question a state asks first, and its choices. Enter takes Quit
+    // here too: the choices a state calls for write the stick, and may
+    // download or erase.
     let first = |question: &str, choices: &[Choice]| -> Result<Choice> {
         let mut choices = choices.to_vec();
         choices.extend([Choice::Other, Choice::Quit]);
-        ask(ui, question, &stick, &offers, &choices, choices[0], true)
+        ask(ui, question, &stick, &offers, &choices, Choice::Quit, true)
     };
     let choice = match &stick.state {
         State::Empty if stick.disk.bytes != 0 && stick.disk.bytes < NETWORK_MIN => {
@@ -719,8 +721,8 @@ fn newer_macos(record: &Record) -> Option<&'static builds::Build> {
 }
 
 /// After an update: offer the newest tested macOS for new installs, saying
-/// what it downloads and removes. The default is no when it downloads more
-/// than 1 GB.
+/// what it downloads and removes. Enter takes Not now: the switch
+/// downloads, and may remove the stick's copy of macOS first.
 fn offer_macos(environment: &Environment<'_>, request: &Request, volume: &Path) -> Result<()> {
     let ui = environment.ui;
     let record = read_record(environment, volume)?;
@@ -734,7 +736,7 @@ fn offer_macos(environment: &Environment<'_>, request: &Request, volume: &Path) 
         "macOS {} is available. Use it for new installs?",
         newest.version
     );
-    match ui.select(&question, &rows, usize::from(offer.large))? {
+    match ui.select(&question, &rows, 1)? {
         0 => change_macos(environment, request, volume, newest.build, offer.named),
         _ => ui.outro(DONE),
     }
@@ -743,8 +745,6 @@ fn offer_macos(environment: &Environment<'_>, request: &Request, volume: &Path) 
 /// What switching `record`'s stick to `build` downloads and removes.
 struct MacosText {
     text: String,
-    /// It downloads more than 1 GB.
-    large: bool,
     /// The text names the download and the copy removed for room: its
     /// source was found.
     named: bool,
@@ -762,13 +762,11 @@ fn macos_text(environment: &Environment<'_>, record: &Record, build: &str) -> Ma
         medium: record.medium_of(build),
     };
     let mut text = String::new();
-    let mut large = false;
     let mut named = false;
     match sources::locate(environment, &lookup) {
         Ok(source) => {
             named = true;
             let bytes = sources::download_bytes(&source);
-            large = bytes > super::LARGE_DOWNLOAD;
             if bytes > 0 {
                 let _ = write!(text, "Downloads {}. ", host::size_text(bytes));
             }
@@ -789,7 +787,7 @@ fn macos_text(environment: &Environment<'_>, record: &Record, build: &str) -> Ma
         }
     }
     text.push_str("The installed macOS is not changed; it updates itself.");
-    MacosText { text, large, named }
+    MacosText { text, named }
 }
 
 /// Switch the stick to `build`: when the question that offered it named

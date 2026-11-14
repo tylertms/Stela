@@ -113,9 +113,14 @@ pub(crate) struct DiskFacts {
 /// Which whole disks setup may erase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Removal {
-    /// A USB disk, or a disk image standing in for one: erased after the
-    /// usual confirmation.
+    /// A USB disk with removable media, as sticks report, or a disk image
+    /// standing in for one: erased after the usual confirmation, unless it
+    /// is larger than a stick ([`typed_reason`]).
     Usb,
+    /// A USB disk that reports fixed media, as USB hard disks, SSDs and
+    /// their enclosures do: erased only once its model or size is typed
+    /// back, since it often holds someone's files.
+    Drive,
     /// Removable by another bus: an SD card in a reader, a FireWire disk, an
     /// external Thunderbolt disk. Erased only once its model or size is
     /// typed back ([`Disk::confirmed_by`]).
@@ -132,26 +137,39 @@ pub(crate) enum Removal {
     Fixed,
 }
 
-impl Removal {
-    /// Why a disk needs its model or size typed back before it is erased.
-    pub(crate) fn why_typed(self) -> &'static str {
-        match self {
-            Removal::Unsure => {
-                "may be the disk this computer runs from: setup cannot tell which disk that is"
-            }
-            Removal::Usb | Removal::Typed | Removal::Fixed => "is not a USB disk",
+/// The largest disk erased without its model or size typed back: sticks
+/// are sold up to 256 GB and report a little less, so a disk above this
+/// is a drive.
+pub(crate) const LARGEST_STICK: u64 = 257_000_000_000;
+
+/// Why a disk of `removal` and `bytes` needs its model or size typed back
+/// before it is erased, at a terminal as without one; `None` for a USB
+/// stick, which the usual confirmation erases.
+pub(crate) fn typed_reason(removal: Removal, bytes: u64) -> Option<&'static str> {
+    match removal {
+        Removal::Unsure => {
+            Some("may be the disk this computer runs from: setup cannot tell which disk that is")
         }
+        Removal::Typed | Removal::Fixed => Some("is not a USB disk"),
+        Removal::Drive => Some("is a USB drive, not a stick"),
+        Removal::Usb if bytes > LARGEST_STICK => {
+            Some("is larger than a stick: sticks hold 256 GB at most")
+        }
+        Removal::Usb => None,
     }
 }
 
 impl DiskFacts {
-    /// USB and disk images are removable; another bus is removable only
-    /// with removable media or a host that places it outside the computer.
-    /// SD and MMC report one bus for a card reader and for soldered eMMC,
-    /// which differ in removable media alone.
+    /// USB and disk images are removable, a USB disk with fixed media as a
+    /// drive; another bus is removable only with removable media or a host
+    /// that places it outside the computer. SD and MMC report one bus for a
+    /// card reader and for soldered eMMC, which differ in removable media
+    /// alone.
     pub(crate) fn removal(self) -> Removal {
         match self.bus {
-            Bus::Usb | Bus::Image => Removal::Usb,
+            Bus::Usb if self.removable_media => Removal::Usb,
+            Bus::Usb => Removal::Drive,
+            Bus::Image => Removal::Usb,
             Bus::FireWire => Removal::Typed,
             Bus::Other if self.removable_media || self.external => Removal::Typed,
             Bus::Other => Removal::Fixed,
@@ -199,6 +217,34 @@ impl Disk {
     /// `typed` names this disk ([`names_disk`]).
     pub(crate) fn confirmed_by(&self, typed: &str) -> bool {
         names_disk(&self.name, self.bytes, typed)
+    }
+
+    /// Why erasing it needs its model or size typed back ([`typed_reason`]).
+    pub(crate) fn why_typed(&self) -> Option<&'static str> {
+        typed_reason(self.removal, self.bytes)
+    }
+
+    /// What is on it, for the erase warning: `2 partitions, mounted at
+    /// /media/me/BACKUP`; empty when it has none.
+    pub(crate) fn contents(&self) -> String {
+        let count = self.partitions.len();
+        if count == 0 {
+            return String::new();
+        }
+        let mut text = match count {
+            1 => "1 partition".to_owned(),
+            n => format!("{n} partitions"),
+        };
+        let mounts: Vec<String> = self
+            .partitions
+            .iter()
+            .filter_map(|p| p.mount.as_ref())
+            .map(|mount| mount.display().to_string())
+            .collect();
+        if !mounts.is_empty() {
+            text.push_str(&format!(", mounted at {}", mounts.join(", ")));
+        }
+        text
     }
 }
 
@@ -407,7 +453,10 @@ mod tests {
 
     #[test]
     fn only_usb_images_and_removable_media_are_erasable() {
-        assert_eq!(facts(Bus::Usb, false, false).removal(), Removal::Usb);
+        assert_eq!(facts(Bus::Usb, true, false).removal(), Removal::Usb);
+        // A USB hard disk or SSD reports fixed media.
+        assert_eq!(facts(Bus::Usb, false, false).removal(), Removal::Drive);
+        assert_eq!(facts(Bus::Usb, false, true).removal(), Removal::Drive);
         assert_eq!(facts(Bus::Image, false, false).removal(), Removal::Usb);
         assert_eq!(facts(Bus::FireWire, false, false).removal(), Removal::Typed);
         // An SD card in a reader; soldered eMMC on the same bus is fixed.
@@ -415,6 +464,52 @@ mod tests {
         assert_eq!(facts(Bus::Other, false, false).removal(), Removal::Fixed);
         // A Thunderbolt SSD macOS places outside the Mac.
         assert_eq!(facts(Bus::Other, false, true).removal(), Removal::Typed);
+    }
+
+    #[test]
+    fn only_a_usb_stick_is_erased_without_its_model_or_size_typed_back() {
+        assert_eq!(typed_reason(Removal::Usb, 64_000_000_000), None);
+        assert_eq!(typed_reason(Removal::Usb, 256_000_000_000), None);
+        for (removal, bytes) in [
+            (Removal::Usb, 512_000_000_000),
+            (Removal::Usb, 2_000_000_000_000),
+            (Removal::Drive, 64_000_000_000),
+            (Removal::Typed, 64_000_000_000),
+            (Removal::Unsure, 64_000_000_000),
+        ] {
+            assert!(
+                typed_reason(removal, bytes).is_some(),
+                "{removal:?} {bytes}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_erase_warning_names_the_partitions_and_where_they_are_mounted() {
+        let mut disk = Disk {
+            identifier: "sdb".into(),
+            name: "Backup".into(),
+            bytes: 2_000_000_000_000,
+            removal: Removal::Drive,
+            system: false,
+            partitions: Vec::new(),
+        };
+        assert_eq!(disk.contents(), "");
+        disk.partitions = vec![
+            Partition {
+                identifier: "sdb1".into(),
+                content: "EFI".into(),
+                mount: None,
+            },
+            Partition {
+                identifier: "sdb2".into(),
+                content: "Linux".into(),
+                mount: Some("/media/me/BACKUP".into()),
+            },
+        ];
+        assert_eq!(disk.contents(), "2 partitions, mounted at /media/me/BACKUP");
+        disk.partitions.truncate(1);
+        assert_eq!(disk.contents(), "1 partition");
     }
 
     #[test]

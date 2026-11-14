@@ -987,17 +987,17 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
             "{disk} ({}) is an internal disk; stela erases only a removable USB stick",
             found.name
         );
-        ensure!(
-            found.removal == host::Removal::Usb
-                || command
+        if let Some(why) = found.why_typed() {
+            ensure!(
+                command
                     .confirm_disk
                     .as_deref()
                     .is_some_and(|typed| found.confirmed_by(typed)),
-            "{disk} ({}, {}) {}; pass --confirm-disk with its model or size to erase it",
-            found.name,
-            host::size_text(found.bytes),
-            found.removal.why_typed()
-        );
+                "{disk} ({}, {}) {why}; pass --confirm-disk with its model or size to erase it",
+                found.name,
+                host::size_text(found.bytes),
+            );
+        }
         // The installer it makes, refused before anything else when it
         // cannot be made on this stick.
         let installer =

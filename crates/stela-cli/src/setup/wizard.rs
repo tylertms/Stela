@@ -70,16 +70,20 @@ impl Usb {
         )
     }
 
-    /// Its model or size, typed back to erase a disk other than a USB
-    /// stick, or any disk when stela cannot tell which one this computer
-    /// runs from.
-    fn typed_back(&self, ui: &dyn Ui) -> Result<String> {
+    /// Why erasing it needs its model or size typed back: a disk other than
+    /// a USB stick, or any disk when stela cannot tell which one this
+    /// computer runs from (`host::typed_reason`).
+    fn why_typed(&self) -> Option<&'static str> {
+        host::typed_reason(self.removal, self.bytes)
+    }
+
+    /// Its model or size, typed back, saying `why` it is asked.
+    fn typed_back(&self, ui: &dyn Ui, why: &str) -> Result<String> {
         ui.warning(&format!(
-            "{} ({}, {}) {}.",
+            "{} ({}, {}) {why}.",
             self.name,
             self.size(),
             self.id,
-            self.removal.why_typed()
         ))?;
         let (name, bytes) = (self.name.clone(), self.bytes);
         let expected = format!("Type {} or {}", self.name, self.size());
@@ -342,16 +346,21 @@ fn ask(environment: &Environment<'_>, command: &mut Request, stick: &Stick) -> R
                 super::home::macos_name(&record.build)
             ))?;
         }
-        ui.warning(&format!("Everything on {} will be erased.", usb.short()))?;
+        let contents = stick.disk.contents();
+        ui.warning(&match contents.is_empty() {
+            true => format!("Everything on {} will be erased.", usb.short()),
+            false => format!("Everything on {} will be erased: {contents}.", usb.short()),
+        })?;
         let create = match download {
             0 => "Erase and create".to_owned(),
             bytes => format!("Erase and create (downloads {})", host::size_text(bytes)),
         };
         let rows = ui::rows(&[(&create, ""), ("Change something", ""), ("Quit", "")]);
-        match ui.select("Create the installer?", &rows, 0)? {
+        // Enter takes Quit: no row that erases or downloads is the default.
+        match ui.select("Create the installer?", &rows, QUIT)? {
             0 => {
-                if matches!(usb.removal, Removal::Typed | Removal::Unsure) {
-                    command.confirm_disk = Some(usb.typed_back(ui)?);
+                if let Some(why) = usb.why_typed() {
+                    command.confirm_disk = Some(usb.typed_back(ui, why)?);
                 }
                 usb.verify(host)?;
                 command.confirmed = true;
@@ -365,6 +374,9 @@ fn ask(environment: &Environment<'_>, command: &mut Request, stick: &Stick) -> R
         }
     }
 }
+
+/// The value of Quit in "Create the installer?".
+const QUIT: usize = 2;
 
 /// Which part of the installer to change.
 fn change(environment: &Environment<'_>, command: &Request, online: bool) -> Result<Part> {
