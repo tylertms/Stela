@@ -862,7 +862,9 @@ fn select_firmware(boot0: u32, catalog: Arc<Catalog>) -> Result<PciFirmware, Ser
     // stays allocated for every image borrowed from it for the boot.
     let stored: &'static Catalog = unsafe { &*Arc::into_raw(catalog.clone()) };
     let mut bindings = Vec::new();
-    let mut available = false;
+    // nouveau needs every file of the chip's recipe: one missing fails its
+    // start later with a generic error.
+    let mut missing = Vec::new();
     for selection in plan.selections() {
         let request = &selection.request;
         // An exact binding, else the bundle's file by its pinned digest.
@@ -894,9 +896,10 @@ fn select_firmware(boot0: u32, catalog: Arc<Catalog>) -> Result<PciFirmware, Ser
                             "the GPU firmware digest does not match its pinned recipe",
                         )
                     })?;
-                available = true;
             }
-            Err(error) if error.kind == FirmwareError::Missing => (),
+            Err(error) if error.kind == FirmwareError::Missing => {
+                missing.push(request.name.clone());
+            }
             Err(error) => {
                 output::arguments(format_args!(
                     "GPU {name}: firmware {} refused: {error:?}\n",
@@ -909,10 +912,13 @@ fn select_firmware(boot0: u32, catalog: Arc<Catalog>) -> Result<PciFirmware, Ser
         }
         names.push(request.name.clone());
     }
-    if !available {
+    if !missing.is_empty() {
         output::arguments(format_args!(
-            "GPU {name}: the USB's firmware bundle lacks this chip's files; `stela repair` \
-             completes it\n"
+            "GPU {name}: the USB's firmware bundle lacks {} of this chip's {} files ({}); \
+             `stela repair` completes it\n",
+            missing.len(),
+            names.len(),
+            missing.join(", ")
         ));
         return Err(ServiceError::Refused(NO_FIRMWARE));
     }
@@ -1289,7 +1295,7 @@ fn cold_refusal(
     ServiceError::Refused("the GPU's original cold handoff was refused")
 }
 
-/// Why a GPU was refused when the USB holds no firmware for its chip.
+/// Why a GPU was refused when the USB lacks any of its chip's firmware files.
 const NO_FIRMWARE: &str = "no pinned firmware for the observed GPU chipset was loaded";
 
 /// An NVIDIA adapter [`claim_all`] did not claim, for the boot screen
