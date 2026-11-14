@@ -258,3 +258,28 @@ fn a_released_display_turns_every_output_off_and_gives_its_buffers_back() {
     assert_eq!(card.removed.len(), 3);
     assert_eq!(card.unmapped, 3);
 }
+
+#[test]
+fn a_wide_panel_whose_native_size_cannot_be_told_runs_the_largest_of_its_shape() {
+    // A 32:9 monitor: its native size is wider than a mode the guest can be
+    // told of; the firmware lit it in 16:9.
+    let modes = [
+        at(5120, 1440, PREFERRED, 60),
+        at(3840, 1080, 0, 60),
+        at(2560, 1440, 0, 60),
+        at(1920, 1080, 0, 60),
+    ];
+    let narrow: Fits<'_> = &|width, _, _| width <= 4095;
+    let firmware = Wanted::Native((1920, 1080));
+    assert_eq!(choose(&modes, firmware, narrow), Some(modes[1]));
+    // A guest size that is set still wins.
+    assert_eq!(
+        choose(&modes, Wanted::Size((1920, 1080)), narrow),
+        Some(modes[3])
+    );
+    // With no larger mode of its shape, the firmware's size.
+    let plain = [modes[0], modes[2], modes[3]];
+    assert_eq!(choose(&plain, firmware, narrow), Some(modes[3]));
+    assert!(same_shape((1366, 768), (1920, 1080)));
+    assert!(!same_shape((2560, 1440), (5120, 1440)));
+}

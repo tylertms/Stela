@@ -622,12 +622,24 @@ fn mode_of(modes: &[ModeInfo], size: (u32, u32), fits: Fits<'_>) -> Option<ModeI
     fitting.or_else(|| sized.next()).copied()
 }
 
+/// Whether sizes `a` and `b` have the same shape, within 1%: 1366x768 is
+/// 16:9.
+fn same_shape(a: (u32, u32), b: (u32, u32)) -> bool {
+    let across = u64::from(a.0) * u64::from(b.1);
+    let down = u64::from(a.1) * u64::from(b.0);
+    across.abs_diff(down) * 100 <= down
+}
+
 /// The size the connected `outputs`, each its modes, show the picture in,
 /// and which of them gives the mode the guest is told of.
 ///
 /// The sizes in order: for [`Wanted::Native`] each output's preferred size,
-/// then the firmware's, then every listed size; for [`Wanted::Size`] that
-/// size first. A size with a mode the guest can be told of beats one
+/// then each output's listed sizes of its preferred mode's shape, largest
+/// first, then the firmware's, then every listed size; for [`Wanted::Size`]
+/// that size first. A panel's native size the guest cannot be told of, as
+/// 5120x1440, so gives way to the largest of its shape that it can, as
+/// 3840x1080, before a firmware's 1920x1080 stretched across it. A size
+/// with a mode the guest can be told of beats one
 /// without. Then [`Wanted::Size`]'s size wins, as only it is shown; for
 /// [`Wanted::Native`] the size most outputs run wins, so every monitor
 /// shows the picture where they share a size, as Linux's fbdev helper
@@ -642,9 +654,35 @@ fn plan(outputs: &[&[ModeInfo]], wanted: Wanted, fits: Fits<'_>) -> Option<((u32
     let listed = outputs
         .iter()
         .flat_map(|modes| modes.iter().map(size_of_mode));
+    let mut shaped = Vec::new();
+    for modes in outputs {
+        let Some(native) = modes.iter().find(|mode| mode.kind & PREFERRED != 0) else {
+            continue;
+        };
+        let start = shaped.len();
+        let native = size_of_mode(native);
+        shaped.extend(
+            modes
+                .iter()
+                .map(size_of_mode)
+                .filter(|&size| same_shape(size, native)),
+        );
+        shaped[start..].sort_by_key(|&(width, height)| {
+            core::cmp::Reverse(u64::from(width) * u64::from(height))
+        });
+    }
     let sizes: Vec<(u32, u32)> = match wanted {
-        Wanted::Native(firmware) => preferred.chain([firmware]).chain(listed).collect(),
-        Wanted::Size(size) => [size].into_iter().chain(preferred).chain(listed).collect(),
+        Wanted::Native(firmware) => preferred
+            .chain(shaped)
+            .chain([firmware])
+            .chain(listed)
+            .collect(),
+        Wanted::Size(size) => [size]
+            .into_iter()
+            .chain(preferred)
+            .chain(shaped)
+            .chain(listed)
+            .collect(),
     };
     let fitting = |modes: &[ModeInfo], size: (u32, u32)| {
         modes
