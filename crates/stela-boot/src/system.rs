@@ -1066,6 +1066,7 @@ fn load(
             device_skips,
             device_needs,
             stop_record: crate::stop_record::services(),
+            serial_present: crate::serial::present(),
         });
     }
     // SAFETY: boot services ended; the completed root maps this code and

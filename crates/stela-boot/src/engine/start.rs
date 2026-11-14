@@ -202,6 +202,9 @@ fn start(handoff: u64) -> Started {
     if handoff.magic != MAGIC {
         output::fatal("engine handoff has the wrong magic");
     }
+    // Before any output or console input: this image's copy has not looked
+    // at COM1.
+    crate::serial::adopt(handoff.serial_present);
     // From here a stop the USB's log cannot keep leaves its record in the
     // firmware; an earlier one has only the screen.
     crate::stop_record::arm(handoff.stop_record, Some(handoff.root));

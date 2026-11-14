@@ -45,12 +45,21 @@ pub fn initialize() {
 /// Whether [`initialize`] found no UART at COM1. Its line status then
 /// always reads as data ready and transmitter empty: without this, the
 /// guest's console was fed 0xff bytes without end and every log byte was
-/// written to a port nothing answers.
+/// written to a port nothing answers. XNU's console takes each such byte
+/// as a break (`cons_cinput` sign-extends it into `TTY_BI`), which with
+/// `BRKINT` sends SIGINT to the console's foreground process group: the
+/// single-user shell, as soon as it starts.
 static ABSENT: AtomicBool = AtomicBool::new(false);
 
 /// Whether COM1 has a UART.
 pub fn present() -> bool {
     !ABSENT.load(Ordering::Relaxed)
+}
+
+/// Take the loader's [`initialize`] result in the engine, whose image copy
+/// was taken before it ran and so starts with a UART assumed present.
+pub fn adopt(present: bool) {
+    ABSENT.store(!present, Ordering::Relaxed);
 }
 /// One input byte for the guest console's device owner, when available.
 pub fn read() -> Option<u8> {

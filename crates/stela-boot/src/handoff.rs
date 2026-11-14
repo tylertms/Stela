@@ -127,6 +127,10 @@ pub struct Handoff {
     /// in the USB's log: what a stop the log cannot keep leaves its record
     /// with (`stop_record`).
     pub(crate) stop_record: crate::stop_record::Services,
+    /// Whether the loader found a UART at COM1 (`serial::present`). The
+    /// engine runs a copy of this image taken before any Rust state
+    /// existed, so it learns the result here, not from its own statics.
+    pub(crate) serial_present: bool,
 }
 
 /// A read of the firmware's real-time clock: its time as UTC and its
