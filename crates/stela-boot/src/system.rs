@@ -372,8 +372,11 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
         // its own after boot services end.
         (None, Some(path)) => {
             crate::status::begin("Checking the macOS install files on the USB");
-            let inventory =
-                crate::engine::bundle::with_inventory(path, crate::engine::install::check_pieces)?;
+            let inventory = crate::engine::bundle::with_inventory(
+                path,
+                system.install_source.map(|guid| guid.0),
+                crate::engine::install::check_pieces,
+            )?;
             crate::status::done("");
             Some(inventory)
         }

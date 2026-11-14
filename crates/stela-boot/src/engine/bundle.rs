@@ -298,13 +298,16 @@ const MAX_HASH_FILE_BYTES: u64 = payload::MAX_HASH_BLOCKS * 32;
 /// ambiguous paths across firmware volumes rather than choosing a different
 /// inventory.
 pub fn restore_inventory(path: &str) -> Result<Inventory> {
-    with_inventory(path, |_, _, _| Ok(()))
+    with_inventory(path, None, |_, _, _| Ok(()))
 }
 
 /// [`restore_inventory`], also running `check` on the inventory's volume
-/// while it is open, with the inventory's directory.
+/// while it is open, with the inventory's directory. With `source`, the
+/// install medium's GPT partition, only the volume on that partition is
+/// searched (`stela_boot_core::bundle::inventory_volume`).
 pub fn with_inventory(
     path: &str,
+    source: Option<[u8; 16]>,
     mut check: impl FnMut(&mut Directory, &str, &PayloadManifest) -> Result<()>,
 ) -> Result<Inventory> {
     const LIMIT: u64 = 16 * 1024 * 1024;
@@ -312,6 +315,12 @@ pub fn with_inventory(
     for handle in
         boot::find_handles::<SimpleFileSystem>().map_err(|_| refuse!("no file systems"))?
     {
+        if !stela_boot_core::bundle::inventory_volume(
+            source,
+            source.and_then(|_| super::translations::partition(handle)),
+        ) {
+            continue;
+        }
         let Ok(mut volume) = boot::open_protocol_exclusive::<SimpleFileSystem>(handle) else {
             continue;
         };
