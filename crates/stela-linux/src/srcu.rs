@@ -194,7 +194,7 @@ impl<P: KernelThreadPlatform + 'static, const N: usize> Bootstrap<P, N> {
             }
             None => {
                 return Err(JoinFailure {
-                    error: Error::Work(WorkError::CorruptContext),
+                    error: Error::Work(WorkError::corrupt()),
                     bootstrap: self,
                 });
             }

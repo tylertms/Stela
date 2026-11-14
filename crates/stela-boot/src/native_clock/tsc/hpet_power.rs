@@ -93,13 +93,13 @@ impl PowerControl {
             || query(1) != self.basic
             || self.monitor.is_some_and(|value| query(5) != value)
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         if let Some(expected) = self.package {
             // SAFETY: the live CPUID gate was rechecked above; this
             // source only observes the control and never disables deep idle.
             if unsafe { crate::cpu::msr::rdmsr(PACKAGE_LIMIT) } != expected {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
         }
         Ok(())

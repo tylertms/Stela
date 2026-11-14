@@ -141,6 +141,34 @@ mod native_policy;
 #[cfg(all(target_arch = "x86_64", unix))]
 mod general_credits;
 
+#[test]
+fn a_corrupt_context_names_the_line_that_refused() {
+    use std::format;
+    let site = core::panic::Location::caller();
+    assert_eq!(
+        named_site(WorkError::CorruptContext, Some(site)),
+        Some(site)
+    );
+    assert_eq!(named_site(WorkError::Busy, Some(site)), None);
+    assert_eq!(named_site(WorkError::CorruptContext, None), None);
+    // Other tests refuse concurrently: some site is recorded, maybe theirs.
+    assert_eq!(WorkError::corrupt(), WorkError::CorruptContext);
+    let recorded = corrupt_site().expect("a refusal records its site");
+    let suffix = |text: std::string::String, account: &str| {
+        let rest = text.strip_prefix(account).expect("the account comes first");
+        assert!(rest.starts_with(" at ") && rest.contains(".rs:"), "{text}");
+    };
+    suffix(format!("{:?}", WorkError::CorruptContext), "CorruptContext");
+    suffix(
+        format!("{}", WorkError::CorruptContext),
+        "a work context is corrupt",
+    );
+    assert!(recorded.line() > 0);
+    // Every other refusal reads as before.
+    assert_eq!(format!("{:?}", WorkError::Busy), "Busy");
+    assert_eq!(format!("{}", WorkError::TimedOut), "the work timed out");
+}
+
 fn cancellation_error<T>(result: Result<(), (T, WorkError)>) -> WorkError {
     match result {
         Err((owner, error)) => {

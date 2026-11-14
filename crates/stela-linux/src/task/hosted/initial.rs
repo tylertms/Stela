@@ -78,7 +78,7 @@ fn allocate<const N: usize>(
         |error| match error {
             MemoryError::OutOfMemory => WorkError::Full,
             MemoryError::Unavailable => WorkError::Unavailable,
-            _ => WorkError::CorruptContext,
+            _ => WorkError::corrupt(),
         },
     )
 }
@@ -118,7 +118,7 @@ impl<const N: usize> HostedTaskBinding<N> {
         for stack in &stacks {
             let base = stack
                 .cpu_address(0, stack.bytes())
-                .map_err(|_| Work(WorkError::CorruptContext))?;
+                .map_err(|_| Work(WorkError::corrupt()))?;
             stack_bases.push(base.as_ptr().cast());
         }
         // One private, inert model PGD. It is an actual retained mmap, with
@@ -127,7 +127,7 @@ impl<const N: usize> HostedTaskBinding<N> {
         let pages = allocate(&runtime, page_count).map_err(Work)?;
         let pgd = root
             .cpu_address(0, PAGE)
-            .map_err(|_| Work(WorkError::CorruptContext))?;
+            .map_err(|_| Work(WorkError::corrupt()))?;
         let owner = Owner::new(platform);
         let fork = fork::Broker::new(runtime, owner.raw(), stacks.len()).map_err(Work)?;
         let mount = Box::new(Initial {
@@ -163,7 +163,7 @@ impl<const N: usize> HostedTaskBinding<N> {
         if status != 0 {
             return Err(Native(status));
         }
-        let task = NonNull::new(raw).ok_or(Work(WorkError::CorruptContext))?;
+        let task = NonNull::new(raw).ok_or_else(|| Work(WorkError::corrupt()))?;
         // SAFETY: the irreversible original mount and same runtime stay kept.
         unsafe { fork.install(task) }.map_err(Work)?;
         mount.binding = Some(Self::new_record(task, runtime, Kind::Initial));

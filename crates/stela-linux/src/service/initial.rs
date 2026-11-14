@@ -30,7 +30,7 @@ impl<const N: usize> Initial<N> {
         let binding = ManuallyDrop::new(binding);
         let body = ManuallyDrop::new(body);
         if !binding.original_initial() {
-            timer::fatal(WorkError::CorruptContext);
+            timer::fatal(WorkError::corrupt());
         }
         Self {
             binding,
@@ -49,7 +49,7 @@ impl<const N: usize> Initial<N> {
         {
             Ok(_) => {}
             Err(2) => return,
-            Err(_) => timer::fatal(WorkError::CorruptContext),
+            Err(_) => timer::fatal(WorkError::corrupt()),
         }
         // SAFETY: only actual begin on this kept original Initial calls here;
         // no affine metadata/EnteredProcess/row borrow spans original C.
@@ -67,7 +67,7 @@ impl<const N: usize> Initial<N> {
     }
     pub(crate) fn service(&self) {
         if self.phase.load(Ordering::Acquire) != 2 {
-            timer::fatal(WorkError::CorruptContext);
+            timer::fatal(WorkError::corrupt());
         }
         // SAFETY: called by the exact Initial begin after original bootstrap,
         // before any passive leaf/IRQ/timer delivery; no native row/loan held.

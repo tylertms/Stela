@@ -43,7 +43,7 @@ impl<const N: usize> Runtime<N> {
                 || task.completed_sequence == 0
                 || task.returned_sequence > task.completed_sequence
             {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             task.returned_sequence = task.completed_sequence;
         }
@@ -116,7 +116,7 @@ impl<const N: usize> Runtime<N> {
             || task.id != id
             || !task.stack.bounds.contains(&context::stack_pointer())
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(task.id)
     }
@@ -176,7 +176,7 @@ impl<const N: usize> Runtime<N> {
             // SAFETY: current task is held and IF0 protects its job assignment.
             let task = unsafe { &*self.task(index) };
             if view.sequence == 0 || task.signal.sequence.load(Ordering::Acquire) != view.sequence {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             let publication = binding.execution_publication(&view)?;
             let metric_sample = if let Some(publication) = publication {
@@ -234,9 +234,9 @@ impl<const N: usize> Runtime<N> {
         if task.binding.is_none() {
             return Err(WorkError::Unavailable);
         }
-        let sequence = task.job.ok_or(WorkError::CorruptContext)?.1.sequence;
+        let sequence = task.job.ok_or_else(|| WorkError::corrupt())?.1.sequence;
         if sequence == 0 || task.signal.sequence.load(Ordering::Acquire) != sequence {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(WakeHandle {
             queue: ManuallyDrop::new(self.queue.clone()),
@@ -302,7 +302,7 @@ impl<const N: usize> Runtime<N> {
             let binding = task.binding.as_ref().ok_or(WorkError::Unavailable)?;
             let view = self.context_view(index, false);
             if !(view.stack_start..view.stack_end).contains(&view.stack_pointer) {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             // SAFETY: unsafe caller supplies real quiescence; failure is transactional.
             unsafe { binding.detach(&view)? };
@@ -329,7 +329,7 @@ impl<const N: usize> Runtime<N> {
             // without dropping it or calling foreign code under this scope.
             match unsafe { (*self.task(index)).binding.take() } {
                 Some(binding) => Ok(binding),
-                None => self.queue.cpu.fatal(WorkError::CorruptContext),
+                None => self.queue.cpu.fatal(WorkError::corrupt()),
             }
         })();
         // SAFETY: no owner is dropped by moving the Result; no queue lock is held.

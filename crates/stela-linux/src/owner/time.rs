@@ -107,7 +107,7 @@ unsafe fn current(context: *mut c_void) -> (*const RawOwner, *mut c_void) {
     // SAFETY: on successful authentication the installed owner is live.
     let matches = !owner.is_null() && unsafe { (*owner).context == context };
     if !matches {
-        fatal(WorkError::CorruptContext);
+        fatal(WorkError::corrupt());
     }
     (owner, task)
 }
@@ -163,7 +163,7 @@ unsafe fn owned<'a>(pointer: *mut Header) -> &'a Owned {
         stela_linux_owner() == value.owner && stela_linux_minimum_task(value.owner) == value.task
     };
     if !matches {
-        fatal(WorkError::CorruptContext);
+        fatal(WorkError::corrupt());
     }
     value
 }

@@ -382,7 +382,7 @@ unsafe impl<const N: usize> HostedSwitchBinding for HostedTaskBinding<N> {
             0 => Ok(false),
             1 => Ok(true),
             -16 => Err(WorkError::Busy),
-            _ => Err(WorkError::CorruptContext),
+            _ => Err(WorkError::corrupt()),
         }
     }
 
@@ -394,7 +394,7 @@ unsafe impl<const N: usize> HostedSwitchBinding for HostedTaskBinding<N> {
     unsafe fn arrive(&self, context: &TaskContext, new_job: bool) -> Result<(), WorkError> {
         if new_job {
             if self.kind != Kind::Bare {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             // Old signal/OS execution owners remain kept by the same runtime.
             *self.wake.borrow_mut() = Some(self.runtime().current_wake()?);

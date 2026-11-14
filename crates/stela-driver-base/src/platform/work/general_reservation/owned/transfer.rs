@@ -153,7 +153,7 @@ impl<const N: usize> TransferOwner<'_, N> {
             || state.jobs[owner.slot].is_some()
             || owner.runtime.pending_reservations.get() == 0
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         // SAFETY: caller checked fresh same-creator scope and IF0. Immutable
         // constructor identities/geometry and the private worker remain kept.
@@ -171,7 +171,7 @@ impl<const N: usize> TransferOwner<'_, N> {
                 stack_requirement::Geometry::of(&task.stack),
             )
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(())
     }

@@ -119,16 +119,16 @@ impl SourceData {
                 return Err(ResourceBootstrapError::Native(value));
             }
             let lease = NonNull::new(prepared.view.lease)
-                .ok_or(ResourceBootstrapError::Work(WorkError::CorruptContext))?;
+                .ok_or_else(|| ResourceBootstrapError::Work(WorkError::corrupt()))?;
             let total = NonNull::new(prepared.view.total)
-                .ok_or(ResourceBootstrapError::Work(WorkError::CorruptContext))?;
+                .ok_or_else(|| ResourceBootstrapError::Work(WorkError::corrupt()))?;
             let system = NonNull::new(prepared.view.system)
-                .ok_or(ResourceBootstrapError::Work(WorkError::CorruptContext))?;
+                .ok_or_else(|| ResourceBootstrapError::Work(WorkError::corrupt()))?;
             for field in [total, system] {
                 let first = field.as_ptr().addr();
                 let end = first
                     .checked_add(core::mem::size_of::<u64>())
-                    .ok_or(ResourceBootstrapError::Work(WorkError::CorruptContext))?;
+                    .ok_or_else(|| ResourceBootstrapError::Work(WorkError::corrupt()))?;
                 if !first.is_multiple_of(core::mem::align_of::<u64>())
                     || !backing.contains(storage, first..end)
                 {
@@ -136,7 +136,7 @@ impl SourceData {
                 }
             }
             if total == system {
-                return Err(ResourceBootstrapError::Work(WorkError::CorruptContext));
+                return Err(ResourceBootstrapError::Work(WorkError::corrupt()));
             }
             Ok((lease, total, system))
         })();
@@ -203,7 +203,7 @@ impl SourceData {
     }
     pub(super) fn attachable(&self, view: &TaskContext) -> Result<(), WorkError> {
         if self.phase.load(Ordering::Acquire) != CONFIGURED || !self.matches_context(view) {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(())
     }
@@ -227,7 +227,7 @@ impl SourceData {
         if self.owner != owner
             || !matches!(self.phase.load(Ordering::Acquire), PREPARED | CONFIGURED)
         {
-            return Err(ResourceBootstrapError::Work(WorkError::CorruptContext));
+            return Err(ResourceBootstrapError::Work(WorkError::corrupt()));
         }
         // SAFETY: caller owns actual NoPublication plus joined source tails;
         // C independently rejects every claimed/live foreign attachment.

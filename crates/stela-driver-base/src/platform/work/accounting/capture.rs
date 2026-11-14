@@ -41,7 +41,7 @@ impl ExecutionTap {
         if index == NONE {
             return Ok(false);
         }
-        let slot = view.slots.get(index).ok_or(WorkError::CorruptContext)?;
+        let slot = view.slots.get(index).ok_or_else(|| WorkError::corrupt())?;
         if !slot.running.load(Ordering::Acquire) || !slot.bounds.contains(&rsp) {
             return Ok(false);
         }

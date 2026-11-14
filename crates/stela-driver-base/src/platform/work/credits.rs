@@ -249,7 +249,7 @@ impl<const N: usize> Queue<N> {
                 .as_mut()
                 .filter(|current| current.id == id)
             else {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             };
             match result {
                 Ok(()) => {
@@ -334,7 +334,7 @@ impl<const N: usize> ResourceRegistration<N> {
                 .as_mut()
                 .filter(|observer| observer.id == self.id)
             else {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             };
             if observer.poisoned {
                 return Err(WorkError::Pending);
@@ -364,7 +364,7 @@ impl<const N: usize> ResourceRegistration<N> {
                 .as_mut()
                 .filter(|observer| observer.id == self.id)
             else {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             };
             let target = observer.closing.ok_or(WorkError::Busy)?;
             if observer.poisoned || observer.sent != target {
@@ -378,7 +378,7 @@ impl<const N: usize> ResourceRegistration<N> {
             let mut guard = self.queue.lock()?;
             let current = &mut guard.state().resources.current;
             let Some(observer) = current.as_mut().filter(|observer| observer.id == self.id) else {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             };
             match drained {
                 Ok(true) => (ManuallyDrop::new(current.take()), Ok(())),

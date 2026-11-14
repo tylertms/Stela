@@ -83,7 +83,7 @@ impl<P: crate::threads::KernelThreadPlatform + 'static, const N: usize> KernelOw
         threads: &'static crate::task::runtime::TaskRuntime<P, Q, N>,
     ) -> Result<(), InitialStartError> {
         if !threads.matches_kernel(self.get_ref()) {
-            return Err(InitialStartError::Service(WorkError::CorruptContext));
+            return Err(InitialStartError::Service(WorkError::corrupt()));
         }
         self.environment()
             .preflight_initial()

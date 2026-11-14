@@ -73,7 +73,7 @@ impl<'kernel, 'catalog, 'runtime, K: KernelThreadPlatform, P: Provider, const N:
         catalog: &'catalog Catalog<P>,
     ) -> Result<Self, Error> {
         if !kernel.matches_runtime(runtime) {
-            return Err(Error::Work(WorkError::CorruptContext));
+            return Err(Error::Work(WorkError::corrupt()));
         }
         if !catalog.matches_kernel(kernel) {
             return Err(Error::Catalog(pages::Error::InvalidReservation));
@@ -126,7 +126,7 @@ impl<'kernel, 'catalog, 'runtime, K: KernelThreadPlatform, P: Provider, const N:
                 return Err(BeginFailure::Identity {
                     _binding: binding,
                     _error: if value == 0 {
-                        Error::Work(WorkError::CorruptContext)
+                        Error::Work(WorkError::corrupt())
                     } else {
                         Error::Source(value)
                     },
@@ -252,7 +252,7 @@ impl<'factory, 'kernel, 'catalog, 'runtime, K: KernelThreadPlatform, P: Provider
             return Err(Error::Source(value));
         }
         if target != self.identity.target.as_ptr() || generation != self.identity.generation {
-            return Err(Error::Work(WorkError::CorruptContext));
+            return Err(Error::Work(WorkError::corrupt()));
         }
         Ok(())
     }

@@ -32,7 +32,7 @@ impl Control {
     }
     pub(in crate::native_clock) fn check(&self) -> Result<(), WorkError> {
         if observe()? != self.inputs {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(())
     }

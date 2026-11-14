@@ -39,7 +39,7 @@ impl<const N: usize> PinnedGeneralStackPreparation<'_, N> {
             self.prepared
                 .pin
                 .as_ref()
-                .ok_or(WorkError::CorruptContext)?,
+                .ok_or_else(|| WorkError::corrupt())?,
         ))
     }
     #[cfg(feature = "linux-kernel")]
@@ -96,7 +96,7 @@ impl<'runtime, const N: usize> GeneralStackPreparation<'runtime, N> {
                 || task.stack_pin_nonce != 0
                 || (task.ever_entered && task.returned_sequence != task.completed_sequence)
             {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             Ok((&*task.stack.backing, task.stack.bounds.clone()))
         })();
@@ -140,7 +140,7 @@ impl<'runtime, const N: usize> GeneralStackPreparation<'runtime, N> {
         // metadata queries, even on failure. No label or caller epoch suffices.
         let post = self.pin_source(entered).and_then(|(after, bounds)| {
             if !core::ptr::eq(source, after as *const dyn StackBacking) || bounds != range {
-                Err(WorkError::CorruptContext)
+                Err(WorkError::corrupt())
             } else {
                 Ok(())
             }

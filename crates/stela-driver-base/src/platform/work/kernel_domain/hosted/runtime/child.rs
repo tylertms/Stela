@@ -198,7 +198,7 @@ impl<'runtime, const N: usize> HostedChildReservation<'runtime, N> {
             || task.state != TaskState::Reserved
             || task.stack_pin_nonce != self.nonce
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(())
     }

@@ -74,7 +74,7 @@ impl<const N: usize> Runtime<N> {
                 self.dispatch.get(),
             );
         }
-        fail(WorkError::CorruptContext)
+        fail(WorkError::corrupt())
     }
     pub(super) fn terminal_returned(self: Pin<&Self>, index: usize) {
         // SAFETY: called only by actual dispatcher immediately after switch.
@@ -114,7 +114,7 @@ impl<const N: usize> Runtime<N> {
         }
         // SAFETY: same checked kept terminal task, no code can alter its job.
         let (slot, job) =
-            unsafe { (*self.task(index)).job }.unwrap_or_else(|| fail(WorkError::CorruptContext));
+            unsafe { (*self.task(index)).job }.unwrap_or_else(|| fail(WorkError::corrupt()));
         self.queue
             .finish(slot, job.sequence, None)
             .unwrap_or_else(|error| self.queue.cpu.fatal(error));

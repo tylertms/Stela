@@ -161,7 +161,7 @@ impl<'runtime, const N: usize> OwnedGeneralEscrow<'runtime, N> {
                     && (task.completed_sequence == 0
                         || task.returned_sequence != task.completed_sequence))
             {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             let runtime = self.runtime.get_ref() as *const Runtime<N> as usize;
             // SAFETY: source preparation owns zeroed usable RAM, no old C or
@@ -213,7 +213,7 @@ impl<const N: usize> GeneralStackPreparation<'_, N> {
                         && task.stack_epoch == epoch
                         && task.ever_entered == (mode == PreparationMode::Returned) => {}
                 (None, None) if self.frame_ready && !self.zeroed && self.pin.is_none() => {}
-                _ => return Err(WorkError::CorruptContext),
+                _ => return Err(WorkError::corrupt()),
             }
             Ok(())
         })();

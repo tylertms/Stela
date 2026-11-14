@@ -106,7 +106,7 @@ pub(super) unsafe fn run(delivery: &TimerDelivery<'_>) -> Option<u64> {
     if deadline == i64::MAX {
         None
     } else {
-        Some(u64::try_from(deadline).unwrap_or_else(|_| fatal(WorkError::CorruptContext)))
+        Some(u64::try_from(deadline).unwrap_or_else(|_| fatal(WorkError::corrupt())))
     }
 }
 static FIRST_FAILURE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
@@ -126,7 +126,7 @@ pub(super) fn failure() -> Option<WorkError> {
         11 => Some(WorkError::TimedOut),
         12 => Some(WorkError::CorruptContext),
         13 => Some(WorkError::Pending),
-        _ => Some(WorkError::CorruptContext),
+        _ => Some(WorkError::corrupt()),
     }
 }
 pub(super) fn fatal(error: WorkError) -> ! {

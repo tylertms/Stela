@@ -361,7 +361,7 @@ impl<const N: usize> Domain<N> {
             return Err(WorkError::InvalidTicket);
         }
         // SAFETY: acquired once-only initialization on the same checked CPU.
-        let wake = unsafe { (&*self.wake.get()).as_ref() }.ok_or(WorkError::CorruptContext)?;
+        let wake = unsafe { (&*self.wake.get()).as_ref() }.ok_or_else(|| WorkError::corrupt())?;
         if wake.renew_current()?.sequence() != wake.sequence() {
             return Err(WorkError::Closed);
         }
@@ -420,7 +420,7 @@ impl<const N: usize> Domain<N> {
             return Ok(true);
         } // initial real service setup
         // SAFETY: acquired publication; immutable handle, no task/C pointer.
-        let wake = unsafe { (&*self.wake.get()).as_ref() }.ok_or(WorkError::CorruptContext)?;
+        let wake = unsafe { (&*self.wake.get()).as_ref() }.ok_or_else(|| WorkError::corrupt())?;
         if self.stopping.load(Ordering::Acquire) {
             if wake.closed()? {
                 return Ok(false);
@@ -450,7 +450,8 @@ impl<const N: usize> Domain<N> {
         self.stopping.store(true, Ordering::Release);
         if self.bound.load(Ordering::Acquire) {
             // SAFETY: acquired initialization; no final owner release or C read.
-            let wake = unsafe { (&*self.wake.get()).as_ref() }.ok_or(WorkError::CorruptContext)?;
+            let wake =
+                unsafe { (&*self.wake.get()).as_ref() }.ok_or_else(|| WorkError::corrupt())?;
             if !wake.closed()? {
                 wake.wake()?;
             }
@@ -472,7 +473,7 @@ impl<const N: usize> Domain<N> {
             return Err(WorkError::Busy);
         }
         // SAFETY: immutable job handle; closed check invokes no provider.
-        let wake = unsafe { (&*self.wake.get()).as_ref() }.ok_or(WorkError::CorruptContext)?;
+        let wake = unsafe { (&*self.wake.get()).as_ref() }.ok_or_else(|| WorkError::corrupt())?;
         if !wake.closed()? {
             return Err(WorkError::Busy);
         }

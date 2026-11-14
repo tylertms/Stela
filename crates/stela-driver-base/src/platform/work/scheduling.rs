@@ -130,13 +130,15 @@ impl Board {
             137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
         ];
         if let Some(index) = self.running_row {
-            let row = self.rows[index].as_mut().ok_or(WorkError::CorruptContext)?;
+            let row = self.rows[index]
+                .as_mut()
+                .ok_or_else(|| WorkError::corrupt())?;
             if row.state != State::Running {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             let elapsed = now
                 .checked_sub(row.started_ns)
-                .ok_or(WorkError::CorruptContext)?;
+                .ok_or_else(|| WorkError::corrupt())?;
             let execution = row
                 .execution_ns
                 .checked_add(elapsed)
@@ -211,12 +213,12 @@ impl Board {
         rank: Snapshot,
     ) -> Result<usize, WorkError> {
         let slot = self.index(id, sequence)?;
-        let row = self.rows[slot].ok_or(WorkError::CorruptContext)?;
+        let row = self.rows[slot].ok_or_else(|| WorkError::corrupt())?;
         if !matches!(row.state, State::Reserved { .. })
             || row.rank != rank
             || self.reserved_tail == 0
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(slot)
     }
@@ -262,7 +264,7 @@ impl Board {
             };
         }
         if sequence == 0 || self.rows.iter().flatten().any(|row| row.id == id) {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         let slot = self
             .rows
@@ -326,15 +328,18 @@ impl Board {
         }
         let slot = self.index(id, sequence)?;
         if self.rows[slot].as_ref().unwrap().state != State::Dormant || self.reserved_tail == 0 {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         // A fresh ready order was reserved before C publication. Every other
         // tail stamp preserves this credit; activation consumes no capacity.
-        let order = self.tail.checked_add(1).ok_or(WorkError::CorruptContext)?;
+        let order = self
+            .tail
+            .checked_add(1)
+            .ok_or_else(|| WorkError::corrupt())?;
         let remaining = self.reserved_tail - 1;
         order
             .checked_add(remaining)
-            .ok_or(WorkError::CorruptContext)?;
+            .ok_or_else(|| WorkError::corrupt())?;
         let floor = self.normal_floor();
         let row = self.rows[slot].as_mut().unwrap();
         row.virtual_ns = row.virtual_ns.max(floor);
@@ -369,15 +374,15 @@ impl Board {
             return Ok(());
         }
         if self.running_row.is_some() {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         let slot = self.index(id, sequence)?;
         let row = self.rows[slot].as_mut().unwrap();
         if row.state != State::Ready {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         if now < row.started_ns {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         row.state = State::Running;
         row.started_ns = now;
@@ -396,7 +401,7 @@ impl Board {
         }
         let slot = self.index(id, sequence)?;
         if self.rows[slot].as_ref().unwrap().state != State::Running {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         if reason == LeaveReason::Yield
             && self
@@ -422,7 +427,7 @@ impl Board {
         if self.running_row != Some(slot)
             || self.rows[slot].as_ref().unwrap().state != State::Running
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         let order = if reason == LeaveReason::Yield {
             Some(self.order(false)?)
@@ -475,7 +480,7 @@ impl Board {
             .normal_history
             .iter_mut()
             .find(|(context, _)| *context == id.get())
-            .ok_or(WorkError::CorruptContext)?;
+            .ok_or_else(|| WorkError::corrupt())?;
         history.1 = row.virtual_ns;
         self.rows[slot] = None;
         self.running_row = None;
@@ -507,11 +512,11 @@ impl Board {
         let row = self.rows[index].as_ref().unwrap();
         if row.state == State::Running {
             if self.running_row != Some(index) {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             let elapsed = now
                 .checked_sub(row.started_ns)
-                .ok_or(WorkError::CorruptContext)?;
+                .ok_or_else(|| WorkError::corrupt())?;
             Ok((
                 row.execution_ns
                     .checked_add(elapsed)
@@ -579,7 +584,7 @@ impl Board {
         let a = self.rows[self.index(candidate.0, candidate.1)?].unwrap();
         let b = self.rows[self.index(selected.0, selected.1)?].unwrap();
         if a.state != State::Ready || b.state != State::Ready {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         if self.fair_normal && a.rank.effective >= 100 && b.rank.effective >= 100 {
             return Ok(a.virtual_ns < b.virtual_ns

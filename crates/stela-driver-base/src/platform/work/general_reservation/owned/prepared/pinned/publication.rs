@@ -34,7 +34,7 @@ impl<'runtime, const N: usize> PinnedGeneralStackPreparation<'runtime, N> {
         entered: &dyn EnteredProcess,
     ) -> Result<OwnedPinnedGeneral<'runtime, N>, (Self, WorkError)> {
         if self.prepared.pin.is_none() {
-            return Err((self, WorkError::CorruptContext));
+            return Err((self, WorkError::corrupt()));
         }
         if let Err(error) = self.prepared.reseed(entered, false) {
             return Err((self, error));
@@ -92,7 +92,7 @@ impl<const N: usize> OwnedPinnedGeneral<'_, N> {
             // SAFETY: same actual excluded native allocation epoch.
             let task = unsafe { &*owner.runtime.task(owner.worker) };
             if self.epoch == 0 || task.stack_epoch != self.epoch {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             if needs_pin && self.pin.is_none() {
                 return Err(WorkError::Pending);
@@ -206,7 +206,7 @@ impl<'runtime, const N: usize> OwnedPinnedGeneral<'runtime, N> {
             }),
             Err((escrow, error)) => {
                 if queue.published_stack_pins.fetch_sub(1, Ordering::AcqRel) == 0 {
-                    queue.cpu.fatal(WorkError::CorruptContext);
+                    queue.cpu.fatal(WorkError::corrupt());
                 }
                 drop(ManuallyDrop::into_inner(queue));
                 Err((Self { escrow, pin, epoch }, error))
@@ -249,7 +249,7 @@ impl<const N: usize> PublishedGeneralStack<'_, N> {
                 return Err(WorkError::Busy);
             }
             if queue.published_stack_pins.load(Ordering::Acquire) == 0 {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             if release {
                 let shape = crate::platform::work::ReleasedStackGeometry::of(
@@ -264,7 +264,7 @@ impl<const N: usize> PublishedGeneralStack<'_, N> {
                 task.stack_pin_nonce = 0;
                 task.state = TaskState::Idle;
                 if queue.published_stack_pins.fetch_sub(1, Ordering::AcqRel) == 0 {
-                    queue.cpu.fatal(WorkError::CorruptContext);
+                    queue.cpu.fatal(WorkError::corrupt());
                 }
             }
             Ok(())
@@ -349,7 +349,7 @@ impl<const N: usize> PublishedGeneralStack<'_, N> {
                 || task.stack_pin_nonce != self.nonce
                 || task.stack_epoch != self.epoch
             {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             Ok(task.state == TaskState::Retained
                 && task.job.is_none()

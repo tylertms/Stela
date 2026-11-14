@@ -334,14 +334,14 @@ impl<const N: usize> HostedRuntime<N> {
             return Err(WorkError::Unavailable);
         }
         if DISPATCH.get().active != ptr::from_ref(self).cast() {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         // SAFETY: the checked original thread is executing this task. No
         // mutable task borrow spans a call to this observation.
         let task = unsafe { &*self.task(index) };
         let stack_pointer = context::stack_pointer();
         if task.state != TaskState::Running || !task.stack.bounds.contains(&stack_pointer) {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(self.context_view(task, stack_pointer))
     }
@@ -529,11 +529,11 @@ impl<const N: usize> HostedRuntime<N> {
         }
         // SAFETY: the successful kernel call initialized the full Timespec.
         let stamp = unsafe { stamp.assume_init() };
-        let seconds = u64::try_from(stamp.seconds).map_err(|_| WorkError::CorruptContext)?;
+        let seconds = u64::try_from(stamp.seconds).map_err(|_| WorkError::corrupt())?;
         let nanos = u64::try_from(stamp.nanoseconds)
             .ok()
             .filter(|nanos| *nanos < 1_000_000_000)
-            .ok_or(WorkError::CorruptContext)?;
+            .ok_or_else(|| WorkError::corrupt())?;
         seconds
             .checked_mul(1_000_000_000)
             .and_then(|seconds| seconds.checked_add(nanos))

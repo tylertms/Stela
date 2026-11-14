@@ -18,7 +18,7 @@ impl<const N: usize> TaskBinding<N> {
         let stopped = ManuallyDrop::new(runtime.take_stopped_publication(self.first()?)?);
         let erased: Arc<dyn ExecutionPublication> = sink.clone();
         if !stopped.matches(&erased) || !sink.matches(stopped.identity()) {
-            return Err(WorkError::CorruptContext); // actual stopped owner retained
+            return Err(WorkError::corrupt()); // actual stopped owner retained
         }
         Ok(StoppedTaskData {
             sink: ManuallyDrop::new(sink.clone()),
@@ -43,7 +43,7 @@ impl StoppedTaskData {
         {
             return Err((
                 ManuallyDrop::into_inner(this),
-                ResourceBootstrapError::Work(WorkError::CorruptContext),
+                ResourceBootstrapError::Work(WorkError::corrupt()),
             ));
         }
         let identity = this.stopped.identity();

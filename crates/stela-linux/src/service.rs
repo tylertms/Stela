@@ -293,7 +293,7 @@ impl<const N: usize> Environment<N> {
             return Ok(false);
         }
         if self.initial().is_some() {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(true)
     }
@@ -602,5 +602,5 @@ unsafe extern "C" fn service<const N: usize>(context: *mut c_void) {
     // This actual original Initial owns permanent kernel roots. There is no
     // genuine shutdown/reaper contract allowing its callback to complete.
     // Keep binding/domain/source/code mounted if the C loop ever returns.
-    timer::fatal(WorkError::CorruptContext);
+    timer::fatal(WorkError::corrupt());
 }

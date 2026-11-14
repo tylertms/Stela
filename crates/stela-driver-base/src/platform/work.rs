@@ -92,7 +92,7 @@ static NEXT_CONTEXT: AtomicU64 = AtomicU64::new(1);
 static NEXT_QUEUE: AtomicU64 = AtomicU64::new(1);
 static QUARANTINED: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum WorkError {
     Unavailable,
     WrongCpu,
@@ -105,8 +105,70 @@ pub enum WorkError {
     InvalidTicket,
     WouldDeadlock,
     TimedOut,
+    /// Made by [`WorkError::corrupt`], which records the refusing line.
     CorruptContext,
     Pending,
+}
+
+/// The line of the latest [`WorkError::corrupt`]: over a hundred checks
+/// refuse with the one variant, and a report that names none of them
+/// cannot tell them apart.
+static CORRUPT_SITE: core::sync::atomic::AtomicPtr<core::panic::Location<'static>> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+impl WorkError {
+    /// [`Self::CorruptContext`], recording the caller's line as the site of
+    /// the refusal ([`corrupt_site`]), which every account of it names.
+    #[must_use]
+    #[track_caller]
+    pub fn corrupt() -> Self {
+        let site = core::panic::Location::caller();
+        CORRUPT_SITE.store(core::ptr::from_ref(site).cast_mut(), Ordering::Release);
+        Self::CorruptContext
+    }
+}
+
+/// Where the latest corrupt-context refusal was made, if any was.
+pub fn corrupt_site() -> Option<&'static core::panic::Location<'static>> {
+    // SAFETY: only `WorkError::corrupt` stores, a `&'static Location`.
+    unsafe { CORRUPT_SITE.load(Ordering::Acquire).as_ref() }
+}
+
+/// The site an account of `error` names: `site` for a corrupt context.
+fn named_site(
+    error: WorkError,
+    site: Option<&'static core::panic::Location<'static>>,
+) -> Option<&'static core::panic::Location<'static>> {
+    site.filter(|_| error == WorkError::CorruptContext)
+}
+
+/// ` at FILE:LINE` after a corrupt context's account, from its site.
+fn write_site(error: WorkError, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match named_site(error, corrupt_site()) {
+        Some(site) => write!(f, " at {}:{}", site.file(), site.line()),
+        None => Ok(()),
+    }
+}
+
+impl core::fmt::Debug for WorkError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Unavailable => "Unavailable",
+            Self::WrongCpu => "WrongCpu",
+            Self::InterruptContext => "InterruptContext",
+            Self::Busy => "Busy",
+            Self::Full => "Full",
+            Self::Closed => "Closed",
+            Self::Exhausted => "Exhausted",
+            Self::InvalidStack => "InvalidStack",
+            Self::InvalidTicket => "InvalidTicket",
+            Self::WouldDeadlock => "WouldDeadlock",
+            Self::TimedOut => "TimedOut",
+            Self::CorruptContext => "CorruptContext",
+            Self::Pending => "Pending",
+        })?;
+        write_site(*self, f)
+    }
 }
 
 /// A plain account for the boot log and screen.
@@ -126,7 +188,8 @@ impl core::fmt::Display for WorkError {
             Self::TimedOut => "the work timed out",
             Self::CorruptContext => "a work context is corrupt",
             Self::Pending => "the work has not finished",
-        })
+        })?;
+        write_site(*self, f)
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

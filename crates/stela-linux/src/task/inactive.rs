@@ -117,7 +117,7 @@ impl<const N: usize> TaskBinding<N> {
                 return Err(WorkError::Unavailable);
             }
             owner.caller = Some(identity);
-            let native = owner.native.as_ref().ok_or(WorkError::CorruptContext)?;
+            let native = owner.native.as_ref().ok_or_else(|| WorkError::corrupt())?;
             runtime.observe_inactive(native, &waiter, force_wait)
         })();
         match result {
@@ -155,7 +155,7 @@ impl<const N: usize> TaskBinding<N> {
             owner
                 .native
                 .as_ref()
-                .ok_or(WorkError::CorruptContext)?
+                .ok_or_else(|| WorkError::corrupt())?
                 .check_process()
         })();
         if let Err(error) = result {

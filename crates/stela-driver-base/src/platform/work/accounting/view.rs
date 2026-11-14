@@ -104,14 +104,14 @@ impl ExecutionView {
         index: usize,
         sample: ExecutionSample,
     ) -> Result<(), WorkError> {
-        let slot = self.slots.get(index).ok_or(WorkError::CorruptContext)?;
+        let slot = self.slots.get(index).ok_or_else(|| WorkError::corrupt())?;
         if self.closed.load(Ordering::Acquire)
             || sample.identity.queue != self.queue
             || sample.identity.context != slot.context
             || sample.identity.sequence == 0
             || self.active.load(Ordering::Acquire) != NONE
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         let previous = slot.sequence.load(Ordering::Acquire);
         if previous != sample.identity.sequence && self.has_target(index) {
@@ -133,7 +133,7 @@ impl ExecutionView {
         &self,
         index: usize,
     ) -> Result<ExecutionIdentity, WorkError> {
-        let slot = self.slots.get(index).ok_or(WorkError::CorruptContext)?;
+        let slot = self.slots.get(index).ok_or_else(|| WorkError::corrupt())?;
         let sequence = slot.sequence.load(Ordering::Acquire);
         if sequence == 0 {
             return Err(WorkError::Unavailable);
@@ -145,14 +145,17 @@ impl ExecutionView {
         index: usize,
         now: u64,
     ) -> Result<ExecutionSample, WorkError> {
-        let slot = self.slots.get(index).ok_or(WorkError::CorruptContext)?;
+        let slot = self.slots.get(index).ok_or_else(|| WorkError::corrupt())?;
         let identity = self.identity(index)?;
         let stored = slot.total.load(Ordering::Relaxed);
         let through = slot.through.load(Ordering::Relaxed);
         let (total, stamp) = if slot.running.load(Ordering::Acquire) {
             (
                 stored
-                    .checked_add(now.checked_sub(through).ok_or(WorkError::CorruptContext)?)
+                    .checked_add(
+                        now.checked_sub(through)
+                            .ok_or_else(|| WorkError::corrupt())?,
+                    )
                     .ok_or(WorkError::Exhausted)?,
                 now,
             )
@@ -187,7 +190,7 @@ impl ExecutionView {
     ) -> Result<(), WorkError> {
         if self.active.load(Ordering::Acquire) != index || self.identity(index)? != sample.identity
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         let slot = &self.slots[index];
         slot.total.store(sample.total_ns, Ordering::Relaxed);
@@ -250,7 +253,7 @@ impl ExecutionView {
         index: usize,
         identity: ExecutionIdentity,
     ) -> Result<StoppedPublication, WorkError> {
-        let slot = self.slots.get(index).ok_or(WorkError::CorruptContext)?;
+        let slot = self.slots.get(index).ok_or_else(|| WorkError::corrupt())?;
         if self.identity(index)? != identity
             || !slot.stopped.load(Ordering::Acquire)
             || slot.running.load(Ordering::Acquire)

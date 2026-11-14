@@ -318,7 +318,7 @@ impl<const N: usize> Runtime<N> {
                 })?;
             let nonce = state.next_reservation;
             if nonce == 0 {
-                return Err(WorkError::CorruptContext.into());
+                return Err(WorkError::corrupt().into());
             }
             let next = nonce.checked_add(1).ok_or(WorkError::Exhausted)?;
             let pending = self
@@ -358,7 +358,7 @@ impl<const N: usize> GeneralReservation<'_, '_, N> {
         if !self.creator.matches(self.runtime.current_context()?)
             || self.runtime.current.get() != self.creator_worker
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(())
     }
@@ -431,7 +431,7 @@ impl<const N: usize> GeneralReservation<'_, '_, N> {
             || state.jobs[self.slot].is_some()
             || self.runtime.pending_reservations.get() == 0
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         // SAFETY: caller checked real current permission at IF0 and kept the
         // unchanged task vector; worker is private constructor-captured.
@@ -448,7 +448,7 @@ impl<const N: usize> GeneralReservation<'_, '_, N> {
                 stack_requirement::Geometry::of(&task.stack),
             )
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(())
     }

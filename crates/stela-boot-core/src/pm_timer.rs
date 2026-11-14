@@ -87,7 +87,7 @@ impl Prepared {
     pub fn delta(self, previous: u32, current: u32) -> Result<u64, WorkError> {
         let delta = current.wrapping_sub(previous) & self.mask;
         if delta > self.max_gap {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(u64::from(delta))
     }

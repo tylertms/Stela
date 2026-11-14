@@ -260,7 +260,7 @@ fn status(value: i32) -> Result<(), WorkError> {
         0 => Ok(()),
         -16 => Err(WorkError::Busy),
         -28 => Err(WorkError::Full),
-        _ => Err(WorkError::CorruptContext),
+        _ => Err(WorkError::corrupt()),
     }
 }
 impl<const N: usize> TaskBinding<N> {
@@ -360,7 +360,7 @@ impl<const N: usize> TaskBinding<N> {
                     return Err(ResourceBootstrapError::Native(value));
                 }
                 let task = NonNull::new(raw)
-                    .ok_or(ResourceBootstrapError::Work(WorkError::CorruptContext))?;
+                    .ok_or_else(|| ResourceBootstrapError::Work(WorkError::corrupt()))?;
                 let source_data = match data::SourceData::prepare(
                     task,
                     kernel.raw(),
@@ -445,7 +445,7 @@ impl<const N: usize> TaskBinding<N> {
                     return Err(ResourceBootstrapError::Native(value));
                 }
                 let task = NonNull::new(raw)
-                    .ok_or(ResourceBootstrapError::Work(WorkError::CorruptContext))?;
+                    .ok_or_else(|| ResourceBootstrapError::Work(WorkError::corrupt()))?;
                 let source_data = match data::SourceData::prepare(
                     task,
                     kernel.raw(),
@@ -759,7 +759,7 @@ impl<const N: usize> TaskBinding<N> {
         let handle = self.current_wake()?;
         if handle.context_id().get() != context.context_id || handle.sequence() != context.sequence
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         // Runtime keeps Queue/signal while attached: this temporary handle's
         // drop is necessarily nonfinal, including IF=0 arrive callbacks.
@@ -972,7 +972,7 @@ unsafe impl<const N: usize> SwitchBinding for TaskBinding<N> {
             0 => Ok(false),
             1 => Ok(true),
             -16 => Err(WorkError::Busy),
-            _ => Err(WorkError::CorruptContext),
+            _ => Err(WorkError::corrupt()),
         }
     }
     unsafe fn leave(&self, context: &TaskContext, reason: LeaveReason) -> Result<(), WorkError> {
@@ -1008,7 +1008,7 @@ unsafe impl<const N: usize> SwitchBinding for TaskBinding<N> {
     unsafe fn terminal_successor(&self, context: &TaskContext) -> Result<(), WorkError> {
         self.first()?.check_process()?;
         if self.first()?.context_id().get() != context.context_id {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         // SAFETY: Core supplied true off-all-stacks native successor/IF0 and
         // exact retained source binding; C only records closure/notification.
@@ -1018,7 +1018,7 @@ unsafe impl<const N: usize> SwitchBinding for TaskBinding<N> {
         // No current validation is invented on the idle dispatcher. Runtime
         // already checks CPU/IF0/quiescence and supplies saved RSP.
         if self.first()?.context_id().get() != context.context_id {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         // SAFETY: unsafe caller's producer quiescence and idle hook.
         status(unsafe { stela_linux_task_detach(self.task.as_ptr(), context) })?;
@@ -1102,7 +1102,7 @@ impl<const N: usize> TargetTask<N> {
             -116 => Err(WorkError::Closed),
             -16 => Err(WorkError::Busy),
             -95 => Err(WorkError::Unavailable),
-            _ => Err(WorkError::CorruptContext),
+            _ => Err(WorkError::corrupt()),
         }
     }
 }

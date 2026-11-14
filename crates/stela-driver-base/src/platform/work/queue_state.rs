@@ -164,7 +164,7 @@ impl<const N: usize> State<N> {
         released_stack: Option<ReleasedStackGeometry>,
     ) -> Result<(), WorkError> {
         if self.reservations.get(slot).is_none_or(|nonce| *nonce != 0) {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         if !self
             .jobs
@@ -173,7 +173,7 @@ impl<const N: usize> State<N> {
             .is_some_and(|j| j.sequence == sequence && j.running)
         {
             self.poisoned = true;
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         #[cfg(target_arch = "x86_64")]
         if self

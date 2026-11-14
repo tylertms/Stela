@@ -130,7 +130,7 @@ impl<const N: usize> OwnedGeneralEscrow<'_, N> {
                         && task.stack_epoch == epoch
                         && task.stack_retired_epoch != epoch => {}
                 None if task.stack_epoch == task.stack_retired_epoch => {}
-                _ => return Err(WorkError::CorruptContext),
+                _ => return Err(WorkError::corrupt()),
             }
             let (sequence, next) = if let Some((sequence, rank)) = self.child_rank {
                 if dormant != Some(rank) || epoch.is_none() {

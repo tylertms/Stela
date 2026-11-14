@@ -18,7 +18,7 @@ impl PhysicalRun {
     fn enter(&self, sequence: u64) -> Result<(), WorkError> {
         let old = self.entered.load(Ordering::Acquire);
         if sequence == 0 || old != self.departed.load(Ordering::Acquire) {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         let next = old.checked_add(1).ok_or(WorkError::Exhausted)?;
         self.assignment.store(sequence, Ordering::Relaxed);
@@ -29,7 +29,7 @@ impl PhysicalRun {
         let run = self.entered.load(Ordering::Acquire);
         let sequence = self.assignment.load(Ordering::Acquire);
         if run == 0 || sequence == 0 || self.departed.load(Ordering::Acquire) >= run {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         self.departed.store(run, Ordering::Release);
         Ok(sequence)
@@ -132,7 +132,7 @@ pub(super) fn notify<const N: usize>(
             continue;
         }
         if row.signal.sequence.load(Ordering::Acquire) != row.waiter_sequence {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         scheduling.wake(row.waiter, row.waiter_sequence)?;
         row.signal.pending.store(true, Ordering::Release);
@@ -146,12 +146,12 @@ impl<const N: usize> Runtime<N> {
     pub(super) fn physical_enter(self: Pin<&Self>, index: usize) -> Result<(), WorkError> {
         // SAFETY: dispatch owns this index at IF0; this bounded leaf never switches.
         let task = unsafe { &*self.task(index) };
-        let sequence = task.job.ok_or(WorkError::CorruptContext)?.1.sequence;
+        let sequence = task.job.ok_or_else(|| WorkError::corrupt())?.1.sequence;
         if task.state != TaskState::Running
             || self.current.get() != index
             || task.signal.sequence.load(Ordering::Acquire) != sequence
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         task.signal.physical.enter(sequence)
     }

@@ -100,7 +100,7 @@ impl<'runtime, const N: usize> DormantGeneralStack<'runtime, N> {
                     .is_none_or(|(_, job)| job.sequence != p.assigned.ticket.sequence)
                 || task.signal.sequence.load(Ordering::Acquire) != p.assigned.ticket.sequence
             {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             state
                 .scheduling

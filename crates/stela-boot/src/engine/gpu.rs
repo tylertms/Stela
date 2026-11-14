@@ -1849,7 +1849,7 @@ fn mount_and_start(
     }
     let job = completed
         .take()
-        .ok_or(environment_error(WorkError::CorruptContext))?;
+        .ok_or_else(|| environment_error(WorkError::corrupt()))?;
     drop(joined.into_job());
     drop(ready);
     Ok((owner, threads, job))

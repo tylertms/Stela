@@ -44,14 +44,14 @@ pub unsafe fn run_hosted_service<const N: usize>(
     // SAFETY: C owns entry and parking in the actual Initial's active scope.
     // The call and its batch slot live on this stack through every suspension.
     unsafe { stela_linux_service_loop(ptr::from_mut(&mut call).cast()) };
-    timer::fatal(WorkError::CorruptContext);
+    timer::fatal(WorkError::corrupt());
 }
 
 unsafe extern "C" fn begin<const N: usize>(context: *mut c_void) -> bool {
     // SAFETY: the original loop lends this slot to one callback at a time.
     let service = unsafe { &mut *context.cast::<Service<'_, N>>() };
     if service.batch.is_some() {
-        timer::fatal(WorkError::CorruptContext);
+        timer::fatal(WorkError::corrupt());
     }
     service.batch = service
         .runtime
@@ -67,7 +67,7 @@ unsafe extern "C" fn finish<const N: usize>(context: *mut c_void) {
         let batch = service
             .batch
             .take()
-            .unwrap_or_else(|| timer::fatal(WorkError::CorruptContext));
+            .unwrap_or_else(|| timer::fatal(WorkError::corrupt()));
         (service.owner, service.runtime, ManuallyDrop::new(batch))
     };
     // SAFETY: exact current, retained owner and captured batch. No service
@@ -79,7 +79,7 @@ unsafe extern "C" fn finish<const N: usize>(context: *mut c_void) {
         .unwrap_or_else(|error| timer::fatal(error));
     // SAFETY: still on this mounted Initial, after the timer capture returned.
     if unsafe { crate::task::hosted_service_progress(owner, runtime) }.is_err() {
-        timer::fatal(WorkError::CorruptContext);
+        timer::fatal(WorkError::corrupt());
     }
 }
 
@@ -89,7 +89,7 @@ unsafe extern "C" fn no_native_irq(_: *mut c_void) -> c_int {
 }
 
 unsafe extern "C" fn unexpected_irq(_: *mut c_void) {
-    timer::fatal(WorkError::CorruptContext);
+    timer::fatal(WorkError::corrupt());
 }
 
 unsafe extern "C" fn no_deferred_leaves(_: *mut c_void) {}

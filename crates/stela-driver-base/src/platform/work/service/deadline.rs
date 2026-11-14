@@ -43,7 +43,7 @@ impl DeadlineCore {
 
     pub(in crate::platform::work) fn observe(&mut self, now: u64) -> Result<(), WorkError> {
         if now < self.last_ns {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         self.last_ns = now;
         Ok(())
@@ -127,9 +127,12 @@ impl DeadlineCore {
     ) -> Result<(), WorkError> {
         self.validate(&capture)?;
         let tick = if capture.tick {
-            let previous = self.tick.ok_or(WorkError::CorruptContext)?;
-            let phases =
-                now.checked_sub(previous).ok_or(WorkError::CorruptContext)? / IRQ_WORK_TICK_NS + 1;
+            let previous = self.tick.ok_or_else(|| WorkError::corrupt())?;
+            let phases = now
+                .checked_sub(previous)
+                .ok_or_else(|| WorkError::corrupt())?
+                / IRQ_WORK_TICK_NS
+                + 1;
             Some(
                 previous
                     .checked_add(

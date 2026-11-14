@@ -208,7 +208,7 @@ impl Prepared {
             Self::Hpet(_) | Self::Tsc(_) => {
                 let delta = current.wrapping_sub(previous);
                 if delta > u64::MAX / 2 {
-                    return Err(WorkError::CorruptContext);
+                    return Err(WorkError::corrupt());
                 }
                 Ok(delta)
             }

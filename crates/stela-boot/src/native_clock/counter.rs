@@ -174,7 +174,7 @@ impl Counter {
                 return Ok(result);
             }
             if now < first {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
         }
         Err(WorkError::Unavailable)
@@ -234,7 +234,7 @@ impl Counter {
                 || geometry.timers != self.geometry.timers
                 || read32(self.base, 0x10) & (ENABLED | LEGACY) != ENABLED
             {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             let mask = (1u32 << geometry.timers) - 1;
             if read32(self.base, 0x20) & mask != 0 {
@@ -299,7 +299,7 @@ impl Counter {
             let current = self.read_irq()?;
             if current != previous {
                 if current.wrapping_sub(previous) > u64::MAX / 2 {
-                    return Err(WorkError::CorruptContext);
+                    return Err(WorkError::corrupt());
                 }
                 return Ok(current);
             }
@@ -326,7 +326,7 @@ impl Counter {
             // reader drain. Preserve firmware's original stopped configuration.
             let current = unsafe { read32(self.base, 0x10) };
             if current & (ENABLED | LEGACY) != ENABLED {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             // SAFETY: sole wholeblock owner; no routes were changed.
             // RMW preserves current reserved bits without assuming they stay

@@ -107,7 +107,7 @@ impl Owner {
         }
         let state = state();
         if state.native || root != state.host_root {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(self.clock_leases.clone())
     }

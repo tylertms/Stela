@@ -295,7 +295,8 @@ impl<const N: usize> HostedRuntime<N> {
             // SAFETY: actual stopped stack and caller-supplied source joins.
             unsafe { binding.detach(&view)? };
             // SAFETY: all shared observations and the hook borrow have ended.
-            return unsafe { (*self.task(index)).binding.take() }.ok_or(WorkError::CorruptContext);
+            return unsafe { (*self.task(index)).binding.take() }
+                .ok_or_else(|| WorkError::corrupt());
         }
         Err(WorkError::InvalidTicket)
     }
