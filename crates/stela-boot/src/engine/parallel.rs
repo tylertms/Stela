@@ -71,6 +71,10 @@ impl Kick for Doorbells {
         host::fresh_counter()
     }
 
+    fn count(&self) -> Option<u64> {
+        Some(host::fresh_counter())
+    }
+
     fn released(&self) -> bool {
         super::storage::released()
     }
@@ -259,7 +263,8 @@ impl Pe {
                 // staged guest disk its host I/O.
                 stop if machine.yielded_for_interrupt(&stop) => {
                     super::run::host_work(&mut machine, |machine| {
-                        super::service::serve(false, false);
+                        let watch = machine.guest_watch();
+                        super::service::serve(false, false, &watch);
                         super::display::flush(super::display::Turn::Idle);
                         if super::storage::serve_staged(true) {
                             machine.devices.call_home();

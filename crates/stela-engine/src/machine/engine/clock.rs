@@ -30,6 +30,16 @@
 //!   no stall native reads share it unmodified. A PE that knows it stops
 //!   for host work in the kernel (`Clock::leave`) sets its own limit.
 //!   Normal host work takes a few milliseconds and never reaches it.
+//! - A PE whose guest waits holds nothing, unless guest work comes for it
+//!   while it is out of its run loop serving the host (`Machine::serve_host`):
+//!   an interrupt or fast IPI another PE sends it, or its own timer coming
+//!   due. Another core's XNU times that PE's answer (a cross-call's
+//!   acknowledgement, a timer call queued on its CPU), so from that moment
+//!   (the wake, or the timer's deadline) it counts as a PE with guest work
+//!   that ran nothing: the count holds a stall limit later if it is still
+//!   out (`SharedClock::pending`), and its host work ends at its next part
+//!   (`GuestWatch`). As with every hold, the held time is lag the slew
+//!   repays, so guest time comes back to wall time.
 //! - A slow PE got more timer interrupts per unit of its work: the EL0
 //!   release experiment counted 34 guest seconds
 //!   where a paced count counted 16, with every PE in timer interrupts. A
@@ -437,6 +447,26 @@ impl SharedClock {
     /// PE `pe` publishes `count`, the count now or a mark.
     fn publish(&self, pe: usize, count: u64) {
         self.slots[pe].count.store(count, Ordering::Relaxed);
+    }
+
+    /// Guest work waits for PE `pe` from `count` on while it is out of its
+    /// run loop serving the host: a wake that another core sends it, or its
+    /// own timer's deadline (`Machine::serve_host`). Its slot takes `count`
+    /// if it showed later or idle, so that the count holds a stall limit
+    /// past `count` until the PE looks again ([`Clock::idle`],
+    /// [`Clock::busy`], [`Clock::look`]): a waiting PE that does not answer
+    /// then looks stalled like a running one. A PE stopped in the kernel
+    /// ([`STOPPED`]) already holds the count and keeps its mark. Any core
+    /// may call this; only the wake path and the start of host service do.
+    pub(super) fn pending(&self, pe: usize, count: u64) {
+        let slot = &self.slots[pe].count;
+        let mut seen = slot.load(Ordering::Relaxed);
+        while (seen == IDLE || seen & STOPPED == 0) && count < seen {
+            match slot.compare_exchange_weak(seen, count, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(now) => seen = now,
+            }
+        }
     }
 
     /// PE `pe` reports a gap of `ticks` host counts that `phase` took most
@@ -964,10 +994,25 @@ impl Clock {
     }
 
     /// The running PE, waiting, looks at the others once a pass: the PEs
-    /// that run may all be stopped.
+    /// that run may all be stopped. It is back in its loop, so a wake mark
+    /// left in its own slot from its host service ([`SharedClock::pending`])
+    /// goes: the pass sees what the wake brought.
     pub(super) fn look(&self, mut counter: impl Counter) {
         if let Some(attachment) = &self.shared {
+            let slot = &attachment.clock.slots[attachment.pe].count;
+            if attachment.idle && slot.load(Ordering::Relaxed) != IDLE {
+                slot.store(IDLE, Ordering::Relaxed);
+            }
             attachment.clock.look(&mut counter);
+        }
+    }
+
+    /// The running PE leaves its run loop to serve the host, its own timers
+    /// next due at `deadline`: the count waits for it a stall limit past
+    /// that deadline if it is still out then ([`SharedClock::pending`]).
+    pub(super) fn serving(&self, deadline: Option<u64>) {
+        if let (Some(attachment), Some(deadline)) = (&self.shared, deadline) {
+            attachment.clock.pending(attachment.pe, deadline);
         }
     }
 

@@ -46,6 +46,108 @@ impl<const N: usize> Default for SlowParts<N> {
     }
 }
 
+/// Why a service turn ended before its last part ([`Turn`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnEnd {
+    /// A step's time ran out.
+    Step,
+    /// An interrupt came for the core.
+    Interrupt,
+    /// Guest work came for the PE whose core serves: an interrupt for it,
+    /// or its own timer.
+    Guest,
+}
+
+/// Which parts of one host service turn run. A turn runs its parts in
+/// order from where the last one ended. It ends before a part once a
+/// step's time is up, or, after at least one part ran, once an interrupt
+/// or guest work came for the PE whose core serves: that PE answers no
+/// interrupt and runs no timer of its own until it is back in its run
+/// loop, so guest work waits at most the part that was running. The one
+/// part every turn runs keeps the host served however often the guest
+/// wants its PE.
+#[derive(Clone, Copy, Debug)]
+pub struct Turn {
+    from: usize,
+    started: u64,
+    /// A step's time, in counter ticks.
+    limit: Option<u64>,
+    ran: bool,
+    ended: Option<(usize, TurnEnd)>,
+}
+
+impl Turn {
+    /// A turn from part `from`, started at counter value `started`; a step
+    /// ends `limit` ticks after that.
+    pub const fn new(from: usize, started: u64, limit: Option<u64>) -> Self {
+        Self {
+            from,
+            started,
+            limit,
+            ran: false,
+            ended: None,
+        }
+    }
+
+    /// Whether `part` runs, asked in part order at counter value `now`,
+    /// with an interrupt for the core and guest work for its PE as seen
+    /// then. A part before `from` or after the turn ended does not.
+    pub fn due(&mut self, part: usize, now: u64, interrupted: bool, guest: bool) -> bool {
+        if self.ended.is_some() || part < self.from {
+            return false;
+        }
+        let end = if self
+            .limit
+            .is_some_and(|limit| now.wrapping_sub(self.started) >= limit)
+        {
+            Some(TurnEnd::Step)
+        } else if self.ran && interrupted {
+            Some(TurnEnd::Interrupt)
+        } else if self.ran && guest {
+            Some(TurnEnd::Guest)
+        } else {
+            None
+        };
+        if let Some(end) = end {
+            self.ended = Some((part, end));
+            return false;
+        }
+        self.ran = true;
+        true
+    }
+
+    /// Whether the turn may go on inside a part between two of its pieces:
+    /// no step's time ran out, and no interrupt or guest work came.
+    pub fn goes_on(&self, now: u64, interrupted: bool, guest: bool) -> bool {
+        self.ended.is_none()
+            && !interrupted
+            && !guest
+            && !self
+                .limit
+                .is_some_and(|limit| now.wrapping_sub(self.started) >= limit)
+    }
+
+    /// The part the next turn starts at and why this one ended early, or
+    /// `None` when it ran to its last part.
+    pub const fn ended(&self) -> Option<(usize, TurnEnd)> {
+        self.ended
+    }
+}
+
+/// Whether a part that kept guest work waiting `waited` counter ticks is
+/// named in a line of its own although it took less than the slow floor:
+/// the guest's PE was out of guest code with an interrupt or timer due for
+/// longer than `floor`, which XNU on another core can time. Rate-limited as
+/// [`SlowParts::worth`] is, apart from the slow parts' own lines.
+pub fn late_worth<const N: usize>(
+    late: &SlowParts<N>,
+    part: usize,
+    waited: Option<u64>,
+    floor: u64,
+) -> bool {
+    waited.is_some_and(|waited| late.worth(part, waited, floor))
+}
+
 /// Where one turn of a part went: the counter ticks of each of its `N`
 /// named pieces, added up as the turn runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +192,102 @@ impl<const N: usize> Split<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run a turn of parts that take `took[part]` ticks each from part
+    /// `from` at tick 0, with guest work arriving at tick `arrives`: the
+    /// parts that ran, where the turn ended and when it returned.
+    fn run_turn(
+        took: &[u64],
+        from: usize,
+        limit: Option<u64>,
+        arrives: u64,
+    ) -> (alloc::vec::Vec<usize>, Option<(usize, TurnEnd)>, u64) {
+        let mut turn = Turn::new(from, 0, limit);
+        let mut now = 0;
+        let mut ran = alloc::vec::Vec::new();
+        for (part, &ticks) in took.iter().enumerate() {
+            if turn.due(part, now, false, now >= arrives) {
+                ran.push(part);
+                now += ticks;
+            }
+        }
+        (ran, turn.ended(), now)
+    }
+
+    #[test]
+    fn guest_work_ends_a_turn_at_the_next_part() {
+        // Six parts of 1 ms (ticks are microseconds) and a 5 s one, as the
+        // USB part of the reported turns, with an IPI at 2.5 ms.
+        let took = [1000, 1000, 1000, 5_000_000, 1000, 1000];
+        let (ran, ended, returned) = run_turn(&took, 0, None, 2500);
+        assert_eq!(ran, [0, 1, 2]);
+        assert_eq!(ended, Some((3, TurnEnd::Guest)));
+        // The IPI waited until the running part ended: 0.5 ms.
+        assert_eq!(returned - 2500, 500);
+        // The next turn starts at the part this one did not run.
+        let (ran, ended, _) = run_turn(&took, 3, None, u64::MAX);
+        assert_eq!(ran, [3, 4, 5]);
+        assert_eq!(ended, None);
+    }
+
+    #[test]
+    fn guest_work_waits_at_most_for_the_part_that_runs() {
+        let took = [700, 3000, 200, 1500, 900, 2500];
+        let longest = *took.iter().max().unwrap();
+        for arrives in (0..10_000).step_by(37) {
+            let (ran, _, returned) = run_turn(&took, 0, None, arrives);
+            assert!(!ran.is_empty());
+            if arrives < returned {
+                assert!(
+                    returned - arrives <= longest,
+                    "work at {arrives} waited until {returned}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_turn_runs_one_part_however_often_the_guest_wants_its_pe() {
+        let took = [10, 10, 10];
+        let mut from = 0;
+        let mut served = alloc::vec::Vec::new();
+        for _ in 0..3 {
+            let (ran, ended, _) = run_turn(&took, from, None, 0);
+            assert_eq!(ran.len(), 1, "one part each turn");
+            served.extend(ran);
+            from = ended.map_or(0, |(next, _)| next);
+        }
+        assert_eq!(served, [0, 1, 2]);
+    }
+
+    #[test]
+    fn a_step_ends_on_its_time_and_an_interrupt_after_a_part() {
+        let mut turn = Turn::new(0, 100, Some(50));
+        assert!(turn.due(0, 100, true, false), "the first part runs");
+        assert!(!turn.due(1, 120, true, false));
+        assert_eq!(turn.ended(), Some((1, TurnEnd::Interrupt)));
+        assert!(!turn.due(2, 130, false, false), "ended once");
+        let mut turn = Turn::new(0, 100, Some(50));
+        assert!(turn.due(0, 100, false, false));
+        assert!(!turn.due(1, 150, false, false));
+        assert_eq!(turn.ended(), Some((1, TurnEnd::Step)));
+        // Parts before the turn's first are passed by.
+        let mut turn = Turn::new(2, 0, None);
+        assert!(!turn.due(1, 0, false, false));
+        assert!(turn.due(2, 0, false, true));
+        assert!(!turn.goes_on(1, false, true));
+        assert!(turn.goes_on(1, false, false));
+    }
+
+    #[test]
+    fn a_part_that_kept_guest_work_waiting_is_named_apart_from_slow_ones() {
+        let late = SlowParts::<2>::new();
+        assert!(!late_worth(&late, 0, None, 50));
+        assert!(!late_worth(&late, 0, Some(49), 50));
+        assert!(late_worth(&late, 0, Some(60), 50));
+        assert!(!late_worth(&late, 0, Some(100), 50));
+        assert!(late_worth(&late, 1, Some(5000), 50));
+    }
 
     #[test]
     fn a_part_below_the_floor_is_never_reported() {

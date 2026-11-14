@@ -3776,3 +3776,184 @@ fn events_raised_while_their_register_is_served_plain_are_never_lost_or_late() {
     assert_eq!(reader.read_scalar(1, 0x40, 4, 0), ScalarRead::Served(Ok(0)));
     assert_eq!(home.with(|devices| devices.pending), 0);
 }
+
+/// Counts its kicks and reads a counter the test moves, as a host's
+/// doorbells and its 24 MHz count do.
+struct Served {
+    kicks: Arc<AtomicUsize>,
+    host: Arc<AtomicU64>,
+}
+impl Kick for Served {
+    fn kick(&self, _pe: usize) {
+        self.kicks.fetch_add(1, Ordering::SeqCst);
+    }
+    fn count(&self) -> Option<u64> {
+        Some(self.host.load(Ordering::SeqCst))
+    }
+}
+
+/// A counter frequency at which the stall limit is 1200 counts.
+const SERVED_FREQUENCY: u64 = 24_000;
+const SERVED_STALL: u64 = SERVED_FREQUENCY * super::super::clock::STALL_MILLIS / 1000;
+
+type Clock = super::super::clock::Clock;
+
+/// Two PEs on a hub whose shared count follows a host counter from 1000,
+/// each with its own reader; both run.
+fn serving_pair() -> (Arc<Hub>, Arc<AtomicUsize>, Arc<AtomicU64>, Clock, Clock) {
+    let kicks = Arc::new(AtomicUsize::new(0));
+    let host = Arc::new(AtomicU64::new(1000));
+    let hub = Hub::new(
+        2,
+        Served {
+            kicks: Arc::clone(&kicks),
+            host: Arc::clone(&host),
+        },
+    );
+    for pe in 0..2 {
+        hub.set_live(pe, true);
+    }
+    Clock::default().seed(&hub.clock, 1000, SERVED_FREQUENCY);
+    let (mut first, mut second) = (Clock::default(), Clock::default());
+    first.attach(Arc::clone(&hub.clock), 0);
+    second.attach(Arc::clone(&hub.clock), 1);
+    (hub, kicks, host, first, second)
+}
+
+/// The reported shape: PE 1's guest waits for an interrupt and its core
+/// serves the host in a part that takes seconds, while PE 0 runs and sends
+/// it a fast IPI. The IPI kicks its core at once, the service sees it at
+/// its next part, and the count PE 0 reads goes on at most a stall limit
+/// past the IPI however long the part takes: PE 0's XNU never sees PE 1
+/// leave an IPI unanswered for longer. Once PE 1 looks again, the count
+/// goes on from there and the held time is lag the slew repays.
+#[test]
+fn an_ipi_to_a_pe_that_serves_the_host_kicks_it_and_holds_the_count_for_it() {
+    let (hub, kicks, host, mut first, mut second) = serving_pair();
+    first.idle(|| 1000, 0, None);
+    first.busy(|| 1000, 0, None);
+    second.idle(|| 1000, 0, None);
+    // PE 1 starts a service turn with nothing pending.
+    let epoch = hub.lines_epoch(1);
+    assert_eq!(hub.set_serving(1, Some(epoch)), None);
+    let watch = GuestWatch::new(Some(Arc::clone(&hub)), 1, epoch, None);
+    assert_eq!(watch.pending(1000), None);
+    // A wake with no guest work for it (a SEV, which a WFI does not take)
+    // neither kicks nor marks it.
+    hub.event(0);
+    assert_eq!(kicks.load(Ordering::SeqCst), 0);
+    // PE 0's fast IPI at host 2000: one kick, and the turn's next look
+    // finds it.
+    host.store(2000, Ordering::SeqCst);
+    hub.lines_changed_unwoken(1);
+    hub.wake(1);
+    assert_eq!(kicks.load(Ordering::SeqCst), 1, "the serving PE is kicked");
+    assert_eq!(watch.pending(2000), Some(super::Pending::Lines));
+    // A second IPI meanwhile kicks it no more.
+    hub.lines_changed_unwoken(1);
+    hub.wake(1);
+    assert_eq!(kicks.load(Ordering::SeqCst), 1);
+    // PE 1 stays out for five seconds of host time; PE 0 runs and marks
+    // its progress every 10 counts.
+    let ipi = 2000;
+    let mut retired = 0;
+    let end = 2000 + 5 * SERVED_FREQUENCY;
+    for now in (2010..end).step_by(10) {
+        retired += 100;
+        first.mark(|| now, retired, None);
+        let count = first.read(|| now);
+        assert!(count <= ipi + SERVED_STALL, "at {now}: count {count}");
+    }
+    assert_eq!(
+        first.read(|| end),
+        ipi + SERVED_STALL,
+        "held a stall limit on"
+    );
+    assert_eq!(
+        watch.waited(end),
+        Some((super::Pending::Lines, Some(end - ipi))),
+        "the wait is measured from the first wake"
+    );
+    // PE 1 is back in its loop: the count goes on from where it held.
+    assert_eq!(hub.set_serving(1, None), Some(epoch));
+    second.idle(|| end, 0, None);
+    first.mark(|| end + 10, retired + 100, None);
+    assert_eq!(first.read(|| end + 10), ipi + SERVED_STALL + 10);
+    assert_eq!(hub.clock.take_stalled(), end - (ipi + SERVED_STALL));
+    // A PE that neither serves nor sleeps is not kicked: it reads its
+    // lines at its next return to the engine.
+    hub.lines_changed_unwoken(1);
+    hub.wake(1);
+    assert_eq!(kicks.load(Ordering::SeqCst), 1);
+}
+
+/// PE 1's own timer comes due while it serves: the service sees it at its
+/// next part, and the count holds a stall limit past the deadline, as for
+/// an IPI. Its next wait pass clears the mark.
+#[test]
+fn a_timer_due_on_a_pe_that_serves_the_host_ends_its_service_and_holds_the_count() {
+    let (hub, kicks, _host, mut first, mut second) = serving_pair();
+    first.idle(|| 1000, 0, None);
+    first.busy(|| 1000, 0, None);
+    second.idle(|| 1000, 0, None);
+    let deadline = 3000;
+    second.serving(Some(deadline));
+    let epoch = hub.lines_epoch(1);
+    hub.set_serving(1, Some(epoch));
+    let watch = GuestWatch::new(Some(Arc::clone(&hub)), 1, epoch, Some(deadline));
+    assert_eq!(watch.pending(2999), None);
+    assert_eq!(watch.pending(3000), Some(super::Pending::Timer));
+    assert_eq!(watch.waited(3500), Some((super::Pending::Timer, Some(500))));
+    // Before its deadline it holds nothing; past it a stall limit on.
+    let mut retired = 0;
+    for now in (1010..10_000).step_by(10) {
+        retired += 100;
+        first.mark(|| now, retired, None);
+        assert_eq!(
+            first.read(|| now),
+            now.min(deadline + SERVED_STALL),
+            "at {now}"
+        );
+    }
+    assert_eq!(
+        kicks.load(Ordering::SeqCst),
+        0,
+        "its own timer needs no kick"
+    );
+    hub.set_serving(1, None);
+    second.look(|| 10_000);
+    first.mark(|| 10_010, retired + 100, None);
+    assert_eq!(first.read(|| 10_010), deadline + SERVED_STALL + 10);
+}
+
+/// Guest work already there when a PE begins to serve marks the count, as
+/// a wake would, without kicking its own core; a forwarded access waits
+/// only for the home machine, a stop only for the others.
+#[test]
+fn guest_work_before_a_service_begins_marks_the_count_without_a_kick() {
+    let (hub, kicks, host, _first, mut second) = serving_pair();
+    second.idle(|| 1000, 0, None);
+    let epoch = hub.lines_epoch(1);
+    host.store(1500, Ordering::SeqCst);
+    hub.lines_changed_unwoken(1);
+    hub.set_serving(1, Some(epoch));
+    assert_eq!(kicks.load(Ordering::SeqCst), 0);
+    let watch = GuestWatch::new(Some(Arc::clone(&hub)), 1, epoch, None);
+    assert_eq!(watch.waited(1600), Some((super::Pending::Lines, Some(100))));
+    hub.set_serving(1, None);
+    let epoch = hub.lines_epoch(1);
+    hub.requested.store(true, Ordering::SeqCst);
+    assert_eq!(hub.guest_pending(1, epoch), None, "PE 1 is not home");
+    assert_eq!(
+        hub.guest_pending(0, hub.lines_epoch(0)),
+        Some(super::Pending::Forward)
+    );
+    hub.requested.store(false, Ordering::SeqCst);
+    hub.stopped.store(true, Ordering::SeqCst);
+    assert_eq!(hub.guest_pending(1, epoch), Some(super::Pending::Stop));
+    assert_eq!(
+        hub.guest_pending(0, hub.lines_epoch(0)),
+        None,
+        "home runs on"
+    );
+}

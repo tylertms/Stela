@@ -854,9 +854,11 @@ pub(super) fn run<H: Host>(
             // other PEs time (`clock`). Waiting PEs serve; with none for a while, it takes one
             // bounded step between slices.
             if !machine.runs_parallel() || idle {
-                machine.exclude_host_time(|_| service::serve(true, false));
+                let watch = machine.guest_watch();
+                machine.exclude_host_time(|_| service::serve(true, false, &watch));
             } else if service::starved(tsc_hz, requested) {
-                machine.exclude_host_time(|_| service::serve(true, true));
+                let watch = machine.guest_watch();
+                machine.exclude_host_time(|_| service::serve(true, true, &watch));
             }
             service.parts.lap(ServiceParts::SERVICE, host::rdtsc());
             // The GPUs' work waits for a boot PE that holds no lock, as the
@@ -894,7 +896,8 @@ pub(super) fn run<H: Host>(
                 service.parts.lap(ServiceParts::DISK, host::rdtsc());
             });
             if service::shutdown_pending() {
-                machine.exclude_host_time(|_| service::serve(true, false));
+                let watch = machine.guest_watch();
+                machine.exclude_host_time(|_| service::serve(true, false, &watch));
             }
             // A GPU compilation no other PE took (`gate::run_job`), while
             // this PE's guest waits, so the count need not wait for it.
@@ -946,7 +949,10 @@ pub(super) fn host_work<H: Host, R>(
     machine: &mut Machine<H, parallel::Board>,
     work: impl FnOnce(&mut Machine<H, parallel::Board>) -> R,
 ) -> R {
-    machine.outside_run(work)
+    // Out of its run loop, the PE stays reachable for guest work: a wake
+    // with an interrupt for it kicks its core, and the shared count holds
+    // for it a stall limit past that or its own timer's deadline.
+    machine.serve_host(work)
 }
 
 /// What the boot PE runs at a slice's end, for the GPUs' pump: `quiet` as

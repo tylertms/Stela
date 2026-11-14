@@ -64,9 +64,9 @@ pub use install_census::InstallCauses;
 pub use monitor::{MonitorEvent, MonitorKind, MonitorLocation};
 pub use native_timing::{NativeInstructionSample, NativeTimingPhase, NativeTimingWork};
 pub use parallel::{
-    BroadcastCounts, BroadcastKind, BroadcastProfile, Call, Counts, GlobalSpan, Hub, Kick,
-    LockTimes, MaterializedSource, ParallelAdmissionError, SharedDevices, SourceObservation,
-    SourcePhase,
+    BroadcastCounts, BroadcastKind, BroadcastProfile, Call, Counts, GlobalSpan, GuestWatch, Hub,
+    Kick, LockTimes, MaterializedSource, ParallelAdmissionError, Pending, SharedDevices,
+    SourceObservation, SourcePhase,
 };
 pub use rebase::RebaseCounts;
 pub use stela_contracts::dma::{DmaError, TransferFault};
