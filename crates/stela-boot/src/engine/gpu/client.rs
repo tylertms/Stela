@@ -1182,7 +1182,13 @@ pub(super) fn control(fd: c_int, request: u32, argument: *mut c_void) -> i64 {
 /// Maps `size` bytes of `fd` at `offset`.
 pub(super) fn map(fd: c_int, offset: u64, size: usize) -> Option<NonNull<u8>> {
     let address = submit(Operation::Map { fd, offset, size });
-    NonNull::new(u64::try_from(address).ok()? as *mut u8)
+    // A negative errno is -4095..=-1, as Linux's IS_ERR_VALUE. Any other value
+    // is the mapped address, which in a four-level placement's upper-half
+    // window (0xffff8000_00000000 and up) is negative as an i64 too.
+    if (-4095..0).contains(&address) {
+        return None;
+    }
+    NonNull::new(address as u64 as *mut u8)
 }
 
 /// `NOUVEAU_GETPARAM_CHIPSET_ID` of the bound GPU at `index`.
