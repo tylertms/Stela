@@ -17,6 +17,112 @@ fn runtime_poll(host: &mut Host, dma: &mut dyn DmaAllocator) -> Changes {
     host.poll(dma, &crate::firmware::HandoffProvider::new(None))
 }
 
+/// A device that a root port finds connected after the start, polled as
+/// the service turn does after boot when `after_boot`: the model, the
+/// changes and the requests the device saw from its connection on.
+fn connect_late(node: Node, after_boot: bool) -> (Rc<RefCell<Hardware>>, Changes, Vec<[u8; 8]>) {
+    let _clock = crate::test_clock::virtualize();
+    let mut dma = TestRegion::new(512 * 1024 * 8);
+    let mut nodes = BTreeMap::from([(0, node)]);
+    if nodes[&0].ports.is_some() {
+        nodes.insert(1, Node::bot_disk(HIGH_SPEED));
+    }
+    let (mut c, model) = controller(&mut dma, 32, nodes);
+    model.borrow_mut().root_status = Some(PP);
+    let mut failures = Vec::new();
+    let devices = c.enumerate(&mut dma, &mut failures);
+    assert!(devices.is_empty() && failures.is_empty(), "{failures:?}");
+    let shared = Rc::new(RefCell::new(c));
+    let mut host = Host::new(shared, &devices, &mut dma, &mut failures);
+    let firmware = crate::firmware::HandoffProvider::new(None);
+    let begin = model.borrow().requests.len();
+    model.borrow_mut().root_status = Some(PP | CCS | CSC | u32::from(HIGH_SPEED) << 10);
+    let changes = match after_boot {
+        true => host.poll_after_boot(&mut dma, &firmware),
+        false => host.poll(&mut dma, &firmware),
+    };
+    let requests = model.borrow().requests[begin..]
+        .iter()
+        .map(|(_, _, request)| *request)
+        .collect();
+    (model, changes, requests)
+}
+
+/// A disk that arrives after boot is enumerated and reported unused: no
+/// configuration, Bulk-Only command or wait of its start runs in the
+/// service turn's poll. At boot the same disk is configured.
+#[test]
+fn a_disk_that_arrives_after_boot_is_reported_unused_and_not_started() {
+    let (model, changes, requests) = connect_late(Node::bot_disk(HIGH_SPEED), true);
+    assert_eq!(
+        changes.added.devices.len(),
+        1,
+        "{:?}",
+        changes.added.failures
+    );
+    assert!(changes.added.storage.is_empty() && changes.added.disks.is_empty());
+    assert!(
+        changes
+            .added
+            .unused
+            .iter()
+            .any(|(_, why)| *why == crate::usb::xhci::AFTER_BOOT),
+        "{:?}",
+        changes.added.unused
+    );
+    assert!(!model.borrow().nodes[&0].configured);
+    assert!(model.borrow().nodes[&0].bot_commands().is_empty());
+    // Only enumeration's descriptor reads reached the device.
+    assert!(
+        requests.iter().all(|request| request[1] == GET_DESCRIPTOR),
+        "{requests:x?}"
+    );
+    let (model, changes, _) = connect_late(Node::bot_disk(HIGH_SPEED), false);
+    assert!(
+        changes
+            .added
+            .unused
+            .iter()
+            .all(|(_, why)| *why != crate::usb::xhci::AFTER_BOOT)
+    );
+    assert!(model.borrow().nodes[&0].configured);
+}
+
+/// A hub that arrives after boot stays unconfigured with its ports
+/// unpowered, so neither its power-on wait nor its children's enumeration
+/// runs in the poll; the disk behind it is not seen.
+#[test]
+fn a_hub_that_arrives_after_boot_is_left_unpowered() {
+    let (model, changes, requests) = connect_late(Node::hub(HIGH_SPEED, 1), true);
+    assert_eq!(
+        changes.added.devices.len(),
+        1,
+        "{:?}",
+        changes.added.failures
+    );
+    assert!(
+        changes
+            .added
+            .unused
+            .iter()
+            .any(|(_, why)| *why == crate::usb::xhci::lifecycle::HUB_AFTER_BOOT),
+        "{:?}",
+        changes.added.unused
+    );
+    assert!(!model.borrow().nodes[&0].configured);
+    assert!(
+        requests.iter().all(|request| request[1] == GET_DESCRIPTOR),
+        "{requests:x?}"
+    );
+    let (_, changes, _) = connect_late(Node::hub(HIGH_SPEED, 1), false);
+    assert_eq!(
+        changes.added.devices.len(),
+        2,
+        "{:?}",
+        changes.added.failures
+    );
+}
+
 #[test]
 fn runtime_hub_bitmap_disconnect_reconnect_retires_old_alias_before_fresh_binding() {
     let _clock = crate::test_clock::virtualize();

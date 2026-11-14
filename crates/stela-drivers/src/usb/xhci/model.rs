@@ -293,6 +293,7 @@ fn address_controller_with_capabilities(
         slots: vec![None, None],
         retry_resources: slot_resources::Cache::new(2),
         queued_resets: Vec::new(),
+        after_boot: false,
         slot_ownership: vec![reset::Ownership::Vacant; 2],
         test_retired_numbers: vec![false; 2],
         power: power::Ledger::new(2),
@@ -1080,6 +1081,21 @@ fn cancellation_controller_with_context(
         controller.current_descriptions(1, configurations).unwrap();
     }
     (controller, model)
+}
+
+/// Mark the boot as handed over, as [`super::Host::poll_after_boot`] does.
+pub(crate) fn boot_ended(controller: &mut Controller) {
+    controller.after_boot = true;
+}
+
+/// Choose a freshly identified device's configuration, as enumeration does.
+pub(crate) fn choose(
+    controller: &mut Controller,
+    device: &mut Device,
+    failures: &mut Vec<(String, BlockError)>,
+) -> bool {
+    let location = device.location.clone();
+    controller.choose(device, &location, failures)
 }
 
 /// Put the controller's minimum provider on the controller clock's own

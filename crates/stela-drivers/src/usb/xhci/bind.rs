@@ -15,6 +15,12 @@ fn audio_unsupported<'a>(
     })
 }
 
+/// Why a device that arrived after boot is not started: the running system
+/// takes only input devices, and a disk, network adapter, audio function or
+/// Bluetooth controller starts at the next boot.
+pub(crate) const AFTER_BOOT: &str =
+    "added after boot, kept unused and not started until the next boot";
+
 /// Binds every interface of `device` a driver here takes: one
 /// configuration, its endpoints configured together. A Bulk-Only disk is
 /// discovered after its settle time, waited for here.
@@ -55,10 +61,22 @@ pub(crate) fn bind_with_provider(
     let mut endpoints = Vec::new();
     let mut plans = Vec::new();
     let mut selected_settings = Vec::new();
+    let after_boot = shared.borrow().after_boot;
     for interface in all.iter().filter(|i| configuration::primary(i)) {
         let plan =
             configuration::plan_with_controller(&device, interface, &all, Some(&shared.borrow()));
         match plan {
+            // Nothing of a class the running system does not take starts
+            // after boot: no configuration, transfer, firmware or wait.
+            Ok(plan) if after_boot && !matches!(plan, Plan::Hid(..)) => found.unused.push((
+                format!("{} interface {}", device.location, interface.number),
+                AFTER_BOOT,
+            )),
+            // A vendor adapter's chip was not asked for its revision.
+            Err(_) if after_boot && ethernet::listed(&device.descriptor) => found.unused.push((
+                format!("{} interface {}", device.location, interface.number),
+                AFTER_BOOT,
+            )),
             Ok(plan) => {
                 selected_settings.extend(plan.settings(interface.number));
                 if !matches!(&plan, Plan::Storage(binding) if binding.uas()) {

@@ -603,7 +603,11 @@ impl Controller {
         location: &str,
         failures: &mut Vec<(String, BlockError)>,
     ) -> bool {
-        if let Err(error) = self.preflight_vendor_ethernet(device) {
+        // After boot no network adapter starts, so its chip is not asked
+        // either.
+        if !self.after_boot
+            && let Err(error) = self.preflight_vendor_ethernet(device)
+        {
             failures.push((format!("{location} RTL815x configuration preflight"), error));
         }
         if let Err(why) = configuration::select_with_controller(device, Some(self)) {
@@ -626,8 +630,12 @@ impl Controller {
         devices: &mut Vec<Device>,
         failures: &mut Vec<(String, BlockError)>,
     ) {
+        // A hub that arrives after boot is left unpowered: its bring-up
+        // waits up to half a second for its ports' power and enumerates
+        // every child in one call.
         if self.choose(&mut device, &location, failures)
             && device.descriptor[4] == HUB_CLASS
+            && !self.after_boot
             && let Err(error) = self.hub(&device, attachment, dma, devices, failures)
         {
             failures.push((format!("{location} {} enumerate hub", device.name()), error));

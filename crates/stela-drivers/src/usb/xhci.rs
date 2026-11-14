@@ -96,6 +96,8 @@ mod teardown;
 mod transfer;
 
 use super::descriptor::*;
+#[cfg(test)]
+pub(crate) use bind::AFTER_BOOT;
 pub use bind::Plan;
 use bind::bind_with_provider;
 pub use descriptor::Device;
@@ -481,6 +483,10 @@ pub struct Controller {
     retry_resources: slot_resources::Cache,
     /// Class requests to reset and rebind a device, in arrival order.
     queued_resets: Vec<SlotId>,
+    /// Whether the boot handed the machine over ([`Host::poll_after_boot`]):
+    /// a device that arrives from then on gets only the classes the running
+    /// system takes, and the rest are reported unused, never started.
+    after_boot: bool,
     /// Transfer events that arrived while waiting for something else.
     pending: Vec<Event>,
     /// USBSTS once the controller reported a fatal error.
@@ -788,6 +794,7 @@ impl Controller {
             test_retired_numbers: vec![false; slots.len()],
             retry_resources: slot_resources::Cache::new(slots.len()),
             queued_resets: Vec::new(),
+            after_boot: false,
             power: power::Ledger::new(slots.len()),
             slots,
             pending: Vec::new(),

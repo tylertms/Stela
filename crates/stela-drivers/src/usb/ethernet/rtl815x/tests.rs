@@ -1101,6 +1101,47 @@ pub(crate) fn rtl8152_fixture() -> ethernet::tests::stepped::Fixture {
     })
 }
 
+/// An RTL8152B that arrives after boot is reported unused: no control
+/// transfer reaches it, not even its revision read, so neither its start,
+/// its firmware patch nor any of its waits runs in the service turn.
+#[test]
+fn an_rtl815x_that_arrives_after_boot_is_not_asked_or_started() {
+    let mut dma = TestRegion::new(128 * 1024 * 8);
+    let (mut controller, model) = unconfigured_cancellation_controller_with_configurations(
+        &mut dma,
+        &[vec![9, 2, 9, 0, 0, 7, 0, 0x80, 50]],
+    );
+    controller.set_slot_speed(1, HIGH_SPEED);
+    model.borrow_mut().ethernet = Some(ethernet::rtl815x::tests::Model::new(0x4c10));
+    let configuration = vec![
+        9, 2, 32, 0, 1, 7, 0, 0x80, 50, 9, 4, 0, 0, 2, 0xff, 0, 0, 0, 7, 5, 0x81, 2, 0, 2, 0, 7, 5,
+        0x02, 2, 0, 2, 0,
+    ];
+    let mut device = model::addressed_device(&controller, vec![configuration]);
+    device.speed = HIGH_SPEED;
+    device.descriptor[8..12].copy_from_slice(&[0xda, 0x0b, 0x52, 0x81]);
+    model::boot_ended(&mut controller);
+    let controls = model.borrow().setup.len();
+    let mut failures = Vec::new();
+    model::choose(&mut controller, &mut device, &mut failures);
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(device.vendor_ethernet_revision, None);
+    let shared = Rc::new(RefCell::new(controller));
+    let mut found = Found::default();
+    bind(&shared, device, &mut dma, &mut found);
+    assert!(found.vendor_links.is_empty() && found.vendor_failures.is_empty());
+    assert!(found.failures.is_empty(), "{:?}", found.failures);
+    assert!(
+        found
+            .unused
+            .iter()
+            .any(|(_, why)| *why == crate::usb::xhci::AFTER_BOOT),
+        "{:?}",
+        found.unused
+    );
+    assert_eq!(model.borrow().setup.len(), controls);
+}
+
 /// The RTL8152B link through carrier, a frame each way, a lost link and its
 /// return, with calls bounded by `calls`; what the device saw.
 fn rtl_link_through_loss(late: bool) -> ethernet::tests::stepped::Effects {

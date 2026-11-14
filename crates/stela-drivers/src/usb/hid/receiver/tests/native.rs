@@ -151,6 +151,15 @@ fn fixture_profiles(
     profiles: &[(u8, u8, u8, &[u8])],
     product: u16,
 ) -> (xhci::Found, Rc<RefCell<model::CancelModel>>, Rc<Cell<bool>>) {
+    fixture_profiles_at(dma, profiles, product, false)
+}
+/// [`fixture_profiles`], bound after boot when `after_boot`.
+fn fixture_profiles_at(
+    dma: &mut dyn DmaAllocator,
+    profiles: &[(u8, u8, u8, &[u8])],
+    product: u16,
+    after_boot: bool,
+) -> (xhci::Found, Rc<RefCell<model::CancelModel>>, Rc<Cell<bool>>) {
     let config = configuration(profiles);
     let descriptors = profiles
         .iter()
@@ -213,9 +222,29 @@ fn fixture_profiles(
         .control([0x80, GET_DESCRIPTOR, 0, 1, 0, 0, 18, 0], &[])
         .unwrap();
     physical.descriptor = wire.try_into().unwrap();
+    if after_boot {
+        model::boot_ended(&mut shared.borrow_mut());
+    }
     let mut found = xhci::Found::default();
     model::bind(&shared, physical, dma, &mut found);
     (found, peer, trap)
+}
+
+/// Input devices are what the running system takes: a keyboard, mouse and
+/// receiver that arrive after boot are started as at boot.
+#[test]
+fn input_interfaces_that_arrive_after_boot_are_started() {
+    let mut dma = model::TestRegion::new(1024 * 1024 * 8);
+    let profiles = [
+        (0, KEYBOARD, 0x82, KEYBOARD_PROFILE),
+        (1, MOUSE, 0x83, MOUSE_PROFILE),
+        (2, 0, 0x81, tests::PROFILE),
+    ];
+    let (mut found, _, _) = fixture_profiles_at(&mut dma, &profiles, 0xc539, true);
+    assert!(found.failures.is_empty(), "{:?}", found.failures);
+    assert!(found.unused.is_empty(), "{:?}", found.unused);
+    assert_eq!(found.inputs.len(), 3);
+    stop(&mut found);
 }
 // Avoid colliding with the parent HID protocol constants.
 fn deliver(peer: &Rc<RefCell<model::CancelModel>>, dci: u8, bytes: &[u8]) {
