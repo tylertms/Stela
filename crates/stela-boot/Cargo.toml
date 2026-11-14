@@ -1,6 +1,6 @@
 [package]
 name = "stela-boot"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "GPL-2.0-or-later AND GPL-2.0-only AND BSD-2-Clause"
 description = "stela.efi: the UEFI application that boots macOS on a PC through Stela"

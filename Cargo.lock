@@ -2105,7 +2105,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stela-boot-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde_json",
  "sha2",
@@ -2125,7 +2125,7 @@ dependencies = [
 
 [[package]]
 name = "stela-c-build"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "cc",
  "libc",
@@ -2136,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "stela-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aes 0.8.4",
  "anyhow",
@@ -2178,7 +2178,7 @@ dependencies = [
 
 [[package]]
 name = "stela-compiler"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "rustc_apfloat",
  "serde",
@@ -2187,14 +2187,14 @@ dependencies = [
 
 [[package]]
 name = "stela-contracts"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "stela-crypto"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aes 0.8.4",
  "chacha20 0.10.2",
@@ -2208,7 +2208,7 @@ dependencies = [
 
 [[package]]
 name = "stela-dev"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2227,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "stela-driver-audio"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "sha2",
  "stela-driver-base",
@@ -2236,7 +2236,7 @@ dependencies = [
 
 [[package]]
 name = "stela-driver-base"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "cc",
  "sha2",
@@ -2248,7 +2248,7 @@ dependencies = [
 
 [[package]]
 name = "stela-driver-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "sha2",
  "stela-contracts",
@@ -2257,7 +2257,7 @@ dependencies = [
 
 [[package]]
 name = "stela-driver-gpu"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ash",
  "cc",
@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "stela-driver-net"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aes 0.8.4",
  "hmac",
@@ -2290,7 +2290,7 @@ dependencies = [
 
 [[package]]
 name = "stela-driver-storage"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "stela-driver-base",
  "stela-driver-core",
@@ -2298,7 +2298,7 @@ dependencies = [
 
 [[package]]
 name = "stela-drivers"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "sha2",
  "stela-crypto",
@@ -2312,7 +2312,7 @@ dependencies = [
 
 [[package]]
 name = "stela-engine"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "hex",
@@ -2330,14 +2330,14 @@ dependencies = [
 
 [[package]]
 name = "stela-fingerprint"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "stela-formats"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "crypto-bigint",
  "hex",
@@ -2355,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "stela-gpu-maintenance"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2372,7 +2372,7 @@ dependencies = [
 
 [[package]]
 name = "stela-linux"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "cc",
  "libc",
@@ -2386,7 +2386,7 @@ dependencies = [
 
 [[package]]
 name = "stela-loader"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "hex",
@@ -2409,7 +2409,7 @@ dependencies = [
 
 [[package]]
 name = "stela-metal-input"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "stela-contracts",
  "stela-crypto",
@@ -2417,7 +2417,7 @@ dependencies = [
 
 [[package]]
 name = "stela-runtime"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "getrandom 0.2.17",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "stela-soc"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aes 0.8.4",
  "hex",
@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "stela-soc-data"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hex",
  "sha2",
@@ -2474,7 +2474,7 @@ dependencies = [
 
 [[package]]
 name = "stela-tls"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.11.1",
@@ -3065,7 +3065,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
