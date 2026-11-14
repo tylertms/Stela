@@ -7264,6 +7264,42 @@ fn no_download_over_a_gigabyte_starts_without_its_question() {
 }
 
 #[test]
+fn plain_stela_unmounts_the_efi_partitions_it_mounted() {
+    // The stick's EFI partition is not mounted, as hosts leave it.
+    let mut f = made_by(Some(release::CURRENT));
+    let usb = f
+        .host
+        .disks
+        .iter_mut()
+        .find(|d| d.identifier == "disk5")
+        .unwrap();
+    usb.partitions[0].mount = None;
+    f.host.mountable.insert("disk5s1".into(), f.esp.clone());
+    let before = stick_files(&f);
+    // Without a terminal, and at one: each ends with it unmounted again.
+    home::run(
+        &environment(&f.host),
+        Request::home(command::Global::default()),
+    )
+    .unwrap();
+    assert_eq!(*f.host.unmounted.borrow(), ["disk5s1"]);
+    let (shown, result, done) = plain_stela(&f, &["Show status"], &[]);
+    result.unwrap();
+    assert!(done, "{shown}");
+    assert!(shown.ends_with("└ No problems found."), "{shown}");
+    assert_eq!(*f.host.unmounted.borrow(), ["disk5s1", "disk5s1"]);
+    // Also when the run stops with an error.
+    let error = plain_stela(&f, &["cancel"], &[]).1;
+    assert!(error.is_ok());
+    assert_eq!(f.host.unmounted.borrow().len(), 3);
+    assert_eq!(stick_files(&f), before);
+    // A partition that was mounted before the run stays mounted.
+    let f = made_by(Some(release::CURRENT));
+    plain_stela(&f, &["Quit"], &[]).1.unwrap();
+    assert!(f.host.unmounted.borrow().is_empty());
+}
+
+#[test]
 fn a_card_reader_without_a_card_is_no_stick() {
     // Linux lists an empty reader with size 0, and Windows gives it no
     // size when its geometry cannot be read.

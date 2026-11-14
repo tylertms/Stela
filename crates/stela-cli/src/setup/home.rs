@@ -189,7 +189,7 @@ fn classify(environment: &Environment<'_>, disk: host::Disk) -> Stick {
         let mount = match esp
             .mount
             .clone()
-            .map_or_else(|| environment.host.mount(&esp.identifier), Ok)
+            .map_or_else(|| super::mount_esp(environment.host, &esp.identifier), Ok)
         {
             Ok(mount) => mount,
             Err(error) => {
@@ -333,8 +333,10 @@ pub(super) fn report(sticks: &[Stick]) -> (String, bool) {
     (text, due)
 }
 
-/// Plain `stela`.
+/// Plain `stela`: what it mounts to look at the sticks is unmounted when it
+/// ends.
 pub(super) fn run(environment: &Environment<'_>, request: Request) -> Result<()> {
+    let _mounted = super::Mounted::hold(environment.host);
     let ui = environment.ui;
     if !ui.interactive() {
         let sticks = sticks(environment)?;

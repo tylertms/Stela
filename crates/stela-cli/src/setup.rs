@@ -164,6 +164,60 @@ thread_local! {
     /// repeat: never the volume path it was resolved to, which may hold
     /// the user's name.
     static NAMED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// The EFI partitions this run mounted, with where: [`Mounted`]
+    /// unmounts them when the run ends.
+    static MOUNTED: std::cell::RefCell<Vec<(String, PathBuf)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Mount the EFI partition `identifier`, which hosts leave unmounted on a
+/// stick, for this run: [`Mounted`] unmounts it when the run ends.
+fn mount_esp(host: &dyn Host, identifier: &str) -> Result<PathBuf> {
+    let mount = host.mount(identifier)?;
+    MOUNTED.with_borrow_mut(|mounted| {
+        if !mounted.iter().any(|(done, _)| done == identifier) {
+            mounted.push((identifier.into(), mount.clone()));
+        }
+    });
+    Ok(mount)
+}
+
+/// Held for a run: when it ends, on every path, it unmounts what the run
+/// mounted ([`mount_esp`]), so a run leaves no EFI partition mounted (a
+/// lasting drive letter on Windows, a read-write mount on Linux) that was
+/// not mounted before it.
+struct Mounted<'a> {
+    host: &'a dyn Host,
+}
+
+impl<'a> Mounted<'a> {
+    fn hold(host: &'a dyn Host) -> Self {
+        Self { host }
+    }
+}
+
+impl Drop for Mounted<'_> {
+    fn drop(&mut self) {
+        for (identifier, mount) in MOUNTED.take().into_iter().rev() {
+            let partition = match self.host.partition(&identifier) {
+                // Unmounted already, as an erase does.
+                Ok(info) if info.mount.is_none() => continue,
+                Ok(info) => info,
+                Err(_) => host::PartitionInfo {
+                    identifier: identifier.clone(),
+                    disk: String::new(),
+                    guid: String::new(),
+                    bytes: 0,
+                    content: "EFI".into(),
+                    mount: Some(mount),
+                    container: None,
+                },
+            };
+            if let Err(error) = self.host.unmount(&partition) {
+                eprintln!("Note: {identifier} stays mounted: {error:#}");
+            }
+        }
+    }
 }
 
 /// `stela {words}` in backticks, as a user types it, with the stick at
@@ -1022,6 +1076,7 @@ impl Request {
             builds: builds::SUPPORTED,
             models: SUPPORTED_MODELS,
         };
+        let _mounted = Mounted::hold(environment.host);
         closed(environment.ui, self.act(&environment))
     }
 
@@ -1505,7 +1560,7 @@ fn locate_esp(host: &dyn Host, usb: &Path) -> Result<PathBuf> {
         Some(partition) => match &partition.mount {
             Some(mount) => mount.clone(),
             // Hosts leave a USB's EFI partition unmounted.
-            None => host.mount(&partition.identifier).with_context(|| {
+            None => mount_esp(host, &partition.identifier).with_context(|| {
                 format!(
                     "{} is on the same disk as EFI partition {}, which could not be mounted \
                      (setup needs {})",
