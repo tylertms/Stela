@@ -232,20 +232,31 @@ impl<R: Registers> Host<R> {
             if registers.parent_read(0x0e, 1)? & 0x7f != 0 {
                 return Err(Error::InvalidResource);
             }
-            // VMD uses the three 64-bit BAR pairs 0/1, 2/3 and 4/5. Check
-            // config against the original reservation before touching
-            // decode or accepting a shadow translation. The reservation
-            // permission, rather than probing live child windows, owns sizing.
+            // VMD's CFGBAR, MEMBAR1 and MEMBAR2 are BARs 0, 2 and 4. Each
+            // is decoded at its own width, as the PCI core sizes it: a
+            // 32-bit one leaves the BAR after it a register of its own,
+            // never its upper address bits. Check config against the
+            // original reservation before touching decode or accepting a
+            // shadow translation. The reservation permission, rather than
+            // probing live child windows, owns sizing.
             for index in [0, 2, 4] {
                 let offset = 0x10 + u16::from(index) * 4;
                 let low = registers.parent_read(offset, 4)?;
-                let high = registers.parent_read(offset + 4, 4)?;
+                let (address, limit) = match low & 7 {
+                    0 => (u64::from(low & !15), 1 << 32),
+                    4 => (
+                        u64::from(registers.parent_read(offset + 4, 4)?) << 32
+                            | u64::from(low & !15),
+                        u64::MAX,
+                    ),
+                    // I/O space or the below-1 MiB memory type.
+                    _ => return Err(Error::InvalidResource),
+                };
                 let (base, bytes, prefetchable) = registers.bar(index);
-                if low & 7 != 4
-                    || (u64::from(high) << 32 | u64::from(low & !15)) != base
+                if address != base
                     || (low & 8 != 0) != prefetchable
                     || bytes == 0
-                    || base.checked_add(bytes).is_none()
+                    || base.checked_add(bytes).is_none_or(|end| end > limit)
                 {
                     return Err(Error::InvalidResource);
                 }

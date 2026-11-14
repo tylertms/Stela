@@ -593,3 +593,44 @@ fn child_providers_gate_parent_owner_return_and_uncertain_stop_retention() {
         }
     }
 }
+
+#[test]
+fn each_bar_is_decoded_at_its_own_width() {
+    // A 32-bit MEMBAR1 between a 64-bit CFGBAR and MEMBAR2: BAR 3 is a
+    // register of its own, not MEMBAR1's upper half.
+    let mut model = Model::new(0x28c0);
+    model.bars[1] = (0x5000_0000, 0x100_0000, false);
+    model.set(0x18, 4, 0x5000_0000);
+    model.set(0x1c, 4, 0x6000_0000);
+    let host = start(model);
+    assert_eq!(host.windows()[0].cpu_start, 0x5000_0000);
+    assert_eq!(host.windows()[0].bytes, 0x100_0000);
+    assert_eq!(host.windows()[1].cpu_start, 0x9000_2010);
+    // SAFETY: model has no hardware or asynchronous consumers.
+    unsafe { host.retire() }.unwrap();
+
+    let refused = |configure: fn(&mut Model)| {
+        let mut model = Model::new(0x28c0);
+        configure(&mut model);
+        matches!(
+            Host::initialize(model),
+            Err((Error::InvalidResource, Some(_)))
+        )
+    };
+    // A 32-bit BAR's reservation that does not match its register.
+    assert!(refused(|m| {
+        m.bars[1] = (0x5000_0000, 0x100_0000, false);
+        m.set(0x18, 4, 0x5100_0000);
+    }));
+    // A 32-bit BAR cannot decode past 4 GiB.
+    assert!(refused(|m| {
+        m.bars[1] = (0xff80_0000, 0x100_0000, false);
+        m.set(0x18, 4, 0xff80_0000);
+    }));
+    // I/O space and the below-1 MiB memory type are no VMD aperture.
+    assert!(refused(|m| {
+        m.bars[1] = (0x5000_0000, 0x100_0000, false);
+        m.set(0x18, 4, 0x5000_0002);
+    }));
+    assert!(refused(|m| m.set(0x20, 4, 0x9000_0001)));
+}
