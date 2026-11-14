@@ -2313,15 +2313,18 @@ fn revision_update_rebuilds_bundles() {
     );
     assert!(!status.contains("--fetch"), "{status}");
     assert!(status.contains("`stela update`"), "{status}");
-    // Other changes that prepare bundles wait for the update.
+    // A repair prepares them again first, as the update does; a dry run
+    // says so and changes nothing.
+    let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
     let repair = run(&|c| {
         c.action = Action::Repair;
         c.ipsw = Some(f.ipsw.clone());
-    });
-    assert!(
-        repair.unwrap_err().to_string().contains("`stela update`"),
-        "the repair is refused"
-    );
+        c.dry_run = true;
+    })
+    .unwrap();
+    assert!(repair.contains("replaces schema 4 revision 0"), "{repair}");
+    assert!(repair.contains("the repair checks the rest"), "{repair}");
+    assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
     let update = |ipsw: bool, dry_run: bool| {
         run(&|c| {
             c.action = Action::UpdateStela;
@@ -2635,11 +2638,14 @@ fn status_advises_update_stela_while_bundles_are_of_another_revision() {
     let problems = status.dispatch(&environment).unwrap_err().to_string();
     assert!(problems.contains("`stela update`"), "{problems}");
     assert!(!problems.contains("`stela repair`"), "{problems}");
-    // Repair refuses before downloading anything (downloads panic here).
+    // Repair prepares the bundles again first, as the update does, and
+    // names what else it needs before downloading anything (downloads
+    // panic here).
     let mut repair = update_request(&f, &f._dir.path().join("cache"));
     repair.action = Action::Repair;
     let error = repair.dispatch(&environment).unwrap_err().to_string();
-    assert!(error.contains("`stela update`"), "{error}");
+    assert!(error.contains("restore image"), "{error}");
+    assert_eq!(record(&f).bundle_revision, 1);
 }
 
 #[test]
@@ -6590,6 +6596,53 @@ fn journey_g_a_damaged_stick_offers_repair_and_quit_changes_nothing() {
     assert!(shown.contains("▲ This stick needs repair:"), "{shown}");
     assert!(shown.contains("? Repair this stick?"), "{shown}");
     assert_eq!(stick_files(&f), before);
+}
+
+#[test]
+fn repair_puts_back_a_missing_or_replaced_stela_efi_and_the_menu_offer_succeeds() {
+    // Missing: the menu's Repair puts it back, and the stick is ready.
+    let f = made_by(Some(release::CURRENT));
+    let installed = fs::read(f.esp.join(LOADER_PATH)).unwrap();
+    fs::remove_file(f.esp.join(LOADER_PATH)).unwrap();
+    let (shown, result, done) = plain_stela(&f, &["Repair"], &[]);
+    result.unwrap();
+    assert!(done, "{shown}");
+    assert!(
+        shown.ends_with("└ Done. Check it any time with `stela status`."),
+        "{shown}"
+    );
+    assert_eq!(fs::read(f.esp.join(LOADER_PATH)).unwrap(), installed);
+    rerun(&f, |c| c.action = Action::Status).unwrap();
+    // Another file in its place: `stela repair` puts this stela's back.
+    fs::write(f.esp.join(LOADER_PATH), b"not stela.efi").unwrap();
+    let status = rerun(&f, |c| c.action = Action::Status)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        status.contains("is not the version setup installed"),
+        "{status}"
+    );
+    // A dry run changes nothing and says what it would do.
+    let report = rerun(&f, |c| {
+        c.action = Action::Repair;
+        c.dry_run = true;
+    })
+    .unwrap();
+    assert!(report.contains("the repair checks the rest"), "{report}");
+    assert_eq!(fs::read(f.esp.join(LOADER_PATH)).unwrap(), b"not stela.efi");
+    rerun(&f, |c| c.action = Action::Repair).unwrap();
+    assert_eq!(fs::read(f.esp.join(LOADER_PATH)).unwrap(), installed);
+    rerun(&f, |c| c.action = Action::Status).unwrap();
+    // Boot bundles of an older revision: repair prepares them again.
+    let mut older = record(&f);
+    older.bundle_revision -= 1;
+    record::write_record(&f.esp, &older).unwrap();
+    let status = rerun(&f, |c| c.action = Action::Status)
+        .unwrap_err()
+        .to_string();
+    assert!(status.contains("prepare them again"), "{status}");
+    rerun(&f, |c| c.action = Action::Repair).unwrap();
+    rerun(&f, |c| c.action = Action::Status).unwrap();
 }
 
 #[test]

@@ -678,6 +678,24 @@ fn read_efi(environment: &Environment<'_>, path: &Path) -> Result<Vec<u8>> {
     Ok(image)
 }
 
+/// Whether `record`'s stela.efi is missing, is not the version the record
+/// names, or reads another interface than this `stela` writes, or its boot
+/// bundles are of an older revision than this `stela` prepares: the damage
+/// `status` names `update` for, which `repair` then does first.
+fn needs_update(environment: &Environment<'_>, record: &Record) -> bool {
+    if record.bundle_revision < environment.bundle_revision {
+        return true;
+    }
+    match fs::read(record.esp.join(LOADER_PATH)) {
+        Err(_) => true,
+        Ok(image) => {
+            record.stela_version.as_deref() != Some(update::version_id(&image).as_str())
+                || mount_interface::mismatch(environment.interface, mount_interface::find(&image))
+                    .is_some()
+        }
+    }
+}
+
 /// Refuse to change a setup whose installed `stela.efi` reads another
 /// interface than this `stela` writes; `update` replaces it first.
 fn check_installed_efi(environment: &Environment<'_>, record: &Record) -> Result<()> {
@@ -1072,6 +1090,31 @@ impl Request {
         self.model.as_deref().unwrap_or(PINNED_MODEL)
     }
 
+    /// Put this stela's stela.efi on the stick of `record`, preparing its
+    /// boot files again when they are of another generation.
+    fn update_stela(&self, environment: &Environment<'_>, record: Record) -> Result<String> {
+        let image = match &self.efi {
+            Some(path) => path.clone(),
+            None => assets::resolve()?,
+        };
+        // The update finds the restore image itself when it needs one,
+        // downloading only its boot files, never the whole image. A local
+        // image named for a macOS change is that build's, not the active
+        // one's.
+        update::update_stela(
+            environment,
+            record,
+            update::UpdateOptions {
+                usb: &self.usb,
+                image_path: &image,
+                ipsw: self.ipsw.as_deref().filter(|_| self.macos.is_none()),
+                download_dir: self.download_dir.as_deref(),
+                dry_run: self.dry_run,
+                yes: self.yes,
+            },
+        )
+    }
+
     /// Bring the stick of `record` to the request's build of macOS.
     fn update_os(&self, environment: &Environment<'_>, mut record: Record) -> Result<String> {
         check_installed_efi(environment, &record)?;
@@ -1147,32 +1190,26 @@ impl Request {
                 ..self
             }
             .dispatch(environment),
+            // What `status` names `update` for (`needs_update`) is put
+            // right as `update` does it, and the repair goes on with the
+            // rest.
+            Action::Repair if needs_update(environment, &record) => {
+                let mut text = self.update_stela(environment, record)?;
+                match self.dry_run {
+                    true => text.push_str(
+                        "  then          the repair checks the rest once this stela.efi is in place\n",
+                    ),
+                    false => text.push_str(&doctor::repair(environment, &self)?),
+                }
+                Ok(text)
+            }
             Action::Repair => doctor::repair(environment, &self),
             Action::ResetNvram => state::reset_nvram(environment, &record, &self),
             Action::BackupState(path) => state::backup(environment, &record, &self, &path),
             Action::RestoreState(path) => state::restore(environment, &record, &self, &path),
             Action::BootLog => state::boot_log(environment, &record, &self),
             Action::UpdateStela => {
-                let image = match &self.efi {
-                    Some(path) => path.clone(),
-                    None => assets::resolve()?,
-                };
-                // The update finds the restore image itself when it needs
-                // one, downloading only its boot files, never the whole
-                // image. A local image named for a macOS change is that
-                // build's, not the active one's.
-                let mut text = update::update_stela(
-                    environment,
-                    record,
-                    update::UpdateOptions {
-                        usb: &self.usb,
-                        image_path: &image,
-                        ipsw: self.ipsw.as_deref().filter(|_| self.macos.is_none()),
-                        download_dir: self.download_dir.as_deref(),
-                        dry_run: self.dry_run,
-                        yes: self.yes,
-                    },
-                )?;
+                let mut text = self.update_stela(environment, record)?;
                 if let Some(build) = self.macos.take() {
                     let next = Request {
                         action: Action::UpdateOs,
