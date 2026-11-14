@@ -203,7 +203,9 @@ impl Disk {
 }
 
 /// `typed` is a disk's model `name`, or its size as [`size_text`] shows
-/// it, ignoring case and spaces.
+/// it, ignoring case and spaces: `64.0 GB`, `64.0GB`, and for a whole
+/// number of GB also `64 GB` and `64GB`. The number is the one shown, to
+/// its one decimal.
 pub(crate) fn names_disk(name: &str, bytes: u64, typed: &str) -> bool {
     let squeeze = |text: &str| {
         text.split_whitespace()
@@ -211,8 +213,19 @@ pub(crate) fn names_disk(name: &str, bytes: u64, typed: &str) -> bool {
             .to_ascii_lowercase()
     };
     let typed = squeeze(typed);
-    !typed.is_empty()
-        && (typed == squeeze(name) || bytes != 0 && typed == squeeze(&size_text(bytes)))
+    if typed.is_empty() {
+        return false;
+    }
+    if typed == squeeze(name) {
+        return true;
+    }
+    let shown = squeeze(&size_text(bytes));
+    bytes != 0
+        && (typed == shown
+            || shown
+                .strip_suffix("gb")
+                .and_then(|number| number.strip_suffix(".0"))
+                .is_some_and(|whole| typed == format!("{whole}gb")))
 }
 
 /// One partition, as `stela.cfg` names it and setup checks it.
@@ -473,6 +486,26 @@ mod tests {
         }
         let no_size = Disk { bytes: 0, ..disk };
         assert!(!no_size.confirmed_by(&size_text(0)));
+        // A whole number of GB, as shown and as a person types it; the
+        // number itself stays exact.
+        let whole = Disk {
+            bytes: 64_000_000_000,
+            ..no_size.clone()
+        };
+        for typed in ["64.0 GB", "64.0GB", "64 GB", "64GB", "64gb", " 64 gb "] {
+            assert!(whole.confirmed_by(typed), "{typed}");
+        }
+        for typed in [
+            "64",
+            "64.0",
+            "64.00 GB",
+            "64.1 GB",
+            "63 GB",
+            "640GB",
+            "6 4.0GB x",
+        ] {
+            assert!(!whole.confirmed_by(typed), "{typed}");
+        }
         let fixed = Disk {
             removal: Removal::Fixed,
             ..no_size

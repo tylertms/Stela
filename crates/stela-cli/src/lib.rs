@@ -26,7 +26,7 @@ fn examples() -> String {
   stela                 Choose what to do, step by step
   stela update          Update the plugged-in stick
   stela log             Save the boot logs to log.txt
-  stela create {disk} --confirm-disk 64GB --installer offline"
+  stela create {disk} --confirm-disk 64.0GB --installer offline"
     )
 }
 
@@ -160,6 +160,19 @@ mod tests {
                 assert!(line.chars().count() <= 80, "{line:?} in:\n{page}");
             }
         }
+    }
+
+    #[test]
+    fn the_help_example_confirms_the_stick_it_names_as_stela_shows_it() {
+        let examples = examples();
+        let typed = examples
+            .split("--confirm-disk ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap();
+        let bytes = 64_000_000_000;
+        assert_eq!(typed, setup::host::size_text(bytes).replace(' ', ""));
+        assert!(setup::host::names_disk("Flash Drive", bytes, typed));
     }
 
     #[test]
