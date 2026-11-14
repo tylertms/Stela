@@ -4,10 +4,11 @@
 //! as Linux's `hub_event` services them. A controller that signals its
 //! events wakes the engine and is polled once it has work
 //! ([`xhci::Host::due`]); another is polled on a timer. A keyboard or
-//! pointer that arrives joins the host input; another new device is
-//! reported unused and is not started: a disk, network adapter, audio
-//! function, Bluetooth controller or hub starts at the next boot. What a
-//! new device leaves is kept until every device it came with is removed. The USB storage interfaces probe configured stay owned here
+//! pointer that arrives joins the host input, behind a hub that arrives
+//! with it too; another new device is reported unused and is not started:
+//! a disk, network adapter, audio function or Bluetooth controller starts
+//! at the next boot. What a new device leaves is kept until every device it
+//! came with is removed. The USB storage interfaces probe configured stay owned here
 //! for the boot, with the disks the guest reaches through them.
 //!
 //! A USB4 host whose firmware runs the connection manager is looked at on the

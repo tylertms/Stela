@@ -23,10 +23,7 @@ fn runtime_poll(host: &mut Host, dma: &mut dyn DmaAllocator) -> Changes {
 fn connect_late(node: Node, after_boot: bool) -> (Rc<RefCell<Hardware>>, Changes, Vec<[u8; 8]>) {
     let _clock = crate::test_clock::virtualize();
     let mut dma = TestRegion::new(512 * 1024 * 8);
-    let mut nodes = BTreeMap::from([(0, node)]);
-    if nodes[&0].ports.is_some() {
-        nodes.insert(1, Node::bot_disk(HIGH_SPEED));
-    }
+    let nodes = BTreeMap::from([(0, node)]);
     let (mut c, model) = controller(&mut dma, 32, nodes);
     model.borrow_mut().root_status = Some(PP);
     let mut failures = Vec::new();
@@ -86,41 +83,6 @@ fn a_disk_that_arrives_after_boot_is_reported_unused_and_not_started() {
             .all(|(_, why)| *why != crate::usb::xhci::AFTER_BOOT)
     );
     assert!(model.borrow().nodes[&0].configured);
-}
-
-/// A hub that arrives after boot stays unconfigured with its ports
-/// unpowered, so neither its power-on wait nor its children's enumeration
-/// runs in the poll; the disk behind it is not seen.
-#[test]
-fn a_hub_that_arrives_after_boot_is_left_unpowered() {
-    let (model, changes, requests) = connect_late(Node::hub(HIGH_SPEED, 1), true);
-    assert_eq!(
-        changes.added.devices.len(),
-        1,
-        "{:?}",
-        changes.added.failures
-    );
-    assert!(
-        changes
-            .added
-            .unused
-            .iter()
-            .any(|(_, why)| *why == crate::usb::xhci::lifecycle::HUB_AFTER_BOOT),
-        "{:?}",
-        changes.added.unused
-    );
-    assert!(!model.borrow().nodes[&0].configured);
-    assert!(
-        requests.iter().all(|request| request[1] == GET_DESCRIPTOR),
-        "{requests:x?}"
-    );
-    let (_, changes, _) = connect_late(Node::hub(HIGH_SPEED, 1), false);
-    assert_eq!(
-        changes.added.devices.len(),
-        2,
-        "{:?}",
-        changes.added.failures
-    );
 }
 
 #[test]

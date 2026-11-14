@@ -87,6 +87,15 @@ pub(in super::super) struct Node {
     pub hub_change: u16,
     pub after_power_status: Option<u16>,
     bot: Option<bot::Disk>,
+    pub hid: Option<HidPeer>,
+}
+
+/// A boot keyboard (protocol 1) or mouse (2): its interrupt IN endpoint
+/// answers only with queued reports, as a real device NAKs until a change.
+#[derive(Clone, Default)]
+pub(in super::super) struct HidPeer {
+    pub protocol: u8,
+    pub reports: VecDeque<Vec<u8>>,
 }
 impl Node {
     pub fn hub(speed: u8, ports: usize) -> Self {
@@ -118,6 +127,7 @@ impl Node {
             hub_change: 0,
             after_power_status: None,
             bot: None,
+            hid: None,
         }
     }
     pub fn leaf(speed: u8) -> Self {
@@ -141,6 +151,23 @@ impl Node {
             hub_change: 0,
             after_power_status: None,
             bot: None,
+            hid: None,
+        }
+    }
+    /// A full-speed boot keyboard (`protocol` 1) or mouse (2).
+    pub fn hid(protocol: u8) -> Self {
+        Self {
+            hid: Some(HidPeer {
+                protocol,
+                reports: VecDeque::new(),
+            }),
+            ..Self::leaf(FULL_SPEED)
+        }
+    }
+    fn report_descriptor(&self) -> &'static [u8] {
+        match self.hid.as_ref().map(|hid| hid.protocol) {
+            Some(1) => &crate::usb::ehci::input::KEYBOARD_REPORT,
+            _ => &crate::usb::ehci::input::MOUSE_REPORT,
         }
     }
     pub fn bot_disk(speed: u8) -> Self {
@@ -180,6 +207,16 @@ impl Node {
             return configuration.clone();
         }
         let hub = self.ports.is_some();
+        if let Some(hid) = &self.hid {
+            let report = self.report_descriptor().len() as u8;
+            let mut out = vec![9, 2, 0, 0, 1, 1, 0, 0xa0, 50];
+            out.extend_from_slice(&[9, 4, 0, 0, 1, 3, 1, hid.protocol, 0]);
+            out.extend_from_slice(&[9, 0x21, 0x11, 1, 0, 1, 0x22, report, 0]);
+            out.extend_from_slice(&[7, 5, 0x81, 3, 8, 0, 10]);
+            let length = out.len() as u16;
+            out[2..4].copy_from_slice(&length.to_le_bytes());
+            return out;
+        }
         let mut out = vec![
             9,
             2,
@@ -331,6 +368,10 @@ pub(in super::super) struct Hardware {
     pub commands: Vec<(u32, u8)>,
     pub fail: Option<(u32, u8)>,
     pub silent: Option<(u32, u8)>,
+    /// The device at this route answers this many more requests, then none,
+    /// and an Address Device for it fails as a controller's does for a
+    /// device that does not answer SET_ADDRESS.
+    pub answers: Option<(u32, usize)>,
     /// A silenced command, keeping CRCR.CRR set until it is aborted.
     stuck: Option<u64>,
     pub outgoing: Vec<Vec<u8>>,
@@ -372,6 +413,7 @@ impl Hardware {
             commands: Vec::new(),
             fail: None,
             silent: None,
+            answers: None,
             stuck: None,
             outgoing: Vec::new(),
             loss_after_child_route: None,
@@ -440,8 +482,16 @@ impl Hardware {
             self.stuck = Some(at);
             return;
         }
+        let route = (kind == ADDRESS_DEVICE)
+            .then(|| read32(parameter + self.context_bytes as u64) & 0xfffff);
         let code = if self.fail == Some((kind, slot)) {
             11
+        } else if route.is_some()
+            && self
+                .answers
+                .is_some_and(|(r, left)| Some(r) == route && left == 0)
+        {
+            transfer::USB_TRANSACTION_ERROR
         } else {
             SUCCESS
         };
@@ -570,6 +620,11 @@ impl Hardware {
         let index = u16::from_le_bytes([request[4], request[5]]);
         let length = u16::from_le_bytes([request[6], request[7]]);
         match (request[0], request[1]) {
+            (0x81, GET_DESCRIPTOR) if node.hid.is_some() && value == 0x2200 => {
+                Ok(node.report_descriptor().to_vec())
+            }
+            // SET_IDLE, SET_PROTOCOL.
+            (0x21, 0x0a | 0x0b) if node.hid.is_some() => Ok(Vec::new()),
             (0xa1, 0xfe) if node.bot.is_some() => {
                 assert_eq!(request, setup(0xa1, 0xfe, 0, 0, 1));
                 Ok(vec![0])
@@ -843,6 +898,14 @@ impl Hardware {
             }
             let (status, _, _, control) = cursor.next();
             assert_eq!(control >> 10 & 0x3f, STATUS);
+            if let Some((route, left)) = &mut self.answers
+                && self.routes.get(&slot) == Some(route)
+            {
+                if *left == 0 {
+                    return;
+                }
+                *left -= 1;
+            }
             let mut reply = self.request(slot, request);
             if self.root_loss_after == Some(request) {
                 self.root_status = Some(PP);
@@ -898,6 +961,16 @@ impl Hardware {
             let (trb, buffer, length, control) =
                 self.endpoints.get_mut(&(slot, dci)).unwrap().next();
             assert_eq!(control >> 10 & 0x3f, NORMAL);
+            if self.nodes[&self.routes[&slot]].hid.is_some() {
+                assert_eq!(dci, 3);
+                assert!(
+                    self.pending_interrupts
+                        .insert((slot, dci), (trb, buffer, length as usize))
+                        .is_none()
+                );
+                self.complete_interrupts();
+                return;
+            }
             if self.nodes[&self.routes[&slot]].ports.is_some() {
                 assert_eq!(
                     dci,
@@ -942,8 +1015,15 @@ impl Hardware {
 impl Hardware {
     fn complete_interrupts(&mut self) {
         let mut completed = Vec::new();
+        let mut reports = Vec::new();
         for (&(slot, dci), &(trb, buffer, length)) in &self.pending_interrupts {
             let node = &self.nodes[&self.routes[&slot]];
+            if let Some(hid) = &node.hid {
+                if !hid.reports.is_empty() {
+                    reports.push((slot, dci, trb, buffer, length));
+                }
+                continue;
+            }
             let mut bits = u32::from(node.hub_change != 0);
             for (port, state) in node.ports.as_ref().unwrap().iter().enumerate() {
                 if state.change != 0 {
@@ -964,6 +1044,23 @@ impl Hardware {
         for (slot, dci, trb) in completed {
             self.pending_interrupts.remove(&(slot, dci));
             self.event(trb, SUCCESS, TRANSFER_EVENT, slot, dci, 0);
+        }
+        for (slot, dci, trb, buffer, length) in reports {
+            let route = self.routes[&slot];
+            let hid = self.nodes.get_mut(&route).unwrap().hid.as_mut().unwrap();
+            let report = hid.reports.pop_front().unwrap();
+            let n = report.len().min(length);
+            // SAFETY: only the published interrupt TD owns this device write.
+            unsafe { core::ptr::copy_nonoverlapping(report.as_ptr(), buffer as *mut u8, n) };
+            self.pending_interrupts.remove(&(slot, dci));
+            self.event(
+                trb,
+                if n < length { SHORT_PACKET } else { SUCCESS },
+                TRANSFER_EVENT,
+                slot,
+                dci,
+                length - n,
+            );
         }
     }
 }

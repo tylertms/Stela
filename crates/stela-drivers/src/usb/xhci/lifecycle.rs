@@ -9,10 +9,6 @@ mod attach;
 mod recovery;
 mod suspend;
 
-/// Why a hub that arrived after boot is not brought up.
-pub(super) const HUB_AFTER_BOOT: &str =
-    "USB hub added after boot, its ports left unpowered until the next boot";
-
 /// Private proof kept only after complete subtree transfer quiescence.
 /// This never restores public access to the old hardware slot.
 pub(super) struct Recovery {
@@ -251,8 +247,8 @@ impl Host {
 
     /// [`Self::poll`] once the boot handed the machine over, from a service
     /// turn: from then on a device that arrives gets only the classes the
-    /// running system takes, input devices, and the others are reported
-    /// unused without being started; a hub that arrives stays unpowered.
+    /// running system takes, input devices and the hubs they sit behind, and
+    /// the others are reported unused without being started.
     pub fn poll_after_boot(
         &mut self,
         dma: &mut dyn DmaAllocator,
@@ -338,16 +334,7 @@ impl Host {
             self.queued_reset(id, dma, &mut changes);
         }
         let added = changes.added.devices.clone();
-        if self.controller.borrow().after_boot {
-            for hub in added.iter().filter(|d| d.descriptor[4] == HUB_CLASS) {
-                changes
-                    .added
-                    .unused
-                    .push((hub.location.clone(), HUB_AFTER_BOOT));
-            }
-        } else {
-            self.register_hubs(&added, dma, &mut changes.added.failures);
-        }
+        self.register_hubs(&added, dma, &mut changes.added.failures);
         for device in &added {
             bind_with_provider(
                 &self.controller,

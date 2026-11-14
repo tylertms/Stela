@@ -71,7 +71,8 @@ impl Controller {
         port: u8,
     ) -> Result<(bool, bool), BlockError> {
         let (status, change) = self.hub_port_status_owned(slot, port)?;
-        powered(status, change)?;
+        // The changes are acknowledged first, so a port refused below is
+        // not reported again by the hub's next status notification.
         for (bit, selector) in [
             (HUB_PORT_CONNECTION, C_PORT_CONNECTION),
             (2, 17),
@@ -87,6 +88,7 @@ impl Controller {
                 )?;
             }
         }
+        powered(status, change)?;
         Ok((
             status & HUB_PORT_CONNECTION != 0,
             change & HUB_PORT_CONNECTION != 0,
