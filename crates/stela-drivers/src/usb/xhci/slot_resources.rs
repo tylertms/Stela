@@ -160,6 +160,7 @@ impl Cache {
             poisoned: false,
             enabled: false,
             in_flight: 0,
+            stopped: false,
         });
     }
 

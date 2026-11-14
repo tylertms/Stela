@@ -259,6 +259,7 @@ impl Controller {
             poisoned: false,
             enabled: true,
             in_flight: 0,
+            stopped: false,
         });
         let input_address = input.device_address();
         // A failed Address Device may leave the output context untouched.

@@ -47,6 +47,7 @@ impl Controller {
         doorbells: &[u32],
     ) -> Result<(), BlockError> {
         self.reset_halted(slot, dci, TSP)?;
+        self.rang(slot, dci);
         fence(Ordering::SeqCst);
         for value in doorbells {
             self.registers

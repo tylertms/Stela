@@ -303,6 +303,7 @@ fn unpublished_data_or_retired_ring_owner_cannot_return_ep0_resources() {
                 poisoned: false,
                 enabled: true,
                 in_flight: 0,
+                stopped: false,
             });
         }
         let before = backing.clone();

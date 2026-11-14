@@ -277,6 +277,7 @@ impl Controller {
                 poisoned: false,
                 enabled: false,
                 in_flight: 0,
+                stopped: false,
             });
             add |= 1 << dci;
             last = last.max(dci);

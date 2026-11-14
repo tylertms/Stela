@@ -388,6 +388,12 @@ struct Transfer {
     enabled: bool,
     /// Bulk and interrupt TDs submitted and not yet completed or cancelled.
     in_flight: usize,
+    /// An acknowledged cancellation left the endpoint Stopped and no
+    /// doorbell rang for it since: its output context's Stopped is current.
+    /// After a doorbell some controllers show Stopped in the output context
+    /// for a while although the endpoint runs again (Linux
+    /// `xhci_handle_cmd_stop_ep`), so only this says Stopped for sure.
+    stopped: bool,
 }
 
 struct Slot {
@@ -833,9 +839,23 @@ impl Controller {
     }
 
     fn doorbell(&mut self, slot: u8, target: u8) {
+        self.rang(slot, target);
         fence(Ordering::SeqCst);
         self.registers
             .write32(self.doorbells + 4 * usize::from(slot), u32::from(target));
+    }
+
+    /// A doorbell for endpoint `dci` of `slot` may restart it: its output
+    /// context no longer says for sure that it is Stopped.
+    fn rang(&mut self, slot: u8, dci: u8) {
+        if let Some(Some(endpoint)) = self
+            .slots
+            .get_mut(usize::from(slot))
+            .and_then(Option::as_mut)
+            .and_then(|state| state.endpoints.get_mut(usize::from(dci)))
+        {
+            endpoint.stopped = false;
+        }
     }
 
     /// The next event on the ring, if the controller has posted one.

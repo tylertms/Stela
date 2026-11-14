@@ -349,6 +349,16 @@ pub(crate) struct CancelModel {
     pub(crate) fail: Option<(u32, u32)>,
     pub(crate) silence: Option<u32>,
     pub(crate) race_halt: bool,
+    /// Stop Endpoint commands a Running endpoint fails with a Context State
+    /// Error, staying Running, as when the controller handles the command
+    /// before the endpoint ran (Linux `xhci_handle_cmd_stop_ep`).
+    pub(crate) stop_races: usize,
+    /// After a doorbell on a Stopped endpoint, Stop Endpoint commands that
+    /// fail with a Context State Error while its output context still says
+    /// Stopped although it runs; then the context says Running.
+    pub(crate) context_lag: usize,
+    /// Endpoints running behind a context that still says Stopped.
+    pub(crate) lagging: [bool; 32],
     pub(crate) stale: Option<u64>,
     pub(crate) seen: Vec<u32>,
     pub(crate) dequeues: Vec<u64>,
@@ -559,6 +569,19 @@ impl CancelModel {
                         }
                     }
                 }
+                STOP_ENDPOINT if self.lagging[dci] => {
+                    code = 19;
+                    self.context_lag = self.context_lag.saturating_sub(1);
+                    if self.context_lag == 0 {
+                        self.lagging[dci] = false;
+                        self.set_state(dci, 1);
+                    }
+                }
+                STOP_ENDPOINT if self.stop_races > 0 && self.state(dci) == 1 => {
+                    self.stop_races -= 1;
+                    code = 19;
+                }
+                SET_DEQUEUE if self.lagging[dci] => code = 19,
                 STOP_ENDPOINT => {
                     if self.race_halt {
                         self.race_halt = false;
@@ -667,7 +690,11 @@ impl CancelModel {
                 ((at + 8) as *const u32).read_volatile() as usize & 0x1ffff,
             )
         };
-        self.set_state(dci, 1);
+        if self.context_lag > 0 && self.state(dci) == 3 {
+            self.lagging[dci] = true;
+        } else {
+            self.set_state(dci, 1);
+        }
         if self.transaction_errors[dci] > 0 {
             // The TD stays at the dequeue pointer of the halted endpoint.
             self.transaction_errors[dci] -= 1;
@@ -1001,6 +1028,9 @@ fn cancellation_controller_with_context(
         fail: None,
         silence: None,
         race_halt: false,
+        stop_races: 0,
+        context_lag: 0,
+        lagging: [false; 32],
         stale: None,
         seen: Vec::new(),
         dequeues: Vec::new(),

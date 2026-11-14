@@ -63,16 +63,141 @@ fn cancellation_stops_running_resets_halted_and_clears_late_events() {
             .ring
             .dequeue_pointer();
         controller.cancel(1, 3).unwrap();
-        let expected = match initial {
-            1 => vec![STOP_ENDPOINT, SET_DEQUEUE],
-            2 => vec![RESET_ENDPOINT, SET_DEQUEUE],
-            _ => vec![SET_DEQUEUE],
-        };
-        assert_eq!(model.borrow().seen, expected);
+        let seen = model.borrow().seen.clone();
+        match initial {
+            1 => assert_eq!(seen, [STOP_ENDPOINT, SET_DEQUEUE]),
+            2 => assert_eq!(seen, [RESET_ENDPOINT, SET_DEQUEUE]),
+            // Stopped since the submission's doorbell: Stop Endpoint, sent
+            // again while it fails on Stopped, then taken as stopped.
+            _ => {
+                let (last, stops) = seen.split_last().unwrap();
+                assert_eq!(*last, SET_DEQUEUE);
+                assert!(stops.len() > 1 && stops.iter().all(|&kind| kind == STOP_ENDPOINT));
+            }
+        }
         assert_eq!(model.borrow().dequeues, vec![pointer]);
         assert_eq!(controller.completed(1, 3, trb, 512), None);
         assert!(controller.submit(1, 3, buffer.physical(), 512).is_ok());
     }
+}
+
+/// One look at a cancellation: its result, and that it took under 5 ms of
+/// the controller's clock.
+fn look(
+    controller: &mut Controller,
+    cancel: &mut Cancel,
+) -> Option<Result<Vec<Event>, BlockError>> {
+    let before = Clock::ticks();
+    let result = controller.poll_cancel(cancel);
+    assert!(Clock::ticks() - before < 5_000, "one look waited");
+    result
+}
+
+/// Linux `xhci_handle_cmd_stop_ep`: a Stop Endpoint that fails with a
+/// Context State Error on an endpoint still Running, or on one whose
+/// context still says Stopped after a doorbell, is sent again, each time
+/// from the next look.
+#[test]
+fn a_refused_stop_is_sent_again_from_the_next_look() {
+    for (races, lag) in [(2, 0), (0, 2)] {
+        let mut dma = TestRegion::new(64 * 1024 * 8);
+        let (mut controller, model) = cancellation_controller(&mut dma);
+        let buffer = dma.allocate(512, 512).unwrap();
+        // A first cancellation leaves the endpoint Stopped.
+        controller.submit(1, 3, buffer.physical(), 512).unwrap();
+        controller.cancel(1, 3).unwrap();
+        model.borrow_mut().stop_races = races;
+        model.borrow_mut().context_lag = lag;
+        model.borrow_mut().seen.clear();
+        let trb = controller.submit(1, 3, buffer.physical(), 512).unwrap();
+        let mut cancel = controller.start_cancel(1, 3).unwrap();
+        let mut looks = 1;
+        let result = loop {
+            if let Some(result) = look(&mut controller, &mut cancel) {
+                break result;
+            }
+            looks += 1;
+        };
+        assert!(result.is_ok());
+        assert_eq!(looks, 3);
+        assert_eq!(
+            model.borrow().seen,
+            [STOP_ENDPOINT, STOP_ENDPOINT, STOP_ENDPOINT, SET_DEQUEUE]
+        );
+        assert_eq!(controller.completed(1, 3, trb, 512), None);
+        assert!(!controller.endpoint_poisoned(1, 3));
+    }
+}
+
+/// Only a cancellation since the last doorbell makes the context's Stopped
+/// current: then Set TR Dequeue comes without a Stop Endpoint.
+#[test]
+fn only_a_stop_since_the_last_doorbell_skips_stop_endpoint() {
+    let mut dma = TestRegion::new(64 * 1024 * 8);
+    let (mut controller, model) = cancellation_controller(&mut dma);
+    let buffer = dma.allocate(512, 512).unwrap();
+    controller.submit(1, 3, buffer.physical(), 512).unwrap();
+    controller.cancel(1, 3).unwrap();
+    model.borrow_mut().seen.clear();
+    controller.cancel(1, 3).unwrap();
+    assert_eq!(model.borrow().seen, [SET_DEQUEUE]);
+    model.borrow_mut().seen.clear();
+    model.borrow_mut().context_lag = 1;
+    controller.submit(1, 3, buffer.physical(), 512).unwrap();
+    assert_eq!(model.borrow().state(3), ENDPOINT_STOPPED);
+    controller.cancel(1, 3).unwrap();
+    assert_eq!(
+        model.borrow().seen,
+        [STOP_ENDPOINT, STOP_ENDPOINT, SET_DEQUEUE]
+    );
+}
+
+/// A Running endpoint that refuses Stop Endpoint past 100 ms did not stop;
+/// a device gone mid-sequence ends it at the next command. Either keeps
+/// the endpoint poisoned with its TD recorded.
+#[test]
+fn a_stop_refused_past_its_window_or_cut_off_by_a_disconnect_ends_poisoned() {
+    let mut dma = TestRegion::new(64 * 1024 * 8);
+    let (mut controller, model) = cancellation_controller(&mut dma);
+    let buffer = dma.allocate(512, 512).unwrap();
+    model.borrow_mut().silence_transfer = Some(3);
+    controller.submit(1, 3, buffer.physical(), 512).unwrap();
+    model.borrow_mut().stop_races = usize::MAX;
+    let mut cancel = controller.start_cancel(1, 3).unwrap();
+    let start = Clock::ticks();
+    let result = loop {
+        if let Some(result) = look(&mut controller, &mut cancel) {
+            break result;
+        }
+    };
+    let elapsed = Clock::ticks() - start;
+    assert_eq!(
+        result.err(),
+        Some(BlockError::Unsupported("xHCI endpoint did not stop"))
+    );
+    assert!((100_000..200_000).contains(&elapsed), "{elapsed} us");
+    let seen = model.borrow().seen.clone();
+    assert!(seen.len() > 2 && seen.iter().all(|&kind| kind == STOP_ENDPOINT));
+    assert!(controller.endpoint_poisoned(1, 3));
+    assert!(model.borrow().active[3].is_some());
+
+    let mut dma = TestRegion::new(64 * 1024 * 8);
+    let (mut controller, model) = cancellation_controller(&mut dma);
+    let buffer = dma.allocate(512, 512).unwrap();
+    model.borrow_mut().silence_transfer = Some(3);
+    controller.submit(1, 3, buffer.physical(), 512).unwrap();
+    model.borrow_mut().stop_races = usize::MAX;
+    let mut cancel = controller.start_cancel(1, 3).unwrap();
+    assert!(look(&mut controller, &mut cancel).is_none());
+    model.borrow_mut().connected = false;
+    model.borrow_mut().fail = Some((STOP_ENDPOINT, 11));
+    assert_eq!(
+        look(&mut controller, &mut cancel).map(Result::err),
+        Some(Some(BlockError::Device { status: 11 }))
+    );
+    assert_eq!(model.borrow().seen, [STOP_ENDPOINT, STOP_ENDPOINT]);
+    assert!(controller.endpoint_poisoned(1, 3));
+    assert!(model.borrow().active[3].is_some());
 }
 
 #[test]

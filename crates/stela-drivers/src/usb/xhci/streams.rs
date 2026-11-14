@@ -727,6 +727,7 @@ impl Controller {
         stream: u16,
         (id, td): (u64, Td),
     ) -> StreamTransfer {
+        self.rang(device.hardware_slot(), dci);
         fence(Ordering::SeqCst);
         self.registers.write32(
             self.doorbells + 4 * usize::from(device.hardware_slot()),

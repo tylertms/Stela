@@ -32,7 +32,17 @@ pub(in super::super) struct Cancel {
     clear_tt: bool,
     command: Option<u64>,
     observed: Vec<Event>,
+    /// Until when a Stop Endpoint that failed with a Context State Error on
+    /// an endpoint still Running, or still showing Stopped, is sent again:
+    /// [`STOP_RETRY_US`] from the first one.
+    retry_until: Option<Deadline>,
 }
+
+/// Linux `xhci_handle_cmd_stop_ep` sends a Stop Endpoint that failed with a
+/// Context State Error again for 100 ms from the first while the endpoint
+/// shows Running or Stopped, then goes on to Set TR Dequeue. Stopped past
+/// it is taken as stopped here too; Running past it did not stop.
+const STOP_RETRY_US: u64 = 100_000;
 
 enum Cancelling {
     Stop,
@@ -289,18 +299,35 @@ impl Controller {
             clear_tt,
             command: None,
             observed: Vec::new(),
+            retry_until: None,
         };
-        // Running, including a ring whose TD just completed, is stopped.
+        let stopped = endpoint.stopped;
+        // Running, including a ring whose TD just completed, is stopped, as
+        // is Stopped since a doorbell: as Linux `xhci_urb_dequeue`, a Stop
+        // Endpoint unless software knows it stopped. Halted only Reset
+        // Endpoint leaves.
         match self.endpoint_state(slot, dci)? {
-            ENDPOINT_RUNNING => {}
             ENDPOINT_HALTED => {
                 cancel.clear_tt |= dci != 1;
                 cancel.step = Cancelling::Reset;
             }
-            ENDPOINT_STOPPED => cancel.step = Cancelling::Dequeue(0),
+            ENDPOINT_STOPPED if stopped => cancel.step = Cancelling::Dequeue(0),
+            ENDPOINT_RUNNING | ENDPOINT_STOPPED => {}
             _ => return Err(DID_NOT_STOP),
         }
         Ok(cancel)
+    }
+
+    /// Whether a Stop Endpoint may be sent again: within [`STOP_RETRY_US`]
+    /// of the first, which starts the window.
+    fn may_retry_stop(&self, cancel: &mut Cancel) -> Result<bool, BlockError> {
+        match &cancel.retry_until {
+            Some(until) => Ok(!until.passed()),
+            None => {
+                cancel.retry_until = Some(self.event_deadline(STOP_RETRY_US)?);
+                Ok(true)
+            }
+        }
     }
 
     fn endpoint_state(&mut self, slot: u8, dci: u8) -> Result<u32, BlockError> {
@@ -324,29 +351,49 @@ impl Controller {
         loop {
             match &mut cancel.step {
                 Cancelling::Stop => {
-                    match self.step_command(
+                    if cancel.command.is_none()
+                        && let Err(error) = self.may_retry_stop(cancel)
+                    {
+                        return Some(Err(error));
+                    }
+                    let refused = match self.step_command(
                         &mut cancel.command,
                         0,
                         0,
                         STOP_ENDPOINT << 10 | target,
                     )? {
-                        Ok(_) => {}
+                        Ok(_) => false,
                         // A STALL can race Stop Endpoint. Recheck the hardware
                         // state; never treat an arbitrary Context State Error
                         // as acknowledgment.
                         Err(BlockError::Device {
                             status: CONTEXT_STATE_ERROR,
-                        }) => {}
+                        }) => true,
                         Err(error) => return Some(Err(error)),
-                    }
-                    match self.endpoint_state(slot, dci) {
-                        Ok(ENDPOINT_HALTED) => {
+                    };
+                    match (self.endpoint_state(slot, dci), refused) {
+                        (Ok(ENDPOINT_HALTED), _) => {
                             cancel.clear_tt |= dci != 1;
                             cancel.step = Cancelling::Reset;
                         }
-                        Ok(ENDPOINT_STOPPED) => cancel.step = Cancelling::Dequeue(0),
-                        Ok(_) => return Some(Err(DID_NOT_STOP)),
-                        Err(error) => return Some(Err(error)),
+                        (Ok(ENDPOINT_STOPPED), false) => cancel.step = Cancelling::Dequeue(0),
+                        // The controller handled the Stop before the
+                        // endpoint ran (Running), or before its context
+                        // caught up with a doorbell (Stopped): send it
+                        // again, from the next look, within the window.
+                        // Stopped past it is taken as stopped.
+                        (Ok(state @ (ENDPOINT_RUNNING | ENDPOINT_STOPPED)), true) => {
+                            match self.may_retry_stop(cancel) {
+                                Ok(true) => return None,
+                                Ok(false) if state == ENDPOINT_STOPPED => {
+                                    cancel.step = Cancelling::Dequeue(0);
+                                }
+                                Ok(false) => return Some(Err(DID_NOT_STOP)),
+                                Err(error) => return Some(Err(error)),
+                            }
+                        }
+                        (Ok(_), _) => return Some(Err(DID_NOT_STOP)),
+                        (Err(error), _) => return Some(Err(error)),
                     }
                 }
                 Cancelling::Reset => {
@@ -380,10 +427,26 @@ impl Controller {
                     };
                     let dequeue = SET_DEQUEUE << 10 | target;
                     let status = streams::dequeue_status(stream_id);
-                    if let Err(error) =
-                        self.step_command(&mut cancel.command, pointer, status, dequeue)?
-                    {
-                        return Some(Err(error));
+                    match self.step_command(&mut cancel.command, pointer, status, dequeue)? {
+                        Ok(_) => {}
+                        // The endpoint ran again after all: stop it again
+                        // within the window, from the next look.
+                        Err(
+                            error @ BlockError::Device {
+                                status: CONTEXT_STATE_ERROR,
+                            },
+                        ) => {
+                            let running = self.endpoint_state(slot, dci) == Ok(ENDPOINT_RUNNING);
+                            match self.may_retry_stop(cancel) {
+                                Ok(true) if running => {
+                                    cancel.step = Cancelling::Stop;
+                                    return None;
+                                }
+                                Err(error) => return Some(Err(error)),
+                                _ => return Some(Err(error)),
+                            }
+                        }
+                        Err(error) => return Some(Err(error)),
                     }
                     match self.slot(slot) {
                         Ok(state) => {
@@ -477,6 +540,7 @@ impl Controller {
         endpoint.ring.normal.cancelled();
         endpoint.poisoned = false;
         endpoint.in_flight = 0;
+        endpoint.stopped = true;
         Ok(core::mem::take(&mut cancel.observed))
     }
 
