@@ -899,6 +899,68 @@ pub(super) fn reinitialize(
     )
 }
 
+/// The NVRAM sectors `repair` writes to an install's machine state so the
+/// automatic Metal plugin repair runs again at its next start
+/// (`bundle_repair::again`).
+pub(super) struct BundleRepairAgain {
+    pub(super) area: StateArea,
+    /// Each changed sector's offset in the NOR image and its new bytes.
+    pub(super) sectors: Vec<(u64, Vec<u8>)>,
+}
+
+impl BundleRepairAgain {
+    pub(super) fn write(&self, host: &dyn Host) -> Result<()> {
+        for (offset, bytes) in &self.sectors {
+            self.area.write(host, *offset, bytes)?;
+            ensure!(
+                self.area.read(host, *offset, bytes.len())? == *bytes,
+                "{} did not read back as written",
+                self.area.describe()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// What lets `disk`'s automatic Metal plugin repair run again: an attempt
+/// that did not install the plugin becomes a request for the next macOS
+/// start, as a boot that finds the plugin missing makes. None when its
+/// NVRAM holds no finished attempt, or is blank or unreadable, which
+/// status and `--initialize-nor` handle.
+pub(super) fn bundle_repair_again(
+    host: &dyn Host,
+    disk: &InstalledDisk,
+) -> Result<Option<BundleRepairAgain>> {
+    if disk.is_chosen() {
+        return Ok(None);
+    }
+    let area = state_area(host, disk, None)?;
+    let Ok(mut image) = Image::from_bytes(area.read(host, 0, CAPACITY)?) else {
+        return Ok(None);
+    };
+    let Ok(mut variables) = image
+        .current_bank()
+        .and_then(|bank| Variables::parse(image.bank(bank)?))
+    else {
+        return Ok(None);
+    };
+    if !stela_boot_core::bundle_repair::again(&mut variables).map_err(anyhow::Error::msg)? {
+        return Ok(None);
+    }
+    let bank = variables.encode().map_err(anyhow::Error::msg)?;
+    let (_, sectors) = image.save_bank(&bank).map_err(anyhow::Error::msg)?;
+    let sectors = sectors
+        .into_iter()
+        .map(|offset| {
+            (
+                offset as u64,
+                image.bytes()[offset..offset + SECTOR_SIZE].to_vec(),
+            )
+        })
+        .collect();
+    Ok(Some(BundleRepairAgain { area, sectors }))
+}
+
 /// What the next boot is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum NextBoot {

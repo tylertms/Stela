@@ -472,7 +472,8 @@ fn bundle(report: BundleReport) {
         }
         (Decision::StopMissing { attempted: true }, _) => stop(
             "StelaGPU.bundle is still not installed in /Library/GPUBundles after the automatic \
-             single-user repair (its BUNDLE REPAIR lines say how it went): boot macOS once with \
+             single-user repair (its BUNDLE REPAIR lines say how it went): run stela repair on \
+             the stick to let the repair run again at the next start, or boot macOS once with \
              --single-user and install it there by hand",
         ),
         (Decision::StopMissing { attempted: false }, _) => stop(

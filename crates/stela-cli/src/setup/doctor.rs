@@ -26,7 +26,10 @@
 //! would refuse (`installed::reinitialize`), blanking a foreign SEP area
 //! only for a machine that never booted. It adds the pinned firmware the
 //! last boot asked for and the USB lacks (`firmware::requested`), keeping
-//! what the USB holds, and names files without a pinned source.
+//! what the USB holds, and names files without a pinned source. An
+//! automatic Metal plugin repair that ran and did not install the plugin
+//! becomes a request again (`installed::bundle_repair_again`), so it runs
+//! at the install's next start.
 use super::{
     CHOICES_PATH, Environment, LOADER_PATH, RECORD, Record, Reported, Request, apply_install,
     bundle, check_bundle_revision, describe_install, ecid::Ecid, fix, host::Host, host::bytes_text,
@@ -619,6 +622,24 @@ fn install_status(
         state::Nvram::Blank => report.line("NVRAM", "blank"),
         state::Nvram::Valid(variables) => {
             report.line("next boot", state::next_boot(&variables));
+            use stela_boot_core::bundle_repair::Record;
+            match Record::read(&variables) {
+                Record::Attempted | Record::Retried | Record::Other => {
+                    let fix = report.fix("repair");
+                    report.line(
+                        "Metal plugin",
+                        format!(
+                            "the automatic repair ran and did not install it; {fix} lets it \
+                             run again at the next start"
+                        ),
+                    )
+                }
+                Record::Pending | Record::Installed | Record::Retry => report.line(
+                    "Metal plugin",
+                    "the automatic repair runs at the next start",
+                ),
+                Record::None => {}
+            }
             for name in [
                 boot_selection::OTA_RESULT,
                 boot_selection::OTA_FAILURE_REASON,
@@ -1172,6 +1193,33 @@ fn repair_steps(environment: &Environment<'_>, command: &Request) -> Result<Stri
             ));
         }
     }
+    // An automatic Metal plugin repair that ran and did not install the
+    // plugin runs again at the install's next start, as the stop it left
+    // asks; a PC without a serial console has no other way.
+    let mut bundle_repairs = Vec::new();
+    for install in &record.installs {
+        match installed::bundle_repair_again(environment.host, &install.disk) {
+            Ok(Some(again)) => {
+                writeln!(
+                    text,
+                    "  Metal plugin   install \"{}\": the automatic repair {} at the next start",
+                    install.name,
+                    match command.dry_run {
+                        true => "would run again",
+                        false => "runs again",
+                    }
+                )?;
+                bundle_repairs.push(again);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let note = unreachable_note(&install.name, &error);
+                if !notes.contains(&note) {
+                    notes.push(note);
+                }
+            }
+        }
+    }
     for note in &notes {
         writeln!(text, "  note           {note}")?;
     }
@@ -1210,6 +1258,9 @@ fn repair_steps(environment: &Environment<'_>, command: &Request) -> Result<Stri
             "{} did not read back as written",
             fresh.area.describe()
         );
+    }
+    for again in &bundle_repairs {
+        again.write(environment.host)?;
     }
     if let Some((plan, obtained)) = install {
         let environment = Environment {

@@ -3994,6 +3994,84 @@ fn installed_os_update_preserves_user_data() {
     assert!(!stela_volume(&f).join("stela/install").exists());
 }
 
+/// Set the automatic Metal plugin repair's NVRAM record on the install's
+/// machine state, as a boot leaves it.
+fn set_bundle_repair(f: &Fixture, value: &[u8]) {
+    use stela_soc_data::nor::{CAPACITY, Image, nvram::Partition};
+    let path = f.host.image(NOR).unwrap();
+    let mut bytes = fs::read(path).unwrap();
+    let mut image = match bytes[..CAPACITY].iter().all(|&b| b == 0) {
+        true => Image::fresh(),
+        false => Image::from_bytes(bytes[..CAPACITY].to_vec()).unwrap(),
+    };
+    let mut variables =
+        Variables::parse(image.bank(image.current_bank().unwrap()).unwrap()).unwrap();
+    variables
+        .set(
+            Partition::System,
+            stela_loader::boot_selection::BUNDLE_REPAIR,
+            value,
+        )
+        .unwrap();
+    image.save_bank(&variables.encode().unwrap()).unwrap();
+    bytes[..CAPACITY].copy_from_slice(image.bytes());
+    fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn repair_lets_an_automatic_metal_plugin_repair_that_did_not_help_run_again() {
+    use stela_boot_core::bundle_repair::Record;
+    let mut f = fixture(64 * GIB, false);
+    add_installed_disk(&mut f, &[], &[]);
+    setup(&environment(&f.host), installed_command(&f)).unwrap();
+    let status = || rerun(&f, |c| c.action = Action::Status).unwrap();
+    assert!(!status().contains("Metal plugin"));
+    // Both attempts ran and the plugin is still missing: the next boot
+    // stops, and a PC without COM1 has no single-user console to fix it.
+    for value in [
+        stela_loader::boot_selection::BUNDLE_REPAIR_ATTEMPTED,
+        stela_loader::boot_selection::BUNDLE_REPAIR_RETRIED,
+    ] {
+        set_bundle_repair(&f, value);
+        let report = status();
+        assert!(
+            report.contains("the automatic repair ran and did not install it"),
+            "{report}"
+        );
+        assert!(report.contains("repair` lets it run again"), "{report}");
+        let before = partition_bytes(&f, NOR);
+        let plan = rerun(&f, |c| {
+            c.action = Action::Repair;
+            c.dry_run = true;
+        })
+        .unwrap();
+        assert!(
+            plan.contains("Metal plugin   install \"macOS\": the automatic repair would run again"),
+            "{plan}"
+        );
+        assert_eq!(partition_bytes(&f, NOR), before);
+        let report = rerun(&f, |c| c.action = Action::Repair).unwrap();
+        assert!(
+            report.contains("the automatic repair runs again at the next start"),
+            "{report}"
+        );
+        assert_eq!(Record::read(&nvram(&f)), Record::Pending);
+        assert!(
+            stela_loader::boot_selection::select(&nvram(&f))
+                .unwrap()
+                .bundle_repair
+        );
+        assert!(
+            status().contains("Metal plugin   the automatic repair runs at the next start"),
+            "{}",
+            status()
+        );
+        // A request still waiting is left alone.
+        let report = rerun(&f, |c| c.action = Action::Repair).unwrap();
+        assert!(!report.contains("Metal plugin"), "{report}");
+    }
+}
+
 #[test]
 fn repair_restores_recorded_state() {
     let mut f = fixture(64 * GIB, false);
