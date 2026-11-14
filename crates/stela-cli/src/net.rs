@@ -94,6 +94,24 @@ fn unreachable(cause: &(dyn Error + 'static)) -> bool {
     })
 }
 
+/// Whether a TLS failure's lower-case text says the certificate's dates do
+/// not cover this computer's clock: rustls (`certificate expired`,
+/// `certificate not valid yet`, `Expired`, `NotValidYet`), OpenSSL
+/// (`certificate has expired`, `certificate is not yet valid`), SChannel
+/// (`not within its validity period`) and Security.framework (`expired`).
+fn clock_wrong(lower: &str) -> bool {
+    let tls = lower.contains("certificate") || lower.contains("tls") || lower.contains("ssl");
+    tls && [
+        "expired",
+        "not valid yet",
+        "not yet valid",
+        "notvalidyet",
+        "validity period",
+    ]
+    .iter()
+    .any(|words| lower.contains(words))
+}
+
 /// [`explain`] for any error, one that ran out of time when `timed_out`.
 pub(crate) fn explain_causes(error: &(dyn Error + 'static), timed_out: bool) -> String {
     let mut text = error.to_string();
@@ -116,6 +134,11 @@ pub(crate) fn explain_causes(error: &(dyn Error + 'static), timed_out: bool) -> 
         || lower.contains("nodename nor servname")
     {
         Some("this computer cannot look up the server's name: check its network connection")
+    } else if clock_wrong(&lower) {
+        Some(
+            "the server's HTTPS certificate is not valid at this computer's date and time: check \
+             that its clock is right",
+        )
     } else if lower.contains("certificate") || lower.contains("unknownissuer") {
         Some(
             "the server's HTTPS certificate is not one this computer trusts. A network that \
@@ -236,6 +259,60 @@ pub(crate) mod tests {
             "{error}"
         );
         assert!(error.contains("cannot reach the server"), "{error}");
+    }
+
+    #[test]
+    fn a_certificate_outside_its_dates_names_the_clock_not_the_network() {
+        /// The TLS library's text, below the HTTP client's.
+        #[derive(Debug)]
+        struct Cause(String);
+        impl std::fmt::Display for Cause {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+        impl Error for Cause {}
+        #[derive(Debug)]
+        struct Request(Cause);
+        impl std::fmt::Display for Request {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error sending request")
+            }
+        }
+        impl Error for Request {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        for text in [
+            // rustls, with and without the dates.
+            "invalid peer certificate: certificate expired: verification time 2582000000 \
+             (UNIX), but certificate is not valid after 1790000000 (792000000 seconds ago)",
+            "invalid peer certificate: certificate not valid yet: verification time 946684800 \
+             (UNIX), but certificate is not valid before 1760000000 (813315200 seconds in future)",
+            "invalid peer certificate: Expired",
+            "invalid peer certificate: NotValidYet",
+            // OpenSSL, through native-tls.
+            "error:0A000086:SSL routines:tls_post_process_server_certificate:certificate verify \
+             failed:ssl/statem/statem_clnt.c:1889: (certificate has expired)",
+            "certificate verify failed: (certificate is not yet valid)",
+            // SChannel.
+            "A required certificate is not within its validity period when verifying against \
+             the current system clock or the timestamp in the signed file. (os error -2146762495)",
+        ] {
+            let explained = explain_causes(&Request(Cause(text.into())), false);
+            assert!(
+                explained.contains("check that its clock is right"),
+                "{explained}"
+            );
+            assert!(!explained.contains("intercepts HTTPS"), "{explained}");
+        }
+        // A certificate this computer does not trust is still the network's.
+        let explained = explain_causes(
+            &Request(Cause("invalid peer certificate: UnknownIssuer".into())),
+            false,
+        );
+        assert!(explained.contains("intercepts HTTPS"), "{explained}");
     }
 
     #[test]
