@@ -448,7 +448,6 @@ unsafe fn attach_with_timeout(
             tail: 0,
             head: 0,
             phase: true,
-            consumed: 0,
         },
         io: Queue {
             submissions: Buffer::Empty,
@@ -458,7 +457,6 @@ unsafe fn attach_with_timeout(
             tail: 0,
             head: 0,
             phase: true,
-            consumed: 0,
         },
         admin_data: Buffer::Empty,
         pool: Pool::new(alloc::vec::Vec::new()),

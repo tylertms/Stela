@@ -285,12 +285,13 @@ impl Controller {
     /// each: an Asynchronous Event Request's is kept for
     /// [`Self::service_events`] and an Abort's ends it. Command `id`'s result
     /// and status once posted, giving the admin page back to the CPU when
-    /// it holds `data`; any other completion breaks the protocol.
+    /// it holds `data`. A completion that names no outstanding command is
+    /// passed over ([`Self::stray_completion`]).
     pub(super) fn admin_completion(
         &mut self,
         expected: Option<(u16, bool)>,
     ) -> Result<Option<(u32, u32)>, BlockError> {
-        while let Some((id, result, status, _)) = self.posted(false)? {
+        while let Some((id, result, status)) = self.posted(false)? {
             self.ring_completion(false)?;
             if self.events.request == Some(id) {
                 self.events.request = None;
@@ -306,7 +307,7 @@ impl Controller {
                 }
                 return Ok(Some((result, status)));
             } else {
-                return Err(BlockError::Device { status: 0xffff });
+                self.stray_completion()?;
             }
         }
         Ok(None)

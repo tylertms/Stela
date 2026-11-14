@@ -392,8 +392,6 @@ struct Queue {
     tail: u16,
     head: u16,
     phase: bool,
-    /// The submission head the controller last reported.
-    consumed: u16,
 }
 
 impl Queue {
@@ -406,7 +404,6 @@ impl Queue {
             tail: 0,
             head: 0,
             phase: true,
-            consumed: 0,
         })
     }
 
@@ -415,37 +412,12 @@ impl Queue {
         self.tail = 0;
         self.head = 0;
         self.phase = true;
-        self.consumed = 0;
     }
 
     /// The next position after an already validated index.
     fn next(&self, slot: u16) -> u16 {
         let next = slot + 1;
         if next == self.entries { 0 } else { next }
-    }
-
-    /// Whether a reported submission head lies no earlier than the last
-    /// one and no further than the tail, in ring order: commands fetched
-    /// together may complete reporting the same head.
-    fn consumes(&self, head: u16) -> bool {
-        head < self.entries
-            && self.ahead(self.consumed, head) <= self.ahead(self.consumed, self.tail)
-    }
-
-    /// Whether `head` shows the command at submission `slot` fetched: past
-    /// it, and no further than the tail.
-    fn fetched(&self, slot: u16, head: u16) -> bool {
-        let past = self.ahead(slot, head);
-        past != 0 && past <= self.ahead(slot, self.tail)
-    }
-
-    /// How many entries `to` lies after `from`, in ring order.
-    fn ahead(&self, from: u16, to: u16) -> u16 {
-        if to >= from {
-            to - from
-        } else {
-            self.entries - (from - to)
-        }
     }
 }
 
@@ -514,10 +486,6 @@ enum Tag {
     Free,
     Running {
         id: u16,
-        /// Its submission queue entry.
-        slot: u16,
-        /// An accepted submission head has passed this command.
-        fetched: bool,
         namespace: u32,
         block: usize,
         command: Command,

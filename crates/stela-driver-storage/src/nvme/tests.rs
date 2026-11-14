@@ -142,35 +142,61 @@ fn a_timeout_aborts_then_a_controller_that_stays_down_poisons_its_siblings() {
     assert_eq!(fixture.disk.controller.borrow().command_id, 2);
 }
 
+/// A completion is taken by its command identifier alone, as Linux's
+/// `nvme_handle_cqe` takes it: the submission queue identifier and head it
+/// reports are not read, so a stale, early or foreign head does not fail the
+/// controller.
 #[test]
-fn unrelated_or_malformed_completions_do_not_retire_our_command() {
-    for (cid, sqid, head) in [
-        (2u32, 1u32, 1u32),
-        (1, 2, 1),
-        (1, 1, 16),
-        (1, 1, 0),
-        (1, 1, 2),
-    ] {
+fn completions_are_taken_whatever_submission_queue_and_head_they_report() {
+    for (sqid, head) in [(2u32, 1u32), (1, 16), (1, 0), (1, 2), (1, 63)] {
         let mut fixture = Fixture::new();
         {
             let mut c = fixture.disk.controller.borrow_mut();
             c.io.completions.write(8, sqid << 16 | head);
-            c.io.completions.write(12, 1u32 << 16 | cid);
+            c.io.completions.write(12, 1u32 << 16 | 1);
         }
-        let error = BlockError::Device { status: 0xffff };
-        assert_eq!(fixture.disk.flush(), Err(error.clone()));
-        assert_eq!(fixture.disk.write(0, &[0x71; 512]), Err(error));
+        assert_eq!(fixture.disk.flush(), Ok(()));
         let c = fixture.disk.controller.borrow();
-        assert_eq!(c.io.head, 0);
-        assert_eq!(c.registers.read32(DOORBELLS + 12).unwrap(), 0);
-        assert!(pool_untouched(&c));
+        assert_eq!(c.io.head, 1);
+        assert_eq!(c.registers.read32(DOORBELLS + 12).unwrap(), 1);
+        assert!(c.fault.is_none());
     }
 }
 
+/// A completion naming no outstanding command is passed over, as Linux
+/// reports an invalid ID and goes on: the entry is retired and counted as a
+/// status read, the controller keeps working and the running command takes
+/// its own completion when it comes.
 #[test]
-fn sq_head_validation_preserves_wrap_and_rejects_stale_or_ahead_heads() {
+fn a_completion_naming_no_command_is_passed_over() {
+    let mut fixture = Fixture::new();
+    let disk = &mut fixture.disk;
+    let read = disk.start(Command::Read { lba: 0, bytes: 512 }).unwrap();
+    {
+        let mut controller = disk.controller.borrow_mut();
+        let id = running_id(&controller, read);
+        post(&mut controller, id.wrapping_add(7), 0);
+    }
+    assert_eq!(disk.finish(read), None);
+    {
+        let mut controller = disk.controller.borrow_mut();
+        assert!(controller.fault.is_none());
+        assert_eq!(controller.io.head, 1);
+        assert_eq!(controller.registers.read32(DOORBELLS + 12).unwrap(), 1);
+        controller.tag_page(read as usize, 0).bytes_mut()[..512].fill(0x5a);
+        let id = running_id(&controller, read);
+        post(&mut controller, id, 0);
+    }
+    assert_eq!(disk.finish(read), Some(Ok(Some(vec![0x5a; 512]))));
+    assert!(disk.controller.borrow().fault.is_none());
+}
+
+/// The completion queue wraps with its phase whatever submission head the
+/// last entry before the wrap reports: a stale or early head is not read.
+#[test]
+fn the_completion_queue_wraps_whatever_head_its_entries_report() {
     let stale = u32::from(IO_ENTRIES - 1);
-    for invalid_head in [None, Some(stale), Some(1)] {
+    for reported in [0, stale, 1] {
         let mut fixture = Fixture::new();
         for next in 1..IO_ENTRIES {
             {
@@ -186,30 +212,19 @@ fn sq_head_validation_preserves_wrap_and_rejects_stale_or_ahead_heads() {
         {
             let mut c = fixture.disk.controller.borrow_mut();
             let last = usize::from(IO_ENTRIES - 1) * 16;
-            c.io.completions
-                .write(last + 8, 1u32 << 16 | invalid_head.unwrap_or(0));
+            c.io.completions.write(last + 8, 1u32 << 16 | reported);
             c.io.completions
                 .write(last + 12, 1u32 << 16 | u32::from(IO_ENTRIES));
         }
-        let result = fixture.disk.flush();
+        assert_eq!(fixture.disk.flush(), Ok(()));
         let mut c = fixture.disk.controller.borrow_mut();
         assert_eq!(c.io.tail, 0);
-        match invalid_head {
-            Some(_) => {
-                assert_eq!(result, Err(BlockError::Device { status: 0xffff }));
-                assert_eq!(c.io.head, IO_ENTRIES - 1);
-                assert!(c.io.phase);
-            }
-            None => {
-                assert_eq!(result, Ok(()));
-                assert_eq!(c.io.head, 0);
-                assert!(!c.io.phase);
-                c.io.completions.write(8, 1u32 << 16 | 1);
-                c.io.completions.write(12, u32::from(IO_ENTRIES) + 1); // New phase is zero.
-                drop(c);
-                fixture.disk.flush().unwrap();
-            }
-        }
+        assert_eq!(c.io.head, 0);
+        assert!(!c.io.phase);
+        c.io.completions.write(8, 1u32 << 16 | 1);
+        c.io.completions.write(12, u32::from(IO_ENTRIES) + 1); // New phase is zero.
+        drop(c);
+        fixture.disk.flush().unwrap();
     }
 }
 
@@ -409,6 +424,42 @@ fn answer_next_admin(controller: &mut Controller) {
         .admin
         .completions
         .write(entry + 12, phase | u32::from(id));
+}
+
+/// An admin completion naming no outstanding command is passed over while
+/// the controller's status is good, and the command waited for takes the
+/// completion after it; with a fatal status the stray one is the
+/// controller's failure.
+#[test]
+fn an_admin_completion_naming_no_command_is_passed_over() {
+    let _clock = crate::test_clock::virtualize();
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    let stray = |c: &mut Controller| {
+        let id = c.command_id.wrapping_add(9);
+        let entry = usize::from(c.admin.head) * 16;
+        let phase = u32::from(c.admin.phase) << 16;
+        c.admin.completions.write(entry + 12, phase | u32::from(id));
+        c.admin.head = c.admin.next(c.admin.head);
+    };
+    let head = c.admin.head;
+    stray(&mut c);
+    answer_next_admin(&mut c);
+    c.admin.head = head;
+    let identify = c.identify_command(IDENTIFY_CONTROLLER, 0).unwrap();
+    assert_eq!(c.admin(identify), Ok(0));
+    assert_eq!(c.fault, None);
+    assert_eq!(c.admin.head, c.admin.next(c.admin.next(head)));
+
+    c.registers.write32(STATUS, READY | FATAL).unwrap();
+    stray(&mut c);
+    c.admin.head = c.admin.next(c.admin.next(head));
+    assert_eq!(
+        c.admin_completion(None),
+        Err(BlockError::Device {
+            status: READY | FATAL
+        })
+    );
 }
 
 /// Linux `nvme_wait_ready` ends at CSTS.RDY and reads no more of CSTS
@@ -660,12 +711,23 @@ fn pool_untouched(controller: &Controller) -> bool {
         .all(|page| page.bytes().iter().all(|byte| *byte == 0))
 }
 
+/// The submission entry of tag `tag`'s running command, found by its
+/// identifier.
+fn submission(controller: &Controller, tag: u32) -> &[u8] {
+    let id = running_id(controller, tag);
+    controller
+        .io
+        .submissions
+        .bytes()
+        .chunks(64)
+        .take(usize::from(IO_ENTRIES))
+        .find(|entry| u16::from_le_bytes([entry[2], entry[3]]) == id)
+        .expect("the command's submission entry")
+}
+
 /// The submission entry of tag `tag`'s command: its PRP1 and PRP2.
 fn prps(controller: &Controller, tag: u32) -> (u64, u64) {
-    let Tag::Running { slot, .. } = controller.tags[tag as usize] else {
-        panic!("tag {tag} runs nothing");
-    };
-    let entry = &controller.io.submissions.bytes()[usize::from(slot) * 64..][..64];
+    let entry = submission(controller, tag);
     let word = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().unwrap());
     (word(24), word(32))
 }
@@ -764,10 +826,7 @@ fn a_write_across_pages_copies_each_page_and_keeps_force_unit_access() {
             .extend_from_slice(&controller.tag_page(write as usize, index).bytes()[..part.len()]);
     }
     assert_eq!(written, data);
-    let Tag::Running { slot, .. } = controller.tags[write as usize] else {
-        panic!("the write runs");
-    };
-    let entry = &controller.io.submissions.bytes()[usize::from(slot) * 64..][..64];
+    let entry = submission(&controller, write);
     let cdw12 = u32::from_le_bytes(entry[48..52].try_into().unwrap());
     assert_eq!(cdw12, FORCE_UNIT_ACCESS | (data.len() / 512 - 1) as u32);
 }
@@ -953,12 +1012,14 @@ fn a_completed_borrowed_read_survives_a_later_cq_fault() {
     let id = running_id(&controller, read);
     controller.tag_page(read as usize, 0).bytes_mut()[..512].fill(0x5a);
     post(&mut controller, id, 0);
+    // A stray completion from a controller that is gone.
     let other_id = running_id(&controller, other);
-    controller.io.completions.write(16 + 8, 2u32 << 16 | 2);
+    controller.io.completions.write(16 + 8, 1u32 << 16 | 2);
     controller
         .io
         .completions
-        .write(16 + 12, 1u32 << 16 | u32::from(other_id));
+        .write(16 + 12, 1u32 << 16 | u32::from(other_id.wrapping_add(5)));
+    controller.registers.write32(STATUS, REMOVED).unwrap();
     let mut data = [0x11; 512];
     assert_eq!(
         controller.finish_into(read as usize, Some(&mut data)),
@@ -966,10 +1027,7 @@ fn a_completed_borrowed_read_survives_a_later_cq_fault() {
     );
     assert_eq!(data, [0x5a; 512]);
     assert_eq!(controller.io.head, 1);
-    assert_eq!(
-        controller.finish(other as usize),
-        Some(Err(BlockError::Device { status: 0xffff }))
-    );
+    assert_eq!(controller.finish(other as usize), Some(Err(removed())));
 }
 
 #[test]
@@ -1016,7 +1074,6 @@ fn delayed_read_completes_after_submission_ring_wraps() {
         {
             let mut controller = disk.controller.borrow_mut();
             assert_eq!(controller.io.tail, 0);
-            assert_eq!(controller.io.consumed, 0);
             controller.tag_page(delayed as usize, 0).bytes_mut()[..512].fill(0x42);
             post(&mut controller, delayed_id, 0);
         }
@@ -1025,8 +1082,10 @@ fn delayed_read_completes_after_submission_ring_wraps() {
     }
 }
 
+/// A reused tag's new command completes by its identifier, whatever
+/// submission head its completion reports.
 #[test]
-fn reused_tag_requires_its_new_submission_to_be_fetched() {
+fn a_reused_tag_completes_by_its_new_identifier() {
     let _clock = crate::test_clock::virtualize();
     let mut fixture = Fixture::new();
     let disk = &mut fixture.disk;
@@ -1042,23 +1101,18 @@ fn reused_tag_requires_its_new_submission_to_be_fetched() {
     {
         let mut controller = disk.controller.borrow_mut();
         let id = running_id(&controller, second);
+        controller.tag_page(second as usize, 0).bytes_mut()[..512].fill(0x33);
         let entry = usize::from(controller.io.head) * 16;
-        let consumed = u32::from(controller.io.consumed);
         let phase = u32::from(controller.io.phase) << 16;
-        controller
-            .io
-            .completions
-            .write(entry + 8, 1u32 << 16 | consumed);
+        // The first command's head, which the second has not passed.
+        controller.io.completions.write(entry + 8, 1u32 << 16 | 1);
         controller
             .io
             .completions
             .write(entry + 12, phase | u32::from(id));
     }
-    assert_eq!(
-        disk.finish(second),
-        Some(Err(BlockError::Device { status: 0xffff }))
-    );
-    assert_eq!(disk.controller.borrow().io.head, 1);
+    assert_eq!(disk.finish(second), Some(Ok(Some(vec![0x33; 512]))));
+    assert_eq!(disk.controller.borrow().io.head, 2);
 }
 
 #[test]
@@ -1574,26 +1628,6 @@ fn completions_are_trusted_without_a_status_read_unless_they_look_invalid() {
     assert_eq!(disk.controller.borrow().fault, Some(error));
 }
 
-/// An invalid completion from a controller whose status is good poisons it
-/// as a corrupt queue.
-#[test]
-fn an_invalid_completion_from_a_healthy_controller_is_a_corrupt_queue() {
-    let mut fixture = Fixture::new();
-    let disk = &mut fixture.disk;
-    let read = disk.start(Command::Read { lba: 0, bytes: 512 }).unwrap();
-    {
-        let mut controller = disk.controller.borrow_mut();
-        controller.registers.write32(STATUS, READY).unwrap();
-        let id = running_id(&controller, read);
-        post(&mut controller, id.wrapping_add(7), 0);
-    }
-    let corrupt = BlockError::Device { status: 0xffff };
-    assert_eq!(disk.finish(read), Some(Err(corrupt)));
-}
-
-/// A dead controller posts nothing: its commands' timeout reads its status,
-/// within the command deadline, and resets one that failed fatally and
-/// fails the commands of one that reads all ones.
 #[test]
 fn a_dead_controller_is_found_at_the_command_timeout() {
     let _clock = crate::test_clock::virtualize();

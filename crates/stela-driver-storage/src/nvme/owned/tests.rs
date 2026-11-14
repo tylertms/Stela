@@ -1160,37 +1160,47 @@ fn invalid_clock_keeps_unadmitted_original_owners_without_any_effect() {
         assert_eq!(f.source.released.load(Ordering::SeqCst), 0);
     }
 }
+/// A completion's submission queue identifier and head are not read, as
+/// Linux's `nvme_handle_cqe` reads neither: commands whose completions
+/// report another queue or a moved head complete with their data.
 #[test]
-fn owned_bad_cqe_identity_never_reuses_dma() {
-    for mutation in [Mutation::Cid, Mutation::Sqid, Mutation::Head] {
+fn owned_cqe_queue_identifier_and_head_are_not_read() {
+    for mutation in [Mutation::Sqid, Mutation::Head] {
         let f = Fixture::new();
         let mut a = f.attach().unwrap();
         let disk = &mut a.namespaces[0];
-        let mut sibling = Namespace {
-            controller: disk.controller.clone(),
-            namespace: disk.namespace,
-            identity: disk.identity.clone(),
-            ids: disk.ids.clone(),
-            scanned: disk.scanned,
-            removed: None,
-        };
-        let before = f.model.lock().unwrap().sync_cpu;
         f.model.lock().unwrap().mutation = mutation;
-        assert!(disk.read(0, &mut [0xa5; 512]).is_err());
-        let commands = f.model.lock().unwrap().commands;
-        assert!(disk.write(0, &[1; 512]).is_err());
-        assert!(disk.flush().is_err());
-        let mut output = [0xa5; 512];
-        assert!(sibling.read(0, &mut output).is_err());
-        assert_eq!(output, [0xa5; 512]);
-        let m = f.model.lock().unwrap();
-        assert_eq!(m.commands, commands);
-        assert_eq!(m.sync_cpu, before);
-        assert_eq!(m.maps.len(), BUFFERS);
-        drop(m);
+        disk.write(0, &[0x3c; 512]).unwrap();
+        disk.flush().unwrap();
+        let mut output = [0; 512];
+        disk.read(0, &mut output).unwrap();
+        assert_eq!(output, [0x3c; 512]);
         disk.retire_owned().unwrap();
         assert!(f.model.lock().unwrap().released);
     }
+}
+
+/// Completions that name no outstanding command are passed over: the CPU
+/// takes back no memory for them (the model refuses a CPU acquire of a page
+/// a command still holds), and the commands they should have ended fail
+/// through their deadlines, Aborts and resets, with the caller's buffer
+/// untouched.
+#[test]
+fn owned_stray_cqe_never_reuses_dma() {
+    let f = Fixture::new();
+    let mut a = f.attach().unwrap();
+    let disk = &mut a.namespaces[0];
+    f.model.lock().unwrap().mutation = Mutation::Cid;
+    let mut output = [0xa5; 512];
+    assert!(disk.read(0, &mut output).is_err());
+    assert_eq!(output, [0xa5; 512]);
+    {
+        let m = f.model.lock().unwrap();
+        assert!(m.events.contains(&"drain"));
+        assert_eq!(m.maps.len(), BUFFERS);
+    }
+    disk.retire_owned().unwrap();
+    assert!(f.model.lock().unwrap().released);
 }
 /// A controller that never sets CSTS.RDY fails its attach at CAP.TO; with
 /// CAP.TO at its largest (127.5 s) a passed device start budget ends the
