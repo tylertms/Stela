@@ -6493,6 +6493,67 @@ fn journey_h_without_a_terminal_plain_stela_reports_and_fails_when_something_is_
 }
 
 #[test]
+fn yes_makes_plain_stela_do_what_is_due_and_accept_what_an_action_asks() {
+    // Without a terminal: the due update runs instead of failing.
+    let f = made_by(None);
+    let yes = command::Global {
+        yes: true,
+        ..command::Global::default()
+    };
+    let request = Request {
+        efi: Some(f.efi.clone()),
+        ..Request::home(yes)
+    };
+    home::run(&environment(&f.host), request).unwrap();
+    assert_eq!(record(&f).release.as_deref(), Some(release::CURRENT));
+    // A stick with nothing due is left as it is.
+    let before = stick_files(&f);
+    let request = Request {
+        efi: Some(f.efi.clone()),
+        ..Request::home(yes)
+    };
+    home::run(&environment(&f.host), request).unwrap();
+    assert_eq!(stick_files(&f), before);
+    // On a terminal: a repair's download question is accepted, as `stela
+    // repair --yes` accepts it.
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    let medium = record(&f).active_medium().cloned().unwrap();
+    let first = medium
+        .directory()
+        .join(stela_formats::payload::piece_name(0));
+    let piece = fs::read(&first).unwrap();
+    fs::write(&first, &piece[1..]).unwrap();
+    let size = |_: &str, _: &str| -> Result<(u64, u64)> { Ok((1_000_000, 3_000_000_000)) };
+    let fetch = |_: &Path, _: &str, _: &str, need: sources::Need| -> Result<sources::Fetched> {
+        anyhow::bail!("asked for {need:?}")
+    };
+    let person = ui::tests::Scripted::new(&["Repair"]);
+    let request = Request {
+        efi: Some(f.efi.clone()),
+        ..Request::home(yes)
+    };
+    let error = home::run(
+        &Environment {
+            image_size: &size,
+            fetch_image: &fetch,
+            ui: &person,
+            ..environment(&f.host)
+        },
+        request,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("asked for Pieces"), "{error}");
+    assert!(
+        !person.transcript().contains("from Apple"),
+        "{}",
+        person.transcript()
+    );
+}
+
+#[test]
 fn journey_settings_change_the_wifi_and_cancel_changes_nothing() {
     let f = made_by(Some(release::CURRENT));
     let before = stick_files(&f);

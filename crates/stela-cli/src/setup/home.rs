@@ -7,7 +7,9 @@
 //! read whole): no Stela, an interrupted first create, an interrupted macOS
 //! switch, a newer or older Stela than this one, problems, or healthy.
 //! Without a terminal nothing is asked: the report names the command for
-//! each stick, and the run fails when one is due.
+//! each stick, and the run fails when one is due, unless `--yes` accepts
+//! it: then each due command runs as it would with `--yes`. On a terminal,
+//! `--yes` accepts the questions an action asks, as a command's does.
 use super::{
     Action, Environment, Record, Reported, Request, builds, doctor, host, read_record, release,
     sources, ui::Ui, wizard,
@@ -109,10 +111,6 @@ impl Stick {
     /// The command that is due for it, if any; with the stick named when
     /// `several` fit.
     pub(super) fn next(&self, several: bool) -> Option<String> {
-        let stick = || match several {
-            true => format!(" {}", self.path()),
-            false => String::new(),
-        };
         match &self.state {
             State::Empty if self.disk.bytes != 0 && self.disk.bytes < NETWORK_MIN => None,
             // Without a terminal, erasing needs the stick typed back.
@@ -124,12 +122,33 @@ impl Stick {
                     bytes => host::size_text(bytes).replace(' ', ""),
                 }
             )),
-            State::Interrupted | State::Replacing(_) | State::Damaged(_) => {
-                Some(format!("stela repair{}", stick()))
-            }
-            State::Older => Some(format!("stela update{}", stick())),
-            State::Newer(_) | State::Healthy => None,
+            _ => self.due().map(|action| match several {
+                true => format!("stela {} {}", super::command_words(&action), self.path()),
+                false => format!("stela {}", super::command_words(&action)),
+            }),
         }
+    }
+
+    /// What a Stela stick needs, if anything: `repair` finishes or puts
+    /// back, `update` brings an older one to this Stela.
+    fn due(&self) -> Option<Action> {
+        match &self.state {
+            State::Interrupted | State::Replacing(_) | State::Damaged(_) => Some(Action::Repair),
+            State::Older => Some(Action::UpdateStela),
+            State::Empty | State::Newer(_) | State::Healthy => None,
+        }
+    }
+}
+
+/// `action` on `stick`, with the options plain `stela` was given.
+fn maintenance(request: &Request, stick: &Stick, action: Action) -> Request {
+    Request {
+        action,
+        usb: stick.volume.clone().unwrap_or_default(),
+        dry_run: request.dry_run,
+        yes: request.yes,
+        efi: request.efi.clone(),
+        ..Request::default()
     }
 }
 
@@ -269,12 +288,23 @@ pub(super) fn report(sticks: &[Stick]) -> (String, bool) {
 pub(super) fn run(environment: &Environment<'_>, request: Request) -> Result<()> {
     let ui = environment.ui;
     if !ui.interactive() {
-        let (text, due) = report(&sticks(environment)?);
+        let sticks = sticks(environment)?;
+        let (text, due) = report(&sticks);
         print!("{text}");
-        return match due {
-            true => Err(Due.into()),
-            false => Ok(()),
-        };
+        if !due {
+            return Ok(());
+        }
+        // `--yes` accepts what is due: each stick's command runs as
+        // `stela update --yes` or `stela repair --yes` would.
+        if !request.yes {
+            return Err(Due.into());
+        }
+        for stick in &sticks {
+            if let Some(action) = stick.due() {
+                perform(environment, maintenance(&request, stick, action))?;
+            }
+        }
+        return Ok(());
     }
     ui.intro(&format!("Stela {}", release::CURRENT))?;
     match look(environment, request) {
@@ -344,13 +374,7 @@ fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<
         ui.info(&details)?;
     }
     let volume = stick.volume.clone().unwrap_or_default();
-    let maintenance = |action: Action| Request {
-        action,
-        usb: volume.clone(),
-        dry_run: request.dry_run,
-        efi: request.efi.clone(),
-        ..Request::default()
-    };
+    let maintenance = |action: Action| maintenance(&request, &stick, action);
     match &stick.state {
         State::Empty if stick.disk.bytes != 0 && stick.disk.bytes < NETWORK_MIN => {
             ui.warning(&format!(
@@ -629,13 +653,7 @@ fn menu(environment: &Environment<'_>, request: Request, stick: &Stick) -> Resul
     row(LOGS, "Save the boot logs for a bug report".into(), "");
     row(ERASE, "Erase it and make a new installer".into(), "");
     row(QUIT, "Quit".into(), "");
-    let maintenance = |action: Action| Request {
-        action,
-        usb: volume.clone(),
-        dry_run: request.dry_run,
-        efi: request.efi.clone(),
-        ..Request::default()
-    };
+    let maintenance = |action: Action| maintenance(&request, stick, action);
     if matches!(stick.state, State::Healthy) {
         ui.info("This stick is ready.")?;
     }
