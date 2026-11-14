@@ -253,6 +253,36 @@ fn nir_compiled_this_boot_is_offered_once_and_read_back_after_the_cache() {
 }
 
 #[test]
+fn nir_is_kept_only_while_the_file_can_hold_it_beside_the_cache() {
+    let gpu = gpu();
+    let key = Key::new(COMPILER, &gpu);
+    // A file of the header, a 100-byte cache, a stored entry of 4 bytes and
+    // room for one more of 64.
+    let mut nir = Vec::new();
+    push_entry(&mut nir, &[1; 32], &[1; 4]);
+    let bytes = sealed(&key, &[5; 100], &nir);
+    let bound = bytes.len() as u64 + 36 + 64;
+    let mut store = Store::new(bytes, COMPILER, bound);
+    let claim = store.claim(&gpu).unwrap();
+    store.add_nir([2; 32], &[2; 64]);
+    store.add_nir([3; 32], &[3; 1]);
+    let update = store.update().unwrap();
+    let keys: Vec<_> = NirEntries(&update.nir).map(|(key, _)| key).collect();
+    assert_eq!(keys, [[2; 32]]);
+    // A larger newest cache leaves less room.
+    let mut blank = Store::new(&[], COMPILER, HEADER_BYTES as u64 + 200);
+    let claim_blank = blank.claim(&gpu).unwrap();
+    blank.keep(&claim_blank, vec![0; 150]);
+    blank.add_nir([4; 32], &[4; 20]);
+    blank.add_nir([5; 32], &[5; 1]);
+    let keys: Vec<_> = NirEntries(&blank.update().unwrap().nir)
+        .map(|(key, _)| key)
+        .collect();
+    assert_eq!(keys, [[5; 32]]);
+    drop(claim);
+}
+
+#[test]
 fn damaged_nir_is_dropped_and_the_cache_kept() {
     let gpu = gpu();
     let key = Key::new(COMPILER, &gpu);

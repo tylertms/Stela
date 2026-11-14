@@ -224,7 +224,8 @@ fn change(update: &pipeline_store::Update, committed: Option<&Commit>) -> Change
     let mut change = Change::default();
     if let Some(cache) = &update.cache {
         change.replace.push(CACHE);
-        change.blobs.push(Blob::new(CACHE, cache.to_vec()));
+        // Shared with the store's snapshot, not copied.
+        change.blobs.push(Blob::new(CACHE, cache.clone()));
     }
     if !update.nir.is_empty() {
         let pieces = committed

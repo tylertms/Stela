@@ -356,11 +356,12 @@ impl Store {
         })
     }
 
-    /// Keeps `blob`, NIR of `key` compiled this boot, for the next.
+    /// Keeps `blob`, NIR of `key` compiled this boot, for the next, while
+    /// it fits [`Self::nir_room`].
     pub fn add_nir(&mut self, key: [u8; 32], blob: &[u8]) {
         let bytes = blob.len() as u64 + 36;
         if self.matched.is_none() && self.owner.is_none()
-            || self.nir_bytes + bytes > MAX_NIR_BYTES
+            || self.nir_bytes + bytes > self.nir_room()
             || self.stored_keys.contains(&key)
         {
             return;
@@ -368,6 +369,20 @@ impl Store {
         if self.nir.insert(key, blob.to_vec()).is_none() {
             self.nir_bytes += bytes;
         }
+    }
+
+    /// The bytes of NIR added this boot that the file can still hold: its
+    /// bound less the header, the newest cache and the stored NIR, and at
+    /// most [`MAX_NIR_BYTES`]. NIR past it could never be written, and
+    /// would only be held in the heap.
+    fn nir_room(&self) -> u64 {
+        let cache = match (&self.kept, self.matched) {
+            (Some((_, kept)), _) => kept.len(),
+            (None, Some(key)) => payload(self.stored, &key, self.bound).map_or(0, <[u8]>::len),
+            (None, None) => 0,
+        };
+        let held = HEADER_BYTES as u64 + cache as u64 + self.stored_nir().0.len() as u64;
+        self.bound.saturating_sub(held).min(MAX_NIR_BYTES)
     }
 
     /// The serialized NIR of `key` that [`Self::add_nir`] kept this boot.
@@ -454,7 +469,7 @@ impl Store {
         (cache.is_some() || !nir.is_empty()).then_some(Update {
             key,
             cache,
-            nir,
+            nir: Arc::new(nir),
             cache_version: self.kept_version,
             nir_keys,
         })
@@ -489,8 +504,9 @@ pub struct Update {
     pub key: Key,
     /// The newest cache snapshot, which replaces the written one.
     pub cache: Option<Arc<Vec<u8>>>,
-    /// NIR entries ([`NirEntries`]) added to the written ones.
-    pub nir: Vec<u8>,
+    /// NIR entries ([`NirEntries`]) added to the written ones, shared with
+    /// the write rather than copied.
+    pub nir: Arc<Vec<u8>>,
     cache_version: u64,
     nir_keys: Vec<[u8; 32]>,
 }

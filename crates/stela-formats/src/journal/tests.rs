@@ -557,3 +557,18 @@ fn the_largest_free_run_takes_a_blob_beside_every_committed_one() {
     let (_, blobs) = content(&file.bytes).unwrap();
     assert_eq!(blobs, vec![(LOG, blob(3, free as usize))]);
 }
+
+#[test]
+fn a_shared_blob_is_read_without_a_copy_of_its_own() {
+    let shared = Arc::new(vec![1u8, 2, 3, 4]);
+    let blob = Blob::new(CACHE, shared.clone());
+    assert_eq!(blob.length(), 4);
+    assert_eq!(
+        Arc::strong_count(&shared),
+        2,
+        "the blob holds the same bytes"
+    );
+    let mut into = [0; 2];
+    blob.source.read_at(1, &mut into);
+    assert_eq!(into, [2, 3]);
+}

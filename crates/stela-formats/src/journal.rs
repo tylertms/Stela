@@ -75,6 +75,15 @@ impl Source for Vec<u8> {
     }
 }
 
+impl Source for Arc<Vec<u8>> {
+    fn length(&self) -> u64 {
+        self.as_slice().length()
+    }
+    fn read_at(&self, offset: u64, into: &mut [u8]) {
+        self.as_slice().read_at(offset, into);
+    }
+}
+
 impl Source for &[u8] {
     fn length(&self) -> u64 {
         (**self).length()
