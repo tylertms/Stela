@@ -297,7 +297,11 @@ impl HostUsb {
             for device in &added.devices {
                 output::arguments(format_args!("USB added {}\n", device.location));
             }
-            if !added.disks.is_empty() || !added.storage.is_empty() || !added.links.is_empty() {
+            if !added.disks.is_empty()
+                || !added.storage.is_empty()
+                || !added.links.is_empty()
+                || !added.vendor_links.is_empty()
+            {
                 output::arguments(format_args!(
                     "USB a disk or network adapter added after boot is kept unused until the next boot\n"
                 ));
