@@ -7,8 +7,21 @@ use crate::bus::dma::TestRegion;
 use crate::input::Input;
 use alloc::collections::BTreeMap;
 
-/// Polls one late arrival takes at most before it settles.
-const POLLS: usize = 4000;
+/// Polls one late arrival takes at most before it settles: a device that
+/// stops answering holds its connection until each of its transfers' 5 s
+/// deadlines pass.
+const POLLS: usize = 50_000;
+
+/// The model time one poll that connects devices may take: a service turn
+/// holds its processor for a few milliseconds at most. Each clock read of
+/// the model costs 100 us, so this is about fifty register or clock looks.
+const POLL_US: u64 = 5000;
+
+/// The model time the poll that retires an unplugged hub with two devices
+/// behind it may take. Retirement still stops each endpoint and disables
+/// each slot with controller commands in that one poll, about a millisecond
+/// of model time each.
+const RETIRE_US: u64 = 20_000;
 
 /// A controller that booted with an empty root port 1, and its runtime
 /// owner, polled after boot.
@@ -58,9 +71,15 @@ impl Late {
         self.model.borrow_mut().root_status = Some(PP | CSC);
     }
 
-    fn poll(&mut self, seen: &mut Seen) -> bool {
+    /// Poll once, as a service turn does; whether anything changed. The
+    /// poll must take at most `bound` of model time.
+    fn poll(&mut self, seen: &mut Seen, bound: u64) -> bool {
         let firmware = crate::firmware::HandoffProvider::new(None);
+        let clock = self.shared.borrow().clock;
+        let begin = clock.try_start().unwrap();
         let changes = self.host.poll_after_boot(&mut self.dma, &firmware);
+        let spent = clock.try_elapsed_us(begin).unwrap();
+        assert!(spent <= bound, "one poll took {spent} us");
         let mut added = changes.added;
         let any = !(added.devices.is_empty()
             && changes.removed.is_empty()
@@ -75,11 +94,16 @@ impl Late {
         any
     }
 
-    /// Poll until the host has nothing left to do, a millisecond apart.
+    /// Poll until the host has nothing left to do, a millisecond apart,
+    /// each poll within [`POLL_US`].
     fn settle(&mut self) -> Seen {
+        self.settle_within(POLL_US)
+    }
+
+    fn settle_within(&mut self, bound: u64) -> Seen {
         let mut seen = Seen::default();
         for _ in 0..POLLS {
-            let any = self.poll(&mut seen);
+            let any = self.poll(&mut seen, bound);
             if !any && !self.host.due() && !self.host.attachment_due() {
                 return seen;
             }
@@ -182,7 +206,7 @@ fn a_hub_that_a_kvm_switch_unplugs_and_replugs_leaks_no_owner_or_key() {
             pressed: true
         }));
         late.unplug();
-        let gone = late.settle();
+        let gone = late.settle_within(RETIRE_US);
         assert_eq!(gone.removed.len(), 3, "{round}");
         assert_eq!(late.enabled_slots(), 0, "{round}");
         assert!(!late.shared.borrow().power.retained(seen.devices[1].slot));

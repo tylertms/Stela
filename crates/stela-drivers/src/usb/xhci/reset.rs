@@ -55,17 +55,33 @@ impl Controller {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn fresh_slot(&mut self) -> Result<u8, BlockError> {
-        if self
-            .slot_ownership
-            .iter()
-            .skip(1)
-            .all(|state| !matches!(state, Ownership::Vacant | Ownership::Retired))
-        {
+        block_on(Self::fresh_slot_with(&Access::blocking(self, None)))
+    }
+
+    pub(super) async fn fresh_slot_with(a: &Access<'_>) -> Result<u8, BlockError> {
+        let max_slots = a.with(|c| c.max_slots);
+        if a.with(|c| {
+            c.slot_ownership
+                .iter()
+                .skip(1)
+                .all(|state| !matches!(state, Ownership::Vacant | Ownership::Retired))
+        }) {
             return Err(BlockError::Unsupported(EXHAUSTED));
         }
-        for _ in 0..self.max_slots {
-            let event = self.command(0, 0, ENABLE_SLOT << 10)?;
+        for _ in 0..max_slots {
+            let event = a.command(0, 0, ENABLE_SLOT << 10).await?;
+            if let Some(id) = a.with(|c| c.enabled_slot(event))? {
+                return Ok(id);
+            }
+        }
+        Err(BlockError::Unsupported(EXHAUSTED))
+    }
+
+    /// Enable Slot's completion: its slot, or `None` when it named a tombstone.
+    fn enabled_slot(&mut self, event: Event) -> Result<Option<u8>, BlockError> {
+        {
             let id = usize::from(event.slot());
             if id == 0 || id > self.max_slots || id >= self.slot_ownership.len() {
                 self.command_poisoned = true;
@@ -76,7 +92,7 @@ impl Controller {
                     // Keep this grant even if any following allocation fails.
                     // Enabled slots do not fetch DCBAA or accept doorbells.
                     self.slot_ownership[id] = Ownership::Enabled;
-                    return Ok(id as u8);
+                    Ok(Some(id as u8))
                 }
                 // xhci_free_virt_device ends the old device once Disable Slot
                 // completes, and Enable Slot may hand its ID to the next one.
@@ -85,18 +101,20 @@ impl Controller {
                 Ownership::Retired if !self.power.retained(id as u8) => {
                     self.slots[id] = None;
                     self.slot_ownership[id] = Ownership::Enabled;
-                    return Ok(id as u8);
+                    Ok(Some(id as u8))
                 }
-                Ownership::Retired => self.slot_ownership[id] = Ownership::Tombstone,
+                Ownership::Retired => {
+                    self.slot_ownership[id] = Ownership::Tombstone;
+                    Ok(None)
+                }
                 Ownership::Enabled | Ownership::Tombstone => {
                     self.command_poisoned = true;
-                    return Err(BlockError::Unsupported(
+                    Err(BlockError::Unsupported(
                         "xHCI returned an already-owned slot ID",
-                    ));
+                    ))
                 }
             }
         }
-        Err(BlockError::Unsupported(EXHAUSTED))
     }
 
     /// # Safety

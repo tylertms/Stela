@@ -38,22 +38,33 @@ impl Controller {
         id: SlotId,
         port: u8,
     ) -> Result<Option<u8>, BlockError> {
-        self.check_minimum()?;
-        self.validate_topology_id(id)?;
-        self.hub_port_owned(id, port)
+        block_on(Self::hub_port_for_with(
+            &Access::blocking(self, None),
+            id,
+            port,
+        ))
     }
 
-    fn hub_port_owned(&mut self, id: SlotId, port: u8) -> Result<Option<u8>, BlockError> {
-        self.check_minimum()?;
-        let slot = self.validate_topology_id(id)?;
-        self.observe_current_ancestors(slot, true)?;
-        let minimum = self.minimum.clone();
-        let connected =
-            enumerate::debounce(minimum, || self.sample_usb2_hub_port_owned(slot, port));
-        if !self.minimum_status(connected)? {
+    pub(in super::super) async fn hub_port_for_with(
+        a: &Access<'_>,
+        id: SlotId,
+        port: u8,
+    ) -> Result<Option<u8>, BlockError> {
+        let slot = a.with(|c| {
+            c.check_minimum()?;
+            c.validate_topology_id(id)?;
+            c.check_minimum()?;
+            c.validate_topology_id(id)
+        })?;
+        Self::observe_current_ancestors_with(a, slot, true).await?;
+        let connected = enumerate::debounce_with(a, async || {
+            Self::sample_usb2_hub_port_with(a, slot, port).await
+        })
+        .await;
+        if !a.with(|c| c.minimum_status(connected))? {
             return Ok(None);
         }
-        self.reset_debounced_usb2_hub_port(id, port)
+        Self::reset_debounced_usb2_hub_port_with(a, id, port).await
     }
 
     pub(in super::super) fn sample_usb2_hub_port(
@@ -62,15 +73,19 @@ impl Controller {
         port: u8,
     ) -> Result<(bool, bool), BlockError> {
         let slot = self.validate_topology_id(id)?;
-        self.sample_usb2_hub_port_owned(slot, port)
+        block_on(Self::sample_usb2_hub_port_with(
+            &Access::blocking(self, None),
+            slot,
+            port,
+        ))
     }
 
-    fn sample_usb2_hub_port_owned(
-        &mut self,
+    async fn sample_usb2_hub_port_with(
+        a: &Access<'_>,
         slot: u8,
         port: u8,
     ) -> Result<(bool, bool), BlockError> {
-        let (status, change) = self.hub_port_status_owned(slot, port)?;
+        let (status, change) = Self::hub_port_status_with(a, slot, port).await?;
         // The changes are acknowledged first, so a port refused below is
         // not reported again by the hub's next status notification.
         for (bit, selector) in [
@@ -81,11 +96,12 @@ impl Controller {
             (32, 23),
         ] {
             if change & bit != 0 {
-                self.control_owned(
+                a.control(
                     slot,
                     setup(0x23, CLEAR_FEATURE, selector, u16::from(port), 0),
                     &[],
-                )?;
+                )
+                .await?;
             }
         }
         powered(status, change)?;
@@ -96,30 +112,34 @@ impl Controller {
     }
 
     /// The caller owns a completed stability interval for this exact port.
-    pub(in super::super) fn reset_debounced_usb2_hub_port(
-        &mut self,
+    pub(in super::super) async fn reset_debounced_usb2_hub_port_with(
+        a: &Access<'_>,
         id: SlotId,
         port: u8,
     ) -> Result<Option<u8>, BlockError> {
-        self.check_minimum()?;
-        let slot = self.validate_topology_id(id)?;
+        let slot = a.with(|c| {
+            c.check_minimum()?;
+            c.validate_topology_id(id)
+        })?;
         let index = u16::from(port);
         for _ in 0..RESET_ATTEMPTS {
-            self.control_owned(slot, setup(0x23, SET_FEATURE, PORT_RESET, index, 0), &[])?;
-            let deadline = self.clock.deadline(PORT_RESET_US);
+            a.control(slot, setup(0x23, SET_FEATURE, PORT_RESET, index, 0), &[])
+                .await?;
+            let deadline = a.with(|c| c.clock.deadline(PORT_RESET_US));
             loop {
-                let (status, change) = self.hub_port_status_owned(slot, port)?;
+                let (status, change) = Self::hub_port_status_with(a, slot, port).await?;
                 powered(status, change)?;
                 if change & HUB_PORT_RESET != 0 && status & HUB_PORT_RESET == 0 {
-                    self.control_owned(
+                    a.control(
                         slot,
                         setup(0x23, CLEAR_FEATURE, C_PORT_RESET, index, 0),
                         &[],
-                    )?;
-                    self.minimum_wait(RESET_SETTLE_US)?;
-                    let (status, change) = self.hub_port_status_owned(slot, port)?;
+                    )
+                    .await?;
+                    a.minimum_wait(RESET_SETTLE_US).await?;
+                    let (status, change) = Self::hub_port_status_with(a, slot, port).await?;
                     powered(status, change)?;
-                    self.observe_current_ancestors(slot, true)?;
+                    Self::observe_current_ancestors_with(a, slot, true).await?;
                     if status & HUB_PORT_CONNECTION == 0 {
                         return Ok(None);
                     }
@@ -129,8 +149,10 @@ impl Controller {
                         ));
                     }
                     if status & (HUB_PORT_ENABLE | HUB_PORT_RESET) == HUB_PORT_ENABLE {
-                        let root = self.slot(slot)?.attachment.root_port;
-                        self.current_hub_port_reset(id, port, root)?;
+                        a.with(|c| {
+                            let root = c.slot(slot)?.attachment.root_port;
+                            c.current_hub_port_reset(id, port, root)
+                        })?;
                         return Ok(Some(if status & HUB_PORT_LOW_SPEED != 0 {
                             LOW_SPEED
                         } else if status & HUB_PORT_HIGH_SPEED != 0 {
@@ -146,7 +168,7 @@ impl Controller {
                 if deadline.passed() {
                     return Err(BlockError::Timeout);
                 }
-                self.clock.delay(1000);
+                a.delay(1000).await;
             }
         }
         Err(BlockError::Unsupported(

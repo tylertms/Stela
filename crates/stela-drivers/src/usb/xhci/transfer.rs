@@ -293,7 +293,23 @@ impl Controller {
         request: [u8; 8],
         out: &[u8],
     ) -> Result<Control, BlockError> {
-        self.live_slot(slot)?;
+        block_on(Self::start_control_owned_with(
+            &Access::blocking(self, None),
+            slot,
+            request,
+            out,
+        ))
+    }
+
+    /// [`Self::start_control_owned`], its hub status reads for the current
+    /// a PORT_POWER or SET_CONFIGURATION request reserves made through `a`.
+    pub(super) async fn start_control_owned_with(
+        a: &Access<'_>,
+        slot: u8,
+        request: [u8; 8],
+        out: &[u8],
+    ) -> Result<Control, BlockError> {
+        a.with(|c| c.live_slot(slot))?;
         // Any raw class requester must acquire the same physical-port current
         // reservation as enumeration before publishing a PORT_POWER request.
         if request[0] == 0x23 && request[2..4] == PORT_POWER.to_le_bytes() {
@@ -308,7 +324,8 @@ impl Controller {
                         "invalid USB hub PORT_POWER request",
                     ));
                 }
-                self.prepare_port_current(slot, request[4])?;
+                // Boxed: its status reads are controls of their own.
+                Box::pin(Self::prepare_port_current_with(a, slot, request[4])).await?;
             }
         }
         let configuration = request[0] == 0 && request[1] == SET_CONFIGURATION;
@@ -316,7 +333,9 @@ impl Controller {
             if request[3..] != [0; 5] || !out.is_empty() {
                 return Err(BlockError::Unsupported("invalid SET_CONFIGURATION request"));
             }
-            if self.slot(slot)?.endpoints[2..].iter().any(Option::is_some) {
+            if a.with(|c| {
+                Ok::<_, BlockError>(c.slot(slot)?.endpoints[2..].iter().any(Option::is_some))
+            })? {
                 return Err(BlockError::Unsupported(
                     "USB configuration change requires endpoint teardown",
                 ));
@@ -324,15 +343,21 @@ impl Controller {
         }
         // A timeout may occur after the device accepted the request; do not
         // preserve the old value or infer success from cancellation of EP0.
-        self.endpoint_ready_owned(slot, 1)?;
+        a.with(|c| c.endpoint_ready_owned(slot, 1))?;
         let configuration = if configuration {
-            let demand = self.prepare_current_configuration(slot, request[2])?;
-            self.slot(slot)?.current_configuration = None;
+            let demand = Box::pin(Self::prepare_current_configuration_with(
+                a, slot, request[2],
+            ))
+            .await?;
+            a.with(|c| {
+                c.slot(slot)?.current_configuration = None;
+                Ok::<_, BlockError>(())
+            })?;
             Some((request[2], demand))
         } else {
             None
         };
-        self.start_control(slot, request, out, configuration)
+        a.with(|c| c.start_control(slot, request, out, configuration))
     }
 
     /// Only the topology owner can mint this capability, after every old alias
@@ -380,25 +405,33 @@ impl Controller {
         self.run_control(control)
     }
 
-    pub(super) fn descriptor(
-        &mut self,
+    pub(super) async fn descriptor_with(
+        a: &Access<'_>,
         slot: u8,
         kind: u8,
         index: u8,
         length: u16,
     ) -> Result<Vec<u8>, BlockError> {
         let value = u16::from(kind) << 8 | u16::from(index);
-        self.control_owned(
+        a.control(
             slot,
             setup(DEVICE_TO_HOST, GET_DESCRIPTOR, value, 0, length),
             &[],
         )
+        .await
     }
 
     /// Linux `usb_get_langid`: the first language string descriptor 0 lists,
     /// English when it lists none, and no strings when it cannot be read.
+    #[cfg(test)]
     pub(super) fn language(&mut self, slot: u8) -> Option<u16> {
-        let bytes = self.descriptor(slot, STRING_DESCRIPTOR, 0, 255).ok()?;
+        block_on(Self::language_with(&Access::blocking(self, None), slot))
+    }
+
+    pub(super) async fn language_with(a: &Access<'_>, slot: u8) -> Option<u16> {
+        let bytes = Self::descriptor_with(a, slot, STRING_DESCRIPTOR, 0, 255)
+            .await
+            .ok()?;
         if bytes.get(1).is_some_and(|kind| *kind != STRING_DESCRIPTOR) {
             return Some(LANGUAGE_EN_US);
         }
@@ -421,12 +454,26 @@ impl Controller {
     }
 
     pub(super) fn string_owned(&mut self, slot: u8, language: u16, index: u8) -> Option<String> {
+        block_on(Self::string_with(
+            &Access::blocking(self, None),
+            slot,
+            language,
+            index,
+        ))
+    }
+
+    pub(super) async fn string_with(
+        a: &Access<'_>,
+        slot: u8,
+        language: u16,
+        index: u8,
+    ) -> Option<String> {
         if index == 0 {
             return None;
         }
         let value = u16::from(STRING_DESCRIPTOR) << 8 | u16::from(index);
         let request = setup(DEVICE_TO_HOST, GET_DESCRIPTOR, value, language, 255);
-        let bytes = self.control_owned(slot, request, &[]).ok()?;
+        let bytes = a.control(slot, request, &[]).await.ok()?;
         if bytes.len() < 2 || bytes[1] != STRING_DESCRIPTOR {
             return None;
         }

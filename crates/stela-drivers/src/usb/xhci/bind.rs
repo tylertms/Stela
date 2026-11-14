@@ -219,6 +219,107 @@ pub(crate) fn bind_with_provider(
     found.inputs.extend(hid_inputs);
 }
 
+/// [`bind_with_provider`] for a device that arrived after boot, in steps:
+/// only its input interfaces start, each request a step's control transfer;
+/// every other interface is reported unused.
+pub(super) async fn bind_after_boot_with(a: &Access<'_>, device: &Device, found: &mut Found) {
+    let Some(shared) = a.shared().cloned() else {
+        return;
+    };
+    if device.slot != device.id.hardware_slot() {
+        found.failures.push((
+            device.location.clone(),
+            BlockError::Unsupported("USB bind descriptor slot identity mismatch"),
+        ));
+        return;
+    }
+    let all = interfaces(&device.configuration);
+    let mut endpoints = Vec::new();
+    let mut inputs = Vec::new();
+    for interface in all.iter().filter(|i| configuration::primary(i)) {
+        let plan =
+            a.with(|c| configuration::plan_with_controller(device, interface, &all, Some(c)));
+        let location = format!("{} interface {}", device.location, interface.number);
+        match plan {
+            Ok(Plan::Hid(input, output)) => {
+                endpoints.extend([Some(input), output].into_iter().flatten());
+                inputs.push((interface.clone(), input));
+            }
+            Ok(_) => found.unused.push((location, AFTER_BOOT)),
+            Err(_) if ethernet::listed(&device.descriptor) => {
+                found.unused.push((location, AFTER_BOOT))
+            }
+            Err(why) => found.unused.push((
+                format!(
+                    "{location} ({:02x}/{:02x}/{:02x})",
+                    interface.class, interface.subclass, interface.protocol
+                ),
+                why,
+            )),
+        }
+    }
+    if inputs.is_empty() {
+        return;
+    }
+    let configured = async {
+        let slot = during(
+            "claim native USB device",
+            a.with(|c| {
+                c.claim_native(device.id)?;
+                c.validate_id(device.id)
+            }),
+        )?;
+        let value = device.configuration_value();
+        during(
+            format!("slot {slot} EP0 SET_CONFIGURATION value={value}"),
+            Controller::set_configuration_with(a, slot, value).await,
+        )?;
+        during(
+            format!("slot {slot} Configure Endpoint"),
+            Controller::configure_with(a, slot, &endpoints, None).await,
+        )
+    }
+    .await;
+    if let Err((operation, error)) = configured {
+        found.failures.push((
+            format!("{} {} {operation}", device.location, device.name()),
+            error,
+        ));
+        return;
+    }
+    let mut hid_inputs = Vec::new();
+    for (interface, endpoint) in inputs {
+        let location = format!("{} interface {}", device.location, interface.number);
+        let negotiated = hid::UsbInput::negotiate(&interface, async |request| {
+            a.device_control(device.id, request, &[]).await
+        })
+        .await;
+        let started = negotiated.and_then(|negotiated| {
+            a.with_dma(|_, dma| {
+                hid::UsbInput::start(
+                    shared.clone(),
+                    device,
+                    &interface,
+                    endpoint,
+                    negotiated,
+                    dma,
+                )
+            })?
+        });
+        match started {
+            Ok(Some(input)) => hid_inputs.push(input),
+            Ok(None) => found.unused.push((location, hid::NO_REPORTS)),
+            Err(error) => found.failures.push((location, error)),
+        }
+    }
+    if let Err(error) = hid::receiver::transport::attach_group(&shared, device, &mut hid_inputs) {
+        found
+            .failures
+            .push((format!("{} HID++ receiver", device.location), error));
+    }
+    found.inputs.extend(hid_inputs);
+}
+
 /// What a class driver will use of an interface.
 pub enum Plan {
     /// Audio function plan, initially at zero-bandwidth streaming alternates.

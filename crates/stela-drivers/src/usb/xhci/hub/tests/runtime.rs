@@ -35,7 +35,22 @@ fn connect_late(node: Node, after_boot: bool) -> (Rc<RefCell<Hardware>>, Changes
     let begin = model.borrow().requests.len();
     model.borrow_mut().root_status = Some(PP | CCS | CSC | u32::from(HIGH_SPEED) << 10);
     let changes = match after_boot {
-        true => host.poll_after_boot(&mut dma, &firmware),
+        // A connection after boot runs over the polls that follow.
+        true => {
+            let mut changes = Changes::default();
+            for _ in 0..1000 {
+                let mut poll = host.poll_after_boot(&mut dma, &firmware);
+                changes.added.devices.append(&mut poll.added.devices);
+                changes.added.unused.append(&mut poll.added.unused);
+                changes.added.failures.append(&mut poll.added.failures);
+                changes.added.storage.append(&mut poll.added.storage);
+                changes.added.disks.append(&mut poll.added.disks);
+                if !host.attachment_due() {
+                    break;
+                }
+            }
+            changes
+        }
         false => host.poll(&mut dma, &firmware),
     };
     let requests = model.borrow().requests[begin..]

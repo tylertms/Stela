@@ -111,7 +111,7 @@ pub(super) fn topology(attachment: Attachment) -> Result<(), BlockError> {
     Ok(())
 }
 
-pub(super) fn child(
+pub(in super::super) fn child(
     parent_slot: u8,
     parent: Attachment,
     port: u8,
@@ -134,6 +134,7 @@ pub(super) fn child(
 }
 
 /// BOS sublink attributes, kept for the port-status speed IDs.
+#[derive(Clone)]
 pub(in super::super) struct Ssp {
     attributes: Vec<u32>,
 }

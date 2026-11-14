@@ -9,6 +9,7 @@ type Debounced = Result<(bool, u64), BlockError>;
 /// Linux `hub_port_debounce`: sample a port until its connection holds
 /// steady and say whether a device is there. `sample` returns the port's
 /// connection and connect change, clearing a change it reports.
+#[cfg(test)]
 pub(super) fn debounce(
     minimum: Minimum,
     sample: impl FnMut() -> Result<(bool, bool), BlockError>,
@@ -17,21 +18,30 @@ pub(super) fn debounce(
     debounce_with_delay(sample, || minimum.wait_us(DEBOUNCE_STEP_US))
 }
 
+#[cfg(test)]
 fn debounce_with_delay(
     mut sample: impl FnMut() -> Result<(bool, bool), BlockError>,
     mut delay: impl FnMut() -> Result<(), BlockError>,
 ) -> Result<bool, BlockError> {
+    block_on(debounce_steps(async || sample(), async || delay()))
+}
+
+/// [`debounce`]'s samples, `delay` apart.
+async fn debounce_steps(
+    mut sample: impl AsyncFnMut() -> Result<(bool, bool), BlockError>,
+    mut delay: impl AsyncFnMut() -> Result<(), BlockError>,
+) -> Result<bool, BlockError> {
     let mut debounce = Debounce::default();
     let mut total = 0;
     loop {
-        let (connected, changed) = sample()?;
+        let (connected, changed) = sample().await?;
         if let Some(connected) = debounce.observe(connected, changed) {
             return Ok(connected);
         }
         if total >= DEBOUNCE_TIMEOUT_US {
             return Err(BlockError::Unsupported("USB port connection never settled"));
         }
-        delay()?;
+        delay().await?;
         total += DEBOUNCE_STEP_US;
     }
 }
@@ -184,6 +194,190 @@ pub(super) fn child_route(parent: u32, tier: u8, port: u8) -> u32 {
     parent | u32::from(port.min(MAX_ROUTE_PORT)) << (4 * tier)
 }
 
+/// [`debounce`] in an [`Access`]: in steps after boot, each debounce step a
+/// wait for the next poll.
+pub(super) async fn debounce_with(
+    a: &Access<'_>,
+    sample: impl AsyncFnMut() -> Result<(bool, bool), BlockError>,
+) -> Result<bool, BlockError> {
+    a.with(|c| c.minimum.check())?;
+    debounce_steps(sample, async || a.minimum_wait(DEBOUNCE_STEP_US).await).await
+}
+
+/// How [`Controller::connect`] brings its port up before each try.
+pub(super) enum Reset {
+    /// A root port enumeration debounced: reset only.
+    Root(u8),
+    /// A root port that changed while running: powered, debounced and
+    /// reset; a device under the port's kept grant is reset with it.
+    Changed(u8),
+    /// A USB 2 hub's port as the hub comes up.
+    Usb2 {
+        hub: SlotId,
+        port: u8,
+        parent: Attachment,
+    },
+    /// A SuperSpeed hub's port as the hub comes up, the hub's power
+    /// observed around its reset.
+    SuperSpeed {
+        hub: SlotId,
+        port: u8,
+        parent: Attachment,
+        ssp: Option<hub::descriptor::Ssp>,
+    },
+    /// A running hub's port that changed, its ancestors' power observed
+    /// around its reset; `debounced` once its connection held steady over
+    /// earlier polls.
+    HubChanged {
+        hub: SlotId,
+        port: u8,
+        parent: Attachment,
+        ssp: Option<hub::descriptor::Ssp>,
+        debounced: bool,
+    },
+    /// A device a recovery brings back at its original attachment: under
+    /// `parent`'s port, its ancestors' power observed around the reset, or
+    /// on its root port, its current checked and its device reset first.
+    Recover {
+        attachment: Attachment,
+        parent: Option<SlotId>,
+        ssp: Option<hub::descriptor::Ssp>,
+        superspeed: bool,
+    },
+}
+
+/// What [`Controller::connect`] did with its port.
+#[derive(Default)]
+pub(super) struct Connected {
+    /// Microseconds a [`Reset::Root`] port's resets took, every try.
+    pub(super) reset_us: u64,
+    /// The speed of the last root port reset that found a device.
+    pub(super) speed: Option<u8>,
+}
+
+/// A USB 2 hub child's attachment.
+fn usb2_child(hub: u8, parent: Attachment, port: u8, speed: u8) -> Attachment {
+    Attachment {
+        root_port: parent.root_port,
+        route: child_route(parent.route, parent.tier, port),
+        tier: parent.tier + 1,
+        speed,
+        parent: Some((hub, port)),
+        translator: match (speed, parent.speed) {
+            (LOW_SPEED | FULL_SPEED, HIGH_SPEED) => Some((hub, port)),
+            _ => parent.translator,
+        },
+    }
+}
+
+impl Reset {
+    async fn port(
+        &mut self,
+        a: &Access<'_>,
+        connected: &mut Connected,
+    ) -> Result<Option<Attachment>, BlockError> {
+        let root = |port, speed| Attachment {
+            root_port: port,
+            route: 0,
+            tier: 0,
+            speed,
+            translator: None,
+            parent: None,
+        };
+        match self {
+            Self::Root(port) => {
+                let clock = a.with(|c| c.clock);
+                let start = clock.now_us();
+                let speed = Controller::root_reset_with(a, *port).await;
+                connected.reset_us += clock.now_us().saturating_sub(start);
+                Ok(speed?.map(|speed| root(*port, speed)))
+            }
+            Self::Changed(port) => {
+                let Some(speed) = Controller::root_port_with(a, *port).await? else {
+                    return Ok(None);
+                };
+                let attachment = root(*port, speed);
+                // USB3 training alone does not retire the old physical address or
+                // current owner. A kept grant requires reset ACK.
+                if a.with(|c| c.power.port_owner(None, *port).is_some()) {
+                    a.with(|c| c.reset_root_device(attachment))?;
+                }
+                connected.speed = Some(speed);
+                Ok(Some(attachment))
+            }
+            Self::Usb2 { hub, port, parent } => {
+                let speed = Controller::hub_port_for_with(a, *hub, *port).await?;
+                Ok(speed.map(|speed| usb2_child(hub.hardware_slot(), *parent, *port, speed)))
+            }
+            Self::SuperSpeed {
+                hub,
+                port,
+                parent,
+                ssp,
+            } => {
+                let slot = hub.hardware_slot();
+                Controller::observe_hub_current_with(a, slot).await?;
+                let speed =
+                    Controller::superspeed_port_for_with(a, *hub, *port, ssp.as_ref()).await;
+                // Recheck global permission even when this individual port
+                // failed. A local reset error must not hide parent power loss.
+                Controller::observe_hub_current_with(a, slot).await?;
+                speed?
+                    .map(|speed| hub::descriptor::child(slot, *parent, *port, speed))
+                    .transpose()
+            }
+            Self::HubChanged {
+                hub,
+                port,
+                parent,
+                ssp,
+                debounced,
+            } => {
+                Controller::observe_current_ancestors_for_with(a, *hub, true).await?;
+                let speed = if parent.speed >= SUPER_SPEED {
+                    Controller::superspeed_port_for_with(a, *hub, *port, ssp.as_ref()).await
+                } else if core::mem::take(debounced) {
+                    Controller::reset_debounced_usb2_hub_port_with(a, *hub, *port).await
+                } else {
+                    Controller::hub_port_for_with(a, *hub, *port).await
+                };
+                Controller::observe_current_ancestors_for_with(a, *hub, true).await?;
+                Ok(speed?.map(|speed| usb2_child(hub.hardware_slot(), *parent, *port, speed)))
+            }
+            Self::Recover {
+                attachment,
+                parent,
+                ssp,
+                superspeed,
+            } => {
+                let speed = if let Some((_, port)) = attachment.parent {
+                    let parent = parent.ok_or(BlockError::Unsupported(
+                        "USB recovery original parent absent",
+                    ))?;
+                    Controller::observe_current_ancestors_for_with(a, parent, true).await?;
+                    let speed = if *superspeed {
+                        Controller::superspeed_port_for_with(a, parent, port, ssp.as_ref()).await?
+                    } else {
+                        Controller::hub_port_for_with(a, parent, port).await?
+                    };
+                    Controller::observe_current_ancestors_for_with(a, parent, true).await?;
+                    speed
+                } else {
+                    a.with(|c| {
+                        c.root_current(attachment.root_port, attachment.speed)?;
+                        c.reset_root_device(*attachment)
+                    })?;
+                    Controller::root_port_with(a, attachment.root_port).await?
+                };
+                Ok(speed.map(|speed| Attachment {
+                    speed,
+                    ..*attachment
+                }))
+            }
+        }
+    }
+}
+
 impl Controller {
     /// Enables a slot and addresses the device at `attachment`.
     #[cfg(test)]
@@ -196,12 +390,17 @@ impl Controller {
         attachment: Attachment,
         dma: &mut dyn DmaAllocator,
     ) -> Result<u8, (String, BlockError)> {
-        self.address_parent(attachment, None, dma)
+        block_on(Self::address_with(
+            &Access::blocking(self, Some(dma)),
+            attachment,
+            None,
+        ))
     }
 
+    #[cfg(test)]
     #[expect(
         clippy::result_large_err,
-        reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+        reason = "This test-only return keeps the shared typed source and cleanup causes without allocating on propagation."
     )]
     pub(super) fn address_parent(
         &mut self,
@@ -209,12 +408,67 @@ impl Controller {
         parent_id: Option<SlotId>,
         dma: &mut dyn DmaAllocator,
     ) -> Result<u8, (String, BlockError)> {
+        block_on(Self::address_with(
+            &Access::blocking(self, Some(dma)),
+            attachment,
+            parent_id,
+        ))
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+    )]
+    pub(super) async fn address_with(
+        a: &Access<'_>,
+        attachment: Attachment,
+        parent_id: Option<SlotId>,
+    ) -> Result<u8, (String, BlockError)> {
         during(
             "validate original USB parent",
-            self.validate_attachment_parent(attachment, parent_id),
+            a.with(|c| c.validate_attachment_parent(attachment, parent_id)),
         )?;
         let generation = during("allocate device generation", identity::next_generation())?;
-        let slot = during("Enable Slot", self.fresh_slot())?;
+        let slot = during("Enable Slot", Self::fresh_slot_with(a).await)?;
+        let input_address = a
+            .with_dma(|c, dma| c.address_context(slot, generation, attachment, parent_id, dma))
+            .map_err(|error| (format!("slot {slot} allocate contexts and EP0 ring"), error))??;
+        let addressed = a
+            .command(
+                input_address,
+                0,
+                ADDRESS_DEVICE << 10 | u32::from(slot) << 24,
+            )
+            .await;
+        if let Err(error) = addressed {
+            let _ = a.with(|c| c.disable_slot(slot, reset::Ownership::Vacant));
+            return Err((format!("slot {slot} Address Device"), error));
+        }
+        // Address Device sends SET_ADDRESS with BSR=0. The xHC does not
+        // time the device's recovery interval (xHCI 1.2b 4.6.5); USB 2.0
+        // 9.2.6.3 permits it to ignore Setup packets for another 2 ms.
+        during(
+            "USB address recovery",
+            a.minimum_wait(ADDRESS_RECOVERY_US).await,
+        )?;
+        a.with(|c| c.slot(slot).unwrap().retiring = false);
+        Ok(slot)
+    }
+
+    /// The new device's current, contexts and EP0 ring, ready for Address
+    /// Device: the input context's address.
+    #[expect(
+        clippy::result_large_err,
+        reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+    )]
+    fn address_context(
+        &mut self,
+        slot: u8,
+        generation: u64,
+        attachment: Attachment,
+        parent_id: Option<SlotId>,
+        dma: &mut dyn DmaAllocator,
+    ) -> Result<u64, (String, BlockError)> {
         if let Err(error) = self.reserve_current(slot, generation, attachment, parent_id) {
             let _ = self.disable_slot(slot, reset::Ownership::Vacant);
             return Err(("reserve USB upstream current".into(), error));
@@ -284,43 +538,31 @@ impl Controller {
             speed: attachment.speed,
             current_configuration: Some(0),
         });
-        let addressed = self.command(
-            input_address,
-            0,
-            ADDRESS_DEVICE << 10 | u32::from(slot) << 24,
-        );
-        if let Err(error) = addressed {
-            let _ = self.disable_slot(slot, reset::Ownership::Vacant);
-            return Err((format!("slot {slot} Address Device"), error));
-        }
-        // Address Device sends SET_ADDRESS with BSR=0. The xHC does not
-        // time the device's recovery interval (xHCI 1.2b 4.6.5); USB 2.0
-        // 9.2.6.3 permits it to ignore Setup packets for another 2 ms.
-        during(
-            "USB address recovery",
-            self.minimum_wait(ADDRESS_RECOVERY_US),
-        )?;
-        self.slot(slot).unwrap().retiring = false;
-        Ok(slot)
+        Ok(input_address)
     }
 
     /// Changes EP0's max packet size (Evaluate Context, 4.6.7).
-    fn set_control_packet(&mut self, slot: u8, max_packet: u16) -> Result<(), BlockError> {
-        self.clear_input(slot)?;
-        let context = self.context();
-        let input_address = {
-            let state = self.slot(slot)?;
+    async fn set_control_packet_with(
+        a: &Access<'_>,
+        slot: u8,
+        max_packet: u16,
+    ) -> Result<(), BlockError> {
+        let input_address = a.with(|c| {
+            c.clear_input(slot)?;
+            let context = c.context();
+            let state = c.slot(slot)?;
             state.input.write(4, 0b10u32);
             state
                 .input
                 .write(2 * context + 4, u32::from(max_packet) << 16);
-            state.input.device_address()
-        };
-        self.command(
+            Ok::<_, BlockError>(state.input.device_address())
+        })?;
+        a.command(
             input_address,
             0,
             EVALUATE_CONTEXT << 10 | u32::from(slot) << 24,
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
@@ -373,28 +615,19 @@ impl Controller {
                 crate::working(&location);
                 let clock = self.clock;
                 let start = clock.now_us();
-                let mut reset_us = 0;
-                let reset = |c: &mut Self| {
-                    let start = clock.now_us();
-                    let speed = c.root_reset(port);
-                    reset_us += clock.now_us().saturating_sub(start);
-                    speed.map(|speed| {
-                        speed.map(|speed| Attachment {
-                            root_port: port,
-                            route: 0,
-                            tier: 0,
-                            speed,
-                            translator: None,
-                            parent: None,
-                        })
-                    })
-                };
-                self.connect(location, None, reset, dma, &mut devices, failures);
-                probe.reset_us = reset_us;
+                let done = self.connect(
+                    location,
+                    None,
+                    Reset::Root(port),
+                    dma,
+                    &mut devices,
+                    failures,
+                );
+                probe.reset_us = done.reset_us;
                 probe.enumerate_us = clock
                     .now_us()
                     .saturating_sub(start)
-                    .saturating_sub(reset_us);
+                    .saturating_sub(done.reset_us);
             }
             probes.push(probe);
         }
@@ -473,37 +706,59 @@ impl Controller {
         &mut self,
         location: String,
         parent_id: Option<SlotId>,
-        mut reset: impl FnMut(&mut Self) -> Result<Option<Attachment>, BlockError>,
+        reset: Reset,
         dma: &mut dyn DmaAllocator,
         devices: &mut Vec<Device>,
         failures: &mut Vec<(String, BlockError)>,
-    ) {
+    ) -> Connected {
+        block_on(Self::connect_with(
+            &Access::blocking(self, Some(dma)),
+            location,
+            parent_id,
+            reset,
+            devices,
+            failures,
+        ))
+    }
+
+    pub(super) async fn connect_with(
+        a: &Access<'_>,
+        location: String,
+        parent_id: Option<SlotId>,
+        mut reset: Reset,
+        devices: &mut Vec<Device>,
+        failures: &mut Vec<(String, BlockError)>,
+    ) -> Connected {
+        let mut connected = Connected::default();
         let mut failure = None;
         for _ in 0..PORT_INIT_TRIES {
             if let Some(id) = parent_id
-                && let Err(error) = self.validate_topology_id(id)
+                && let Err(error) = a.with(|c| c.validate_topology_id(id))
             {
                 failures.push((format!("{location} original parent generation"), error));
-                return;
+                return connected;
             }
-            let attachment = match reset(self) {
+            let attachment = match reset.port(a, &mut connected).await {
                 Ok(Some(attachment)) => attachment,
-                Ok(None) => return,
+                Ok(None) => return connected,
                 Err(error) => {
                     failures.push((format!("{location} enable/reset port"), error));
-                    return;
+                    return connected;
                 }
             };
-            match self.identify_parent(attachment, parent_id, location.clone(), dma) {
+            match Self::identify_with(a, attachment, parent_id, location.clone()).await {
                 Ok(device) => {
-                    return self.adopt(device, attachment, location, dma, devices, failures);
+                    Self::adopt_with(a, device, attachment, location, devices, failures).await;
+                    return connected;
                 }
                 Err(error) => failure = Some((attachment, error)),
             }
         }
         if let Some((attachment, (operation, error))) = failure {
-            let at = self.port_offset(attachment.root_port);
-            let portsc = self.registers.read32(at);
+            let portsc = a.with(|c| {
+                let at = c.port_offset(attachment.root_port);
+                c.registers.read32(at)
+            });
             failures.push((
                 format!(
                     "{location} speed={} root-portsc={portsc:#010x} {operation}",
@@ -512,105 +767,123 @@ impl Controller {
                 error,
             ));
         }
+        connected
     }
 
     /// A root port's device speed once the port is enabled, or `None` with
     /// nothing connected.
+    #[cfg(test)]
     pub(super) fn root_port(&mut self, port: u8) -> Result<Option<u8>, BlockError> {
-        self.check_minimum()?;
-        self.validate_current_graph(port)?;
-        let at = self.port_offset(port);
-        if self.registers.read32(at) & PP == 0 {
-            self.write_port(port, PP);
-            self.minimum_wait(PORT_POWER_US)?;
+        block_on(Self::root_port_with(&Access::blocking(self, None), port))
+    }
+
+    pub(super) async fn root_port_with(a: &Access<'_>, port: u8) -> Result<Option<u8>, BlockError> {
+        let unpowered = a.with(|c| {
+            c.check_minimum()?;
+            c.validate_current_graph(port)?;
+            let at = c.port_offset(port);
+            let unpowered = c.registers.read32(at) & PP == 0;
+            if unpowered {
+                c.write_port(port, PP);
+            }
+            Ok::<_, BlockError>(unpowered)
+        })?;
+        if unpowered {
+            a.minimum_wait(PORT_POWER_US).await?;
         }
-        let connected = debounce(self.minimum.clone(), || Ok(self.sample_root(port)));
-        let connected = self.minimum_status(connected)?;
+        let connected = debounce_with(a, async || Ok(a.with(|c| c.sample_root(port)))).await;
+        let connected = a.with(|c| c.minimum_status(connected))?;
         if !connected {
             return Ok(None);
         }
-        self.root_reset(port)
+        Self::root_reset_with(a, port).await
     }
 
     /// Reset a debounced root port and return its device's speed once the
     /// port is enabled, or `None` once nothing is connected.
-    pub(super) fn root_reset(&mut self, port: u8) -> Result<Option<u8>, BlockError> {
-        self.check_minimum()?;
-        self.validate_current_graph(port)?;
-        let at = self.port_offset(port);
-        let clock = self.clock;
-        let portsc = self.registers.read32(at);
-        let warm = self.warm_reset_required(port, portsc);
-        if portsc & CCS == 0 && !warm {
+    pub(super) async fn root_reset_with(
+        a: &Access<'_>,
+        port: u8,
+    ) -> Result<Option<u8>, BlockError> {
+        let started = a.with(|c| {
+            c.check_minimum()?;
+            c.validate_current_graph(port)?;
+            let at = c.port_offset(port);
+            let portsc = c.registers.read32(at);
+            let warm = c.warm_reset_required(port, portsc);
+            if portsc & CCS == 0 && !warm {
+                return Ok(None);
+            }
+            // Clear the remaining changes, so later changes are this driver's.
+            c.write_port(port, portsc & PORT_CHANGES);
+            let usb3 = c.port_major[usize::from(port - 1)] == 3;
+            if warm {
+                // Linux `hub_port_reset` warm-resets a SuperSpeed link stuck in
+                // SS.Inactive or Compliance Mode, or one that never trained.
+                c.write_port(port, WPR);
+            } else if !usb3 {
+                c.write_port(port, PR);
+            }
+            Ok::<_, BlockError>(Some((at, warm, usb3)))
+        })?;
+        let Some((at, warm, usb3)) = started else {
             return Ok(None);
-        }
-        // Clear the remaining changes, so later changes are this driver's.
-        self.write_port(port, portsc & PORT_CHANGES);
-        let usb3 = self.port_major[usize::from(port - 1)] == 3;
+        };
         if warm {
-            // Linux `hub_port_reset` warm-resets a SuperSpeed link stuck in
-            // SS.Inactive or Compliance Mode, or one that never trained.
-            self.write_port(port, WPR);
-            if !wait(&mut *self.registers, clock, PORT_RESET_US, |r| {
-                r.read32(at) & (WRC | PRC) == WRC | PRC
-            }) {
+            if !a
+                .wait(PORT_RESET_US, |r| r.read32(at) & (WRC | PRC) == WRC | PRC)
+                .await
+            {
                 return Err(BlockError::Timeout);
             }
-            self.write_port(port, WRC | PRC);
-            self.minimum_wait(RESET_RECOVERY_US)?;
+            a.with(|c| c.write_port(port, WRC | PRC));
+            a.minimum_wait(RESET_RECOVERY_US).await?;
         } else if !usb3 {
-            self.write_port(port, PR);
-            let clock = self.clock;
-            if !wait(&mut *self.registers, clock, PORT_RESET_US, |r| {
-                r.read32(at) & PRC != 0
-            }) {
+            if !a.wait(PORT_RESET_US, |r| r.read32(at) & PRC != 0).await {
                 return Err(BlockError::Timeout);
             }
-            self.write_port(port, PRC);
-            self.minimum_wait(RESET_RECOVERY_US)?;
-        } else {
-            let clock = self.clock;
-            if !wait(&mut *self.registers, clock, PORT_RESET_US, |r| {
-                r.read32(at) & PED != 0
-            }) {
-                return Err(BlockError::Timeout);
+            a.with(|c| c.write_port(port, PRC));
+            a.minimum_wait(RESET_RECOVERY_US).await?;
+        } else if !a.wait(PORT_RESET_US, |r| r.read32(at) & PED != 0).await {
+            return Err(BlockError::Timeout);
+        }
+        a.with(|c| {
+            let portsc = c.registers.read32(at);
+            // Linux `hub_port_reset` returns -ENOTCONN for a warm reset that
+            // leaves no connection, and the port stays disabled: it is empty,
+            // not a failure. The warm reset cleared CAS, so the next look does
+            // not reset it again.
+            if warm && portsc & CCS == 0 {
+                return Ok(None);
             }
-        }
-        let portsc = self.registers.read32(at);
-        // Linux `hub_port_reset` returns -ENOTCONN for a warm reset that
-        // leaves no connection, and the port stays disabled: it is empty,
-        // not a failure. The warm reset cleared CAS, so the next look does
-        // not reset it again.
-        if warm && portsc & CCS == 0 {
-            return Ok(None);
-        }
-        if portsc & PED == 0 {
-            return Err(BlockError::Unsupported("root port did not enable"));
-        }
-        if !usb3 || warm {
-            self.current_port_reset(None, port)?;
-        }
-        Ok(Some((portsc >> PORT_SPEED_SHIFT & PORT_SPEED_FIELD) as u8))
+            if portsc & PED == 0 {
+                return Err(BlockError::Unsupported("root port did not enable"));
+            }
+            if !usb3 || warm {
+                c.current_port_reset(None, port)?;
+            }
+            Ok(Some((portsc >> PORT_SPEED_SHIFT & PORT_SPEED_FIELD) as u8))
+        })
     }
 
     /// Choose an enumerated device's configuration and bring up a hub's
     /// ports; the device joins the inventory either way.
     /// `usb_choose_configuration` for a freshly identified device. A failed
     /// selection leaves the descriptor inventory with no configuration.
-    pub(super) fn choose(
-        &mut self,
+    async fn choose_with(
+        a: &Access<'_>,
         device: &mut Device,
         location: &str,
         failures: &mut Vec<(String, BlockError)>,
     ) -> bool {
         // After boot no network adapter starts, so its chip is not asked
         // either.
-        if !self.after_boot
-            && let Err(error) = self.preflight_vendor_ethernet(device)
+        if !a.with(|c| c.after_boot)
+            && let Err(error) = Self::preflight_vendor_ethernet_with(a, device).await
         {
             failures.push((format!("{location} RTL815x configuration preflight"), error));
         }
-        if let Err(why) = configuration::select_with_controller(device, Some(self)) {
+        if let Err(why) = a.with(|c| configuration::select_with_controller(device, Some(c))) {
             device.configuration.clear();
             failures.push((
                 format!("{location} {} choose configuration", device.name()),
@@ -621,37 +894,65 @@ impl Controller {
         true
     }
 
-    fn adopt(
+    pub(super) fn choose(
         &mut self,
+        device: &mut Device,
+        location: &str,
+        failures: &mut Vec<(String, BlockError)>,
+    ) -> bool {
+        block_on(Self::choose_with(
+            &Access::blocking(self, None),
+            device,
+            location,
+            failures,
+        ))
+    }
+
+    async fn adopt_with(
+        a: &Access<'_>,
         mut device: Device,
         attachment: Attachment,
         location: String,
-        dma: &mut dyn DmaAllocator,
         devices: &mut Vec<Device>,
         failures: &mut Vec<(String, BlockError)>,
     ) {
-        if self.choose(&mut device, &location, failures)
+        if Self::choose_with(a, &mut device, &location, failures).await
             && device.descriptor[4] == HUB_CLASS
-            && let Err(error) = self.hub(&device, attachment, dma, devices, failures)
+            && let Err(error) = Self::hub_with(a, &device, attachment, devices, failures).await
         {
             failures.push((format!("{location} {} enumerate hub", device.name()), error));
         }
-        self.initial_usb2_lpm(&device, attachment);
+        Self::initial_usb2_lpm_with(a, &device, attachment).await;
         // Selection failures still preserve the entire descriptor
         // inventory for diagnostics and future generic forwarding.
-        if let Ok(slot) = self.slot(device.slot) {
-            slot.inventory = Some(device.clone());
-        }
+        a.with(|c| {
+            if let Ok(slot) = c.slot(device.slot) {
+                slot.inventory = Some(device.clone());
+            }
+        });
         devices.push(device);
     }
 
+    #[cfg(test)]
     pub(crate) fn preflight_vendor_ethernet(
         &mut self,
         device: &mut Device,
     ) -> Result<(), BlockError> {
+        block_on(Self::preflight_vendor_ethernet_with(
+            &Access::blocking(self, None),
+            device,
+        ))
+    }
+
+    async fn preflight_vendor_ethernet_with(
+        a: &Access<'_>,
+        device: &mut Device,
+    ) -> Result<(), BlockError> {
         if ethernet::matches(&device.descriptor) {
             use ethernet::rtl815x::Revision;
-            let bytes = self.device(device.id)?.control(Revision::request(), &[])?;
+            let bytes = a
+                .device_control(device.id, Revision::request(), &[])
+                .await?;
             let revision = Revision::from_register(&bytes)?;
             device.vendor_ethernet_revision = Some(revision.0);
             device.vendor_ethernet_tcr = Some(u32::from_le_bytes(bytes.try_into().unwrap()));
@@ -672,7 +973,12 @@ impl Controller {
         location: String,
         dma: &mut dyn DmaAllocator,
     ) -> Result<Device, (String, BlockError)> {
-        self.identify_parent(attachment, None, location, dma)
+        block_on(Self::identify_with(
+            &Access::blocking(self, Some(dma)),
+            attachment,
+            None,
+            location,
+        ))
     }
 
     #[expect(
@@ -686,14 +992,32 @@ impl Controller {
         location: String,
         dma: &mut dyn DmaAllocator,
     ) -> Result<Device, (String, BlockError)> {
-        let slot = self.address_parent(attachment, parent_id, dma)?;
-        let described = self.describe(slot, attachment, location);
+        block_on(Self::identify_with(
+            &Access::blocking(self, Some(dma)),
+            attachment,
+            parent_id,
+            location,
+        ))
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+    )]
+    async fn identify_with(
+        a: &Access<'_>,
+        attachment: Attachment,
+        parent_id: Option<SlotId>,
+        location: String,
+    ) -> Result<Device, (String, BlockError)> {
+        let slot = Self::address_with(a, attachment, parent_id).await?;
+        let described = Self::describe_with(a, slot, attachment, location).await;
         if described.is_err() {
             // Best effort: a slot that will not disable stays enabled.
-            let _ = self.disable_slot(slot, reset::Ownership::Vacant);
+            let _ = a.with(|c| c.disable_slot(slot, reset::Ownership::Vacant));
         }
         if let Ok(device) = &described {
-            self.slot(slot).unwrap().inventory = Some(device.clone());
+            a.with(|c| c.slot(slot).unwrap().inventory = Some(device.clone()));
         }
         described
     }
@@ -702,13 +1026,13 @@ impl Controller {
         clippy::result_large_err,
         reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
     )]
-    fn describe(
-        &mut self,
+    async fn describe_with(
+        a: &Access<'_>,
         slot: u8,
         attachment: Attachment,
         location: String,
     ) -> Result<Device, (String, BlockError)> {
-        let first = self.enumeration_descriptor(slot, DEVICE_DESCRIPTOR, 0, 8)?;
+        let first = Self::enumeration_descriptor_with(a, slot, DEVICE_DESCRIPTOR, 0, 8).await?;
         if first.len() < 8 {
             return during(
                 format!("slot {slot} device descriptor header"),
@@ -724,10 +1048,10 @@ impl Controller {
         if attachment.speed == FULL_SPEED && ep0 != expected && [8, 16, 32, 64].contains(&ep0) {
             during(
                 format!("slot {slot} Evaluate Context EP0 max_packet={ep0}"),
-                self.set_control_packet(slot, ep0),
+                Self::set_control_packet_with(a, slot, ep0).await,
             )?;
         }
-        let bytes = self.enumeration_descriptor(slot, DEVICE_DESCRIPTOR, 0, 18)?;
+        let bytes = Self::enumeration_descriptor_with(a, slot, DEVICE_DESCRIPTOR, 0, 18).await?;
         let descriptor: [u8; 18] = during(
             format!("slot {slot} full device descriptor"),
             bytes
@@ -748,22 +1072,24 @@ impl Controller {
                 )),
             );
         }
-        let configurations = self
-            .configurations(slot, descriptor[17])
+        let configurations = Self::configurations_with(a, slot, descriptor[17])
+            .await
             .map_err(|(operation, error)| (format!("{identity} {operation}"), error))?;
         let language = if descriptor[14..17].iter().any(|index| *index != 0) {
-            self.language(slot)
+            Self::language_with(a, slot).await
         } else {
             None
         };
-        let mut string =
-            |index| language.and_then(|language| self.string_owned(slot, language, index));
-        let manufacturer = string(descriptor[14]);
-        let product = string(descriptor[15]);
-        let serial = string(descriptor[16]);
+        let mut strings = [None, None, None];
+        if let Some(language) = language {
+            for (string, index) in strings.iter_mut().zip(&descriptor[14..17]) {
+                *string = Self::string_with(a, slot, language, *index).await;
+            }
+        }
+        let [manufacturer, product, serial] = strings;
         let device = Device {
-            id: self
-                .device_id(slot)
+            id: a
+                .with(|c| c.device_id(slot))
                 .map_err(|error| ("identify device generation".into(), error))?,
             vendor_ethernet_revision: None,
             vendor_ethernet_tcr: None,
@@ -782,12 +1108,29 @@ impl Controller {
     }
 
     /// Read every descriptor index, keeping the complete original byte streams.
+    #[cfg(test)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "This test-only return keeps the shared typed source and cleanup causes without allocating on propagation."
+    )]
+    pub(super) fn configurations(
+        &mut self,
+        slot: u8,
+        count: u8,
+    ) -> Result<Vec<Vec<u8>>, (String, BlockError)> {
+        block_on(Self::configurations_with(
+            &Access::blocking(self, None),
+            slot,
+            count,
+        ))
+    }
+
     #[expect(
         clippy::result_large_err,
         reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
     )]
-    pub(super) fn configurations(
-        &mut self,
+    async fn configurations_with(
+        a: &Access<'_>,
         slot: u8,
         count: u8,
     ) -> Result<Vec<Vec<u8>>, (String, BlockError)> {
@@ -800,7 +1143,7 @@ impl Controller {
         let mut configurations = Vec::new();
         let mut inventory_bytes = 0;
         for index in 0..count {
-            let bytes = self.configuration(slot, index)?;
+            let bytes = Self::configuration_with(a, slot, index).await?;
             inventory_bytes += bytes.len();
             if inventory_bytes > CONFIGURATION_INVENTORY_BYTES {
                 return during(
@@ -814,7 +1157,7 @@ impl Controller {
             // Linux keeps both and a value selects the first; so does this.
             configurations.push(bytes);
         }
-        self.current_descriptions(slot, &configurations)
+        a.with(|c| c.current_descriptions(slot, &configurations))
             .map_err(|error| ("retain USB configuration current descriptors".into(), error))?;
         Ok(configurations)
     }
@@ -824,12 +1167,13 @@ impl Controller {
         clippy::result_large_err,
         reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
     )]
-    pub(super) fn configuration(
-        &mut self,
+    async fn configuration_with(
+        a: &Access<'_>,
         slot: u8,
         index: u8,
     ) -> Result<Vec<u8>, (String, BlockError)> {
-        let head = self.enumeration_descriptor(slot, CONFIGURATION_DESCRIPTOR, index, 9)?;
+        let head =
+            Self::enumeration_descriptor_with(a, slot, CONFIGURATION_DESCRIPTOR, index, 9).await?;
         if head.len() < 9 {
             return during(
                 format!("slot {slot} configuration {index} header"),
@@ -849,7 +1193,9 @@ impl Controller {
                 )),
             );
         }
-        let bytes = self.enumeration_descriptor(slot, CONFIGURATION_DESCRIPTOR, index, total)?;
+        let bytes =
+            Self::enumeration_descriptor_with(a, slot, CONFIGURATION_DESCRIPTOR, index, total)
+                .await?;
         during(
             format!(
                 "slot {slot} configuration {index} value={} validate",
@@ -866,9 +1212,10 @@ impl Controller {
         Ok(bytes)
     }
 
+    #[cfg(test)]
     #[expect(
         clippy::result_large_err,
-        reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+        reason = "This test-only return keeps the shared typed source and cleanup causes without allocating on propagation."
     )]
     pub(super) fn enumeration_descriptor(
         &mut self,
@@ -877,12 +1224,33 @@ impl Controller {
         index: u8,
         length: u16,
     ) -> Result<Vec<u8>, (String, BlockError)> {
+        block_on(Self::enumeration_descriptor_with(
+            &Access::blocking(self, None),
+            slot,
+            kind,
+            index,
+            length,
+        ))
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+    )]
+    async fn enumeration_descriptor_with(
+        a: &Access<'_>,
+        slot: u8,
+        kind: u8,
+        index: u8,
+        length: u16,
+    ) -> Result<Vec<u8>, (String, BlockError)> {
         during(
             format!("slot {slot} EP0 GET_DESCRIPTOR type={kind} index={index} length={length}"),
-            self.descriptor(slot, kind, index, length),
+            Self::descriptor_with(a, slot, kind, index, length).await,
         )
     }
 
+    #[cfg(test)]
     pub(super) fn hub(
         &mut self,
         device: &Device,
@@ -891,18 +1259,34 @@ impl Controller {
         devices: &mut Vec<Device>,
         failures: &mut Vec<(String, BlockError)>,
     ) -> Result<(), BlockError> {
-        if self.validate_topology_id(device.id)? != device.slot {
+        block_on(Self::hub_with(
+            &Access::blocking(self, Some(dma)),
+            device,
+            attachment,
+            devices,
+            failures,
+        ))
+    }
+
+    async fn hub_with(
+        a: &Access<'_>,
+        device: &Device,
+        attachment: Attachment,
+        devices: &mut Vec<Device>,
+        failures: &mut Vec<(String, BlockError)>,
+    ) -> Result<(), BlockError> {
+        if a.with(|c| c.validate_topology_id(device.id))? != device.slot {
             return Err(BlockError::Unsupported(
                 "USB hub original descriptor slot changed",
             ));
         }
-        if self.slot(device.slot)?.attachment != attachment {
+        if a.with(|c| Ok::<_, BlockError>(c.slot(device.slot)?.attachment))? != attachment {
             return Err(BlockError::Unsupported(
                 "USB hub attachment is not its retained owner",
             ));
         }
         if matches!(attachment.speed, SUPER_SPEED | SUPER_SPEED_PLUS) {
-            return self.superspeed_hub(device, attachment, dma, devices, failures);
+            return Self::superspeed_hub_with(a, device, attachment, devices, failures).await;
         }
         if attachment.tier + 1 > MAX_TIERS {
             return Err(BlockError::Unsupported("hub more than five tiers deep"));
@@ -912,17 +1296,19 @@ impl Controller {
         // fields and the port count.
         let mut bytes = Vec::new();
         for _ in 0..3 {
-            bytes = self.control_owned(
-                slot,
-                setup(
-                    DEVICE_TO_HOST | TYPE_CLASS,
-                    GET_DESCRIPTOR,
-                    u16::from(HUB_DESCRIPTOR) << 8,
-                    0,
-                    hub::descriptor::Usb2Descriptor::REQUEST,
-                ),
-                &[],
-            )?;
+            bytes = a
+                .control(
+                    slot,
+                    setup(
+                        DEVICE_TO_HOST | TYPE_CLASS,
+                        GET_DESCRIPTOR,
+                        u16::from(HUB_DESCRIPTOR) << 8,
+                        0,
+                        hub::descriptor::Usb2Descriptor::REQUEST,
+                    ),
+                    &[],
+                )
+                .await?;
             if bytes.len() >= hub::descriptor::Usb2Descriptor::MINIMUM {
                 break;
             }
@@ -947,44 +1333,44 @@ impl Controller {
         } else {
             0
         };
-        self.set_configuration_owned(slot, device.configuration_value())?;
+        Self::set_configuration_with(a, slot, device.configuration_value()).await?;
         // Device status describes the configuration the device acknowledged.
-        let self_powered = self.hub_power_source(slot)?;
-        self.install_hub_current(slot, ports, descriptor.controller_ma, self_powered)?;
-        self.observe_hub_current(slot)?;
+        let self_powered = Self::hub_power_source_with(a, slot).await?;
+        a.with(|c| c.install_hub_current(slot, ports, descriptor.controller_ma, self_powered))?;
+        Self::observe_hub_current_with(a, slot).await?;
         // Linux `hub_configure`: a multi-TT hub (device protocol 2) gets one
         // TT per port through interface 0's alternate setting 1; a refusal
         // leaves it a single-TT hub.
         let multi = device.descriptor[6] == HUB_MULTI_TT
-            && self
-                .control_owned(
-                    slot,
-                    setup(
-                        RECIPIENT_INTERFACE,
-                        SET_INTERFACE,
-                        u16::from(MULTI_TT_ALTERNATE),
-                        0,
-                        0,
-                    ),
-                    &[],
-                )
-                .is_ok();
+            && a.control(
+                slot,
+                setup(
+                    RECIPIENT_INTERFACE,
+                    SET_INTERFACE,
+                    u16::from(MULTI_TT_ALTERNATE),
+                    0,
+                    0,
+                ),
+                &[],
+            )
+            .await
+            .is_ok();
         let alternate = if multi { MULTI_TT_ALTERNATE } else { 0 };
         // SET_INTERFACE success is physical permission for this setting. If its
         // original descriptor cannot supply a complete status bitmap, refuse
         // before Configure Endpoint, downstream power or child publication.
         let endpoint = hub::usb2_status_endpoint(original, device.speed, alternate, ports)?;
-        self.configure_owned(slot, &[endpoint], Some((ports, tt_think, multi)), dma)?;
+        Self::configure_with(a, slot, &[endpoint], Some((ports, tt_think, multi))).await?;
         let mut powered_ports = Vec::new();
         for port in 1..=ports {
-            if let Err(error) = self.reserve_port_current(slot, port) {
+            if let Err(error) = a.with(|c| c.reserve_port_current(slot, port)) {
                 failures.push((
                     format!("{}.{port} reserve initial USB current", device.location),
                     error,
                 ));
                 continue;
             }
-            self.control_owned(
+            a.control(
                 slot,
                 setup(
                     TYPE_CLASS | RECIPIENT_OTHER,
@@ -994,29 +1380,28 @@ impl Controller {
                     0,
                 ),
                 &[],
-            )?;
+            )
+            .await?;
             powered_ports.push(port);
         }
-        self.minimum_wait(descriptor.power_good_us)?;
+        a.minimum_wait(descriptor.power_good_us).await?;
         for port in powered_ports {
             let location = format!("{}.{port}", device.location);
             crate::working(&location);
-            let reset = |c: &mut Self| {
-                c.hub_port_for(device.id, port).map(|speed| {
-                    speed.map(|speed| Attachment {
-                        root_port: attachment.root_port,
-                        route: child_route(attachment.route, attachment.tier, port),
-                        tier: attachment.tier + 1,
-                        speed,
-                        parent: Some((slot, port)),
-                        translator: match (speed, attachment.speed) {
-                            (LOW_SPEED | FULL_SPEED, HIGH_SPEED) => Some((slot, port)),
-                            _ => attachment.translator,
-                        },
-                    })
-                })
+            let reset = Reset::Usb2 {
+                hub: device.id,
+                port,
+                parent: attachment,
             };
-            self.connect(location, Some(device.id), reset, dma, devices, failures);
+            Box::pin(Self::connect_with(
+                a,
+                location,
+                Some(device.id),
+                reset,
+                devices,
+                failures,
+            ))
+            .await;
         }
         Ok(())
     }
@@ -1045,21 +1430,36 @@ impl Controller {
         slot: u8,
         port: u8,
     ) -> Result<(u16, u16), BlockError> {
-        let status = self.control_owned(
+        block_on(Self::hub_port_status_with(
+            &Access::blocking(self, None),
             slot,
-            setup(
-                DEVICE_TO_HOST | TYPE_CLASS | RECIPIENT_OTHER,
-                GET_STATUS,
-                0,
-                u16::from(port),
-                4,
-            ),
-            &[],
-        )?;
+            port,
+        ))
+    }
+
+    pub(super) async fn hub_port_status_with(
+        a: &Access<'_>,
+        slot: u8,
+        port: u8,
+    ) -> Result<(u16, u16), BlockError> {
+        let status = a
+            .control(
+                slot,
+                setup(
+                    DEVICE_TO_HOST | TYPE_CLASS | RECIPIENT_OTHER,
+                    GET_STATUS,
+                    0,
+                    u16::from(port),
+                    4,
+                ),
+                &[],
+            )
+            .await?;
         if status.len() != 4 {
             return Err(BlockError::Unsupported("short hub port status"));
         }
-        hub::validate_port_status(&status, self.slot(slot)?.attachment.speed)?;
+        let speed = a.with(|c| Ok::<_, BlockError>(c.slot(slot)?.attachment.speed))?;
+        hub::validate_port_status(&status, speed)?;
         Ok((
             u16::from_le_bytes([status[0], status[1]]),
             u16::from_le_bytes([status[2], status[3]]),

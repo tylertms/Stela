@@ -64,6 +64,7 @@ use core::{
     sync::atomic::{Ordering, fence},
 };
 
+mod access;
 mod bind;
 mod command;
 mod configuration;
@@ -80,7 +81,9 @@ mod lifecycle;
 mod lpm;
 mod memory;
 mod minimum;
+use access::Access;
 use minimum::Minimum;
+use stela_driver_base::stepped::block_on;
 #[cfg(test)]
 pub(crate) mod model;
 pub mod native;

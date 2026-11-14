@@ -499,8 +499,20 @@ impl Controller {
         id: SlotId,
         include_hub: bool,
     ) -> Result<(), BlockError> {
-        self.validate_ancestry(id)?;
-        self.observe_current_ancestors(id.hardware_slot(), include_hub)
+        block_on(Self::observe_current_ancestors_for_with(
+            &Access::blocking(self, None),
+            id,
+            include_hub,
+        ))
+    }
+
+    pub(super) async fn observe_current_ancestors_for_with(
+        a: &Access<'_>,
+        id: SlotId,
+        include_hub: bool,
+    ) -> Result<(), BlockError> {
+        a.with(|c| c.validate_ancestry(id))?;
+        Self::observe_current_ancestors_with(a, id.hardware_slot(), include_hub).await
     }
 
     pub(super) fn root_current(&mut self, port: u8, speed: u8) -> Result<u16, BlockError> {
@@ -580,65 +592,91 @@ impl Controller {
     ) -> Result<(), BlockError> {
         self.power.descriptions(slot, configurations)
     }
-    pub(super) fn prepare_current_configuration(
-        &mut self,
+    pub(super) async fn prepare_current_configuration_with(
+        a: &Access<'_>,
         slot: u8,
         value: u8,
     ) -> Result<u16, BlockError> {
-        // A configured hub owns its powered ports and descendant contracts.
-        // Endpoint teardown alone cannot authorize replacing that permission.
-        // Reconfiguration needs explicit subtree retirement and a fresh hub
-        // owner; the cached same-value helper remains a harmless no-op.
-        if self.power.grant(slot)?.hub.is_some() {
-            return Err(BlockError::Unsupported(
-                "USB hub configuration requires complete subtree retirement",
-            ));
-        }
-        self.power.demand(slot, value)?;
-        self.observe_current_ancestors(slot, false)?;
-        self.power.configuration_prepare(slot, value)
+        a.with(|c| {
+            // A configured hub owns its powered ports and descendant
+            // contracts. Endpoint teardown alone cannot authorize replacing
+            // that permission. Reconfiguration needs explicit subtree
+            // retirement and a fresh hub owner; the cached same-value helper
+            // remains a harmless no-op.
+            if c.power.grant(slot)?.hub.is_some() {
+                return Err(BlockError::Unsupported(
+                    "USB hub configuration requires complete subtree retirement",
+                ));
+            }
+            c.power.demand(slot, value)?;
+            Ok(())
+        })?;
+        Self::observe_current_ancestors_with(a, slot, false).await?;
+        a.with(|c| c.power.configuration_prepare(slot, value))
     }
     pub(super) fn observe_current_ancestors(
         &mut self,
         slot: u8,
         include_hub: bool,
     ) -> Result<(), BlockError> {
-        self.validate_owned_slot_ancestry(slot)?;
-        let attachment = self.power.grant(slot)?.attachment;
-        let root_speed = if self
-            .port_major
-            .get(usize::from(attachment.root_port.wrapping_sub(1)))
-            == Some(&3)
-        {
-            SUPER_SPEED
-        } else {
-            HIGH_SPEED
-        };
-        self.root_current(attachment.root_port, root_speed)?;
+        block_on(Self::observe_current_ancestors_with(
+            &Access::blocking(self, None),
+            slot,
+            include_hub,
+        ))
+    }
+
+    pub(super) async fn observe_current_ancestors_with(
+        a: &Access<'_>,
+        slot: u8,
+        include_hub: bool,
+    ) -> Result<(), BlockError> {
+        let attachment = a.with(|c| {
+            c.validate_owned_slot_ancestry(slot)?;
+            let attachment = c.power.grant(slot)?.attachment;
+            let root_speed = if c
+                .port_major
+                .get(usize::from(attachment.root_port.wrapping_sub(1)))
+                == Some(&3)
+            {
+                SUPER_SPEED
+            } else {
+                HIGH_SPEED
+            };
+            c.root_current(attachment.root_port, root_speed)?;
+            Ok::<_, BlockError>(attachment)
+        })?;
         if include_hub {
-            self.observe_hub_current(slot)?;
+            Self::observe_hub_current_with(a, slot).await?;
         }
         let mut parent = attachment.parent;
         while let Some((slot, _)) = parent {
-            let ancestor = self.power.grant(slot)?.attachment;
+            let ancestor = a.with(|c| Ok::<_, BlockError>(c.power.grant(slot)?.attachment))?;
             // Raw GET_STATUS does not recurse into SET_CONFIGURATION accounting.
-            self.observe_hub_current(slot)?;
+            Self::observe_hub_current_with(a, slot).await?;
             parent = ancestor.parent;
         }
         Ok(())
     }
-    pub(super) fn prepare_port_current(&mut self, slot: u8, port: u8) -> Result<(), BlockError> {
-        self.validate_owned_slot_ancestry(slot)?;
-        let root = self.slots[usize::from(slot)]
-            .as_ref()
-            .unwrap()
-            .attachment
-            .root_port;
-        self.validate_current_graph(root)?;
-        // Reject pure budget/ownership failures before touching MMIO or DMA.
-        // Reservation is conservative across any later uncertain health/ACK.
-        self.power.powered_port(slot, port)?;
-        self.observe_current_ancestors(slot, true)
+    pub(super) async fn prepare_port_current_with(
+        a: &Access<'_>,
+        slot: u8,
+        port: u8,
+    ) -> Result<(), BlockError> {
+        a.with(|c| {
+            c.validate_owned_slot_ancestry(slot)?;
+            let root = c.slots[usize::from(slot)]
+                .as_ref()
+                .unwrap()
+                .attachment
+                .root_port;
+            c.validate_current_graph(root)?;
+            // Reject pure budget/ownership failures before touching MMIO or
+            // DMA. Reservation is conservative across any later uncertain
+            // health/ACK.
+            c.power.powered_port(slot, port)
+        })?;
+        Self::observe_current_ancestors_with(a, slot, true).await
     }
     pub(super) fn ack_current_configuration(
         &mut self,
@@ -661,15 +699,24 @@ impl Controller {
         self.validate_owned_slot_ancestry(slot)?;
         self.power.powered_port(slot, port)
     }
-    pub(super) fn observe_hub_current(&mut self, slot: u8) -> Result<(), BlockError> {
-        self.validate_owned_slot_ancestry(slot)?;
-        let result = (|| {
-            let bytes = self.control_owned(slot, setup(0x80, GET_STATUS, 0, 0, 2), &[])?;
-            if bytes.len() != 2 || (bytes[0] & 1 != 0) != self.power.hub_is_self_powered(slot)? {
+    pub(super) async fn observe_hub_current_with(
+        a: &Access<'_>,
+        slot: u8,
+    ) -> Result<(), BlockError> {
+        a.with(|c| c.validate_owned_slot_ancestry(slot))?;
+        let result = async {
+            let bytes = a
+                .control(slot, setup(0x80, GET_STATUS, 0, 0, 2), &[])
+                .await?;
+            if bytes.len() != 2
+                || (bytes[0] & 1 != 0) != a.with(|c| c.power.hub_is_self_powered(slot))?
+            {
                 return Err(BlockError::Unsupported("USB hub power source changed"));
             }
             for _ in 0..2 {
-                let bytes = self.control_owned(slot, setup(0xa0, GET_STATUS, 0, 0, 4), &[])?;
+                let bytes = a
+                    .control(slot, setup(0xa0, GET_STATUS, 0, 0, 4), &[])
+                    .await?;
                 if bytes.len() != 4 {
                     return Err(BlockError::Unsupported("short USB hub power status"));
                 }
@@ -683,14 +730,16 @@ impl Controller {
                 if change == 0 {
                     return Ok(());
                 }
-                self.control_owned(slot, setup(0x20, CLEAR_FEATURE, 0, 0, 0), &[])?;
+                a.control(slot, setup(0x20, CLEAR_FEATURE, 0, 0, 0), &[])
+                    .await?;
             }
             Err(BlockError::Unsupported(
                 "USB hub local power change did not clear",
             ))
-        })();
+        }
+        .await;
         if result.is_err() {
-            self.quarantine_current_subtree(slot);
+            a.with(|c| c.quarantine_current_subtree(slot));
         }
         result
     }

@@ -144,32 +144,15 @@ impl Host {
                     ))
             })
             .transpose()?;
-        let ssp = parent.and_then(|index| self.hubs[index].ssp.as_ref());
+        let ssp = parent.and_then(|index| self.hubs[index].ssp.clone());
         let superspeed =
             parent.is_some_and(|index| self.hubs[index].attachment.speed >= SUPER_SPEED);
         let mut c = self.controller.borrow_mut();
-        let reset = |c: &mut Controller| {
-            let speed = if let Some((_, port)) = attachment.parent {
-                let parent = original_parent.ok_or(BlockError::Unsupported(
-                    "USB recovery original parent absent",
-                ))?;
-                c.observe_current_ancestors_for(parent, true)?;
-                let speed = if superspeed {
-                    c.superspeed_port_for(parent, port, ssp)?
-                } else {
-                    c.hub_port_for(parent, port)?
-                };
-                c.observe_current_ancestors_for(parent, true)?;
-                speed
-            } else {
-                c.root_current(attachment.root_port, attachment.speed)?;
-                c.reset_root_device(attachment)?;
-                c.root_port(attachment.root_port)?
-            };
-            Ok(speed.map(|speed| Attachment {
-                speed,
-                ..attachment
-            }))
+        let reset = enumerate::Reset::Recover {
+            attachment,
+            parent: original_parent,
+            ssp,
+            superspeed,
         };
         c.connect(
             location,

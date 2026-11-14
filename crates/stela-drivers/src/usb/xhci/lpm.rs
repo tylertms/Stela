@@ -171,11 +171,25 @@ impl Controller {
     /// from ACPI `_UPC`, which this driver does not have. Failures leave LPM
     /// off, as Linux ignores them.
     pub(super) fn initial_usb2_lpm(&mut self, device: &Device, attachment: Attachment) {
+        block_on(Self::initial_usb2_lpm_with(
+            &Access::blocking(self, None),
+            device,
+            attachment,
+        ))
+    }
+
+    pub(super) async fn initial_usb2_lpm_with(
+        a: &Access<'_>,
+        device: &Device,
+        attachment: Attachment,
+    ) {
         let port = attachment.root_port;
-        if let Some(enabled) = self.lpm.enabled.get_mut(usize::from(port) - 1) {
-            *enabled = None;
-        }
-        let protocol = self.lpm.port(port);
+        let protocol = a.with(|c| {
+            if let Some(enabled) = c.lpm.enabled.get_mut(usize::from(port) - 1) {
+                *enabled = None;
+            }
+            c.lpm.port(port)
+        });
         let bcd = u16::from_le_bytes([device.descriptor[2], device.descriptor[3]]);
         let id = (
             u16::from_le_bytes([device.descriptor[8], device.descriptor[9]]),
@@ -190,7 +204,7 @@ impl Controller {
         {
             return;
         }
-        let Some(attributes) = self.usb2_extension(device.slot) else {
+        let Some(attributes) = Self::usb2_extension_with(a, device.slot).await else {
             return;
         };
         if attributes & (LPM_SUPPORT | BESL_SUPPORT) != LPM_SUPPORT | BESL_SUPPORT {
@@ -201,9 +215,19 @@ impl Controller {
             attributes,
             besl_capable: protocol & PROTOCOL_BLC != 0,
         };
-        if self.set_usb2_lpm(port, lpm, true).is_ok() {
-            self.lpm.enabled[usize::from(port) - 1] = Some(lpm);
+        if lpm.besl_capable {
+            let latency = BESL_ENCODING[usize::from(lpm.besl())];
+            if Self::max_exit_latency_with(a, lpm.slot, latency)
+                .await
+                .is_err()
+            {
+                return;
+            }
         }
+        a.with(|c| {
+            c.enable_usb2_lpm(port, lpm);
+            c.lpm.enabled[usize::from(port) - 1] = Some(lpm);
+        });
     }
 
     /// `usb_disable_usb2_hardware_lpm` before a root device's reset.
@@ -217,13 +241,17 @@ impl Controller {
 
     /// `usb_get_bos_descriptor`'s USB 2.0 Extension bmAttributes; a device
     /// without a readable BOS has none.
-    fn usb2_extension(&mut self, slot: u8) -> Option<u32> {
-        let header = self.descriptor(slot, BOS_DESCRIPTOR, 0, 5).ok()?;
+    async fn usb2_extension_with(a: &Access<'_>, slot: u8) -> Option<u32> {
+        let header = Self::descriptor_with(a, slot, BOS_DESCRIPTOR, 0, 5)
+            .await
+            .ok()?;
         if header.len() < 5 || header[1] != BOS_DESCRIPTOR {
             return None;
         }
         let total = u16::from_le_bytes([header[2], header[3]]);
-        let bytes = self.descriptor(slot, BOS_DESCRIPTOR, 0, total).ok()?;
+        let bytes = Self::descriptor_with(a, slot, BOS_DESCRIPTOR, 0, total)
+            .await
+            .ok()?;
         let mut at = usize::from(header[0]).max(5);
         while let Some(&length) = bytes.get(at) {
             let length = usize::from(length);
@@ -248,24 +276,12 @@ impl Controller {
     /// drops the exit latency and waits for U0.
     fn set_usb2_lpm(&mut self, port: u8, lpm: Usb2Lpm, enable: bool) -> Result<(), BlockError> {
         let pmsc = self.port_offset(port) + PORTPMSC;
-        let hlpmc = self.port_offset(port) + PORTHLPMC;
         let mut value = self.registers.read32(pmsc);
         if enable {
-            let hird = if lpm.besl_capable {
-                let besl = lpm.besl();
-                self.max_exit_latency(lpm.slot, BESL_ENCODING[usize::from(besl)])?;
-                self.registers.write32(hlpmc, lpm.hlpmc());
-                self.registers.read32(hlpmc);
-                besl
-            } else {
-                lpm.hird(self.lpm.u2_latency)
-            };
-            value &= !PMSC_HIRD;
-            value |= u32::from(hird) << 4 | PMSC_RWE | u32::from(lpm.slot) << 8;
-            self.registers.write32(pmsc, value);
-            let value = self.registers.read32(pmsc);
-            self.registers.write32(pmsc, value | PMSC_HLE);
-            self.registers.read32(pmsc);
+            if lpm.besl_capable {
+                self.max_exit_latency(lpm.slot, BESL_ENCODING[usize::from(lpm.besl())])?;
+            }
+            self.enable_usb2_lpm(port, lpm);
         } else {
             value &= !(PMSC_HLE | PMSC_RWE | PMSC_HIRD | PMSC_L1DS);
             self.registers.write32(pmsc, value);
@@ -281,29 +297,65 @@ impl Controller {
         Ok(())
     }
 
+    /// [`Self::set_usb2_lpm`]'s registers once a BESL port's exit latency
+    /// is in.
+    fn enable_usb2_lpm(&mut self, port: u8, lpm: Usb2Lpm) {
+        let pmsc = self.port_offset(port) + PORTPMSC;
+        let hlpmc = self.port_offset(port) + PORTHLPMC;
+        let mut value = self.registers.read32(pmsc);
+        let hird = if lpm.besl_capable {
+            self.registers.write32(hlpmc, lpm.hlpmc());
+            self.registers.read32(hlpmc);
+            lpm.besl()
+        } else {
+            lpm.hird(self.lpm.u2_latency)
+        };
+        value &= !PMSC_HIRD;
+        value |= u32::from(hird) << 4 | PMSC_RWE | u32::from(lpm.slot) << 8;
+        self.registers.write32(pmsc, value);
+        let value = self.registers.read32(pmsc);
+        self.registers.write32(pmsc, value | PMSC_HLE);
+        self.registers.read32(pmsc);
+    }
+
     /// `xhci_change_max_exit_latency`: the slot context's Max Exit Latency
     /// through Evaluate Context.
     fn max_exit_latency(&mut self, slot: u8, latency: u16) -> Result<(), BlockError> {
-        self.clear_input(slot)?;
-        let context = self.context();
-        let input_address = {
-            let state = self.slot(slot)?;
+        block_on(Self::max_exit_latency_with(
+            &Access::blocking(self, None),
+            slot,
+            latency,
+        ))
+    }
+
+    async fn max_exit_latency_with(
+        a: &Access<'_>,
+        slot: u8,
+        latency: u16,
+    ) -> Result<(), BlockError> {
+        let input_address = a.with(|c| {
+            c.clear_input(slot)?;
+            let context = c.context();
+            let state = c.slot(slot)?;
             let mut words = state.context;
             words[1] = words[1] & !0xffff | u32::from(latency);
             state.input.write(4, 1u32);
             for (index, word) in words.iter().enumerate() {
                 state.input.write(context + 4 * index, *word);
             }
-            state.input.device_address()
-        };
-        self.command(
+            Ok::<_, BlockError>(state.input.device_address())
+        })?;
+        a.command(
             input_address,
             0,
             EVALUATE_CONTEXT << 10 | u32::from(slot) << 24,
-        )?;
-        let state = self.slot(slot)?;
-        state.context[1] = state.context[1] & !0xffff | u32::from(latency);
-        Ok(())
+        )
+        .await?;
+        a.with(|c| {
+            let state = c.slot(slot)?;
+            state.context[1] = state.context[1] & !0xffff | u32::from(latency);
+            Ok(())
+        })
     }
 }
 

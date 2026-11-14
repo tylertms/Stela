@@ -30,14 +30,27 @@ impl Controller {
         slot: u8,
         value: u8,
     ) -> Result<(), BlockError> {
-        if self.current_configuration_owned(slot)? == Some(value) {
+        block_on(Self::set_configuration_with(
+            &Access::blocking(self, None),
+            slot,
+            value,
+        ))
+    }
+
+    pub(super) async fn set_configuration_with(
+        a: &Access<'_>,
+        slot: u8,
+        value: u8,
+    ) -> Result<(), BlockError> {
+        if a.with(|c| c.current_configuration_owned(slot))? == Some(value) {
             return Ok(());
         }
-        self.control_owned(
+        a.control(
             slot,
             setup(0, SET_CONFIGURATION, u16::from(value), 0, 0),
             &[],
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
@@ -62,6 +75,22 @@ impl Controller {
         dma: &mut dyn DmaAllocator,
     ) -> Result<(), BlockError> {
         self.configure_inner(slot, endpoints, hub, &[], 0, dma)
+            .map(|_| ())
+    }
+
+    /// [`Self::configure_owned`].
+    pub(super) async fn configure_with(
+        a: &Access<'_>,
+        slot: u8,
+        endpoints: &[Endpoint],
+        hub: Option<(u8, u8, bool)>,
+    ) -> Result<(), BlockError> {
+        let (input, layout) =
+            a.with_dma(|c, dma| c.prepare_configure(slot, endpoints, hub, &[], 0, dma))??;
+        let result = a
+            .command(input, 0, CONFIGURE_ENDPOINT << 10 | u32::from(slot) << 24)
+            .await;
+        a.with(|c| c.conclude_configure(slot, endpoints, result, layout))
             .map(|_| ())
     }
 
@@ -164,6 +193,32 @@ impl Controller {
         requested_streams: u16,
         dma: &mut dyn DmaAllocator,
     ) -> Result<u16, BlockError> {
+        let (input_address, layout) = self.prepare_configure(
+            slot,
+            endpoints,
+            hub,
+            stream_endpoints,
+            requested_streams,
+            dma,
+        )?;
+        let result = self.command(
+            input_address,
+            0,
+            CONFIGURE_ENDPOINT << 10 | u32::from(slot) << 24,
+        );
+        self.conclude_configure(slot, endpoints, result, layout)
+    }
+
+    /// Configure Endpoint's rings and input context, before the command.
+    fn prepare_configure(
+        &mut self,
+        slot: u8,
+        endpoints: &[Endpoint],
+        hub: Option<(u8, u8, bool)>,
+        stream_endpoints: &[u8],
+        requested_streams: u16,
+        dma: &mut dyn DmaAllocator,
+    ) -> Result<(u64, Option<streams::Layout>), BlockError> {
         let contexts = self.endpoint_contexts(slot, endpoints)?;
         let speed = self.slot(slot)?.speed;
         let layout = if stream_endpoints.is_empty() {
@@ -299,11 +354,17 @@ impl Controller {
             }
             state.input.device_address()
         };
-        let result = self.command(
-            input_address,
-            0,
-            CONFIGURE_ENDPOINT << 10 | u32::from(slot) << 24,
-        );
+        Ok((input_address, layout))
+    }
+
+    /// Configure Endpoint's completion, `result`.
+    fn conclude_configure(
+        &mut self,
+        slot: u8,
+        endpoints: &[Endpoint],
+        result: Result<Event, BlockError>,
+        layout: Option<streams::Layout>,
+    ) -> Result<u16, BlockError> {
         // Keep rings on any error: a lost command completion may still leave
         // them reachable by the controller. Never expose an unacknowledged ring.
         for endpoint in endpoints {
