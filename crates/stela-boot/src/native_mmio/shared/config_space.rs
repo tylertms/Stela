@@ -209,29 +209,23 @@ impl ConfigInventory<'_> {
         scope.read(offset, width)
     }
 
-    /// Check a bridge's buses against its root grant and the ECAM windows,
-    /// returning the buses it forwards. The primary field routes nothing;
-    /// like Linux, a wrong one is kept.
+    /// Check a bridge's buses against its root grant, the ECAM windows and
+    /// the bridges `admitted` before it (`census::admit`), returning the
+    /// buses it forwards. The primary field routes nothing; like Linux, a
+    /// wrong one is kept.
     pub(crate) fn check_bridge(
         &self,
         address: Address,
         buses: u32,
-    ) -> Result<Option<RangeInclusive<u8>>, Error> {
-        match census::route(address.bus, buses) {
-            census::Route::Unconfigured => Ok(None),
-            census::Route::Invalid => Err(Error::InvalidPlatformReply),
-            census::Route::Forwards { buses, primary } => {
-                self.geometry.check_bridge(
-                    self.source.platform.wire().roots(),
-                    address,
-                    buses.clone(),
-                )?;
-                if !primary {
-                    report_oddity(census::Oddity::PrimaryBus, address);
-                }
-                Ok(Some(buses))
-            }
+        admitted: &[(Address, RangeInclusive<u8>)],
+    ) -> Result<Option<RangeInclusive<u8>>, census::Misconfigured> {
+        let roots = self.source.platform.wire().roots();
+        let within = |range| self.geometry.check_bridge(roots, address, range).is_ok();
+        let forwarded = census::admit(address, buses, within, admitted)?;
+        if forwarded.is_some() && buses as u8 != address.bus {
+            report_oddity(census::Oddity::PrimaryBus, address);
         }
+        Ok(forwarded)
     }
 
     fn withdraw(&mut self) -> Result<(), Error> {

@@ -75,7 +75,10 @@ pub fn exposed_by(bridge: Address, secondary: u8, address: Address) -> bool {
 
 /// Return the direct parent of every function in BDF order. An occupied
 /// subordinate bus must be the exact secondary bus of its immediate bridge.
-/// The rest of a subordinate range can be unpopulated.
+/// The rest of a subordinate range can be unpopulated. A function on a bus
+/// that no bridge forwards to, such as uncore devices on a high bus number
+/// or a bus behind a bridge the census left out, is placed under its root,
+/// which decodes every bus it grants.
 pub fn resolve(
     roots: &[RootWindow],
     functions: &[Function],
@@ -122,6 +125,14 @@ pub fn resolve(
         return Err(Error::DuplicateSecondary(pair[1].address));
     }
 
+    // No bridge forwards to this bus by its secondary bus number.
+    let orphan = |address: Address| {
+        routes
+            .binary_search_by_key(&(address.segment, address.bus), |route| {
+                (route.address.segment, route.secondary)
+            })
+            .is_err()
+    };
     let mut nesting: Vec<&Route> = Vec::new();
     nesting
         .try_reserve(routes.len().min(256))
@@ -135,11 +146,13 @@ pub fn resolve(
         if let Some(parent) = nesting.last() {
             if parent.root != route.root
                 || route.subordinate > parent.subordinate
-                || route.address.bus != parent.secondary
+                || (route.address.bus != parent.secondary && !orphan(route.address))
             {
                 return Err(Error::OverlappingBridges(route.address));
             }
-        } else if roots[route.root].minimum != u64::from(route.address.bus) {
+        } else if roots[route.root].minimum != u64::from(route.address.bus)
+            && !orphan(route.address)
+        {
             return Err(Error::MissingParent(route.address));
         }
         nesting.push(route);
@@ -155,8 +168,8 @@ pub fn resolve(
             .binary_search_by_key(&key, |route| (route.address.segment, route.secondary))
         {
             Ok(index) if routes[index].root == root => Parent::Bridge(routes[index].address),
-            Err(_) if u64::from(address.bus) == roots[root].minimum => Parent::Root(root),
-            _ => return Err(Error::MissingParent(address)),
+            Err(_) => Parent::Root(root),
+            Ok(_) => return Err(Error::MissingParent(address)),
         };
         parents.push((address, parent));
     }
@@ -234,10 +247,43 @@ mod tests {
                 (endpoint.address, Parent::Bridge(downstream.address)),
             ]
         );
-        let orphan = node(6, 1, None);
+    }
+
+    #[test]
+    fn a_bus_no_bridge_forwards_to_is_placed_under_its_root() {
+        let upstream = node(0, 1, Some((2, 8)));
+        // Inside the upstream range, with no bridge on bus 2 forwarding to
+        // it, as behind a bridge the census left out.
+        let inside = node(6, 1, None);
+        let inside_bridge = node(6, 2, Some((7, 7)));
+        let below = node(7, 0, None);
+        // Uncore devices on the root's last bus.
+        let uncore = node(0xff, 0x1e, None);
+        let uncore_bridge = node(0xff, 0x1f, Some((0xfe, 0xfe)));
         assert_eq!(
-            resolve(&[root(0, 9)], &[upstream, downstream, orphan]),
-            Err(Error::MissingParent(orphan.address))
+            resolve(
+                &[root(0, 0xff)],
+                &[upstream, inside, inside_bridge, below, uncore]
+            )
+            .unwrap(),
+            [
+                (upstream.address, Parent::Root(0)),
+                (inside.address, Parent::Root(0)),
+                (inside_bridge.address, Parent::Root(0)),
+                (below.address, Parent::Bridge(inside_bridge.address)),
+                (uncore.address, Parent::Root(0)),
+            ]
+        );
+        // A bridge's secondary bus never sits at or below its own.
+        assert_eq!(
+            resolve(&[root(0, 0xff)], &[uncore_bridge]),
+            Err(Error::InvalidBridge(uncore_bridge.address))
+        );
+        // A bus that a bridge does forward to keeps that bridge as parent.
+        let beside = node(2, 0, None);
+        assert_eq!(
+            resolve(&[root(0, 9)], &[upstream, beside]).unwrap()[1],
+            (beside.address, Parent::Bridge(upstream.address))
         );
     }
 
