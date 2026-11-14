@@ -206,6 +206,19 @@ fn start(handoff: u64) -> Started {
     // firmware; an earlier one has only the screen.
     crate::stop_record::arm(handoff.stop_record, Some(handoff.root));
     layout::set(handoff.placement);
+    // Before this image's first line: the loader's lines that no log stored.
+    let lines = handoff
+        .loader_lines
+        .bytes
+        .min(stela_boot_core::loader_lines::BYTES as u64) as usize;
+    // SAFETY: the loader wrote these bytes in the handoff allocation's
+    // tail, which the physmap keeps mapped like the handoff itself.
+    output::carry_loader_lines(unsafe {
+        core::slice::from_raw_parts(
+            layout::physical(handoff.loader_lines.physical) as *const u8,
+            lines,
+        )
+    });
     // Use the physmap directly: its CPU and physical bases have the
     // same alignment phase. A separately placed heap alias cannot in general
     // satisfy higher-order CPU/physical page alignment simultaneously.

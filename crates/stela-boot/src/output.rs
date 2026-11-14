@@ -667,6 +667,43 @@ pub fn leave_boot_services() {
 /// firmware ([`keep_stop_record`]).
 static UNKEPT_FROM: AtomicU64 = AtomicU64::new(0);
 
+/// Copy the lines no log stored since the firmware's log closed into
+/// `into`, the newest whole lines that fit (`loader_lines`), for the engine
+/// to put at the head of its own record ([`carry_loader_lines`]); the
+/// bytes used.
+pub fn unkept_lines(into: &mut [u8]) -> usize {
+    use stela_boot_core::loader_lines::{Carry, first};
+    exclusive(|| {
+        let Ok(record) = RECORD.0.try_borrow() else {
+            return 0;
+        };
+        let unkept = UNKEPT_FROM.load(Ordering::Relaxed);
+        let from = first(unkept, record.pushed(), into.len());
+        let mut carry = Carry::new(into, from - unkept);
+        let Ok(_) = record.copy_since(from, |bytes| {
+            carry.push(bytes);
+            Ok::<_, Infallible>(())
+        });
+        carry.finish()
+    })
+    .unwrap_or(0)
+}
+
+/// Put the loader's lines that no log stored ([`unkept_lines`]) at the
+/// head of this image's record, with their stamps, for every log it opens
+/// to store first. The serial port had them from the loader.
+pub fn carry_loader_lines(lines: &[u8]) {
+    if lines.is_empty() {
+        return;
+    }
+    let _ = exclusive(|| {
+        if let Ok(mut record) = RECORD.0.try_borrow_mut() {
+            record.push(lines);
+            LINE_START.store(lines.ends_with(b"\n"), Ordering::Relaxed);
+        }
+    });
+}
+
 /// Leave the newest lines in the PC's firmware (`stop_record::keep`), for
 /// the next start to copy into the log and to say this one stopped: those
 /// the USB's log does not hold, or a stop's inside the host drivers, whose

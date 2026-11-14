@@ -975,6 +975,23 @@ fn load(
         count,
         installed,
     } = handoff_phase::guest_memory(exit.map());
+    // The lines since the firmware's log closed, which no log stored, for
+    // the engine's record: the USB's log takes them when it resumes.
+    let loader_lines = {
+        let physical = handoff_page.physical + size_of::<Handoff>() as u64;
+        // SAFETY: the handoff allocation's tail, sized for these lines and
+        // used by nothing else; the firmware's identity map is loaded.
+        let into = unsafe {
+            core::slice::from_raw_parts_mut(
+                physical as *mut u8,
+                stela_boot_core::loader_lines::BYTES,
+            )
+        };
+        Region {
+            physical,
+            bytes: output::unkept_lines(into) as u64,
+        }
+    };
     // SAFETY: fresh LOADER_DATA pages sized for the handoff.
     unsafe {
         handoff.write(Handoff {
@@ -995,6 +1012,7 @@ fn load(
             screen,
             history,
             history_bytes,
+            loader_lines,
             host,
             host_bytes,
             log_partition: log.map(|guid| guid.0),

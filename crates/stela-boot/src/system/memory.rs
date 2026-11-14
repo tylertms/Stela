@@ -180,7 +180,9 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
     };
     let code = allocate_large(sizes.code.bytes)?;
     let pool = allocate(sizes.pool)?;
-    let handoff_page = allocate(size_of::<Handoff>() as u64)?;
+    // The handoff, then the loader's unstored lines (`Handoff::loader_lines`).
+    let handoff_page =
+        allocate((size_of::<Handoff>() + stela_boot_core::loader_lines::BYTES) as u64)?;
     let trampoline = low_page(MemoryType::LOADER_CODE)?;
     let loader_tables = crate::paging::loader::Builder::new()?;
     let root = loader_tables.root();

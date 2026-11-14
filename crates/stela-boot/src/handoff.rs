@@ -47,6 +47,10 @@ pub struct Handoff {
     /// with (`status::replay`).
     pub history: [u8; crate::status::HISTORY_BYTES],
     pub history_bytes: usize,
+    /// The loader's lines that no log stored, after the firmware's log
+    /// closed (`output::unkept_lines`), in the handoff allocation's tail,
+    /// which the engine's record starts with (`output::carry_loader_lines`).
+    pub loader_lines: Region,
     /// The loader's facts about the PC, as a host record, which the engine
     /// takes up (`host_inventory::restore`).
     pub host: [u8; crate::host_inventory::HANDOFF_BYTES],
