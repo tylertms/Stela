@@ -396,6 +396,13 @@ impl<const N: usize> Runtime<N> {
         self.physical_enter(i)
             .unwrap_or_else(|error| self.queue.cpu.fatal(error));
         let switched = step_counts::now();
+        // SAFETY: task `i` is valid and IRQs are disabled; this read ends
+        // before the switch.
+        let (id, sequence) = unsafe {
+            let task = &*self.task(i);
+            (task.id.get(), task.job.map_or(0, |(_, job)| job.sequence))
+        };
+        step_counts::begin(id, sequence, switched);
         // SAFETY: both frames are held, pinned and initialized; IRQs stay disabled
         // across the switch, and no lock or borrow spans it.
         unsafe {
@@ -405,6 +412,7 @@ impl<const N: usize> Runtime<N> {
             )
         };
         let returned = step_counts::now();
+        step_counts::end(returned);
         if self.current.get() != NONE || self.queue.active.id.load(Ordering::Acquire) != 0 {
             self.queue.cpu.fatal(WorkError::corrupt());
         }
@@ -438,6 +446,8 @@ impl<const N: usize> Runtime<N> {
         let Some(domain) = self.domain() else {
             return Ok(false);
         };
+        // Nothing runs: no step is stuck while the dispatcher idles.
+        step_counts::WATCH.returned(step_counts::now());
         if let Err(error) = domain.idle() {
             self.queue.cpu.fatal(error);
         }

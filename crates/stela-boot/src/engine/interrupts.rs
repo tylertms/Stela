@@ -658,6 +658,18 @@ pub fn fatal(frame: &Frame) -> ! {
         18 => machine_check(),
         _ => alloc::string::String::new(),
     };
+    // An NMI from the step watchdog's counter: the step it names never
+    // returned, and `rip` is where it ran.
+    if frame.vector == 2
+        && let Some(reason) = super::step_watchdog::nmi_reason()
+    {
+        output::fatal(format_args!(
+            "{reason}: rip={:#x} (image+{:#x}) code={} drivers={drivers} stack={callers}",
+            frame.rip,
+            frame.rip.wrapping_sub(&raw const __ImageBase as u64),
+            output::Code::at(frame.rip),
+        ))
+    }
     output::fatal(format_args!(
         "unexpected x86 exception in the system engine: vector={} error={:#x} rip={:#x} \
          (image+{:#x}) code={} rax={:#x} cr2={:#x} cr3={:#x} drivers={drivers} \

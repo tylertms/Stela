@@ -468,6 +468,9 @@ impl Platform for Host {
     }
 
     fn log(&self, level: i32, message: &CStr) {
+        // A line Linux prints is progress: a long step that reports it is
+        // not stuck.
+        super::step_watchdog::progress();
         let message = message.to_str().unwrap_or("(not UTF-8)").trim_end();
         self.report(format_args!("<{level}> {message}"));
         // KERN_ALERT to KERN_ERR; KERN_EMERG is a terminal stop's own report.
@@ -1864,7 +1867,7 @@ fn mount_and_start(
         threads,
         time,
         deadline,
-        "Linux's first tasks",
+        &FIRST_TASKS,
         || matches!(srcu.status(), stela_linux::srcu::Status::Pending(status) if status.joined),
     )?;
     // SAFETY: the taskless dispatcher observed the original joined job.
@@ -1881,7 +1884,7 @@ fn mount_and_start(
     // SAFETY: the ready original task broker keeps the callback and all
     // original owners until its genuine managed child has joined.
     let pending = unsafe { threads.submit(job) }.map_err(|refusal| Error::Submit(refusal.error))?;
-    wait_for_child(runtime, threads, time, deadline, "the GPU's probe", || {
+    wait_for_child(runtime, threads, time, deadline, &PROBE, || {
         pending.status().joined
     })?;
     // SAFETY: physical return on the same dispatcher with the joined status.
@@ -1899,6 +1902,10 @@ fn mount_and_start(
     Ok((owner, threads, job))
 }
 
+/// The start's stages [`wait_for_child`] names.
+static FIRST_TASKS: &str = "Linux's first tasks";
+static PROBE: &str = "the GPU's probe";
+
 /// Wait for `stage` of the start, which Linux's tasks run, until `finished`
 /// or `deadline` on `time`. A long wait says every
 /// [`WAIT_REPORT_SECONDS`] how long it has waited by the counter and by
@@ -1912,9 +1919,17 @@ fn wait_for_child(
     threads: &LinuxThreads,
     time: &dyn Clock,
     deadline: u64,
-    stage: &str,
+    stage: &'static &'static str,
     finished: impl Fn() -> bool,
 ) -> Result<(), Error> {
+    struct Staged;
+    impl Drop for Staged {
+        fn drop(&mut self) {
+            super::step_watchdog::clear_stage();
+        }
+    }
+    super::step_watchdog::stage(stage);
+    let _staged = Staged;
     let began = host::rdtsc();
     let began_ns = time.now_ns().map_err(environment_error)?;
     let mut steps = 0u64;

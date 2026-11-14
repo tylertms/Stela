@@ -27,6 +27,21 @@ use stela_drivers::{
     bus::dma::memory::MemoryError,
     platform::work::{self, Cpu, Executor, Queue, Stack, StackBacking, WorkError},
 };
+/// A work segment the step watchdog watches while it runs
+/// (`step_watchdog::enter`).
+struct Watched;
+impl Watched {
+    fn enter() -> Self {
+        super::step_watchdog::enter();
+        Self
+    }
+}
+impl Drop for Watched {
+    fn drop(&mut self) {
+        super::step_watchdog::leave();
+    }
+}
+
 /// Jobs the BSP's queue admits: one for every stack of its pool, and as many
 /// again waiting, which covers the firmware's protected pending events.
 pub(super) const SLOTS: usize = 2 * native_smp::resources::TASK_STACKS;
@@ -627,6 +642,7 @@ impl KernelWork {
         timeout_us: u64,
         function: F,
     ) -> Result<T, Error> {
+        let _watched = Watched::enter();
         self.reservation
             .identity
             .check_clock_root()
@@ -733,6 +749,7 @@ impl KernelWork {
         if self.linux_execution.get().is_some() {
             return Err(Error::Work(WorkError::Busy));
         }
+        let _watched = Watched::enter();
         self.dispatch(|_| {
             // SAFETY: dispatch entered the kept loader root on the owning
             // BSP. This scope ends after every active frame returns or parks.

@@ -145,13 +145,13 @@ pub(crate) fn fixup(frame: &mut Frame) -> bool {
 }
 
 /// WRMSR that answers a #GP with `false`.
-fn write(index: u32, value: u64) -> bool {
+pub(crate) fn write(index: u32, value: u64) -> bool {
     // SAFETY: ring 0; a refused write takes #GP, which `fixup` resumes.
     unsafe { stela_pmu_wrmsr(index, value) == 0 }
 }
 
 /// RDMSR that answers a #GP with `None`: the register is not implemented.
-fn read(index: u32) -> Option<u64> {
+pub(crate) fn read(index: u32) -> Option<u64> {
     let mut value = 0;
     // SAFETY: ring 0; an unimplemented register takes #GP, which `fixup`
     // resumes; the value goes to this frame's `value`.

@@ -692,6 +692,8 @@ fn start_processors(boot: Boot<'_>, host: &mut OpenedHost) -> Processors {
         ..
     } = *host;
     crate::status::begin("Starting the other host processors");
+    // The boot processor's counter is free for `--profile` from here on.
+    super::step_watchdog::retire();
     // SAFETY: the physical inventory and loader-owned reservations
     // were validated before any SIPI; the BSP Host is installed, guest entry
     // is excluded, and APs remain parked until canonical worker publication.
@@ -2589,6 +2591,9 @@ fn start_platform(
     // SAFETY: validated BSP handoff, before AP/driver producers.
     let work = match unsafe { kernel_work::KernelWork::prepare(handoff, host_owner, clock) } {
         Ok(work) => {
+            // SAFETY: the BSP in the engine's root, before the APs start and
+            // before any producer uses its counters or its APIC's entry.
+            unsafe { super::step_watchdog::install(handoff.tsc_hz) };
             #[cfg(feature = "diagnostics")]
             output::arguments(format_args!(
                 "NATIVE WORK owned stacks=32 foreground=verified services=unpublished\n"

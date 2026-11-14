@@ -45,6 +45,7 @@ mod restore;
 mod service;
 mod services;
 mod speculation;
+mod step_watchdog;
 pub(crate) mod storage;
 mod store_file;
 mod topology;
