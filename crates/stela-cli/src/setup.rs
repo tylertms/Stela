@@ -1093,12 +1093,13 @@ impl Request {
 
     /// Put this stela's stela.efi on the stick of `record`, preparing its
     /// boot files again when they are of another generation; `allowed`
-    /// when this run already asked to change a newer Stela's stick.
+    /// when this run already asked to change a newer Stela's stick, and
+    /// `skips` when it reports and ends the device skips.
     fn update_stela(
         &self,
         environment: &Environment<'_>,
         record: Record,
-        allowed: bool,
+        (allowed, skips): (bool, bool),
     ) -> Result<String> {
         let image = match &self.efi {
             Some(path) => path.clone(),
@@ -1118,6 +1119,7 @@ impl Request {
                 download_dir: self.download_dir.as_deref(),
                 dry_run: self.dry_run,
                 yes: self.yes || allowed,
+                skips,
             },
         )
     }
@@ -1208,7 +1210,8 @@ impl Request {
                     false => record,
                     true => {
                         // The question above asked to change a newer stick.
-                        text = self.update_stela(environment, record, true)?;
+                        // Finishing a switch leaves the device skips.
+                        text = self.update_stela(environment, record, (true, false))?;
                         if self.dry_run {
                             text.push_str(&format!(
                                 "  then          the switch to macOS {build} goes on once this \
@@ -1225,8 +1228,10 @@ impl Request {
             // What `status` names `update` for (`needs_update`) is put
             // right as `update` does it, and the repair goes on with the
             // rest.
+            // The repair reports and ends the device skips; a dry run does
+            // not reach it.
             Action::Repair if needs_update(environment, &record) => {
-                let mut text = self.update_stela(environment, record, false)?;
+                let mut text = self.update_stela(environment, record, (false, self.dry_run))?;
                 match self.dry_run {
                     true => text.push_str(
                         "  then          the repair checks the rest once this stela.efi is in place\n",
@@ -1240,8 +1245,10 @@ impl Request {
             Action::BackupState(path) => state::backup(environment, &record, &self, &path),
             Action::RestoreState(path) => state::restore(environment, &record, &self, &path),
             Action::BootLog => state::boot_log(environment, &record, &self),
+            // The device skips end once the whole update is done.
             Action::UpdateStela => {
-                let mut text = self.update_stela(environment, record, false)?;
+                let (esp, dry_run) = (record.esp.clone(), self.dry_run);
+                let mut text = self.update_stela(environment, record, (false, true))?;
                 if let Some(build) = self.macos.take() {
                     let next = Request {
                         action: Action::UpdateOs,
@@ -1249,6 +1256,9 @@ impl Request {
                         ..self
                     };
                     text.push_str(&next.dispatch(environment)?);
+                }
+                if !dry_run {
+                    doctor::end_device_skips(&esp, "stela update")?;
                 }
                 Ok(text)
             }

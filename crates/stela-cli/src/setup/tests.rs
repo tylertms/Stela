@@ -3121,6 +3121,68 @@ fn a_stopped_switch_finishes_after_a_bundle_revision_change_and_keeps_its_new_co
 }
 
 #[test]
+fn device_skips_end_only_once_an_update_or_repair_has_done_everything_else() {
+    let cleared = |f: &Fixture| {
+        let bytes = fs::read(f.esp.join(efi::BOOT_LOG)).unwrap();
+        let log = stela_runtime::pc::boot_log::read(&bytes).unwrap();
+        String::from_utf8(log.stream)
+            .unwrap()
+            .contains("SKIPS CLEARED")
+    };
+    // A boot that stopped inside a device's start.
+    let skipped =
+        || crate::boot_log::tests::region(&["HOST DEVICE START pci=0000:07:00.0 id=10ec:8125\n"]);
+    // An update or repair that must prepare the boot files again, and whose
+    // download of them fails: it stops, and the device stays skipped.
+    let fetch = |_: &Path, _: &str, _: &str, need: sources::Need| -> Result<sources::Fetched> {
+        anyhow::bail!("asked for {need:?}")
+    };
+    let size = |_: &str, _: &str| -> Result<(u64, u64)> { Ok((1_000_000, 3_000_000_000)) };
+    let mut f = fixture(64 * GIB, false);
+    let (older, newer) = (preparers(0), preparers(1));
+    network_setup(&mut f, &older);
+    drop_inputs(&f);
+    fs::write(f.esp.join(efi::BOOT_LOG), skipped()).unwrap();
+    for action in [|| Action::UpdateStela, || Action::Repair] {
+        let mut request = update_request(&f, &f._dir.path().join("cache"));
+        request.action = action();
+        let error = request
+            .dispatch(&Environment {
+                image_size: &size,
+                fetch_image: &fetch,
+                ..environment_at(&f.host, &newer, 1)
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("asked for BootFiles"), "{error}");
+        assert!(!cleared(&f), "a failed run ended the device skips");
+    }
+    // A repair that succeeds names them and ends them last.
+    let f = made_by(Some(release::CURRENT));
+    fs::write(f.esp.join(efi::BOOT_LOG), skipped()).unwrap();
+    fs::remove_file(f.esp.join(LOADER_PATH)).unwrap();
+    let report = rerun(&f, |c| c.action = Action::Repair).unwrap();
+    assert!(
+        report.contains("PCI 0000:07:00.0 10ec:8125 will be started again"),
+        "{report}"
+    );
+    assert_eq!(report.matches("device skips").count(), 1, "{report}");
+    assert!(cleared(&f));
+    // So does an update; a dry run names them and changes nothing.
+    let f = made_by(None);
+    fs::write(f.esp.join(efi::BOOT_LOG), skipped()).unwrap();
+    let report = rerun(&f, |c| {
+        c.action = Action::UpdateStela;
+        c.dry_run = true;
+    })
+    .unwrap();
+    assert!(report.contains("would be started again"), "{report}");
+    assert!(!cleared(&f));
+    rerun(&f, |c| c.action = Action::UpdateStela).unwrap();
+    assert!(cleared(&f));
+}
+
+#[test]
 fn stela_updates_remove_the_previous_bundles() {
     let mut f = fixture(64 * GIB, false);
     add_stela(&mut f);

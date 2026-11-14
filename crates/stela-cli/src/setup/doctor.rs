@@ -754,11 +754,12 @@ pub(super) fn status(environment: &Environment<'_>, usb: &Path, full: bool) -> R
     .into())
 }
 
-/// The report line for the device skips `by` ends
-/// (`boot_log::clear_device_skips`): empty when the USB's log names none.
-pub(super) fn device_skips(esp: &Path, by: &str, dry_run: bool) -> Result<String> {
+/// The report line for the device skips the command ends once it has
+/// done the rest (`boot_log::clear_device_skips`, [`end_device_skips`]):
+/// empty when the USB's log names none. Nothing is written here.
+pub(super) fn device_skips(esp: &Path, dry_run: bool) -> Result<String> {
     let log = esp.join(crate::efi::BOOT_LOG);
-    let named = crate::boot_log::clear_device_skips(&log, by, dry_run)?;
+    let named = crate::boot_log::clear_device_skips(&log, "", true)?;
     Ok(match (named.is_empty(), dry_run) {
         (true, _) => String::new(),
         (false, true) => format!(
@@ -772,8 +773,25 @@ pub(super) fn device_skips(esp: &Path, by: &str, dry_run: bool) -> Result<String
     })
 }
 
-/// `repair`.
+/// End the device skips the USB's log at `esp` names, as `by`: the last
+/// write of a command that succeeded, so one that stops keeps them and the
+/// device that froze the PC stays skipped.
+pub(super) fn end_device_skips(esp: &Path, by: &str) -> Result<()> {
+    crate::boot_log::clear_device_skips(&esp.join(crate::efi::BOOT_LOG), by, false)?;
+    Ok(())
+}
+
+/// `repair`: the device skips end once everything else is done.
 pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result<String> {
+    let text = repair_steps(environment, command)?;
+    if !command.dry_run {
+        let record = read_record(environment, &command.usb)?;
+        end_device_skips(&record.esp, "stela repair")?;
+    }
+    Ok(text)
+}
+
+fn repair_steps(environment: &Environment<'_>, command: &Request) -> Result<String> {
     let usb = &command.usb;
     let mut record = read_record(environment, usb)?;
     update::ready(&record, usb)?;
@@ -790,7 +808,7 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
     debug_assert!(record.replacing.is_none());
     let esp = record.esp.clone();
     let mut text = format!("Stela repair on {}:\n", esp.display());
-    text.push_str(&device_skips(&esp, "stela repair", command.dry_run)?);
+    text.push_str(&device_skips(&esp, command.dry_run)?);
     let Ok(tool) = fs::read(esp.join(LOADER_PATH)) else {
         bail!("{} has no stela.efi: {}", esp.display(), fix(usb, "update"));
     };

@@ -117,6 +117,9 @@ pub(super) struct UpdateOptions<'a> {
     pub(super) dry_run: bool,
     /// `--yes`: put an older Stela on a stick without asking.
     pub(super) yes: bool,
+    /// It reports the device skips the stick's log names, which `update`
+    /// ends once the whole command is done; a repair reports its own.
+    pub(super) skips: bool,
 }
 
 /// Replace `stela.efi` with `image_path`, preparing bundles of its schema
@@ -133,6 +136,7 @@ pub(super) fn update_stela(
         download_dir,
         dry_run,
         yes,
+        skips,
     } = options;
     let image = read_efi(environment, image_path)?;
     check_firmware_support(&record.esp, &image)?;
@@ -187,7 +191,9 @@ pub(super) fn update_stela(
     let from = fs::read(esp.join(LOADER_PATH)).map_or("none".into(), |image| version_id(&image));
     let mut text = String::new();
     writeln!(text, "Stela update on {}:", esp.display())?;
-    text.push_str(&super::doctor::device_skips(&esp, "stela update", dry_run)?);
+    if skips {
+        text.push_str(&super::doctor::device_skips(&esp, dry_run)?);
+    }
     text.push_str(&super::fdr::prepare(&record, true)?);
     // The firmware the last boot asked for and the USB lacks, which every
     // update that changes something adds.
