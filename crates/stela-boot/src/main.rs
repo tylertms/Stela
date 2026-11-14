@@ -24,6 +24,7 @@ use uefi::{
 };
 #[cfg(feature = "diagnostics")]
 mod audio_check;
+mod boot_exit;
 mod choice;
 mod console;
 mod cpu;

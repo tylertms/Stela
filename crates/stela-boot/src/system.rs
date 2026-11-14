@@ -29,7 +29,7 @@ use stela_runtime::pc::gpt::Guid;
 use uefi::{
     boot::{self, AllocateType, MemoryType},
     fs::FileSystem,
-    mem::memory_map::{MemoryMap, MemoryMapOwned},
+    mem::memory_map::{MemoryMap, MemoryMapRef},
     proto::loaded_image::LoadedImage,
 };
 
@@ -50,12 +50,12 @@ pub(crate) struct EbsOwnership {
 
 /// Keeps the final memory map and its receipt together on the loader side.
 pub(crate) struct SuccessfulExit {
-    map: core::mem::ManuallyDrop<MemoryMapOwned>,
+    map: MemoryMapRef<'static>,
     ownership: Option<EbsOwnership>,
 }
 
 impl SuccessfulExit {
-    pub(crate) fn map(&self) -> &MemoryMapOwned {
+    pub(crate) fn map(&self) -> &MemoryMapRef<'static> {
         &self.map
     }
 
@@ -874,12 +874,15 @@ fn load(
         ));
     }
     crate::status::begin("Taking control of the other processors");
+    // The last allocation Stela makes before the exit: from here to the
+    // exit's own map read only the firmware's timer and logs close.
+    let final_map = crate::boot_exit::Buffer::allocate();
     crate::output::leave_boot_services();
     // SAFETY: no protocol or pool allocation outlives this call; every page
     // Stela keeps is LOADER_DATA or LOADER_CODE.
-    let map = unsafe { boot::exit_boot_services(None) };
+    let map = unsafe { crate::boot_exit::exit(final_map) };
     let mut exit = SuccessfulExit {
-        map: core::mem::ManuallyDrop::new(map),
+        map,
         ownership: Some(EbsOwnership { _private: () }),
     };
     // The firmware's exception handlers ended with its boot services. Until

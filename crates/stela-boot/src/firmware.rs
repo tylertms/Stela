@@ -452,11 +452,11 @@ pub fn take_over(
     let screen = Framebuffer::from_firmware();
     let mut tables = tables(&image, [0, guard], screen.as_ref())?;
     storage.map(&mut tables)?;
+    let final_map = crate::boot_exit::Buffer::allocate();
     crate::output::leave_boot_services();
     // SAFETY: no protocol or pool allocation outlives this call; the heap,
     // stack and tables are LOADER_DATA, which Stela keeps.
-    let map = unsafe { boot::exit_boot_services(None) };
-    core::mem::forget(map);
+    let _ = unsafe { crate::boot_exit::exit(final_map) };
     Ok((
         Handoff {
             active_tables: None,

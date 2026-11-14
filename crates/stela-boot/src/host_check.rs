@@ -64,7 +64,6 @@ use stela_runtime::pc::{
     gpt::{self, Guid},
     power::HostPower,
 };
-use uefi::boot;
 
 const BEAT_SECONDS: u64 = 10;
 /// The stop code at `--deadline`.
@@ -285,11 +284,11 @@ fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
     }
     let registers = (machine.apic_base & apic::BASE_ADDRESS) as usize;
     tables.device(registers, registers + PAGE)?;
+    let final_map = crate::boot_exit::Buffer::allocate();
     crate::output::leave_boot_services();
     // SAFETY: no protocol or pool allocation outlives this call; the heap,
     // stack and tables are LOADER_DATA, which Stela keeps.
-    let map = unsafe { boot::exit_boot_services(None) };
-    core::mem::forget(map);
+    let _ = unsafe { crate::boot_exit::exit(final_map) };
     Ok((machine, tables))
 }
 
