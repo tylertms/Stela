@@ -5,8 +5,9 @@
 //! events wakes the engine and is polled once it has work
 //! ([`xhci::Host::due`]); another is polled on a timer. A keyboard or
 //! pointer that arrives joins the host input; another new device is
-//! reported and its owners kept until every device they came with is
-//! removed. The USB storage interfaces probe configured stay owned here
+//! reported unused and is not started: a disk, network adapter, audio
+//! function, Bluetooth controller or hub starts at the next boot. What a
+//! new device leaves is kept until every device it came with is removed. The USB storage interfaces probe configured stay owned here
 //! for the boot, with the disks the guest reaches through them.
 //!
 //! A USB4 host whose firmware runs the connection manager is looked at on the
@@ -261,7 +262,7 @@ impl HostUsb {
                 timed || host.attachment_due()
             };
             let changes = due.then(|| {
-                let changes = host.poll(&mut self.dma, firmware);
+                let changes = host.poll_after_boot(&mut self.dma, firmware);
                 // A new device's driver may have found its firmware missing;
                 // the record is reached under the same lock.
                 firmware.report();
@@ -296,15 +297,6 @@ impl HostUsb {
             );
             for device in &added.devices {
                 output::arguments(format_args!("USB added {}\n", device.location));
-            }
-            if !added.disks.is_empty()
-                || !added.storage.is_empty()
-                || !added.links.is_empty()
-                || !added.vendor_links.is_empty()
-            {
-                output::arguments(format_args!(
-                    "USB a disk or network adapter added after boot is kept unused until the next boot\n"
-                ));
             }
             if !changes.added.devices.is_empty() {
                 self.kept.push(Kept {
