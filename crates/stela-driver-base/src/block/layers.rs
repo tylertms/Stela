@@ -1,16 +1,185 @@
 //! Block devices built on others or on memory: extent runs, read-ahead,
 //! volatile overlays and RAM disks.
 
+use super::shared::WINDOW_DEPTH;
 use super::*;
 
 /// Runs of blocks of a [`Shared`] disk, one after another as one device.
+/// Like a [`Window`], it takes queued commands, each sent to the disk as one
+/// command per run it reaches, and never waits to look at the disk.
 pub struct Runs {
     pub(super) disk: Shared,
     pub(super) runs: Vec<(u64, u64)>,
     pub(super) identity: Identity,
+    /// The commands started and not yet finished.
+    pub(super) started: Vec<Spread>,
+    /// The next command's tag.
+    pub(super) next: u32,
+    /// A commit put off while another owner held the disk.
+    pub(super) uncommitted: bool,
+}
+
+/// A command started on [`Runs`]: the disk's ticket of each piece and the
+/// piece's byte offset in the transfer, those not finished yet, and what
+/// the finished ones gave.
+pub(super) struct Spread {
+    tag: u32,
+    pending: Vec<(u32, usize)>,
+    /// A read's bytes, assembled as its pieces finish.
+    read: Option<(usize, Option<Vec<u8>>)>,
+    failed: Option<BlockError>,
+}
+
+impl Spread {
+    fn completed(&mut self, offset: usize, result: Finished) {
+        match result {
+            Ok(Some(bytes)) => {
+                if let Some((total, data)) = &mut self.read {
+                    if data.is_none() && offset == 0 && bytes.len() == *total {
+                        *data = Some(bytes);
+                    } else if offset + bytes.len() <= *total {
+                        data.get_or_insert_with(|| vec![0; *total])[offset..offset + bytes.len()]
+                            .copy_from_slice(&bytes);
+                    } else {
+                        self.failed
+                            .get_or_insert(BlockError::Protocol("a read returned too much data"));
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.failed.get_or_insert(error);
+            }
+        }
+    }
+
+    /// The command's result once every piece has finished.
+    fn result(&mut self) -> Option<Finished> {
+        if !self.pending.is_empty() {
+            return None;
+        }
+        Some(match self.failed.take() {
+            Some(error) => Err(error),
+            None => Ok(self
+                .read
+                .take()
+                .map(|(total, data)| data.unwrap_or_else(|| vec![0; total]))),
+        })
+    }
 }
 
 impl Runs {
+    /// The disk commands `command` becomes, each with its byte offset in
+    /// the transfer; refused whole before any reaches the disk.
+    fn spread(&self, command: Command) -> Result<Vec<(usize, Command)>, BlockError> {
+        let size = self.identity.block_size as usize;
+        Ok(match command {
+            Command::Read { lba, bytes } => {
+                let blocks = self.identity.check(lba, bytes)?;
+                self.pieces(lba, blocks)
+                    .into_iter()
+                    .map(|(at, from, count)| {
+                        let bytes = count * size;
+                        (from * size, Command::Read { lba: at, bytes })
+                    })
+                    .collect()
+            }
+            Command::Write { lba, data, fua } => {
+                let blocks = self.identity.check_write(lba, data.len())?;
+                self.pieces(lba, blocks)
+                    .into_iter()
+                    .map(|(at, from, count)| {
+                        let data = data[from * size..(from + count) * size].to_vec();
+                        (from * size, Command::Write { lba: at, data, fua })
+                    })
+                    .collect()
+            }
+            Command::Flush => vec![(0, Command::Flush)],
+            Command::Discard { extents } => {
+                let mut commands = Vec::new();
+                for extent in extents {
+                    self.identity
+                        .check_write(extent.lba, extent.blocks as usize * size)?;
+                    for (at, _, count) in self.pieces(extent.lba, extent.blocks) {
+                        commands.push((0, Command::discard(at, count as u64)));
+                    }
+                }
+                commands
+            }
+            Command::WriteZeroes { lba, blocks, unmap } => {
+                self.identity.check_write(lba, blocks as usize * size)?;
+                self.pieces(lba, blocks)
+                    .into_iter()
+                    .map(|(at, _, count)| {
+                        let blocks = count as u64;
+                        (
+                            0,
+                            Command::WriteZeroes {
+                                lba: at,
+                                blocks,
+                                unmap,
+                            },
+                        )
+                    })
+                    .collect()
+            }
+        })
+    }
+
+    /// Queue `command` on the disk as its pieces; its tag. The device is
+    /// told of them at once unless `more` follow ([`BlockDevice::commit`]).
+    fn submit(&mut self, command: Command, more: bool) -> Result<u32, BlockError> {
+        if self.started.len() >= WINDOW_DEPTH {
+            return Err(BlockError::Protocol("the disk runs queue is full"));
+        }
+        let read = match &command {
+            Command::Read { bytes, .. } => Some((*bytes, None)),
+            _ => None,
+        };
+        let pieces = self.spread(command)?;
+        let last = pieces.len().saturating_sub(1);
+        let mut pending = Vec::with_capacity(pieces.len());
+        {
+            let mut disk = self.disk.lock();
+            for (index, (offset, piece)) in pieces.into_iter().enumerate() {
+                pending.push((disk.submit(piece, more || index != last), offset));
+            }
+        }
+        self.uncommitted &= more;
+        let tag = self.next;
+        self.next = self.next.wrapping_add(1);
+        self.started.push(Spread {
+            tag,
+            pending,
+            read,
+            failed: None,
+        });
+        Ok(tag)
+    }
+
+    /// Command `tag`'s result once each of its pieces has one, collecting
+    /// each with `take`.
+    fn collect(
+        &mut self,
+        tag: u32,
+        mut take: impl FnMut(u32) -> Option<Finished>,
+    ) -> Option<Finished> {
+        let index = self.started.iter().position(|spread| spread.tag == tag)?;
+        let spread = &mut self.started[index];
+        let mut at = 0;
+        while let Some(&(ticket, offset)) = spread.pending.get(at) {
+            match take(ticket) {
+                Some(result) => {
+                    spread.pending.swap_remove(at);
+                    spread.completed(offset, result);
+                }
+                None => at += 1,
+            }
+        }
+        let result = spread.result()?;
+        self.started.swap_remove(index);
+        Some(result)
+    }
     /// The disk's blocks for `blocks` blocks from `lba`, which
     /// [`Identity::check`] has kept inside the device: each piece's first
     /// disk block, and its first block and count in the transfer.
@@ -110,6 +279,69 @@ impl BlockDevice for Runs {
             blocks,
             unmap,
         })
+    }
+
+    /// Runs take queued commands as a window does: the disk runs their
+    /// pieces in turn, so a caller that may not wait, such as a log store
+    /// in a service turn, never runs one where it asks.
+    fn depth(&self) -> usize {
+        WINDOW_DEPTH
+    }
+
+    fn room(&self) -> bool {
+        self.started.len() < WINDOW_DEPTH && !self.disk.held()
+    }
+
+    fn start(&mut self, command: Command) -> Result<u32, BlockError> {
+        self.submit(command, false)
+    }
+
+    fn start_more(&mut self, command: Command) -> Result<u32, BlockError> {
+        self.submit(command, true)
+    }
+
+    fn commit(&mut self) {
+        match self.disk.try_lock() {
+            Some(mut disk) => disk.commit(),
+            None => self.uncommitted = true,
+        }
+    }
+
+    /// Takes the disk's completions and commits what waits.
+    fn finish(&mut self, tag: u32) -> Option<Finished> {
+        let disk = self.disk.clone();
+        let mut held = disk.try_lock()?;
+        self.uncommitted = false;
+        self.collect(tag, |ticket| held.take(ticket))
+    }
+
+    /// A finish collects every completed command of the disk.
+    fn reaps_together(&self) -> bool {
+        true
+    }
+
+    fn finished(&mut self, tag: u32) -> Option<Finished> {
+        let disk = self.disk.clone();
+        let mut held = disk.try_lock()?;
+        self.collect(tag, |ticket| held.requests().finished.remove(&ticket))
+    }
+
+    /// One of these runs' pieces has a result, or the disk has posted a
+    /// completion: another owner's results never count.
+    fn posted(&self) -> bool {
+        let Some(mut disk) = self.disk.try_lock() else {
+            return true;
+        };
+        let finished = &disk.requests().finished;
+        self.started
+            .iter()
+            .flat_map(|spread| &spread.pending)
+            .any(|(ticket, _)| finished.contains_key(ticket))
+            || disk.posted()
+    }
+
+    fn signals(&self) -> bool {
+        self.disk.lock().signals()
     }
 }
 

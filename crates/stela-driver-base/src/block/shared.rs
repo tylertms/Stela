@@ -472,7 +472,7 @@ impl Shared {
     }
 
     /// Whether another owner is using the disk now.
-    fn held(&self) -> bool {
+    pub(super) fn held(&self) -> bool {
         self.0.held.load(Ordering::Relaxed)
     }
 
@@ -577,6 +577,9 @@ impl Shared {
             disk: self.clone(),
             runs,
             identity,
+            started: Vec::new(),
+            next: 0,
+            uncommitted: false,
         })
     }
 }

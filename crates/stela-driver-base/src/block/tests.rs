@@ -876,6 +876,66 @@ fn runs_join_scattered_blocks_into_one_device() {
     runs.flush().unwrap();
 }
 
+/// A log file's runs on a disk that queues commands: a submission's store
+/// starts one command per run it reaches and returns before the disk runs
+/// them, where runs took no queued command and every store ran its writes
+/// where it was asked, waiting for the disk and the commands queued ahead.
+#[test]
+fn runs_queue_each_piece_on_the_disk_and_never_run_one_where_asked() {
+    let (delayed, (released, _, given)) = Delayed::new(RamDisk::new("q", 16, 512), 4);
+    let shared = Shared::new(Box::new(delayed));
+    let mut runs = shared.runs(vec![(10, 2), (3, 1), (6, 3)]).unwrap();
+    assert!(runs.depth() > 0 && runs.room());
+    // Another owner's command is queued ahead.
+    let mut other = shared.window(0, 3).unwrap();
+    let ahead = other.start(write(0, 9)).unwrap();
+    let data: Vec<u8> = (0..4 * 512).map(|i| (i / 512) as u8 + 1).collect();
+    let mut store = Submission::new(
+        Request::Write {
+            lba: 1,
+            data: data.clone(),
+            durable: false,
+        },
+        runs.identity(),
+    )
+    .unwrap();
+    assert_eq!(store.poll(&mut runs), None);
+    // Its three pieces reached the disk's queue behind the other's write,
+    // and nothing ran.
+    let lbas: Vec<u64> = given
+        .borrow()
+        .iter()
+        .map(|command| match command {
+            Command::Write { lba, .. } => *lba,
+            _ => panic!("only writes"),
+        })
+        .collect();
+    assert_eq!(lbas, [0, 11, 3, 6]);
+    assert_eq!(store.poll(&mut runs), None);
+    released.set(4);
+    assert_eq!(store.poll(&mut runs), Some(Ok(None)));
+    assert_eq!(other.finish(ahead), Some(Ok(None)));
+    // A queued read across the runs assembles its pieces in order.
+    let mut read = Submission::new(
+        Request::Read {
+            lba: 0,
+            bytes: 6 * 512,
+        },
+        runs.identity(),
+    )
+    .unwrap();
+    assert_eq!(read.poll(&mut runs), None);
+    released.set(3);
+    let back = read.poll(&mut runs).unwrap().unwrap().unwrap();
+    assert_eq!(&back[..512], &[0; 512]);
+    assert_eq!(&back[512..5 * 512], &data[..]);
+    assert_eq!(&back[5 * 512..], &[0; 512]);
+    // A command past the runs refuses before any piece queues.
+    let queued = given.borrow().len();
+    assert!(runs.start(write(6, 1)).is_err());
+    assert_eq!(given.borrow().len(), queued);
+}
+
 #[test]
 fn a_volatile_disk_reads_zeros_until_written_and_refuses_past_its_limit() {
     assert!(Volatile::new("ram", 4096, 0).is_err());
