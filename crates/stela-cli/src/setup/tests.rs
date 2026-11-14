@@ -7049,6 +7049,102 @@ fn home_create_dispatches_create_after_wizard_confirmation() {
 }
 
 #[test]
+fn a_stick_whose_record_cannot_be_read_is_never_taken_for_one_without_stela() {
+    let newer_schema = format!(
+        "{{\"kind\": \"{RECORD_KIND}\", \"schema_version\": {}}}",
+        RECORD_SCHEMA + 1
+    );
+    let schema_8 = format!("{{\"kind\": \"{RECORD_KIND}\", \"schema_version\": 8}}");
+    for (what, record, reason) in [
+        ("damaged", "{\"kind\": ".to_owned(), "read setup record"),
+        ("newer schema", newer_schema, "may come from a newer stela"),
+        ("schema 8", schema_8, "no longer reads"),
+    ] {
+        let f = made_by(Some(release::CURRENT));
+        fs::write(f.esp.join(RECORD), record).unwrap();
+        let before = stick_files(&f);
+        let (shown, result, done) = plain_stela(&f, &[ui::tests::ENTER], &[]);
+        result.unwrap();
+        assert!(done, "{what}:\n{shown}");
+        assert!(
+            shown.contains("▲ This stick may hold Stela, but stela cannot read it"),
+            "{what}:\n{shown}"
+        );
+        assert!(shown.contains(reason), "{what}:\n{shown}");
+        // No wizard: its choices, Quit the one Enter takes.
+        assert!(!shown.contains("? Installer"), "{what}:\n{shown}");
+        assert_eq!(
+            last_rows(&shown),
+            [
+                "Save the boot logs for a bug report",
+                "Erase it and make a new installer",
+                "Quit"
+            ],
+            "{what}"
+        );
+        assert!(shown.contains("● Quit"), "{what}:\n{shown}");
+        assert!(
+            shown.ends_with("■ Nothing was changed."),
+            "{what}:\n{shown}"
+        );
+        assert_eq!(stick_files(&f), before, "{what}");
+        // Without a terminal: the reason, and no create to run.
+        let (text, due) = home::report(&home::sticks(&environment(&f.host)).unwrap());
+        assert!(!due, "{what}:\n{text}");
+        assert!(
+            text.contains("may hold Stela: its record cannot be read"),
+            "{what}:\n{text}"
+        );
+        assert!(text.contains(reason), "{what}:\n{text}");
+        assert!(!text.contains("Next:"), "{what}:\n{text}");
+        // Erasing it from the menu warns that it may hold Stela.
+        let (shown, result, _) = plain_stela(
+            &f,
+            &["Erase it and make a new installer", "Offline", "Quit"],
+            &[],
+        );
+        result.unwrap();
+        assert!(
+            shown.contains("A new installer replaces whatever it holds"),
+            "{what}:\n{shown}"
+        );
+        assert_eq!(stick_files(&f), before, "{what}");
+    }
+    // A newer schema that names its Stela is a newer stick.
+    let f = made_by(Some(release::CURRENT));
+    fs::write(
+        f.esp.join(RECORD),
+        format!(
+            "{{\"kind\": \"{RECORD_KIND}\", \"schema_version\": {}, \"release\": \"9.0.0\"}}",
+            RECORD_SCHEMA + 1
+        ),
+    )
+    .unwrap();
+    let (shown, result, _) = plain_stela(&f, &["Quit"], &[]);
+    result.unwrap();
+    assert!(
+        shown.contains("Stela 9.0.0, newer than this stela"),
+        "{shown}"
+    );
+    assert!(!shown.contains("Erase"), "{shown}");
+    let (text, due) = home::report(&home::sticks(&environment(&f.host)).unwrap());
+    assert!(!due && text.contains("Download stela 9.0.0"), "{text}");
+    // An EFI partition that cannot be mounted to look for a record.
+    let mut f = fixture(64 * GIB, false);
+    let usb = f
+        .host
+        .disks
+        .iter_mut()
+        .find(|d| d.identifier == "disk5")
+        .unwrap();
+    usb.partitions[0].mount = None;
+    let sticks = home::sticks(&environment(&f.host)).unwrap();
+    let (text, _) = home::report(&sticks);
+    assert!(text.contains("could not be mounted"), "{text}");
+    assert!(!text.contains("stela create"), "{text}");
+}
+
+#[test]
 fn enter_at_every_question_never_erases_and_a_drive_is_typed_back() {
     use ui::tests::ENTER;
     // The only USB disk, holding mounted volumes: a stick, a 2 TB disk, and

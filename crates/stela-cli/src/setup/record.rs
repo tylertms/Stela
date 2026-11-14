@@ -505,7 +505,8 @@ pub(super) fn read_record(environment: &Environment<'_>, usb: &Path) -> Result<R
         "{} holds no Stela setup: make an installer on the stick with `stela create`",
         esp.display()
     );
-    let header: serde_json::Value = stela_engine::read_json(&path)?;
+    let header: serde_json::Value = stela_engine::read_json(&path)
+        .with_context(|| format!("cannot read setup record {}", path.display()))?;
     let schema = header["schema_version"].as_u64().unwrap_or(0);
     ensure!(
         header["kind"] == RECORD_KIND && schema <= u64::from(RECORD_SCHEMA),
@@ -537,6 +538,45 @@ pub(super) fn read_record(environment: &Environment<'_>, usb: &Path) -> Result<R
         path.display()
     );
     Ok(record)
+}
+
+/// What the EFI partition of `usb` says about a Stela setup.
+pub(super) enum Probe {
+    /// No setup record: no Stela on it.
+    Absent,
+    Read(Box<Record>),
+    /// A record of a newer schema, from the newer Stela it names.
+    Newer(String),
+    /// A record that cannot be read, or an EFI partition that cannot be
+    /// found or mounted: why. It may hold Stela.
+    Unreadable(String),
+}
+
+/// What `usb`'s EFI partition holds: no record is told apart from a record
+/// that cannot be read, which is never taken for no Stela.
+pub(super) fn probe(environment: &Environment<'_>, usb: &Path) -> Probe {
+    let esp = match locate_esp(environment.host, usb) {
+        Ok(esp) => esp,
+        Err(error) => return Probe::Unreadable(format!("{error:#}")),
+    };
+    let path = esp.join(RECORD);
+    if !path.exists() {
+        return Probe::Absent;
+    }
+    // A newer schema names the Stela that wrote it, when it can be read.
+    if let Ok(header) = stela_engine::read_json::<serde_json::Value>(&path)
+        && header["kind"] == RECORD_KIND
+        && header["schema_version"]
+            .as_u64()
+            .is_some_and(|schema| schema > u64::from(RECORD_SCHEMA))
+        && let Some(release) = header["release"].as_str()
+    {
+        return Probe::Newer(release.into());
+    }
+    match read_record(environment, usb) {
+        Ok(record) => Probe::Read(Box::new(record)),
+        Err(error) => Probe::Unreadable(format!("{error:#}")),
+    }
 }
 
 /// Where the data partition of the stick whose EFI partition is `esp` is

@@ -11,8 +11,8 @@
 //! it: then each due command runs as it would with `--yes`. On a terminal,
 //! `--yes` accepts the questions an action asks, as a command's does.
 use super::{
-    Action, Environment, Record, Reported, Request, builds, doctor, host, read_record, release,
-    sources, ui::Ui, wizard,
+    Action, Environment, Record, Reported, Request, builds, doctor, host, read_record, record,
+    release, sources, ui::Ui, wizard,
 };
 use anyhow::{Context, Result};
 use std::{
@@ -39,6 +39,9 @@ pub(super) enum State {
     /// What `status` finds wrong.
     Damaged(Vec<String>),
     Healthy,
+    /// A setup record, or the EFI partition that holds it, that cannot be
+    /// read: why. It may hold Stela, so it is never taken for empty.
+    Unreadable(String),
 }
 
 /// A plugged-in stick.
@@ -80,10 +83,11 @@ impl Stick {
             State::Empty => "no Stela on it".into(),
             State::Interrupted => "a create stopped part way".into(),
             State::Replacing(_) => format!("{}, a macOS switch stopped part way", stela()),
-            State::Newer(_) => format!("{}, newer than this stela", stela()),
+            State::Newer(version) => format!("Stela {version}, newer than this stela"),
             State::Older => format!("{}, update available", stela()),
             State::Damaged(_) => format!("{}, needs repair", stela()),
             State::Healthy => stela(),
+            State::Unreadable(_) => "may hold Stela: its record cannot be read".into(),
         }
     }
 
@@ -135,7 +139,7 @@ impl Stick {
         match &self.state {
             State::Interrupted | State::Replacing(_) | State::Damaged(_) => Some(Action::Repair),
             State::Older => Some(Action::UpdateStela),
-            State::Empty | State::Newer(_) | State::Healthy => None,
+            State::Empty | State::Newer(_) | State::Healthy | State::Unreadable(_) => None,
         }
     }
 }
@@ -169,31 +173,67 @@ pub(super) fn sticks(environment: &Environment<'_>) -> Result<Vec<Stick>> {
         .filter(host::Disk::erasable)
         .map(|disk| classify(environment, disk))
         .collect();
-    sticks.sort_by_key(|stick| stick.record.is_none());
+    // Sticks that hold or may hold Stela first.
+    sticks.sort_by_key(|stick| matches!(stick.state, State::Empty));
     Ok(sticks)
 }
 
-/// What `disk` holds.
+/// What `disk` holds. A record that cannot be read, and an EFI partition
+/// that cannot be mounted to look for one, are told apart from no record.
 fn classify(environment: &Environment<'_>, disk: host::Disk) -> Stick {
+    let mut unmountable = None;
     let volume = super::setup_volume(&disk).or_else(|| {
         // Hosts often leave a stick's EFI partition unmounted: it holds the
         // record.
         let esp = disk.partitions.iter().find(|p| p.content == "EFI")?;
-        let mount = environment.host.mount(&esp.identifier).ok()?;
-        mount.join(super::RECORD).is_file().then_some(mount)
+        let mount = match esp
+            .mount
+            .clone()
+            .map_or_else(|| environment.host.mount(&esp.identifier), Ok)
+        {
+            Ok(mount) => mount,
+            Err(error) => {
+                unmountable = Some(format!(
+                    "its EFI partition {} could not be mounted: {error:#}",
+                    esp.identifier
+                ));
+                return None;
+            }
+        };
+        mount.join(super::RECORD).exists().then_some(mount)
     });
-    let record = volume
-        .as_ref()
-        .and_then(|volume| read_record(environment, volume).ok());
-    let state = match &record {
-        None => State::Empty,
-        Some(record) if !record.complete => State::Interrupted,
-        Some(record) => match (&record.replacing, release::newer(record)) {
+    let found = match (&volume, unmountable) {
+        (None, None) => record::Probe::Absent,
+        (None, Some(reason)) => record::Probe::Unreadable(reason),
+        (Some(volume), _) => record::probe(environment, volume),
+    };
+    let (record, state) = match found {
+        record::Probe::Absent => (None, State::Empty),
+        record::Probe::Newer(version) => (None, State::Newer(version)),
+        record::Probe::Unreadable(reason) => (None, State::Unreadable(reason)),
+        record::Probe::Read(record) => {
+            let state = state_of(environment, &record, volume.as_deref());
+            (Some(*record), state)
+        }
+    };
+    Stick {
+        disk,
+        volume,
+        record,
+        state,
+    }
+}
+
+/// The state of a stick whose record reads as `record`, on `volume`.
+fn state_of(environment: &Environment<'_>, record: &Record, volume: Option<&Path>) -> State {
+    match record {
+        record if !record.complete => State::Interrupted,
+        record => match (&record.replacing, release::newer(record)) {
             (Some(next), _) => State::Replacing(next.clone()),
             (None, Some(version)) => State::Newer(version),
             (None, None) if release::older(record) => State::Older,
             (None, None) => {
-                let usb = volume.clone().unwrap_or_default();
+                let usb = volume.map(Path::to_path_buf).unwrap_or_default();
                 match doctor::status(environment, &usb, false) {
                     Ok(_) => State::Healthy,
                     Err(error) => match error.downcast::<Reported>() {
@@ -203,13 +243,19 @@ fn classify(environment: &Environment<'_>, disk: host::Disk) -> Stick {
                 }
             }
         },
-    };
-    Stick {
-        disk,
-        volume,
-        record,
-        state,
     }
+}
+
+/// `text` as a sentence: its first letter upper case, a full stop at its
+/// end.
+pub(super) fn sentence(text: &str) -> String {
+    let mut text = text.trim_end_matches('.').to_owned();
+    if let Some(first) = text.get(..1) {
+        let upper = first.to_ascii_uppercase();
+        text.replace_range(..1, &upper);
+    }
+    text.push('.');
+    text
 }
 
 /// The problems a `status` report lists.
@@ -264,6 +310,9 @@ pub(super) fn report(sticks: &[Stick]) -> (String, bool) {
                 for problem in problems {
                     let _ = writeln!(text, "  - {problem}");
                 }
+            }
+            State::Unreadable(reason) => {
+                let _ = writeln!(text, "  {}", sentence(reason));
             }
             _ => {}
         }
@@ -447,7 +496,7 @@ fn choices(stick: &Stick, offers: &Offers) -> Vec<Choice> {
         State::Replacing(_) => vec![Choice::FinishSwitch],
         State::Older => vec![Choice::Update, Choice::Repair],
         State::Damaged(_) | State::Healthy => vec![Choice::Repair],
-        State::Empty | State::Newer(_) => Vec::new(),
+        State::Empty | State::Newer(_) | State::Unreadable(_) => Vec::new(),
     };
     // Only an Online installer's install uses the stick's network settings.
     let offline = stick
@@ -463,7 +512,11 @@ fn choices(stick: &Stick, offers: &Offers) -> Vec<Choice> {
     if offline {
         all.push(Choice::Check);
     }
-    all.extend([Choice::Status, Choice::Logs]);
+    // `status` reads the record.
+    if stick.record.is_some() {
+        all.push(Choice::Status);
+    }
+    all.push(Choice::Logs);
     // A newer Stela's stick is changed by that Stela only.
     if !matches!(stick.state, State::Newer(_)) {
         all.push(Choice::Erase);
@@ -613,6 +666,14 @@ fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<
         }
         State::Healthy => {
             ui.info("This stick is ready.")?;
+            Choice::Other
+        }
+        // Erasing it is a choice of its own, never the way in.
+        State::Unreadable(reason) => {
+            ui.warning(&format!(
+                "This stick may hold Stela, but stela cannot read it: {}",
+                sentence(reason)
+            ))?;
             Choice::Other
         }
     };

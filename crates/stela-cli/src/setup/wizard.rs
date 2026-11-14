@@ -346,6 +346,20 @@ fn ask(environment: &Environment<'_>, command: &mut Request, stick: &Stick) -> R
                 super::home::macos_name(&record.build)
             ))?;
         }
+        match &stick.state {
+            super::home::State::Unreadable(reason) => ui.warning(&format!(
+                "This stick may hold Stela, but stela cannot read it: {} A new installer \
+                 replaces whatever it holds. To keep it, choose Quit.",
+                super::home::sentence(reason)
+            ))?,
+            super::home::State::Newer(version) if stick.record.is_none() => {
+                ui.warning(&format!(
+                    "This stick holds Stela {version}: a new installer replaces it. To keep it, \
+                 choose Quit."
+                ))?
+            }
+            _ => {}
+        }
         let contents = stick.disk.contents();
         ui.warning(&match contents.is_empty() {
             true => format!("Everything on {} will be erased.", usb.short()),
