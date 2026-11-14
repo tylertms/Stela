@@ -1402,6 +1402,30 @@ fn identification_descriptors_parse_like_nvme_identify_ns_descs() {
     assert_eq!(ids.nguid, [6; 16]);
 }
 
+/// An active namespace list is increasing and within NN; `NVME_QUIRK_BOGUS_NID`
+/// keeps only the descriptors' command set.
+#[test]
+fn active_lists_must_increase_within_nn_and_bogus_ids_keep_the_command_set() {
+    assert!(active_list_valid(&[], 0));
+    assert!(active_list_valid(&[1, 2, 7], 7));
+    assert!(!active_list_valid(&[1, 1], 7));
+    assert!(!active_list_valid(&[3, 2], 7));
+    assert!(!active_list_valid(&[1, 8], 7));
+    let ids = Ids {
+        eui64: [1; 8],
+        nguid: [2; 16],
+        uuid: [3; 16],
+        csi: CSI_ZONED,
+    };
+    assert_eq!(
+        ids.without_identifiers(),
+        Ids {
+            csi: CSI_ZONED,
+            ..Ids::default()
+        }
+    );
+}
+
 #[test]
 fn a_controller_shuts_down_once_and_then_refuses_commands() {
     let fixture = Fixture::new();

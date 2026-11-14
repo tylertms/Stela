@@ -219,6 +219,8 @@ struct Model {
     /// before one, with Invalid Field in Command.
     /// Refuse the Identify with this CNS, with Invalid Field in Command.
     refuse_identify: Option<u32>,
+    /// The Identify Active Namespace List's IDs, when not namespace 1 alone.
+    active: Option<Vec<u32>>,
     /// Leave every admin command unanswered; and report CSTS.CFS once one
     /// is.
     ignore_admin: bool,
@@ -311,6 +313,7 @@ impl Model {
             nvm_limits: None,
             nvm_identifies: 0,
             refuse_identify: None,
+            active: None,
             ignore_admin: false,
             fatal_on_admin: false,
             queue_counts: 0,
@@ -489,7 +492,12 @@ impl Model {
                             data[2048 + 32 + 8..][..2].copy_from_slice(&1000u16.to_le_bytes());
                         }
                     }
-                    2 => data[..4].copy_from_slice(&1u32.to_le_bytes()),
+                    2 => {
+                        let active = self.active.clone().unwrap_or(vec![1]);
+                        for (at, id) in active.iter().enumerate() {
+                            data[4 * at..4 * at + 4].copy_from_slice(&id.to_le_bytes());
+                        }
+                    }
                     3 => {
                         data[..4].copy_from_slice(&[1, 8, 0, 0]);
                         data[4..12].copy_from_slice(&self.eui64);
@@ -1353,6 +1361,104 @@ fn a_refused_identify_namespace_leaves_the_controller_attached() {
     );
 }
 
+/// Linux `nvme_scan_ns` passes over a namespace whose Namespace
+/// Identification Descriptor list (NVMe 1.3) the controller refuses; it is
+/// reported with the command. `NVME_QUIRK_NO_NS_DESC_LIST` never asks for
+/// the list, and the namespace attaches with its IDs from Identify
+/// Namespace, or none under `NVME_QUIRK_BOGUS_NID`.
+#[test]
+fn a_refused_descriptor_list_is_reported_or_never_asked_for_under_its_quirk() {
+    let refusing = |quirks| {
+        let mut f = Fixture::new();
+        {
+            let mut m = f.model.lock().unwrap();
+            m.registers.insert(8, 0x0001_0300);
+            m.refuse_identify = Some(3);
+        }
+        f.quirks = quirks;
+        f
+    };
+    let a = refusing(Quirks::NONE).attach().unwrap();
+    assert!(a.namespaces.is_empty());
+    assert_eq!(a.failures.len(), 1);
+    assert_eq!(
+        format!("namespace {}: {}", a.failures[0].0, a.failures[0].1),
+        "namespace 1: NVMe Identify Namespace Identification Descriptors \
+         (opcode 0x06, CNS 0x03): device status 0x2"
+    );
+    let a = refusing(Quirks::NO_DESCRIPTOR_LIST).attach().unwrap();
+    assert!(a.failures.is_empty());
+    assert_eq!(a.namespaces[0].ids.eui64, [0x11; 8]);
+    let a = refusing(Quirks::for_device(0x126f, 0x2263))
+        .attach()
+        .unwrap();
+    assert!(a.failures.is_empty());
+    assert_eq!(a.namespaces[0].ids, Ids::default());
+}
+
+/// Garbage namespace identifiers under `NVME_QUIRK_BOGUS_NID` are ignored:
+/// a reset whose rescan reads another EUI64, in the descriptors and in
+/// Identify Namespace, keeps the namespace.
+#[test]
+fn bogus_namespace_ids_keep_the_namespace_across_a_reset() {
+    let mut f = Fixture::new();
+    f.model.lock().unwrap().registers.insert(8, 0x0001_0300);
+    f.quirks = Quirks::BOGUS_IDS;
+    let mut a = f.attach().unwrap();
+    let disk = &mut a.namespaces[0];
+    assert_eq!(disk.ids, Ids::default());
+    disk.write(2, &[0x5c; 512]).unwrap();
+    {
+        let mut m = f.model.lock().unwrap();
+        m.eui64 = [0x99; 8];
+        m.delay_io = 1;
+        m.abortable = false;
+    }
+    disk.flush().unwrap();
+    let mut data = [0; 512];
+    disk.read(2, &mut data).unwrap();
+    assert_eq!(data, [0x5c; 512]);
+    disk.retire_owned().unwrap();
+}
+
+/// A refused active namespace list, or one out of order or past NN, is
+/// replaced by the sequential scan, which the attachment notes once: a
+/// list naming namespace 1 twice gives one disk, not two.
+#[test]
+fn a_refused_or_garbage_active_list_falls_back_to_the_sequential_scan() {
+    let scanned = |prepare: fn(&mut Model)| {
+        let f = Fixture::new();
+        prepare(&mut f.model.lock().unwrap());
+        let a = f.attach().unwrap();
+        assert!(a.failures.is_empty());
+        let ids: Vec<u32> = a.namespaces.iter().map(|disk| disk.namespace).collect();
+        (ids, a.sequential)
+    };
+    assert_eq!(scanned(|_| {}), (vec![1], None));
+    let (ids, scan) = scanned(|m| m.refuse_identify = Some(2));
+    assert_eq!(ids, [1]);
+    assert_eq!(
+        format!("{}", scan.unwrap()),
+        "NVMe Identify Active Namespace List (opcode 0x06, CNS 0x02) refused, status 0x2: \
+         NVMe namespace IDs 1 to 1 scanned one by one"
+    );
+    for active in [vec![1, 1], vec![2], vec![1, u32::MAX]] {
+        let f = Fixture::new();
+        f.model.lock().unwrap().active = Some(active.clone());
+        let a = f.attach().unwrap();
+        assert_eq!(a.namespaces.len(), 1, "{active:?}");
+        assert_eq!(a.namespaces[0].namespace, 1);
+        assert_eq!(
+            format!("{}", a.sequential.unwrap()),
+            format!(
+                "NVMe Identify Active Namespace List (opcode 0x06, CNS 0x02) of {} IDs \
+                 out of order or past NN 1: NVMe namespace IDs 1 to 1 scanned one by one",
+                active.len()
+            )
+        );
+    }
+}
+
 #[test]
 fn owned_timeouts_abort_then_reset_contain_dma_and_retry_like_linux() {
     // An abort that completes the held write: it is retried, no reset.
@@ -1497,12 +1603,13 @@ fn namespaces_are_scanned_like_nvme_scan_ns_with_io_command_sets() {
         drop(m);
         f
     };
-    // A namespace not ready is passed over, a zoned one is unsupported.
+    // A namespace not ready is passed over and reported, a zoned one is
+    // unsupported.
     let attached = |f: Fixture| {
         let a = f.attach().unwrap();
         (a.namespaces.len(), a.failures.len())
     };
-    assert_eq!(attached(fixture(0, true)), (0, 0));
+    assert_eq!(attached(fixture(0, true)), (0, 1));
     assert_eq!(attached(fixture(2, false)), (0, 1));
     let f = fixture(0, false);
     let a = f.attach().unwrap();

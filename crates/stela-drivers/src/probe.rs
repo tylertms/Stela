@@ -231,6 +231,9 @@ pub enum Warning {
     /// An NVMe controller runs with Linux's quirks for its PCI ID, model or
     /// board.
     NvmeQuirks(nvme::Quirks),
+    /// An NVMe controller's namespaces were scanned one ID at a time in
+    /// place of its refused or garbage active namespace list.
+    NvmeScan(nvme::SequentialScan),
 }
 
 impl fmt::Display for Warning {
@@ -255,6 +258,7 @@ impl fmt::Display for Warning {
                 switched.superspeed, switched.usb2
             ),
             Self::NvmeQuirks(quirks) => f.write_str(&quirks.describe()),
+            Self::NvmeScan(scan) => write!(f, "{scan}"),
         }
     }
 }
@@ -1826,6 +1830,9 @@ pub unsafe fn probe_observed(
                             .warnings
                             .push((address, Warning::NvmeQuirks(attached.quirks)));
                     }
+                    if let Some(scan) = attached.sequential {
+                        devices.warnings.push((address, Warning::NvmeScan(scan)));
+                    }
                     devices
                         .device_failures
                         .extend(attached.failures.into_iter().map(|(namespace, error)| {
@@ -2547,6 +2554,9 @@ unsafe fn attach_native(
                             devices
                                 .warnings
                                 .push((address, Warning::NvmeQuirks(attached.quirks)));
+                        }
+                        if let Some(scan) = attached.sequential {
+                            devices.warnings.push((address, Warning::NvmeScan(scan)));
                         }
                         devices
                             .device_failures

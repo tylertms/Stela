@@ -321,18 +321,18 @@ impl Controller {
 
     /// Linux `nvme_scan_ns` before it adds or validates a namespace: its
     /// identifiers and whether the command-set-independent Identify
-    /// Namespace described it, or `None` when Linux passes it over for
-    /// refused descriptors, a command set the controller does not run, or a
+    /// Namespace described it, or why Linux passes it over: refused
+    /// descriptors, a command set the controller does not run, or a
     /// namespace that is not ready.
-    pub(super) fn namespace_ids(
-        &mut self,
-        namespace: u32,
-    ) -> Result<Option<(Ids, bool)>, BlockError> {
-        let Some(ids) = self.descriptors(namespace)? else {
-            return Ok(None);
+    pub(super) fn namespace_ids(&mut self, namespace: u32) -> Result<Scan, BlockError> {
+        let ids = match self.descriptors(namespace)? {
+            Ok(ids) => ids,
+            Err(error) => return Ok(Scan::Passed(error)),
         };
         if ids.csi != CSI_NVM && self.configuration & COMMAND_SETS_ALL == 0 {
-            return Ok(None);
+            return Ok(Scan::Passed(BlockError::Unsupported(
+                "NVMe namespace of a command set the controller does not run",
+            )));
         }
         if self.independent_identify
             || (ids.csi != CSI_NVM && ids.csi != CSI_ZONED)
@@ -340,25 +340,39 @@ impl Controller {
         {
             match self.identify(IDENTIFY_INDEPENDENT_NAMESPACE, namespace) {
                 Ok(data) => {
-                    let ready = data[INDEPENDENT_STATUS] & NAMESPACE_READY != 0;
-                    return Ok(ready.then_some((ids, true)));
+                    return Ok(if data[INDEPENDENT_STATUS] & NAMESPACE_READY != 0 {
+                        Scan::Found(ids, true)
+                    } else {
+                        Scan::Passed(BlockError::Unsupported(
+                            "NVMe namespace not ready (NSTAT.NRDY clear)",
+                        ))
+                    });
                 }
                 Err(BlockError::Device { .. }) => {}
                 Err(error) => return Err(error),
             }
         }
-        Ok(Some((ids, false)))
+        Ok(Scan::Found(ids, false))
     }
 
-    /// Linux `nvme_identify_ns_descs`: none before NVMe 1.3. `None` when the
-    /// controller refused the list; the scan then skips the namespace.
-    pub(super) fn descriptors(&mut self, namespace: u32) -> Result<Option<Ids>, BlockError> {
-        if self.version < VERSION_1_3 {
-            return Ok(Some(Ids::default()));
+    /// Linux `nvme_identify_ns_descs`: none before NVMe 1.3 or under
+    /// `NVME_QUIRK_NO_NS_DESC_LIST`, and only the command set under
+    /// `NVME_QUIRK_BOGUS_NID`. The controller's refusal, named, when it
+    /// refused the list; the scan then skips the namespace.
+    pub(super) fn descriptors(
+        &mut self,
+        namespace: u32,
+    ) -> Result<Result<Ids, BlockError>, BlockError> {
+        if self.version < VERSION_1_3 || self.quirks.contains(Quirks::NO_DESCRIPTOR_LIST) {
+            return Ok(Ok(Ids::default()));
         }
+        let bogus = self.quirks.contains(Quirks::BOGUS_IDS);
         match self.identify(IDENTIFY_DESCRIPTORS, namespace) {
-            Ok(data) => Ok(Some(Ids::from_descriptors(data))),
-            Err(BlockError::Device { .. }) => Ok(None),
+            Ok(data) if bogus => Ok(Ok(Ids::from_descriptors(data).without_identifiers())),
+            Ok(data) => Ok(Ok(Ids::from_descriptors(data))),
+            Err(error @ BlockError::Device { .. }) => {
+                Ok(Err(error.at(identify_name(IDENTIFY_DESCRIPTORS))))
+            }
             Err(error) => Err(error),
         }
     }

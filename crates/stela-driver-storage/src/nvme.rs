@@ -345,6 +345,15 @@ impl Ids {
         ids
     }
 
+    /// Under `NVME_QUIRK_BOGUS_NID` the descriptors' EUI64, NGUID and UUID
+    /// are skipped; the command set stays.
+    fn without_identifiers(self) -> Self {
+        Self {
+            csi: self.csi,
+            ..Self::default()
+        }
+    }
+
     /// Linux `nvme_ns_info_from_identify`: EUI64 and NGUID from Identify
     /// Namespace when the descriptors gave none.
     fn fill(&mut self, version: u32, data: &[u8]) {
@@ -355,6 +364,16 @@ impl Ids {
             self.nguid.copy_from_slice(&data[NAMESPACE_NGUID]);
         }
     }
+}
+
+/// What Linux `nvme_scan_ns` learns of a namespace before Identify
+/// Namespace ([`Controller::namespace_ids`]).
+enum Scan {
+    /// Its identifiers, and whether the command-set-independent Identify
+    /// Namespace described it.
+    Found(Ids, bool),
+    /// Passed over, and why.
+    Passed(BlockError),
 }
 
 /// How an admin command was lost, when it produced no completion to report.
@@ -1029,31 +1048,52 @@ fn discover(
     controller.settle()?;
 
     // Linux `nvme_scan_work`: the active list from NVMe 1.1, otherwise (or
-    // when the controller refuses it) every namespace ID in turn.
+    // when the controller refuses it) every namespace ID in turn. A list
+    // out of order, or naming an ID past NN, is garbage, which the
+    // sequential scan replaces too: its IDs could name one namespace twice.
     let listed = if version >= VERSION_1_1 {
-        controller
-            .identify(IDENTIFY_ACTIVE_NAMESPACES, 0)
-            .map(|list| {
-                list.as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|word| u32::from_le_bytes(*word))
-                    .take_while(|namespace| *namespace != 0)
-                    .collect::<Vec<u32>>()
-            })
-            .ok()
+        Some(
+            controller
+                .identify(IDENTIFY_ACTIVE_NAMESPACES, 0)
+                .map(|list| {
+                    list.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|word| u32::from_le_bytes(*word))
+                        .take_while(|namespace| *namespace != 0)
+                        .collect::<Vec<u32>>()
+                })
+                .map_err(|error| match error {
+                    BlockError::Device { status } => ActiveList::Refused(status),
+                    _ => ActiveList::Lost,
+                }),
+        )
     } else {
         None
     };
     controller.ready()?;
-    let (candidates, sequential) = match listed {
-        Some(active) => (active, false),
-        None => ((1..=namespaces.min(SEQUENTIAL_SCAN_LIMIT)).collect(), true),
-    };
     let mut attached = Attached {
         namespaces: Vec::new(),
         failures: Vec::new(),
         quirks: controller.quirks,
+        sequential: None,
+    };
+    let scanned = namespaces.min(SEQUENTIAL_SCAN_LIMIT);
+    let (candidates, sequential) = match listed {
+        Some(Ok(active)) if active_list_valid(&active, namespaces) => (active, false),
+        listed => {
+            let why = match listed {
+                Some(Ok(active)) => Some(ActiveList::Invalid(active.len())),
+                Some(Err(why)) => Some(why),
+                None => None,
+            };
+            attached.sequential = why.map(|why| SequentialScan {
+                why,
+                namespaces,
+                scanned,
+            });
+            ((1..=scanned).collect(), true)
+        }
     };
     let mut found = Vec::new();
     let (max_transfer, max_command_bytes, commands, scans, limits, quirks) = (
@@ -1065,8 +1105,16 @@ fn discover(
         controller.quirks,
     );
     for namespace in candidates {
-        let Some((mut ids, independent)) = controller.namespace_ids(namespace)? else {
-            continue;
+        // A sequential scan meets IDs of no namespace, which refuse; a
+        // listed namespace passed over is reported with why.
+        let (mut ids, independent) = match controller.namespace_ids(namespace)? {
+            Scan::Found(ids, independent) => (ids, independent),
+            Scan::Passed(error) => {
+                if !sequential {
+                    attached.failures.push((namespace, error));
+                }
+                continue;
+            }
         };
         // Zoned and other command sets need drivers Stela does not have.
         if ids.csi != CSI_NVM {
@@ -1089,7 +1137,7 @@ fn discover(
             }
             Err(error) => return Err(error),
         };
-        if !independent {
+        if !independent && !quirks.contains(Quirks::BOGUS_IDS) {
             ids.fill(version, data);
         }
         match plain_format(data, max_transfer) {
@@ -1249,12 +1297,61 @@ fn features(
     }
 }
 
-/// The namespaces of one controller, those it cannot serve, and the
-/// quirks it runs with.
+/// Whether an Identify Active Namespace List is one: in increasing order
+/// (NVMe Base 2.1 5.1.13.2.2), each ID within NN, which bounds valid IDs.
+fn active_list_valid(active: &[u32], namespaces: u32) -> bool {
+    active.windows(2).all(|pair| pair[0] < pair[1])
+        && active.last().is_none_or(|last| *last <= namespaces)
+}
+
+/// Why a controller from NVMe 1.1 was scanned one namespace ID at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveList {
+    /// It refused the Identify Active Namespace List with this status.
+    Refused(u32),
+    /// The list got no answer, and the controller was reset.
+    Lost,
+    /// Its list of this many IDs was out of order or named one past NN.
+    Invalid(usize),
+}
+
+/// A sequential namespace scan in place of the active list: why, NN, and
+/// the IDs scanned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SequentialScan {
+    pub why: ActiveList,
+    pub namespaces: u32,
+    pub scanned: u32,
+}
+
+impl core::fmt::Display for SequentialScan {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = identify_name(IDENTIFY_ACTIVE_NAMESPACES);
+        match self.why {
+            ActiveList::Refused(status) => write!(f, "{name} refused, status {status:#x}")?,
+            ActiveList::Lost => write!(f, "{name} got no answer")?,
+            ActiveList::Invalid(listed) => write!(
+                f,
+                "{name} of {listed} IDs out of order or past NN {}",
+                self.namespaces
+            )?,
+        }
+        write!(
+            f,
+            ": NVMe namespace IDs 1 to {} scanned one by one",
+            self.scanned
+        )
+    }
+}
+
+/// The namespaces of one controller, those it cannot serve, the quirks it
+/// runs with and the sequential scan that replaced a refused or garbage
+/// active namespace list.
 pub struct Attached {
     pub namespaces: Vec<Namespace>,
     pub failures: Vec<(u32, BlockError)>,
     pub quirks: Quirks,
+    pub sequential: Option<SequentialScan>,
 }
 
 /// A namespace's size and its in-use LBA format.
@@ -1323,7 +1420,7 @@ impl Namespace {
             return Ok(());
         }
         let scans = controller.scans;
-        let Some((mut ids, independent)) = controller.namespace_ids(self.namespace)? else {
+        let Scan::Found(mut ids, independent) = controller.namespace_ids(self.namespace)? else {
             self.scanned = scans;
             return Ok(());
         };
@@ -1342,7 +1439,7 @@ impl Namespace {
             }
             Err(error) => return Err(error),
         };
-        if !independent {
+        if !independent && !quirks.contains(Quirks::BOGUS_IDS) {
             ids.fill(version, data);
         }
         let allocated = data[NAMESPACE_CAPACITY] != [0; 8];
