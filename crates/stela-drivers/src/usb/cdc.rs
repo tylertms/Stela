@@ -202,6 +202,9 @@ enum Reset {
     Input,
     /// A failed or timed-out OUT transfer, reported once it is cancelled.
     Output(BlockError),
+    /// A failed notification transfer, resubmitted once its endpoint is
+    /// reset, as usbnet's intr_complete resubmits after an error.
+    Notify,
 }
 
 pub struct UsbNet {
@@ -377,13 +380,15 @@ impl UsbNet {
         })
     }
 
-    /// Takes any NetworkConnection notifications that arrived.
+    /// Takes any NetworkConnection notifications that arrived. A failed
+    /// notification transfer leaves its endpoint to a reset, after which
+    /// the next call submits again; the carrier stays as last reported.
     fn notifications(&mut self) -> Result<(), BlockError> {
-        let mut host = self.controller.borrow_mut();
-        let mut c = host.device(self.id)?;
         let Some(notify) = self.binding.notify else {
             return Ok(());
         };
+        let mut host = self.controller.borrow_mut();
+        let mut c = host.device(self.id)?;
         let length = usize::from(notify.max_packet & 0x7ff).min(64);
         for _ in 0..4 {
             if self.notify_queued.is_none() {
@@ -394,9 +399,23 @@ impl UsbNet {
                 return Ok(());
             };
             self.notify_queued = None;
-            if let Ok(bytes) = result
-                && bytes >= 8
-            {
+            let bytes = match result {
+                Ok(bytes) => bytes,
+                // Only retiring the slot ends this; no reset can.
+                Err(
+                    error @ BlockError::Device {
+                        status: INCOMPATIBLE_DEVICE,
+                    },
+                ) => return Err(error),
+                Err(_) => {
+                    let operation = c.start_clear(&notify)?;
+                    drop(host);
+                    self.resetting = Some((operation, Reset::Notify));
+                    self.advance()?;
+                    return Ok(());
+                }
+            };
+            if bytes >= 8 {
                 let header = &self.status.bytes()[..8];
                 if header[0] == DEVICE_TO_HOST | CLASS_INTERFACE && header[1] == NETWORK_CONNECTION
                 {
@@ -434,6 +453,7 @@ impl UsbNet {
                 self.sending = None;
                 self.sent_error = Some(error);
             }
+            Reset::Notify => {}
         }
         Ok(true)
     }
@@ -519,8 +539,13 @@ impl Link for UsbNet {
         self.mac
     }
 
+    /// While an endpoint reset runs, the carrier last reported.
     fn carrier(&mut self) -> bool {
-        self.advance().is_ok() && self.notifications().is_ok() && self.connected.unwrap_or(true)
+        match self.advance() {
+            Ok(true) => self.notifications().is_ok() && self.connected.unwrap_or(true),
+            Ok(false) => self.connected.unwrap_or(true),
+            Err(_) => false,
+        }
     }
 
     /// Queue `frame` and return without waiting for the controller, as

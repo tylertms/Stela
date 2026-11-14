@@ -743,6 +743,7 @@ fn ecm() -> Ecm {
     }
 }
 
+const NOTIFY: usize = 3;
 const OUTPUT: usize = 4;
 
 /// A STALLed OUT transfer also clears the device's halt, as usbnet's
@@ -773,6 +774,32 @@ fn ecm_clears_a_stalled_out_endpoint_and_only_cancels_a_late_one() {
     );
     assert_eq!(ecm.model.borrow().setup.len(), controls);
     ecm.link.transmit(&[0x9a; 60]).unwrap();
+}
+
+/// usbnet's intr_complete resubmits after an error: a failed notification
+/// transfer has its endpoint reset and the next carrier check submits
+/// again, so the adapter's later NetworkConnection notifications still set
+/// the carrier, where one failure left it down.
+#[test]
+fn ecm_resets_a_failed_notification_endpoint_and_takes_later_notifications() {
+    use crate::net::Link;
+    let mut ecm = ecm();
+    ecm.model.borrow_mut().halt_transfer = Some(NOTIFY);
+    assert!(ecm.link.carrier());
+    ecm.model.borrow_mut().halt_transfer = None;
+    assert!(ecm.link.resetting.is_none());
+    let clear = setup(RECIPIENT_ENDPOINT, CLEAR_FEATURE, 0, 0x81, 0);
+    assert_eq!(ecm.model.borrow().setup.last().unwrap().0, clear);
+    assert!(ecm.link.carrier());
+    assert!(ecm.link.notify_queued.is_some());
+    ecm.model
+        .borrow_mut()
+        .push_event(vec![0xa1, 0, 0, 0, 0, 0, 0, 0]);
+    assert!(!ecm.link.carrier());
+    ecm.model
+        .borrow_mut()
+        .push_event(vec![0xa1, 0, 1, 0, 0, 0, 0, 0]);
+    assert!(ecm.link.carrier());
 }
 
 pub(crate) mod generation;
