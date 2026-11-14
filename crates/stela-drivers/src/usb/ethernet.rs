@@ -628,8 +628,12 @@ impl UsbEthernet {
     /// Stop requires acknowledged cancellation of both bulk endpoints before
     /// the device reset; failed stops remain closed and never reuse DMA.
     /// Work under way ends first. It runs to completion, as teardown may.
+    /// An unplugged adapter's work ends at its next control transfer, which
+    /// finds no device, and the adapter gets only the host side's
+    /// cancellation, as r8152 skips register access once RTL8152_UNPLUG is
+    /// set.
     pub fn stop(&mut self) -> Result<(), BlockError> {
-        self.controller.borrow_mut().device(self.id)?;
+        let connected = self.controller.borrow_mut().device(self.id)?.connected()?;
         if self.stopped {
             return Ok(());
         }
@@ -642,6 +646,10 @@ impl UsbEthernet {
         self.queued = None;
         self.sending = None;
         self.pending.clear();
+        if !connected {
+            self.stopped = true;
+            return Ok(());
+        }
         let chip = self.chip.as_mut().expect("no work holds the chip");
         block_on(chip.stop())?;
         self.stopped = true;

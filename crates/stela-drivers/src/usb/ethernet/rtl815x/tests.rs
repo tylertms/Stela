@@ -1072,12 +1072,9 @@ fn every_patched_revision_starts_without_its_firmware_file() {
 
 mod minimum;
 
-/// The RTL8152B link of [`a_transmit_in_flight_makes_the_next_busy_until_it_ends_or_times_out`]
-/// through carrier, a frame each way, a lost link and its return, with
-/// calls bounded by `calls`; what the device saw.
-fn rtl_link_through_loss(late: bool) -> ethernet::tests::stepped::Effects {
-    use crate::net::{Link, LinkError};
-    use ethernet::tests::stepped::{Calls, effects};
+/// An RTL8152B link bound on the cancellation model, its minimum waits on
+/// the controller clock.
+pub(crate) fn rtl8152_fixture() -> ethernet::tests::stepped::Fixture {
     let mut dma = TestRegion::new(128 * 1024 * 8);
     let (mut controller, model) = unconfigured_cancellation_controller_with_configurations(
         &mut dma,
@@ -1098,8 +1095,21 @@ fn rtl_link_through_loss(late: bool) -> ethernet::tests::stepped::Effects {
     let shared = Rc::new(RefCell::new(controller));
     let mut found = Found::default();
     bind(&shared, device, &mut dma, &mut found);
-    let mut link = found.vendor_links.pop().unwrap();
-    let clock = shared.borrow().clock;
+    let link = found.vendor_links.pop().unwrap();
+    ethernet::tests::stepped::Fixture::new(link, model, shared, dma, |model, up| {
+        model.ethernet.as_mut().unwrap().link = up;
+    })
+}
+
+/// The RTL8152B link through carrier, a frame each way, a lost link and its
+/// return, with calls bounded by `calls`; what the device saw.
+fn rtl_link_through_loss(late: bool) -> ethernet::tests::stepped::Effects {
+    use crate::net::{Link, LinkError};
+    use ethernet::tests::stepped::{Calls, effects};
+    let mut fixture = rtl8152_fixture();
+    let model = fixture.model.clone();
+    let clock = fixture.clock();
+    let link = &mut fixture.link;
     let mut calls = Calls::new(model.clone(), clock, late);
     let not_busy = |result: &Result<(), LinkError>| result != &Err(LinkError::Busy);
 
@@ -1122,14 +1132,14 @@ fn rtl_link_through_loss(late: bool) -> ethernet::tests::stepped::Effects {
     assert_eq!(frame, Some(vec![0x7a; 60]));
 
     // The lost link: both bulk endpoints cancelled, then the MAC stopped.
-    model.borrow_mut().ethernet.as_mut().unwrap().link = false;
+    (fixture.set_link)(&mut model.borrow_mut(), false);
     calls.wait(ethernet::LINK_POLL_US);
     calls.until(
         || (link.carrier(), link.running.is_some()),
         |(up, busy)| !up && !busy,
     );
     assert!(model.borrow().active[3].is_none());
-    model.borrow_mut().ethernet.as_mut().unwrap().link = true;
+    (fixture.set_link)(&mut model.borrow_mut(), true);
     calls.wait(ethernet::LINK_POLL_US);
     calls.until(|| link.carrier(), |up| *up);
     calls

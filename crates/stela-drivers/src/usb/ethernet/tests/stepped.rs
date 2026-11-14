@@ -2,7 +2,9 @@
 //! Link calls against a device that answers late, after the call that asked
 //! returned: each call stays within its step's bound on the model clock, and
 //! the device sees what a device that answers at once sees.
-use crate::usb::xhci::model::CancelModel;
+use super::super::UsbEthernet;
+use crate::bus::dma::TestRegion;
+use crate::usb::xhci::{Shared, model::CancelModel};
 use crate::{Clock, test_clock};
 use alloc::{rc::Rc, vec::Vec};
 use core::cell::RefCell;
@@ -80,4 +82,59 @@ pub(crate) fn effects(model: &CancelModel, ignored: impl Fn(&[u8; 8]) -> bool) -
         .cloned()
         .collect();
     (writes, model.seen.clone(), model.outgoing.clone())
+}
+
+/// A vendor Ethernet link bound on the cancellation model, with the model's
+/// way of bringing its PHY up or down. The link drops first, while the
+/// controller and DMA it uses still live.
+pub(crate) struct Fixture {
+    pub(crate) link: UsbEthernet,
+    pub(crate) model: Rc<RefCell<CancelModel>>,
+    shared: Shared,
+    _dma: TestRegion,
+    pub(crate) set_link: fn(&mut CancelModel, bool),
+}
+
+impl Fixture {
+    pub(crate) fn new(
+        link: UsbEthernet,
+        model: Rc<RefCell<CancelModel>>,
+        shared: Shared,
+        dma: TestRegion,
+        set_link: fn(&mut CancelModel, bool),
+    ) -> Self {
+        Self {
+            link,
+            model,
+            shared,
+            _dma: dma,
+            set_link,
+        }
+    }
+    pub(crate) fn clock(&self) -> Clock {
+        self.shared.borrow().clock
+    }
+}
+
+/// An unplugged adapter's stop: only the host side cancels its bulk
+/// endpoints, as r8152 skips register access once RTL8152_UNPLUG is set,
+/// and the MAC stop's control transfers, which could only fail, are never
+/// sent.
+#[test]
+fn an_unplugged_adapter_stops_with_the_host_side_cancellation_alone() {
+    use crate::net::Link;
+    let mut fixture = super::super::rtl815x::tests::rtl8152_fixture();
+    assert!(fixture.link.settled_carrier());
+    // A transmit TD the device never answers and a receive TD waiting.
+    fixture.model.borrow_mut().silence_transfer = Some(4);
+    fixture.link.transmit(&[0x5a; 60]).unwrap();
+    assert_eq!(fixture.link.receive(), Ok(None));
+    fixture.model.borrow_mut().connected = false;
+    let controls = fixture.model.borrow().setup.len();
+    assert_eq!(fixture.link.stop(), Ok(()));
+    let model = fixture.model.borrow();
+    assert_eq!(model.setup.len(), controls);
+    assert!(model.active[3].is_none() && model.active[4].is_none());
+    drop(model);
+    assert!(fixture.link.transmit(&[0x6a; 60]).is_err());
 }
