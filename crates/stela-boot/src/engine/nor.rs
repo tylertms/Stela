@@ -42,6 +42,12 @@ pub fn split(partition: Box<dyn BlockDevice>) -> (Box<dyn BlockDevice>, Box<dyn 
     (Box::new(namespace), Box::new(state))
 }
 
+/// The longest the stop waits for the NOR's stores, and then for the RTC
+/// anchor's: a disk that never completes a command must not keep the PC at
+/// the stop.
+const NOR_STOP_MILLIS: u64 = 5000;
+const ANCHOR_STOP_MILLIS: u64 = 2000;
+
 pub struct HostNor {
     device: Box<dyn BlockDevice>,
     /// Changed sectors waiting for the store in progress, and that store:
@@ -113,21 +119,36 @@ impl AnchorStore {
     }
 
     /// Start the waiting anchor's store once the one in progress is done,
-    /// the caller waiting for both when `wait`. A failed store is reported
-    /// and ends the anchor's stores for this run: the next boot goes on
-    /// from the last stored anchor, which with a wall time loses nothing.
-    fn advance(slot: &mut Option<Self>, wait: bool) {
+    /// the caller waiting for both for at most `wait` counter ticks. A
+    /// failed store is reported and ends the anchor's stores for this run:
+    /// the next boot goes on from the last stored anchor, which with a wall
+    /// time loses nothing. So does a wait past its limit, reported once.
+    fn advance(slot: &mut Option<Self>, wait: Option<u64>) {
         let Some(store) = slot.as_mut() else {
             return;
         };
+        let started = super::host::fresh_counter();
         loop {
             if let Some(running) = store.running.as_mut() {
                 match running.poll(&mut *store.device) {
-                    None if wait => {
-                        core::hint::spin_loop();
-                        continue;
-                    }
-                    None => return,
+                    None => match wait {
+                        Some(limit)
+                            if super::host::fresh_counter().wrapping_sub(started) < limit =>
+                        {
+                            core::hint::spin_loop();
+                            continue;
+                        }
+                        Some(limit) => {
+                            output::arguments(format_args!(
+                                "RTC ANCHOR refusal: store at stop timed out after {} ms; the \
+                                 next boot goes on from the last stored anchor\n",
+                                limit / (super::host::COUNTER_HZ / 1000)
+                            ));
+                            *slot = None;
+                            return;
+                        }
+                        None => return,
+                    },
                     Some(Err(error)) => {
                         output::arguments(format_args!(
                             "RTC ANCHOR refusal: store: {error}; no more anchors this run\n"
@@ -221,14 +242,37 @@ impl HostNor {
     /// guest believes committed must not be lost silently.
     pub fn store(&mut self, dirty: Vec<(usize, Vec<u8>)>) {
         self.stores.add(dirty);
-        self.advance(false);
-        AnchorStore::advance(&mut self.anchor, false);
+        self.advance();
+        AnchorStore::advance(&mut self.anchor, None);
     }
 
-    /// Complete every store, the caller waiting: at the stop.
+    /// Complete every store, the caller waiting at most [`NOR_STOP_MILLIS`]
+    /// and [`ANCHOR_STOP_MILLIS`]: at the stop. A disk that never completes
+    /// is reported once and the restart or power-off goes on; the sectors
+    /// it did not store are lost, as the line says.
     pub fn finish(&mut self) {
-        self.advance(true);
-        AnchorStore::advance(&mut self.anchor, true);
+        let limit = super::host::COUNTER_HZ / 1000 * NOR_STOP_MILLIS;
+        match self.stores.finish(
+            &mut *self.device,
+            super::host::fresh_counter,
+            limit,
+            core::hint::spin_loop,
+        ) {
+            Ok(persist::Finish::Done) => {}
+            Ok(persist::Finish::TimedOut { waited, sectors }) => {
+                output::arguments(format_args!(
+                    "NOR refusal: store at stop timed out after {} ms; {sectors} sectors not stored\n",
+                    waited / (super::host::COUNTER_HZ / 1000)
+                ));
+            }
+            Err(error) => {
+                output::fatal(format_args!("a NOR sector could not be stored: {error}"));
+            }
+        }
+        AnchorStore::advance(
+            &mut self.anchor,
+            Some(super::host::COUNTER_HZ / 1000 * ANCHOR_STOP_MILLIS),
+        );
     }
 
     /// The PMU upcount's anchor this boot starts from: `None` on a new
@@ -243,18 +287,13 @@ impl HostNor {
         if let Some(store) = self.anchor.as_mut() {
             store.waiting = Some(anchor);
         }
-        AnchorStore::advance(&mut self.anchor, false);
+        AnchorStore::advance(&mut self.anchor, None);
     }
 
-    fn advance(&mut self, wait: bool) {
-        loop {
-            match self.stores.advance(&mut *self.device) {
-                Ok(false) if wait => core::hint::spin_loop(),
-                Ok(_) => return,
-                Err(error) => {
-                    output::fatal(format_args!("a NOR sector could not be stored: {error}"));
-                }
-            }
+    /// Move the stores on without waiting.
+    fn advance(&mut self) {
+        if let Err(error) = self.stores.advance(&mut *self.device) {
+            output::fatal(format_args!("a NOR sector could not be stored: {error}"));
         }
     }
 }

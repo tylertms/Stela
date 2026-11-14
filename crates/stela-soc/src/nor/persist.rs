@@ -184,6 +184,43 @@ impl Stores {
             self.running = Some((store, count));
         }
     }
+
+    /// Complete every store, the caller waiting at most `limit` ticks of
+    /// `now`: at the stop, which must not hang on a device that never
+    /// completes a command. `relax` runs between polls.
+    pub fn finish(
+        &mut self,
+        device: &mut dyn BlockDevice,
+        mut now: impl FnMut() -> u64,
+        limit: u64,
+        mut relax: impl FnMut(),
+    ) -> Result<Finish> {
+        let started = now();
+        loop {
+            if self.advance(device)? {
+                return Ok(Finish::Done);
+            }
+            let waited = now().wrapping_sub(started);
+            if waited >= limit {
+                let running = self.running.as_ref().map_or(0, |(_, count)| *count);
+                return Ok(Finish::TimedOut {
+                    waited,
+                    sectors: running + self.waiting.len(),
+                });
+            }
+            relax();
+        }
+    }
+}
+
+/// How waiting for the NOR's stores ended ([`Stores::finish`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Finish {
+    /// Every store is durable.
+    Done,
+    /// `limit` ticks passed with stores left: these many sectors waited or
+    /// ran still.
+    TimedOut { waited: u64, sectors: usize },
 }
 
 /// Blocks per sector and the block size; the partition must hold the image
@@ -228,6 +265,8 @@ mod tests {
         next: u32,
         pick: Pick,
         completed: usize,
+        /// It completes every running write as soon as asked.
+        instant: bool,
     }
 
     impl Adversary {
@@ -243,6 +282,7 @@ mod tests {
                 next: 0,
                 pick,
                 completed: 0,
+                instant: false,
             }
         }
 
@@ -295,6 +335,9 @@ mod tests {
             Ok(tag)
         }
         fn finish(&mut self, tag: u32) -> Option<Finished> {
+            if self.instant {
+                while self.complete() {}
+            }
             self.done.remove(&tag)
         }
     }
@@ -385,6 +428,39 @@ mod tests {
         disk.complete();
         disk.complete();
         assert!(!disk.valid_bank());
+    }
+
+    #[test]
+    fn the_stores_at_the_stop_end_at_their_deadline_on_a_disk_that_never_completes() {
+        let (before, dirty) = two_saves();
+        let mut disk = Adversary::new(before.clone(), oldest);
+        let mut stores = Stores::new();
+        stores.add(dirty.clone());
+        let clock = core::cell::Cell::new(0u64);
+        let finished = stores
+            .finish(
+                &mut disk,
+                || clock.get(),
+                100,
+                || clock.set(clock.get() + 7),
+            )
+            .unwrap();
+        // The first store's sectors run and the second's wait.
+        assert_eq!(
+            finished,
+            Finish::TimedOut {
+                waited: 105,
+                sectors: dirty.len()
+            }
+        );
+        // A disk that completes lets it finish before the deadline.
+        let mut disk = Adversary::new(before, oldest);
+        disk.instant = true;
+        let mut stores = Stores::new();
+        stores.add(dirty);
+        let finished = stores.finish(&mut disk, || 0, 100, || {}).unwrap();
+        assert_eq!(finished, Finish::Done);
+        assert!(disk.valid_bank());
     }
 
     #[test]

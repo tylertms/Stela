@@ -466,16 +466,20 @@ struct Sink {
 
 impl Sink {
     /// Move the store in progress on: collect the running request's result
-    /// and start the next; with `wait`, until the store is done.
-    fn advance(&mut self, wait: bool) -> Result<(), BlockError> {
+    /// and start the next; with a counter deadline `wait`, until the store
+    /// is done or the deadline passed. Whether it is done: a device that
+    /// never completes leaves the store in progress at the deadline.
+    fn advance(&mut self, wait: Option<u64>) -> Result<bool, BlockError> {
         loop {
             if let Some(request) = self.request.as_mut() {
                 let Some(finished) = request.poll(&mut *self.device) else {
-                    if !wait {
-                        return Ok(());
+                    match wait {
+                        Some(deadline) if !passed(deadline) => {
+                            core::hint::spin_loop();
+                            continue;
+                        }
+                        _ => return Ok(false),
                     }
-                    core::hint::spin_loop();
-                    continue;
                 };
                 self.request = None;
                 self.writer.completed(finished)?;
@@ -486,7 +490,7 @@ impl Sink {
                     self.stores += 1;
                     self.ticks += self.flushed.wrapping_sub(began);
                 }
-                return Ok(());
+                return Ok(true);
             };
             match Submission::new(request, self.device.identity()) {
                 Ok(request) => self.request = Some(request),
@@ -497,6 +501,21 @@ impl Sink {
             }
         }
     }
+}
+
+/// The longest a store that waits for the logs (at a stop, or the USB's log
+/// before a device starts) waits for their disks: a disk that never
+/// completes a command must not keep the PC at the stop. On expiry it is
+/// reported once and the stop goes on.
+const STORE_WAIT_MILLIS: u64 = 2000;
+
+/// The TSC rate taken before it is measured, for [`STORE_WAIT_MILLIS`]: no
+/// PC's is higher, so the wait is at least that long.
+const UNMEASURED_TSC_HZ: u64 = 6_000_000_000;
+
+/// Whether the counter passed `deadline`.
+fn passed(deadline: u64) -> bool {
+    rdtsc().wrapping_sub(deadline) < u64::MAX / 2
 }
 
 /// Seconds between the machine state's log stores while the engine runs:
@@ -858,6 +877,16 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
         return;
     }
     let mut failed = Vec::new();
+    let mut late = Vec::new();
+    // One deadline for every log's store.
+    let started = rdtsc();
+    let deadline = wait.then(|| {
+        let hz = match TSC_HZ.load(Ordering::Relaxed) {
+            0 => UNMEASURED_TSC_HZ,
+            hz => hz,
+        };
+        started.wrapping_add(hz / 1000 * STORE_WAIT_MILLIS)
+    });
     let reached = with_sinks(false, |sinks| {
         // A log whose store is in progress takes new bytes at its next one.
         let is_due = |sink: &Sink| !sink.writer.storing() && due(sink);
@@ -889,8 +918,13 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
             if is_due(sink) && sink.writer.begin_store() {
                 sink.began = Some(rdtsc());
             }
-            match sink.advance(wait) {
-                Ok(()) => index += 1,
+            match sink.advance(deadline) {
+                Ok(done) => {
+                    if wait && !done {
+                        late.push(sink.kind);
+                    }
+                    index += 1;
+                }
                 Err(error) => failed.push((sinks.remove(index).kind, error)),
             }
         }
@@ -900,10 +934,22 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
         );
     });
     if wait {
-        UNSTORED.store(reached.is_none(), Ordering::Relaxed);
+        UNSTORED.store(reached.is_none() || !late.is_empty(), Ordering::Relaxed);
     }
     for (kind, error) in failed {
         log_lost(kind, error);
+    }
+    // Reported once a boot: its store stays in progress and goes on at the
+    // next turn, if any.
+    static LATE: AtomicBool = AtomicBool::new(false);
+    if let Some(kind) = late.first()
+        && !LATE.swap(true, Ordering::Relaxed)
+    {
+        arguments(format_args!(
+            "BOOT LOG refusal: the {} log's store timed out after {} ms; going on without it\n",
+            kind.name(),
+            millis_since(started)
+        ));
     }
 }
 
