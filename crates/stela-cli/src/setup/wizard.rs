@@ -337,9 +337,15 @@ fn ask(environment: &Environment<'_>, command: &mut Request, stick: &Stick) -> R
         }
         ui.info(super::create::SIGNING_SUMMARY)?;
         if let Some(record) = &stick.record {
+            // The command its state calls for, if any: a stick that needs
+            // nothing is kept by not erasing it.
+            let keep = match stick.next(true) {
+                Some(command) => format!("choose Cancel and run `{command}`"),
+                None => "choose Cancel".into(),
+            };
             ui.warning(&format!(
                 "This stick holds Stela with macOS {}: a new installer replaces it. To keep it, \
-                 choose Cancel and run `stela update`.",
+                 {keep}.",
                 super::home::macos_name(&record.build)
             ))?;
         }

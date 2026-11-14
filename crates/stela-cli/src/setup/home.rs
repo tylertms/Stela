@@ -106,8 +106,9 @@ impl Stick {
         ))
     }
 
-    /// The command that is due for it, if any.
-    fn next(&self, several: bool) -> Option<String> {
+    /// The command that is due for it, if any; with the stick named when
+    /// `several` fit.
+    pub(super) fn next(&self, several: bool) -> Option<String> {
         let stick = || match several {
             true => format!(" {}", self.path()),
             false => String::new(),

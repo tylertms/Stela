@@ -6256,6 +6256,59 @@ fn journey_b_a_stick_with_stela_is_not_treated_as_blank() {
 }
 
 #[test]
+fn erasing_a_stela_stick_names_the_command_that_keeps_it_for_its_state() {
+    let keep = |shown: &str| {
+        shown
+            .lines()
+            .find(|line| line.starts_with("▲ This stick holds Stela"))
+            .unwrap_or_else(|| panic!("no warning:\n{shown}"))
+            .split("To keep it, ")
+            .nth(1)
+            .unwrap()
+            .to_owned()
+    };
+    // A ready stick needs nothing: not erasing it keeps it.
+    let f = made_by(Some(release::CURRENT));
+    let (shown, result, _) = plain_stela(
+        &f,
+        &["Erase it and make a new installer", "Offline", "Cancel"],
+        &[],
+    );
+    result.unwrap();
+    assert_eq!(keep(&shown), "choose Cancel.");
+    // An older one is updated.
+    let f = made_by(None);
+    let (shown, result, _) = plain_stela(
+        &f,
+        &[
+            "Other choices",
+            "Erase it and make a new installer",
+            "Offline",
+            "Cancel",
+        ],
+        &[],
+    );
+    result.unwrap();
+    let update = format!(
+        "choose Cancel and run `stela update {}disk5`.",
+        host::DISK_PREFIX
+    );
+    assert_eq!(keep(&shown), update);
+    // A stopped create is finished.
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    interrupt_setup(&f);
+    let (shown, result, _) = plain_stela(&f, &["Start over", "Offline", "Cancel"], &[]);
+    result.unwrap();
+    let repair = format!(
+        "choose Cancel and run `stela repair {}disk5`.",
+        host::DISK_PREFIX
+    );
+    assert_eq!(keep(&shown), repair);
+}
+
+#[test]
 fn journey_c_an_older_stick_offers_the_update_and_quit_changes_nothing() {
     let f = made_by(None);
     let before = stick_files(&f);
