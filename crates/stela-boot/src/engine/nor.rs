@@ -14,8 +14,7 @@
 //! layout in that partition's last bytes ([`machine_state`]) and gives the
 //! ANS2 model only the rest, so the guest never sees the machine state.
 use crate::output;
-use alloc::{boxed::Box, collections::BTreeMap, format, vec::Vec};
-use stela_contracts::refuse;
+use alloc::{boxed::Box, format, vec::Vec};
 use stela_drivers::block::{BlockDevice, BlockError, Shared, Submission};
 use {
     stela_formats::boot_bundle::Nvram, stela_runtime::pc::board_flash, stela_runtime::pc::boot_log,
@@ -45,12 +44,10 @@ pub fn split(partition: Box<dyn BlockDevice>) -> (Box<dyn BlockDevice>, Box<dyn 
 
 pub struct HostNor {
     device: Box<dyn BlockDevice>,
-    /// Changed sectors by offset, waiting for the store in progress; a
-    /// newer copy of a sector replaces the waiting one.
-    waiting: BTreeMap<usize, Vec<u8>>,
-    /// The store in progress: its sectors' writes run together, and they
-    /// are durable before the next store begins.
-    running: Option<Submission>,
+    /// Changed sectors waiting for the store in progress, and that store:
+    /// its sectors' writes run together, never both NVRAM banks', and they
+    /// are durable before the next store begins ([`persist::Stores`]).
+    stores: persist::Stores,
     /// The PMU upcount's anchor, when the partition holds its region.
     anchor: Option<AnchorStore>,
 }
@@ -202,8 +199,7 @@ impl HostNor {
         (
             Self {
                 device,
-                waiting: BTreeMap::new(),
-                running: None,
+                stores: persist::Stores::new(),
                 anchor,
             },
             image,
@@ -224,7 +220,7 @@ impl HostNor {
     /// progress is durable. A failed store stops the machine: NVRAM the
     /// guest believes committed must not be lost silently.
     pub fn store(&mut self, dirty: Vec<(usize, Vec<u8>)>) {
-        self.waiting.extend(dirty);
+        self.stores.add(dirty);
         self.advance(false);
         AnchorStore::advance(&mut self.anchor, false);
     }
@@ -252,33 +248,9 @@ impl HostNor {
 
     fn advance(&mut self, wait: bool) {
         loop {
-            if let Some(running) = self.running.as_mut() {
-                match running.poll(&mut *self.device) {
-                    None if wait => {
-                        core::hint::spin_loop();
-                        continue;
-                    }
-                    None => return,
-                    Some(Err(error)) => {
-                        output::fatal(format_args!("a NOR sector could not be stored: {error}"));
-                    }
-                    Some(Ok(_)) => self.running = None,
-                }
-            }
-            if self.waiting.is_empty() {
-                return;
-            }
-            let identity = self.device.identity();
-            let store = core::mem::take(&mut self.waiting)
-                .into_iter()
-                .map(|(offset, sector)| persist::request(identity, offset, sector))
-                .collect::<Result<Vec<_>, _>>()
-                .and_then(|requests| {
-                    Submission::batch(requests, identity)
-                        .map_err(|error| refuse!("NOR persistence batch: {error}", %error))
-                });
-            match store {
-                Ok(store) => self.running = Some(store),
+            match self.stores.advance(&mut *self.device) {
+                Ok(false) if wait => core::hint::spin_loop(),
+                Ok(_) => return,
                 Err(error) => {
                     output::fatal(format_args!("a NOR sector could not be stored: {error}"));
                 }
