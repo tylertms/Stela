@@ -102,6 +102,16 @@ global_asm!(
     "rdpmc",
     "xor eax, eax",
     "ret",
+    ".global stela_pmu_rdmsr",
+    "stela_pmu_rdmsr:",
+    "mov ecx, edi",
+    ".global stela_pmu_rdmsr_instruction",
+    "stela_pmu_rdmsr_instruction:",
+    "rdmsr",
+    "mov dword ptr [rsi], eax",
+    "mov dword ptr [rsi + 4], edx",
+    "xor eax, eax",
+    "ret",
     ".global stela_pmu_refused",
     "stela_pmu_refused:",
     "mov eax, 1",
@@ -111,19 +121,22 @@ global_asm!(
 unsafe extern "sysv64" {
     fn stela_pmu_wrmsr(index: u32, value: u64) -> u32;
     fn stela_pmu_rdpmc(counter: u32) -> u32;
+    fn stela_pmu_rdmsr(index: u32, value: *mut u64) -> u32;
     static stela_pmu_wrmsr_instruction: u8;
     static stela_pmu_rdpmc_instruction: u8;
+    static stela_pmu_rdmsr_instruction: u8;
     static stela_pmu_refused: u8;
 }
 
-/// Resume a #GP of the probing WRMSR or RDPMC at its refusal: the event or
-/// counter is unsupported.
+/// Resume a #GP of the probing WRMSR, RDPMC or RDMSR at its refusal: the
+/// event, counter or register is unsupported.
 pub(crate) fn fixup(frame: &mut Frame) -> bool {
     let rip = frame.rip;
     if frame.vector != 13
         || frame.cs & 3 != 0
         || (rip != (&raw const stela_pmu_wrmsr_instruction).addr() as u64
-            && rip != (&raw const stela_pmu_rdpmc_instruction).addr() as u64)
+            && rip != (&raw const stela_pmu_rdpmc_instruction).addr() as u64
+            && rip != (&raw const stela_pmu_rdmsr_instruction).addr() as u64)
     {
         return false;
     }
@@ -135,6 +148,41 @@ pub(crate) fn fixup(frame: &mut Frame) -> bool {
 fn write(index: u32, value: u64) -> bool {
     // SAFETY: ring 0; a refused write takes #GP, which `fixup` resumes.
     unsafe { stela_pmu_wrmsr(index, value) == 0 }
+}
+
+/// RDMSR that answers a #GP with `None`: the register is not implemented.
+fn read(index: u32) -> Option<u64> {
+    let mut value = 0;
+    // SAFETY: ring 0; an unimplemented register takes #GP, which `fixup`
+    // resumes; the value goes to this frame's `value`.
+    (unsafe { stela_pmu_rdmsr(index, &mut value) } == 0).then_some(value)
+}
+
+/// The SMI counter's register (`stela_boot_core::smi`), probed once for
+/// every processor, which share a vendor: `u32::MAX` before the probe, 0
+/// where there is none.
+static SMI_COUNTER: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// The SMIs this processor has taken, where it counts them.
+pub(crate) fn smi_count() -> Option<u64> {
+    let counter = match SMI_COUNTER.load(Relaxed) {
+        u32::MAX => {
+            let identity = __cpuid(0);
+            // "GenuineIntel".
+            let intel = (identity.ebx, identity.edx, identity.ecx)
+                == (0x756e_6547, 0x4965_6e69, 0x6c65_746e);
+            let counter = stela_boot_core::smi::counter(intel)
+                .filter(|&index| read(index).is_some())
+                .unwrap_or(0);
+            SMI_COUNTER.store(counter, Relaxed);
+            counter
+        }
+        counter => counter,
+    };
+    match counter {
+        0 => None,
+        index => read(index),
+    }
 }
 
 #[inline]

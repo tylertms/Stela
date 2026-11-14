@@ -549,6 +549,9 @@ struct Lap<'a> {
     step: bool,
     watch: &'a GuestWatch,
     turn_late: Option<(Pending, u64)>,
+    /// This core's SMI count when the turn began (`pmu::smi_count`), for a
+    /// slow part's line: SMIs taken in the turn are firmware time.
+    smis: Option<u64>,
 }
 
 impl<'a> Lap<'a> {
@@ -561,6 +564,7 @@ impl<'a> Lap<'a> {
             step,
             watch,
             turn_late: None,
+            smis: host::pmu::smi_count(),
         }
     }
 
@@ -641,8 +645,16 @@ impl<'a> Lap<'a> {
                     u128::from(ticks) * 1_000_000 / u128::from(host::COUNTER_HZ)
                 ),
             };
+            // The SMIs from the turn's start to this part's end.
+            let smis = self
+                .smis
+                .zip(host::pmu::smi_count())
+                .map(|(before, after)| {
+                    format!(" turn_smis={}", stela_boot_core::smi::taken(before, after))
+                })
+                .unwrap_or_default();
             output::arguments(format_args!(
-                "HOST SERVICE SLOW part={} us={} boot={} step={} pe={}{guest}{}\n",
+                "HOST SERVICE SLOW part={} us={} boot={} step={} pe={}{guest}{}{smis}\n",
                 NAMES[part as usize],
                 u128::from(took) * 1_000_000 / u128::from(self.tsc_hz.max(1)),
                 self.boot,

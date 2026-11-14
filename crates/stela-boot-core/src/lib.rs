@@ -82,6 +82,7 @@ pub mod root_transition;
 pub mod screen;
 pub mod service_watch;
 pub mod shutdown;
+pub mod smi;
 pub mod source_health;
 pub mod staged_disk;
 pub mod staged_frame;
