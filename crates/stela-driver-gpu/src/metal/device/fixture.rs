@@ -183,6 +183,9 @@ pub(crate) struct MockBackend {
     /// The word a test's GPU writes as the completion marker, when the
     /// test gives one: every mapped word answers it.
     pub(crate) marker: Option<Box<core::sync::atomic::AtomicU32>>,
+    /// The descriptor each export of a semaphore answers, when a test gives
+    /// one.
+    pub(crate) exported: Option<i32>,
     pub(crate) retired: VecDeque<NonZeroU64>,
     pub(crate) semaphores: BTreeMap<u64, u64>,
     /// The highest value each semaphore's submitted signals reach.
@@ -422,7 +425,7 @@ impl Backend for MockBackend {
         Ok(Semaphore(id))
     }
     fn export_semaphore(&mut self, _: Semaphore) -> Option<i32> {
-        None
+        self.exported
     }
     fn create_indirect_commands_layout(
         &mut self,

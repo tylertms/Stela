@@ -434,6 +434,19 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         self.completion.take()
     }
 
+    /// Exports the queue's timeline again for [`Self::take_completion`],
+    /// as the platform's waiter that took it left: whether one is offered.
+    /// None once lost.
+    pub fn rearm_completion(&mut self) -> bool {
+        if self.lost {
+            return false;
+        }
+        if self.completion.is_none() {
+            self.completion = self.backend.export_semaphore(self.timeline);
+        }
+        self.completion.is_some()
+    }
+
     /// `currentAllocatedSize`, including allocations pending GPU completion.
     pub fn current_allocated_size(&self) -> u64 {
         self.allocated

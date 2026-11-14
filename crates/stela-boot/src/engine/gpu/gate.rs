@@ -1157,12 +1157,28 @@ pub(super) fn interrupted() {
 }
 
 /// Waits on the completion timeline of each device that has not yet given
-/// it, as a newly opened or reopened device has: completed work is then
+/// it, as a newly opened or reopened device has, or whose waiter left by
+/// itself, which the device then exports again: completed work is then
 /// looked for at once.
 pub(super) fn watch_completions() {
+    use super::waiter::{self, Due};
     for (index, service) in shared().iter().enumerate() {
+        match waiter::due(index) {
+            // A call holding the service leaves it due for the next look.
+            Due::Restart if service.rearm_completion() => {
+                let count = waiter::restarted(index);
+                output::arguments(format_args!(
+                    "GPU {index}: completion waiter started again ({count})\n"
+                ));
+            }
+            Due::GiveUp => output::arguments(format_args!(
+                "GPU {index}: completion waiter left too often; completions are found by \
+                 looks\n"
+            )),
+            Due::Restart | Due::Nothing => {}
+        }
         if let Some((fd, timeline)) = service.take_completion() {
-            super::waiter::start(fd, index, timeline);
+            waiter::start(fd, index, timeline);
         }
     }
 }

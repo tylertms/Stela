@@ -2619,8 +2619,9 @@ enum Look {
 /// have moved. Most pumps run for a call a PE posted or a Linux timer. The
 /// fallback look every [`LOOK_FALLBACK_NS`] is for a device no waiter
 /// watches: while one waits on the only device's timeline, every fence it
-/// signals reaches the waiter, which asks for the look itself, so the
-/// fallback only starts the waiters of new timelines.
+/// signals reaches the waiter, which asks for the look itself, so while
+/// every device's waiter waits the fallback only starts the waiters of new
+/// timelines.
 fn look_due(gpu: &Installed) -> Look {
     let fired = FIRED.load(Ordering::Acquire);
     let interrupted = LOOKED.swap(fired, Ordering::Relaxed) != fired;
@@ -2637,7 +2638,7 @@ fn look_due(gpu: &Installed) -> Look {
         Look::Device
     } else if !fallback {
         Look::No
-    } else if gate::shared().len() == 1 && waiter::watching() {
+    } else if waiter::watching(gate::shared().len()) {
         Look::Waiters
     } else {
         Look::Device

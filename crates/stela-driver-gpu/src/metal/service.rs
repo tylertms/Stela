@@ -56,6 +56,7 @@ mod shared;
 mod sharing;
 #[cfg(test)]
 mod tests;
+pub mod waiters;
 pub mod wire;
 
 /// Opens a new device for the GPU after a loss.

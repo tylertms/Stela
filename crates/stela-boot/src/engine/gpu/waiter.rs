@@ -9,7 +9,10 @@
 //! point, waiting for its submission too. Its own handle keeps the syncobj
 //! alive whatever becomes of the device, and each wait ends within
 //! [`WAIT_NS`] while work is outstanding, else [`IDLE_WAIT_NS`], so a
-//! waiter a newer device or the stop replaced leaves.
+//! waiter a newer device of its GPU or the stop replaced leaves. Each GPU's
+//! service has a waiter of its own ([`Waiters`]); one that leaves by itself
+//! is started again, a bounded number of times, by the next look
+//! (`gate::watch_completions`).
 //!
 //! Each point it sees signaled goes straight to the device's service
 //! (`SharedService::completed_through`), which tells the guest at once even
@@ -20,18 +23,18 @@
 //! ([`wait_gone`]): frees that reach nouveau after the stop began are refused,
 //! and GSP-RM is then asked to unload with that client still allocated.
 use super::{client, gate, look_again};
+use crate::output;
 use alloc::boxed::Box;
 use core::{
     ffi::{c_int, c_uint, c_void},
     ptr,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
+pub(super) use stela_drivers::gpu::metal::service::waiters::Due;
+use stela_drivers::gpu::metal::service::waiters::{SERVICES, Waiters};
 
-/// The waiters' generation: a waiter of another one leaves.
-static GENERATION: AtomicU64 = AtomicU64::new(0);
-
-/// The generation of the waiter that waits on its timeline now, 0 for none.
-static WATCHING: AtomicU64 = AtomicU64::new(0);
+/// Each service's waiter: which is current and which waits now.
+static WAITERS: Waiters = Waiters::new();
 
 /// Waiters started that have not yet closed their file.
 static RUNNING: AtomicU32 = AtomicU32::new(0);
@@ -52,11 +55,21 @@ impl Drop for Running {
     }
 }
 
-/// Whether the newest waiter waits on its timeline: every fence of it that
-/// signals, in an interrupt or not, ends its wait and has the services look.
-pub(super) fn watching() -> bool {
-    let generation = GENERATION.load(Ordering::Acquire);
-    generation != 0 && WATCHING.load(Ordering::Acquire) == generation
+/// Whether a waiter waits on the timeline of each of the first `services`
+/// services: every fence of them that signals, in an interrupt or not, ends
+/// a wait and has the services look.
+pub(super) fn watching(services: usize) -> bool {
+    WAITERS.all_watching(services)
+}
+
+/// What service `index`'s waiter needs from the next look.
+pub(super) fn due(index: usize) -> Due {
+    WAITERS.due(index)
+}
+
+/// Service `index`'s timeline was offered again for a new waiter.
+pub(super) fn restarted(index: usize) -> u32 {
+    WAITERS.restarted(index)
 }
 
 /// The longest one wait lasts while the service awaits a completion: a
@@ -125,10 +138,19 @@ struct Watch {
 }
 
 /// Waits on `fd`, the completion timeline `timeline` of service `service`'s
-/// device, which the waiter owns; earlier waiters leave. A waiter that
-/// cannot start closes `fd`.
+/// device, which the waiter owns; that service's earlier waiter leaves. A
+/// waiter that cannot start closes `fd`.
 pub(super) fn start(fd: c_int, service: usize, timeline: u64) {
-    let generation = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    let Some(generation) = WAITERS.begin(service) else {
+        if service >= SERVICES {
+            output::arguments(format_args!(
+                "GPU {service}: no completion waiter past {SERVICES} GPUs; completions are \
+                 found by looks\n"
+            ));
+        }
+        client::close_descriptor(fd);
+        return;
+    };
     let watch = Box::into_raw(Box::new(Watch {
         fd,
         generation,
@@ -140,12 +162,26 @@ pub(super) fn start(fd: c_int, service: usize, timeline: u64) {
         // SAFETY: the thread was refused, so the box is still ours.
         let watch = unsafe { Box::from_raw(watch) };
         client::close_descriptor(watch.fd);
+        ended(&watch);
     }
 }
 
-/// Every waiter leaves within [`IDLE_WAIT_NS`]: the GPUs stop.
+/// The waiter `watch` ended; one that left by itself is reported, and the
+/// next look starts its service another.
+fn ended(watch: &Watch) {
+    if WAITERS.ended(watch.service, watch.generation) {
+        output::arguments(format_args!(
+            "GPU {}: completion waiter left by itself\n",
+            watch.service
+        ));
+        look_again();
+    }
+}
+
+/// Every waiter leaves within [`IDLE_WAIT_NS`] and none starts again: the
+/// GPUs stop.
 pub(super) fn stop() {
-    GENERATION.fetch_add(1, Ordering::AcqRel);
+    WAITERS.stop();
 }
 
 /// The longest the stop waits for the waiters to close their files: one
@@ -175,6 +211,7 @@ unsafe extern "C" fn run(argument: *mut c_void) {
     let watch = unsafe { Box::from_raw(argument.cast::<Watch>()) };
     let Some(file) = client::open_node(client::RENDER_MINOR) else {
         client::close_descriptor(watch.fd);
+        ended(&watch);
         return;
     };
     let mut import = Handle {
@@ -195,16 +232,18 @@ unsafe extern "C" fn run(argument: *mut c_void) {
         client::control(file, SYNCOBJ_DESTROY, destroy.as_mut_ptr().cast());
     }
     client::close_descriptor(file);
+    ended(&watch);
 }
 
 /// Waits for each next point of `handle`, publishing each and having the
-/// services look, until another generation starts or waits keep failing.
+/// services look, until its service's waiter is replaced, the GPUs stop or
+/// waits keep failing.
 fn wait(file: c_int, handle: u32, watch: &Watch) {
     let generation = watch.generation;
     let mut next = value(file, handle).unwrap_or(0) + 1;
     let mut failures = 0;
-    WATCHING.store(generation, Ordering::Release);
-    while GENERATION.load(Ordering::Acquire) == generation && failures < FAILURES {
+    WAITERS.waiting(watch.service, generation);
+    while WAITERS.stays(watch.service, generation) && failures < FAILURES {
         let mut point = next;
         let mut handles = handle;
         let timeout = if gate::awaits_completion(watch.service) {
@@ -247,8 +286,6 @@ fn wait(file: c_int, handle: u32, watch: &Watch) {
             _ => failures += 1,
         }
     }
-    // A newer waiter may already have stored its own.
-    let _ = WATCHING.compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Relaxed);
 }
 
 /// The newest point of `handle` that signaled.

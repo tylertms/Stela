@@ -1169,6 +1169,15 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         Some((fd, self.timeline.fetch_add(1, Ordering::AcqRel) + 1))
     }
 
+    /// Offers the device's completion timeline again
+    /// ([`Self::take_completion`]), for a waiter started in place of one that
+    /// left by itself ([`super::waiters`]): whether one is offered. False
+    /// while a call holds the service, or once the device is lost.
+    pub fn rearm_completion(&self) -> bool {
+        self.try_turn()
+            .is_some_and(|mut turn| turn.device().rearm_completion())
+    }
+
     /// Whether work was submitted that is not yet published complete: a
     /// waiter whose wait times out then has the platform look at the device,
     /// which notices a loss the stalled timeline never signals. Not once

@@ -5206,3 +5206,20 @@ fn a_destroyed_events_late_completion_does_not_answer_for_its_handles_next_event
     assert_eq!(device.signaled_value(b), Ok(0));
     assert_eq!(device.wait_event(b, 3, 0), Ok(false));
 }
+
+/// A waiter that took the completion timeline and left gets it again: the
+/// timeline is exported anew, never once the device is lost.
+#[test]
+fn the_completion_timeline_is_offered_again_until_the_device_is_lost() {
+    let mut backend = MockBackend::new();
+    backend.exported = Some(7);
+    let mut device = device_on(backend);
+    assert_eq!(device.take_completion(), Some(7));
+    assert_eq!(device.take_completion(), None);
+    assert!(device.rearm_completion());
+    assert!(device.rearm_completion(), "offered once until taken");
+    assert_eq!(device.take_completion(), Some(7));
+    device.mark_lost();
+    assert!(!device.rearm_completion());
+    assert_eq!(device.take_completion(), None);
+}
