@@ -60,10 +60,15 @@ pub(super) fn cancelled(error: &anyhow::Error) -> bool {
 /// The terminal's prompts, in Stela's Clack theme.
 pub(super) struct Terminal;
 
+/// Whether standard input and error are a terminal: someone can answer.
+pub(super) fn attached() -> bool {
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
 impl Terminal {
     /// The terminal when standard input and error are one, else no one.
     pub(super) fn or_none() -> &'static dyn Ui {
-        if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        if attached() {
             cliclack::set_theme(super::wizard::theme::Stela);
             &Terminal
         } else {

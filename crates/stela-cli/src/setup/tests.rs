@@ -7300,6 +7300,23 @@ fn plain_stela_unmounts_the_efi_partitions_it_mounted() {
 }
 
 #[test]
+fn status_needs_rights_only_for_an_efi_partition_without_a_mount() {
+    // Windows gives a stick's EFI partition no drive letter unless the PC
+    // that made it did: reading it then means giving it one.
+    let mut f = made_by(Some(release::CURRENT));
+    assert!(!esp_unmounted(&f.host, &stela_volume(&f)));
+    let usb = f
+        .host
+        .disks
+        .iter_mut()
+        .find(|d| d.identifier == "disk5")
+        .unwrap();
+    usb.partitions[0].mount = None;
+    assert!(esp_unmounted(&f.host, &stela_volume(&f)));
+    assert!(!esp_unmounted(&f.host, Path::new("/nowhere")));
+}
+
+#[test]
 fn a_card_reader_without_a_card_is_no_stick() {
     // Linux lists an empty reader with size 0, and Windows gives it no
     // size when its geometry cannot be read.

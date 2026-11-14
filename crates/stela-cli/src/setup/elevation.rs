@@ -15,7 +15,7 @@ pub(super) enum Rights {
     /// It runs again with them: through `sudo` in the same terminal, or on
     /// Windows in a new administrator window.
     Relaunch,
-    /// It stops and says how to run it with them ([`REFUSED`]).
+    /// It stops and says how to run it with them ([`refused`]).
     Refuse,
 }
 
@@ -25,43 +25,64 @@ pub(super) struct Situation {
     /// Root on Unix, an elevated administrator on Windows.
     pub(super) administrator: bool,
     pub(super) dry_run: bool,
-    /// The wizard, plain `stela` and `log`, whose output a new window may
-    /// carry.
+    /// The wizard, plain `stela`, `log` and a `status` that mounts the
+    /// stick's EFI partition, whose output a new window may carry.
     pub(super) own_window: bool,
+    /// Someone answers at a terminal: a new window reaches them, and a
+    /// script that waits for the output and exit status gets neither.
+    pub(super) interactive: bool,
     /// It may write to a disk, as every command but `status` and `log`
     /// does.
     pub(super) writes_disks: bool,
+    /// It reads what Windows lets only an administrator read: every disk
+    /// raw for `log`, and for `status` an EFI partition that has no drive
+    /// letter, which only an administrator can give it.
+    pub(super) admin_reads: bool,
 }
 
 /// A command's way to the rights it needs. A dry run changes nothing and
 /// needs none. On Unix, `sudo` runs the same command in the same terminal.
 /// On Windows, a relaunch opens a new window, which loses a scripted
-/// command's output and exit status, so only the wizard, plain `stela` and
-/// `log` are relaunched; any other command that writes a disk stops before it
-/// downloads or changes anything.
+/// command's output and exit status, so only a windowed command run at a
+/// terminal is relaunched; any other command that writes a disk, or reads
+/// what only an administrator may, stops before it downloads or changes
+/// anything.
 pub(super) fn rights(situation: Situation) -> Rights {
     let Situation {
         windows,
         administrator,
         dry_run,
         own_window,
+        interactive,
         writes_disks,
+        admin_reads,
     } = situation;
     if administrator || dry_run {
         Rights::Enough
-    } else if !windows || own_window {
+    } else if !windows {
         Rights::Relaunch
-    } else if writes_disks {
-        Rights::Refuse
-    } else {
+    } else if !(writes_disks || admin_reads) {
         Rights::Enough
+    } else if own_window && interactive {
+        Rights::Relaunch
+    } else {
+        Rights::Refuse
     }
 }
 
-/// Why a command stopped at [`Rights::Refuse`], and how to run it.
-pub(super) const REFUSED: &str = "this command writes to disks, which Windows allows only to an \
-    administrator. Open Terminal or Command Prompt with Run as administrator and run the same \
-    command there. Nothing was downloaded or changed.";
+/// Why a command stopped at [`Rights::Refuse`], and how to run it: one that
+/// writes disks (`writes`), or one that only reads them.
+pub(super) fn refused(writes: bool) -> String {
+    format!(
+        "this command {}, which Windows allows only to an administrator. Open Terminal or \
+         Command Prompt with Run as administrator and run the same command there. Nothing was \
+         downloaded or changed.",
+        match writes {
+            true => "writes to disks",
+            false => "reads the stick's EFI partition or every disk",
+        }
+    )
+}
 
 /// Whether this process has the rights to write disks: root.
 #[cfg(not(windows))]
@@ -127,7 +148,9 @@ mod rights_tests {
             administrator,
             dry_run,
             own_window,
+            interactive: true,
             writes_disks: true,
+            admin_reads: false,
         })
     }
 
@@ -147,14 +170,44 @@ mod rights_tests {
         assert_eq!(decide(true, true, false, true), Rights::Enough);
         assert_eq!(decide(true, false, true, false), Rights::Enough);
         // `status` writes no disk and runs with the rights it has.
-        let status = rights(Situation {
-            windows: true,
-            administrator: false,
-            dry_run: false,
-            own_window: false,
-            writes_disks: false,
-        });
-        assert_eq!(status, Rights::Enough);
+        let status = |own_window, interactive, admin_reads| {
+            rights(Situation {
+                windows: true,
+                administrator: false,
+                dry_run: false,
+                own_window,
+                interactive,
+                writes_disks: false,
+                admin_reads,
+            })
+        };
+        assert_eq!(status(false, true, false), Rights::Enough);
+        assert_eq!(status(false, false, false), Rights::Enough);
+        // Unless its EFI partition has no drive letter to read it through:
+        // a new window at a terminal, refused without one.
+        assert_eq!(status(true, true, true), Rights::Relaunch);
+        assert_eq!(status(true, false, true), Rights::Refuse);
+    }
+
+    #[test]
+    fn windows_never_relaunches_a_run_without_a_terminal() {
+        // Plain `stela --yes` in a script: refused, not relaunched into a
+        // window whose output and exit status the script never gets.
+        let home = |interactive| {
+            rights(Situation {
+                windows: true,
+                administrator: false,
+                dry_run: false,
+                own_window: true,
+                interactive,
+                writes_disks: true,
+                admin_reads: false,
+            })
+        };
+        assert_eq!(home(false), Rights::Refuse);
+        assert_eq!(home(true), Rights::Relaunch);
+        assert!(super::refused(true).contains("writes to disks"));
+        assert!(super::refused(false).contains("reads the stick's EFI partition"));
     }
 }
 

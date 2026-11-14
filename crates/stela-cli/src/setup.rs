@@ -841,6 +841,22 @@ fn setup_volume(disk: &host::Disk) -> Option<PathBuf> {
         .cloned()
 }
 
+/// Whether the EFI partition of the stick whose volume is `usb` has no
+/// mount, so reading it means mounting it: on Windows, giving it a drive
+/// letter, which only an administrator can.
+fn esp_unmounted(host: &dyn Host, usb: &Path) -> bool {
+    let Ok(volume) = host.volume(usb) else {
+        return false;
+    };
+    host.disks()
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter(|disk| volume.disk.as_deref() == Some(disk.identifier.as_str()))
+        .flat_map(|disk| disk.partitions)
+        .any(|partition| partition.content == "EFI" && partition.mount.is_none())
+}
+
 /// The mounted volume that holds the setup of the whole disk `stick`
 /// names; `stick` itself when it names no whole disk.
 fn stick_volume(host: &dyn Host, stick: &Path) -> Result<PathBuf> {
@@ -963,15 +979,23 @@ impl Request {
         }
         // The rights to write disks, before anything is downloaded or
         // changed. A Windows relaunch opens its own window, which only the
-        // wizard and `log`, whose raw disk reads need administrator
-        // rights, want.
+        // wizard, `log`, whose raw disk reads need administrator rights,
+        // and a `status` that must mount the stick's EFI partition want,
+        // and only at a terminal.
         let boot_log = matches!(self.action, Action::BootLog);
+        let administrator = elevation::is_administrator();
+        let status_mounts = cfg!(windows)
+            && !administrator
+            && matches!(self.action, Action::Status)
+            && esp_unmounted(&host::System, &self.usb);
         let rights = elevation::rights(elevation::Situation {
             windows: cfg!(windows),
-            administrator: elevation::is_administrator(),
+            administrator,
             dry_run: self.dry_run,
-            own_window: self.usb.as_os_str().is_empty() || boot_log,
+            own_window: self.usb.as_os_str().is_empty() || boot_log || status_mounts,
+            interactive: ui::attached(),
             writes_disks: writes_disks(&self.action),
+            admin_reads: boot_log || status_mounts,
         });
         match rights {
             elevation::Rights::Enough => {}
@@ -985,7 +1009,7 @@ impl Request {
                 }
                 return Ok(());
             }
-            elevation::Rights::Refuse => bail!(elevation::REFUSED),
+            elevation::Rights::Refuse => bail!(elevation::refused(writes_disks(&self.action))),
         }
         // Said once, by the run that has the rights.
         if let Some(disk) = found {
