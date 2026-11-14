@@ -336,7 +336,7 @@ impl Timer for Hpet {
 
 /// Whether the firmware's current page tables map `address` (UEFI maps
 /// what it maps one to one). Reads its tables through that identity map.
-fn identity_mapped(address: u64) -> bool {
+pub(crate) fn identity_mapped(address: u64) -> bool {
     let (cr3, cr4): (u64, u64);
     // SAFETY: reads control registers only.
     unsafe {

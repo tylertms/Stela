@@ -78,6 +78,7 @@ pub mod record;
 pub mod remapping;
 #[cfg(target_arch = "x86_64")]
 pub mod requester;
+pub mod reset_reason;
 pub mod resident_image;
 pub mod root_transition;
 pub mod screen;

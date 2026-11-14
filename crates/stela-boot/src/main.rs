@@ -156,6 +156,25 @@ fn host_identity() -> alloc::string::String {
     })
 }
 
+/// What ended this PC's last boot, where its chipset records it
+/// (`stela_boot_core::reset_reason`): a boot whose log stops with no stop
+/// line is told apart from a reset or a power-button hold at the next one.
+fn previous_reset() -> Option<alloc::string::String> {
+    use core::arch::x86_64::__cpuid;
+    use stela_boot_core::{host_identity, reset_reason};
+    let leaf0 = __cpuid(0);
+    let vendor = host_identity::vendor([leaf0.ebx, leaf0.edx, leaf0.ecx]);
+    let (family, _, _) = host_identity::signature_parts(__cpuid(1).eax);
+    if !reset_reason::applies(&vendor, family) || !firmware::identity_mapped(reset_reason::ADDRESS)
+    {
+        return None;
+    }
+    // SAFETY: the FCH register Zen processors decode at this address, which
+    // the firmware's page tables map (checked above); a read has no effect.
+    let status = unsafe { (reset_reason::ADDRESS as *const u32).read_volatile() };
+    reset_reason::line(status)
+}
+
 /// The longest [`EarlyText`]: room for the low-RAM refusal, small enough
 /// to return by value.
 const EARLY_BYTES: usize = 112;
@@ -285,6 +304,9 @@ fn main() -> Status {
         stop_record::carry();
     }
     output::arguments(format_args!("{}", host_identity()));
+    if let Some(line) = previous_reset() {
+        output::arguments(format_args!("{line}"));
+    }
     if output::hypervisor_exit_port() {
         output::arguments(format_args!(
             "HOST hypervisor present: stop codes also go to its exit port\n"
