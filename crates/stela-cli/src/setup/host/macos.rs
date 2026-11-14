@@ -172,6 +172,27 @@ impl Host for System {
     fn cpu(&self) -> Result<Cpu> {
         super::cpu()
     }
+
+    /// `disk6`, `/dev/disk6` or `/dev/rdisk6` names whole disk `disk6`; a
+    /// partition is refused (`diskutil::typed_disk`).
+    fn whole_disk(&self, usb: &Path) -> Result<Option<String>> {
+        if usb.is_dir() {
+            return Ok(None);
+        }
+        let Some(disk) = usb
+            .to_str()
+            .map(diskutil::typed_disk)
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .disks()?
+            .into_iter()
+            .map(|listed| listed.identifier)
+            .find(|identifier| *identifier == disk))
+    }
 }
 
 /// The block size of the raw device `file` (`DKIOCGETBLOCKSIZE`), or 4096,

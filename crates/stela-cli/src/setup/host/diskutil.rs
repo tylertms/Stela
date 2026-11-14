@@ -117,6 +117,31 @@ pub(super) fn whole_disk(device: &str) -> String {
     }
 }
 
+/// The whole disk a typed STICK names, as macOS users type one: `disk6`,
+/// `/dev/disk6` or its raw device `/dev/rdisk6`, all `disk6`. `None` when it
+/// names no disk, such as a volume's path; a partition (`disk6s1`,
+/// `/dev/rdisk6s1`) is refused, naming its whole disk.
+pub(super) fn typed_disk(typed: &str) -> Result<Option<String>> {
+    let name = typed.strip_prefix("/dev/").unwrap_or(typed);
+    let name = name.strip_prefix('r').unwrap_or(name);
+    let Some(rest) = name.strip_prefix("disk") else {
+        return Ok(None);
+    };
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    if digits(rest) {
+        return Ok(Some(name.into()));
+    }
+    if let Some((disk, slice)) = rest.split_once('s')
+        && digits(disk)
+        && digits(slice)
+    {
+        anyhow::bail!(
+            "{typed} is a partition; name the whole stick, disk{disk}, which stela erases whole"
+        );
+    }
+    Ok(None)
+}
+
 /// `/dev/rdiskNsM` for a partition identifier.
 pub(super) fn raw_device(identifier: &str) -> Result<String> {
     let partition = identifier.strip_prefix("disk").is_some_and(|rest| {
@@ -377,5 +402,24 @@ mod tests {
         );
         assert_eq!(usb_serial_of(&devices, "disk5s1"), None);
         assert_eq!(usb_serial_of(&devices, "disk6"), None);
+    }
+
+    #[test]
+    fn a_stick_is_named_by_its_disk_or_raw_disk_and_never_by_a_partition() {
+        for typed in ["disk6", "/dev/disk6", "/dev/rdisk6", "rdisk6"] {
+            assert_eq!(
+                typed_disk(typed).unwrap().as_deref(),
+                Some("disk6"),
+                "{typed}"
+            );
+        }
+        for typed in ["/Volumes/STELA", "STELA", "/dev/diskx", "disk", "/dev/sdb"] {
+            assert_eq!(typed_disk(typed).unwrap(), None, "{typed}");
+        }
+        for typed in ["disk6s1", "/dev/rdisk6s2"] {
+            let error = typed_disk(typed).unwrap_err().to_string();
+            assert!(error.contains("is a partition"), "{error}");
+            assert!(error.contains("disk6"), "{error}");
+        }
     }
 }
