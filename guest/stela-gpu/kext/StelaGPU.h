@@ -50,6 +50,9 @@ public:
 	 * connection of gate page `page`, answering the handle, 0 on failure.
 	 */
 	uint64_t importMemory(uint64_t page, task_t task, mach_vm_address_t address, mach_vm_size_t length);
+	/* Opens the sandbox patcher's connection (kStelaGPUSandboxClientType). */
+	IOReturn newSandboxClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
+	    IOUserClient **handler);
 
 private:
 	/*
@@ -125,4 +128,20 @@ private:
 	bool armed = false;
 	uint64_t armedSeen = 0;
 	OSAsyncReference64 armedReference = {};
+};
+
+/*
+ * Root's connection for the sandbox patcher (sandbox_cache.cpp): it swaps
+ * the compiled rules of a WebKit sandbox cache, keeping the cache's header.
+ */
+class StelaSandboxClient : public IOUserClient {
+	OSDeclareDefaultStructors(StelaSandboxClient);
+
+public:
+	bool initWithTask(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties) override;
+	IOReturn clientClose() override;
+	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
+	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) override;
+	static IOReturn replaceCache(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+	static IOReturn readCache(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
 };

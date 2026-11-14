@@ -45,6 +45,11 @@ pub fn run() -> Result<()> {
     let bundle = build_bundle(&component, &output, &include)?;
     println!("StelaGPU bundle: {}", bundle.display());
     fs::write(include.join("stela/bundle.h"), bundle_header(&bundle)?)?;
+    let patcher = build_sandbox_patch(&component, &output)?;
+    fs::write(
+        include.join("stela/sandbox_patch.h"),
+        sandbox_patch_header(&patcher, &component.join("sandbox").join(SANDBOX_PATCH_JOB))?,
+    )?;
     fs::write(include.join("stela/app.h"), app_header(root)?)?;
     let kext = build_kext(&component, &output, &xnu, &include)?;
     let code = stela_loader::plugin::code_hashes(&fs::read(bundle.join(BUNDLE_EXECUTABLE))?)?;
@@ -197,6 +202,59 @@ fn build_kext(component: &Path, output: &Path, xnu: &Path, include: &Path) -> Re
         exec(command.arg("-c").arg(&path).arg("-o").arg(&object))?;
     }
     Ok(bundle)
+}
+
+/// Where the kext installs the sandbox patcher and its launchd job
+/// (`kext/sandbox_cache.cpp`), on the Data volume.
+const SANDBOX_PATCH_PATH: &str = "/System/Volumes/Data/private/var/db/org.stela.SandboxPatch";
+const SANDBOX_PATCH_JOB_PATH: &str = "/System/Volumes/Data/Library/LaunchDaemons/org.stela.SandboxPatch.plist";
+const SANDBOX_PATCH_JOB: &str = "org.stela.SandboxPatch.plist";
+
+/// The sandbox patcher (`guest/stela-gpu/sandbox`): a plain arm64 macOS
+/// executable, linked by `ld64.lld` against the stubs beside its source,
+/// which ad-hoc signs it.
+fn build_sandbox_patch(component: &Path, output: &Path) -> Result<PathBuf> {
+    let source = component.join("sandbox");
+    let toolset = crate::clang::toolset()?;
+    let object = output.join("org.stela.SandboxPatch.o");
+    let executable = output.join("org.stela.SandboxPatch");
+    exec(
+        Command::new(&toolset.clang)
+            .args(["--no-default-config", "-ffreestanding", "-O2", "-Wall", "-Werror"])
+            .arg("--target=arm64-apple-macos27.0")
+            .arg("-I")
+            .arg(component.join("include"))
+            .arg("-c")
+            .arg(source.join("patcher.c"))
+            .arg("-o")
+            .arg(&object),
+    )?;
+    let linker = toolset.linker.with_file_name("ld64.lld");
+    exec(
+        Command::new(&linker)
+            .args(["-arch", "arm64", "-platform_version", "macos", "27.0", "27.0", "-o"])
+            .arg(&executable)
+            .arg(&object)
+            .arg(source.join("libSystem.tbd"))
+            .arg(source.join("IOKit.tbd")),
+    )
+    .with_context(|| format!("linking the sandbox patcher with {}", linker.display()))?;
+    Ok(executable)
+}
+
+/// `stela/sandbox_patch.h`: the patcher and its launchd job as the kext
+/// installs them, with their paths and SHA-256 digests.
+fn sandbox_patch_header(executable: &Path, job: &Path) -> Result<String> {
+    use std::fmt::Write as _;
+    let mut header = String::from("#pragma once\n");
+    writeln!(header, "#define STELA_SANDBOX_PATCH_PATH {SANDBOX_PATCH_PATH:?}")?;
+    writeln!(header, "#define STELA_SANDBOX_PATCH_JOB_PATH {SANDBOX_PATCH_JOB_PATH:?}")?;
+    for (name, path) in [("stela_sandbox_patch", executable), ("stela_sandbox_patch_job", job)] {
+        let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        c_bytes(&mut header, name, &bytes)?;
+        writeln!(header, "static const unsigned char {name}_sha256[32] = {{{}}};", c_digest(&bytes))?;
+    }
+    Ok(header)
 }
 
 /// `stela/bundle.h`: the Metal plugin `bundle` as the kext installs it, each

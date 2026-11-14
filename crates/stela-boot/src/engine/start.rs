@@ -71,6 +71,13 @@ fn from_disk(
         defaults.boot_args.push_str(" bt-transport-override=0");
     }
     defaults.boot_args.push_str(&lock_timeout_arguments(tsc_hz));
+    // Workaround: run AppleCredentialManager's own AP implementation
+    // (`ACMKernelUtils::isFastSimTarget` reads boot-arg `acm_fastsim`;
+    // `_performCommand` then calls `_ProcessRawCommand`) instead of sending
+    // its commands to this SEP's `scrd`, which serves only initialization and
+    // the Lockdown Mode variable. Without it every password prompt fails at
+    // kCmdContextCreateWithTracking with ODErrorCredentialsOperationFailed.
+    defaults.boot_args.push_str(" acm_fastsim=1");
     // The automatic Metal plugin repair NVRAM asked for is the manual
     // remedy's boot: single-user, filesystem protection off.
     let maintenance_write = options.maintenance_write || options.bundle_repair;
