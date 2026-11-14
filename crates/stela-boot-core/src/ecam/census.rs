@@ -26,6 +26,36 @@ pub fn presence(identity: u32) -> Presence {
     }
 }
 
+/// What the census makes of a function from its identity dword.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Found {
+    /// Nothing answers.
+    Absent,
+    /// No function, with the oddity that says why, logged once.
+    Skipped(Oddity),
+    /// Vendor ID 0000 on a function that can reach memory or raise INTx:
+    /// it can neither be driven nor left alone.
+    ActiveWithoutVendor,
+    Present,
+}
+
+/// [`Found`] for `identity`. A function with vendor ID 0000 is skipped only
+/// while its command and status dword (offset 4), read only for it, shows
+/// it [`quiet`]: firmware may name such a function, as ACPI does an absent
+/// function of a multifunction device, and it reads all zeros.
+pub fn found<E>(
+    identity: u32,
+    command_status: impl FnOnce() -> Result<u32, E>,
+) -> Result<Found, E> {
+    Ok(match presence(identity) {
+        Presence::Absent => Found::Absent,
+        Presence::NotReady => Found::Skipped(Oddity::NotReady),
+        Presence::NoVendor if quiet(command_status()?) => Found::Skipped(Oddity::NoVendor),
+        Presence::NoVendor => Found::ActiveWithoutVendor,
+        Presence::Present => Found::Present,
+    })
+}
+
 /// The header layout of the dword at offset 0x0c.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Layout {
@@ -156,6 +186,60 @@ mod tests {
         assert_eq!(presence(0x1234_0001), Presence::NotReady);
         assert_eq!(presence(0x0000_0000), Presence::NoVendor);
         assert_eq!(presence(0x2204_10de), Presence::Present);
+    }
+
+    /// A laptop's slot 3: function 0 answers, with the multifunction bit,
+    /// and firmware names functions 2 to 4, which read all zeros; the rest
+    /// read all ones. Only function 0 is a function, and nothing refuses.
+    #[test]
+    fn functions_that_read_all_zeros_or_all_ones_beside_function_zero_are_skipped() {
+        // (identity, command and status) by function number.
+        let slot: [(u32, u32); 8] = [
+            (0x14ea_1022, 0x0000_0000),
+            (u32::MAX, u32::MAX),
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (u32::MAX, u32::MAX),
+            (u32::MAX, u32::MAX),
+            (u32::MAX, u32::MAX),
+        ];
+        let found = slot.map(|(identity, command_status)| {
+            super::found(identity, || Ok::<_, ()>(command_status)).unwrap()
+        });
+        let absent = Found::Absent;
+        let skipped = Found::Skipped(Oddity::NoVendor);
+        assert_eq!(
+            found,
+            [
+                Found::Present,
+                absent,
+                skipped,
+                skipped,
+                skipped,
+                absent,
+                absent,
+                absent
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_function_without_a_vendor_has_its_command_read_and_an_active_one_refuses() {
+        let unread = || -> Result<u32, ()> { panic!("command read for a function with a vendor") };
+        assert_eq!(found(0x2204_10de, unread), Ok(Found::Present));
+        assert_eq!(found(0xffff_ffff, unread), Ok(Found::Absent));
+        assert_eq!(
+            found(0x1234_0001, unread),
+            Ok(Found::Skipped(Oddity::NotReady))
+        );
+        // Bus Master on.
+        assert_eq!(
+            found(0, || Ok::<_, ()>(0x0000_0004)),
+            Ok(Found::ActiveWithoutVendor)
+        );
+        // A failed read of the command is the census's error.
+        assert_eq!(found(0, || Err::<u32, _>("unmapped")), Err("unmapped"));
     }
 
     #[test]

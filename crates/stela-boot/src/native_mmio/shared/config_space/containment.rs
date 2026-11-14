@@ -740,22 +740,18 @@ impl Input {
         single: Option<Address>,
     ) -> Result<Observed, ContainmentError> {
         let identity = reader.read32(address, 0)?;
-        match census::presence(identity) {
-            census::Presence::Absent => return Ok(Observed::Absent),
-            census::Presence::NotReady => {
-                report_oddity(census::Oddity::NotReady, address);
+        // A function without a vendor is skipped only while its other
+        // registers show it cannot reach memory or raise INTx.
+        match census::found(identity, || reader.read32(address, 4))? {
+            census::Found::Absent => return Ok(Observed::Absent),
+            census::Found::Skipped(oddity) => {
+                report_oddity(oddity, address);
                 return Ok(Observed::Absent);
             }
-            // Its other registers do answer; skip it only while they show
-            // it cannot reach memory or raise INTx.
-            census::Presence::NoVendor if census::quiet(reader.read32(address, 4)?) => {
-                report_oddity(census::Oddity::NoVendor, address);
-                return Ok(Observed::Absent);
-            }
-            census::Presence::NoVendor => {
+            census::Found::ActiveWithoutVendor => {
                 return Err(topology::Error::ActiveWithoutVendor(address).into());
             }
-            census::Presence::Present => {}
+            census::Found::Present => {}
         }
         if let Some(first) = single
             && repeats(reader, first, address)?
