@@ -307,6 +307,46 @@ pub struct Features {
     /// Write Zeroes: the most blocks one command takes, and whether the
     /// device deallocates the blocks it zeroes when allowed to.
     pub write_zeroes: Option<WriteZeroes>,
+    /// Whether the medium spins, as far as the device reports it (Linux's
+    /// `BLK_FEAT_ROTATIONAL`, which sets it unless the device says it is
+    /// non-rotating).
+    pub rotation: Rotation,
+}
+
+/// A medium's nominal rotation rate, in the one encoding ATA IDENTIFY word
+/// 217 and SCSI's Block Device Characteristics VPD page (B1h, bytes 4-5)
+/// share.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Rotation {
+    /// Not reported (0), a reserved value, or a device with no such field.
+    #[default]
+    Unreported,
+    /// A non-rotating medium (1), such as flash.
+    None,
+    /// A spinning medium at this many revolutions per minute
+    /// (0x0401..=0xfffe).
+    Rpm(u16),
+}
+
+impl Rotation {
+    /// The rate a device reported in the shared encoding.
+    pub const fn from_nominal(value: u16) -> Self {
+        match value {
+            1 => Self::None,
+            0x0401..=0xfffe => Self::Rpm(value),
+            _ => Self::Unreported,
+        }
+    }
+}
+
+impl fmt::Display for Rotation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unreported => f.write_str("unreported"),
+            Self::None => f.write_str("none"),
+            Self::Rpm(rpm) => write!(f, "{rpm}rpm"),
+        }
+    }
 }
 
 impl Features {

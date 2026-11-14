@@ -1738,11 +1738,12 @@ pub unsafe fn open(
         .collect();
     let service = |partition: PartitionDevice<Window>, role: &str| -> Box<dyn BlockDevice> {
         output::arguments(format_args!(
-            "HOST PARTITION serial={} partition={} blocks={} block_size={}{role}\n",
+            "HOST PARTITION serial={} partition={} blocks={} block_size={} rotation={}{role}\n",
             partition.disk().serial,
             partition.partition().unique_guid,
             partition.identity().blocks,
-            partition.identity().block_size
+            partition.identity().block_size,
+            partition.disk().features.rotation
         ));
         Box::new(Service {
             inner: Box::new(partition),
@@ -2130,12 +2131,14 @@ pub unsafe fn open(
             host_disks.add(&disk);
             let disk = disk.whole();
             output::arguments(format_args!(
-                "HOST USB DISK serial={} model={:?} blocks={} block_size={} read_only={}\n",
+                "HOST USB DISK serial={} model={:?} blocks={} block_size={} read_only={} \
+                 rotation={}\n",
                 disk.identity().serial,
                 disk.identity().model,
                 disk.identity().blocks,
                 disk.identity().block_size,
-                disk.identity().read_only
+                disk.identity().read_only,
+                disk.identity().features.rotation
             ));
             Box::new(Service {
                 inner: Box::new(disk),

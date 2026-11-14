@@ -16,8 +16,8 @@ use crate::bytes::le32;
 use crate::{
     Clock, Handoff,
     block::{
-        BlockDevice, BlockError, Command, DiscardLimits, Features, Finished, Identity, Transport,
-        WriteZeroes, ascii,
+        BlockDevice, BlockError, Command, DiscardLimits, Features, Finished, Identity, Rotation,
+        Transport, WriteZeroes, ascii,
     },
     bus::{dma::DmaAllocator, pci::Function},
     registers,
@@ -1287,6 +1287,9 @@ fn features(
             blocks: (zeroes >> block_shift).min(1 << 16),
             unmap: format.deallocate & 0x7 == 1 && format.deallocate & 1 << 3 != 0,
         }),
+        // The namespace's rotational media bit (NVMe 2.0's I/O Command Set
+        // Independent Identify Namespace) is not read.
+        rotation: Rotation::Unreported,
     }
 }
 

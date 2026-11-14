@@ -9,8 +9,8 @@ use super::descriptor::{Endpoint, Interface, setup};
 use super::xhci::{Device, MAX_TD, Plan, STALL, Shared};
 use crate::{
     block::{
-        BlockDevice, BlockError, Command, Features, Finished, Identity, Sense, SenseCompletion,
-        Transport,
+        BlockDevice, BlockError, Command, Features, Finished, Identity, Rotation, Sense,
+        SenseCompletion, Transport,
     },
     bus::dma::DmaAllocator,
 };
@@ -630,6 +630,10 @@ fn publication<T: Scsi>(
             max_read_transfer,
             discard: None,
             write_zeroes: None,
+            // Bulk-Only units skip the VPD pages, Block Device
+            // Characteristics among them, as Linux's usb-storage does; a UAS
+            // unit's is not read.
+            rotation: Rotation::Unreported,
         };
     }
     Ok(Disk {

@@ -12,7 +12,7 @@ use crate::{
     Clock, Deadline, Handoff,
     block::{
         BlockDevice, BlockError, Command, DiscardLimits, Extent, Features, Finished, Identity,
-        Sense, SenseCompletion, Transport, ascii,
+        Rotation, Sense, SenseCompletion, Transport, ascii,
     },
     bus::{
         dma::{DmaAllocator, DmaBuffer},
@@ -330,6 +330,8 @@ const SECTOR_SIZE_VALID_MASK: u16 = 0xc000;
 const SECTOR_SIZE_VALID: u16 = 0x4000;
 const SECTOR_SIZE_LOGICAL_LONG: u16 = 1 << 12;
 const IDENTIFY_LOGICAL_WORDS: usize = 117;
+/// Word 217: the nominal media rotation rate (`ata_id_rotation_rate`).
+const IDENTIFY_ROTATION: usize = 217;
 const ATA_SECTOR_BYTES: u32 = 512;
 
 /// The 32-slot command list (1 KiB aligned) followed by the received-FIS
@@ -883,6 +885,8 @@ struct Identified {
     devslp: bool,
     /// `ata_id_has_trim`.
     trim: bool,
+    /// Word 217.
+    rotation: Rotation,
 }
 
 /// What `ata_id_xfermask`, `ata_id_has_iordy` and `ata_id_is_cfa` read.
@@ -1013,6 +1017,7 @@ fn identify(data: &[u8]) -> Result<Identified, BlockError> {
         sata_speeds: word(IDENTIFY_SATA_CAPABILITY) & 0xe,
         devslp: word(IDENTIFY_SATA_FEATURES) & SATA_FEATURE_DEVICE_SLEEP != 0,
         trim: word(IDENTIFY_DATA_SET_MANAGEMENT) & DATA_SET_MANAGEMENT_TRIM != 0,
+        rotation: Rotation::from_nominal(word(IDENTIFY_ROTATION)),
     })
 }
 

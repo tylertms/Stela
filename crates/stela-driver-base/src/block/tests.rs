@@ -1149,3 +1149,19 @@ fn a_window_start_waits_for_an_owner_that_took_the_disk_after_room() {
     }
     assert_eq!(result, Some(Ok(None)));
 }
+
+#[test]
+fn a_rotation_rate_reads_as_ata_word_217_and_scsi_vpd_b1_encode_it() {
+    assert_eq!(Rotation::from_nominal(0), Rotation::Unreported);
+    assert_eq!(Rotation::from_nominal(1), Rotation::None);
+    // 0002h-0400h and FFFFh are reserved.
+    for reserved in [2, 0x0400, 0xffff] {
+        assert_eq!(Rotation::from_nominal(reserved), Rotation::Unreported);
+    }
+    assert_eq!(Rotation::from_nominal(0x0401), Rotation::Rpm(0x0401));
+    assert_eq!(Rotation::from_nominal(5400), Rotation::Rpm(5400));
+    assert_eq!(Rotation::from_nominal(0xfffe), Rotation::Rpm(0xfffe));
+    assert_eq!(alloc::format!("{}", Rotation::Rpm(7200)), "7200rpm");
+    assert_eq!(alloc::format!("{}", Rotation::None), "none");
+    assert_eq!(alloc::format!("{}", Rotation::default()), "unreported");
+}

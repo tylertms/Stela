@@ -205,3 +205,18 @@ fn identify_serials_are_unswapped_and_trimmed_of_padding() {
     assert_eq!(serial(b"XYZ27\0garbage"), "XYZ27");
     assert_eq!(serial(b""), "");
 }
+
+#[test]
+fn identify_word_217_reports_whether_the_disk_spins() {
+    // Reference: ata_id_rotation_rate and ata_id_is_ssd.
+    let mut page = identify_page("S1", 1024);
+    assert_eq!(identify(&page).unwrap().rotation, Rotation::Unreported);
+    for (word, rotation) in [
+        (1, Rotation::None),
+        (5400, Rotation::Rpm(5400)),
+        (0xffff, Rotation::Unreported),
+    ] {
+        page[2 * 217..2 * 217 + 2].copy_from_slice(&u16::to_le_bytes(word));
+        assert_eq!(identify(&page).unwrap().rotation, rotation, "{word:#x}");
+    }
+}

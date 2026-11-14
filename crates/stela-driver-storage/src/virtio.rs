@@ -4,7 +4,7 @@ use crate::{
     Clock, Deadline, Handoff,
     block::{
         BlockDevice, BlockError, Command, DiscardLimits, Extent, Features, Finished, Identity,
-        Transport, WriteZeroes, ascii,
+        Rotation, Transport, WriteZeroes, ascii,
     },
     bus::{
         dma::{DmaAllocator, DmaBuffer},
@@ -163,6 +163,8 @@ impl VirtioBlk {
                 blocks: blocks(CONFIG_MAX_WRITE_ZEROES),
                 unmap: device.read8(CONFIG_WRITE_ZEROES_UNMAP) != 0,
             }),
+            // virtio-blk has no rotation field.
+            rotation: Rotation::Unreported,
         };
         let mut driver = Self {
             device,

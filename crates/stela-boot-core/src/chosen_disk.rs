@@ -136,6 +136,21 @@ pub fn picker_refusal(
     }
 }
 
+/// The picker's caution for a disk it lets the user choose but that spins,
+/// as the disk reports its rotation (ATA IDENTIFY word 217): macOS starts
+/// with a storm of small random reads, which a spinning disk serves too
+/// slowly for daemons such as kernelmanagerd to check in within their 60 s,
+/// so macOS on it may never finish starting. `None` for a disk that does not
+/// spin or does not say. The disk is not refused: a fast one may still do.
+pub fn picker_caution(rotation: stela_drivers::block::Rotation) -> Option<alloc::string::String> {
+    match rotation {
+        stela_drivers::block::Rotation::Rpm(rpm) => Some(alloc::format!(
+            "Spinning disk ({rpm} rpm): macOS may be too slow to start"
+        )),
+        stela_drivers::block::Rotation::None | stela_drivers::block::Rotation::Unreported => None,
+    }
+}
+
 /// What a chosen partition whose NVRAM store could not be read is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unreadable {
@@ -164,6 +179,25 @@ pub const UNREADABLE_STORE: &str = "NVRAM on the disk chosen for macOS cannot be
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spinning_disk_is_marked_but_not_refused() {
+        use stela_drivers::block::Rotation;
+        assert_eq!(
+            picker_caution(Rotation::from_nominal(5400)).as_deref(),
+            Some("Spinning disk (5400 rpm): macOS may be too slow to start")
+        );
+        assert_eq!(picker_caution(Rotation::from_nominal(1)), None);
+        assert_eq!(picker_caution(Rotation::from_nominal(0)), None);
+        // The caution is no refusal: a spinning disk of any size and a
+        // unique serial can still be chosen.
+        let disks = [Candidate {
+            serial: Some("WD-1"),
+            bytes: 1_000_000_000_000,
+            controller: None,
+        }];
+        assert_eq!(picker_refusal(&disks, 0, 60_000_000_000), None);
+    }
 
     #[test]
     fn the_found_partition_is_not_stale() {

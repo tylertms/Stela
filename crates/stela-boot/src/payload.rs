@@ -437,6 +437,8 @@ const NVME_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(5);
 const ATA_IDENTIFY_BYTES: usize = 512;
 const ATA_SERIAL: core::ops::Range<usize> = 20..40;
 const ATA_MODEL: core::ops::Range<usize> = 54..94;
+/// ATA IDENTIFY DEVICE word 217: the nominal media rotation rate.
+const ATA_ROTATION: usize = 217;
 /// NVMe Identify Controller bytes 24-63: the model number.
 const NVME_MODEL: core::ops::Range<usize> = 24..64;
 
@@ -540,8 +542,24 @@ fn nvme_identify(path: &str) -> Option<Vec<u8>> {
     None
 }
 
-/// The text in `range` of the disk's ATA IDENTIFY data.
-fn ata_text(handle: Handle, range: core::ops::Range<usize>) -> Option<String> {
+/// A whole disk's nominal rotation rate, from its ATA IDENTIFY data (word
+/// 217), read as Stela's AHCI driver reads it. Other buses report none
+/// through the firmware: its USB and NVMe disks give no such field.
+pub(crate) fn disk_rotation(handle: Handle) -> stela_drivers::block::Rotation {
+    ata_identify(handle)
+        .and_then(|data| {
+            data.get(2 * ATA_ROTATION..2 * ATA_ROTATION + 2)?
+                .first_chunk()
+                .copied()
+        })
+        .map_or(stela_drivers::block::Rotation::Unreported, |word| {
+            stela_drivers::block::Rotation::from_nominal(u16::from_le_bytes(word))
+        })
+}
+
+/// The disk's ATA IDENTIFY data, as much as the firmware's disk information
+/// keeps for an AHCI or IDE disk.
+fn ata_identify(handle: Handle) -> Option<Vec<u8>> {
     use uefi::proto::media::disk_info::{DiskInfo, DiskInfoInterface};
     // SAFETY: the identify data is only read.
     let info = unsafe {
@@ -561,11 +579,15 @@ fn ata_text(handle: Handle, range: core::ops::Range<usize>) -> Option<String> {
     ) {
         return None;
     }
-    let mut data = [0u8; ATA_IDENTIFY_BYTES];
-    if info.identify(&mut data).ok()? < range.end {
-        return None;
-    }
-    let mut text = data[range].to_vec();
+    let mut data = vec![0u8; ATA_IDENTIFY_BYTES];
+    let bytes = info.identify(&mut data).ok()?;
+    data.truncate(bytes);
+    Some(data)
+}
+
+/// The text in `range` of the disk's ATA IDENTIFY data.
+fn ata_text(handle: Handle, range: core::ops::Range<usize>) -> Option<String> {
+    let mut text = ata_identify(handle)?.get(range)?.to_vec();
     for pair in text.as_chunks_mut::<2>().0 {
         pair.swap(0, 1);
     }

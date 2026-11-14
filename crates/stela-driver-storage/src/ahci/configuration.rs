@@ -273,6 +273,7 @@ impl AhciDisk {
                     .trim
                     .then_some(DiscardLimits::single(TRIM_RANGES * TRIM_RANGE_SECTORS)),
                 write_zeroes: None,
+                rotation: found.rotation,
             };
             disk.transfer = found.transfer;
             disk.locked = found.locked;

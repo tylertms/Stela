@@ -26,7 +26,7 @@ use crate::{
     choice::{self, Press, Wait},
     console::{Framebuffer, font},
     output,
-    payload::{Aligned, device_path, disk_model, disk_serial},
+    payload::{Aligned, device_path, disk_model, disk_rotation, disk_serial},
     ui::{self, Canvas},
 };
 use alloc::string::ToString;
@@ -73,6 +73,11 @@ struct Disk {
     foreign: bool,
     /// Why it cannot take macOS, when it cannot.
     refusal: Option<&'static str>,
+    /// Its nominal rotation rate, as it reports it.
+    rotation: stela_drivers::block::Rotation,
+    /// Why macOS may run too slowly on it, which does not refuse it
+    /// (`chosen_disk::picker_caution`).
+    caution: Option<String>,
 }
 
 impl Disk {
@@ -209,11 +214,12 @@ pub fn choose() -> Option<Plan> {
     };
     for disk in &picker.disks {
         output::arguments(format_args!(
-            "INSTALLER disk {} {} serial={:?} bytes={} table={} refusal={:?}\n",
+            "INSTALLER disk {} {} serial={:?} bytes={} rotation={} table={} refusal={:?}\n",
             disk.bus,
             disk.model,
             disk.serial,
             disk.bytes(),
+            disk.rotation,
             disk.table.as_ref().map_or(0, |t| t.partitions.len()),
             disk.refusal
         ));
@@ -545,6 +551,7 @@ fn disks() -> Vec<Disk> {
             blocks: media.last_block() + 1,
         };
         let serial = disk_serial(handle, &path);
+        let rotation = disk_rotation(handle);
         let mut disk = Disk {
             media: media.media_id(),
             io,
@@ -555,6 +562,8 @@ fn disks() -> Vec<Disk> {
             table: None,
             foreign: false,
             refusal: None,
+            rotation,
+            caution: chosen_disk::picker_caution(rotation),
         };
         let found = gpt::read(geometry, |lba, blocks| {
             disk.read(lba, blocks)
@@ -757,9 +766,18 @@ impl Picker {
             };
             let segments = segments_of(disk, &[], false);
             self.draw_bar(canvas, n, &segments, &bar, None, None);
-            match disk.refusal {
-                Some(refusal) => canvas.text(inner, y + 64, refusal, 1, ui::ORANGE),
-                None => self.legend(canvas, n, &segments, inner, right, y + 64),
+            match (disk.refusal, &disk.caution) {
+                (Some(refusal), _) => canvas.text(inner, y + 64, refusal, 1, ui::ORANGE),
+                (None, None) => self.legend(canvas, n, &segments, inner, right, y + 64),
+                // The caution takes the line's right end; the legend keeps
+                // what fits before it.
+                (None, Some(caution)) => {
+                    canvas.text_right(right, y + 64, caution, 1, ui::ORANGE);
+                    let end = right.saturating_sub(canvas.text_width(caution, 1) + 24);
+                    if end > inner {
+                        self.legend(canvas, n, &segments, inner, end, y + 64);
+                    }
+                }
             }
         }
     }
@@ -998,6 +1016,9 @@ impl Picker {
         rows.push(("Disk", disk_line, ui::TEXT));
         if let Some(serial) = &disk.serial {
             rows.push(("Serial", serial.clone(), ui::TEXT));
+        }
+        if let Some(caution) = &disk.caution {
+            rows.push(("Speed", caution.clone(), ui::ORANGE));
         }
         rows.push((
             "macOS",
