@@ -715,4 +715,64 @@ fn ecm_link_calls_never_wait_when_the_device_answers_late() {
     );
 }
 
+/// An ECM link bound on the cancellation model. The link drops first,
+/// while the controller and DMA it uses still live.
+struct Ecm {
+    link: UsbNet,
+    model: Rc<RefCell<CancelModel>>,
+    shared: Shared,
+    _dma: TestRegion,
+}
+
+fn ecm() -> Ecm {
+    let mut dma = TestRegion::new(128 * 1024 * 8);
+    let (controller, model) = unconfigured_cancellation_controller_with_configurations(
+        &mut dma,
+        &[vec![9, 2, 9, 0, 0, 42, 0, 0x80, 50]],
+    );
+    model.borrow_mut().descriptors = vec![(STRING_DESCRIPTOR, 1, cdc_mac_descriptor())];
+    let shared = Rc::new(RefCell::new(controller));
+    let mut found = Found::default();
+    bind(&shared, cdc_device(&shared, None), &mut dma, &mut found);
+    assert!(found.failures.is_empty(), "{:?}", found.failures);
+    Ecm {
+        link: found.links.pop().unwrap(),
+        model,
+        shared,
+        _dma: dma,
+    }
+}
+
+const OUTPUT: usize = 4;
+
+/// A STALLed OUT transfer also clears the device's halt, as usbnet's
+/// EVENT_TX_HALT does and as the vendor adapters' links do; one past its
+/// deadline is only cancelled, as usbnet_tx_timeout unlinks it.
+#[test]
+fn ecm_clears_a_stalled_out_endpoint_and_only_cancels_a_late_one() {
+    use crate::net::{Link, LinkError};
+    let mut ecm = ecm();
+    let clock = ecm.shared.borrow().clock;
+    ecm.model.borrow_mut().halt_transfer = Some(OUTPUT);
+    // A device that answers at once lets the reset end within the call.
+    let failed = ecm.link.transmit(&[0x5a; 60]);
+    assert!(matches!(failed, Err(LinkError::Adapter(_))), "{failed:?}");
+    ecm.model.borrow_mut().halt_transfer = None;
+    let clear = setup(RECIPIENT_ENDPOINT, CLEAR_FEATURE, 0, 0x02, 0);
+    assert_eq!(ecm.model.borrow().setup.last().unwrap().0, clear);
+    ecm.link.transmit(&[0x6a; 60]).unwrap();
+    let controls = ecm.model.borrow().setup.len();
+    ecm.model.borrow_mut().silence_transfer = Some(OUTPUT);
+    ecm.link.transmit(&[0x7a; 60]).unwrap();
+    crate::test_clock::advance(clock, SEND_US);
+    ecm.model.borrow_mut().silence_transfer = None;
+    let failed = ecm.link.transmit(&[0x8a; 60]);
+    assert!(
+        matches!(&failed, Err(LinkError::Adapter(message)) if message.ends_with("device timeout")),
+        "{failed:?}"
+    );
+    assert_eq!(ecm.model.borrow().setup.len(), controls);
+    ecm.link.transmit(&[0x9a; 60]).unwrap();
+}
+
 pub(crate) mod generation;

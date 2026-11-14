@@ -455,7 +455,7 @@ impl UsbNet {
             let mut host = self.controller.borrow_mut();
             let clock = host.clock;
             let mut c = host.device(self.id).map_err(link_error)?;
-            let error = match c.completed_ticket(&sending.ticket) {
+            let (error, clear) = match c.completed_ticket(&sending.ticket) {
                 Some(Ok(actual)) if actual != sending.bytes => {
                     self.sending = None;
                     return Err(LinkError::Adapter(String::from(
@@ -490,11 +490,19 @@ impl UsbNet {
                     self.sending = None;
                     return Err(link_error(error));
                 }
-                Some(Err(error)) => error,
-                None if sending.deadline.passed() => BlockError::Timeout,
+                // A failed transfer, a STALL above all, also clears the
+                // device's halt, as usbnet's EVENT_TX_HALT does; one past
+                // its deadline is only cancelled, as usbnet_tx_timeout
+                // unlinks it.
+                Some(Err(error)) => (error, true),
+                None if sending.deadline.passed() => (BlockError::Timeout, false),
                 None => return Ok(false),
             };
-            let operation = c.start_cancel(output.dci()).map_err(link_error)?;
+            let operation = match clear {
+                true => c.start_clear(&output),
+                false => c.start_cancel(output.dci()),
+            }
+            .map_err(link_error)?;
             drop(host);
             self.resetting = Some((operation, Reset::Output(error)));
             self.advance().map_err(link_error)?;
