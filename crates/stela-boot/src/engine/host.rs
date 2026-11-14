@@ -395,12 +395,43 @@ pub(crate) fn fresh_counter() -> u64 {
     counter_at_tsc(state, rdtsc())
 }
 
-/// Count this processor's 24 MHz clock from a base its software TSC
-/// correction moved (`tsc::sync::corrected_base`): its raw counter reads
-/// `offset` ticks behind the BSP's. Runs on the AP before it is ready.
-pub(crate) fn correct_tsc_base(offset: i64) {
-    let state = state();
-    state.tsc_base = stela_boot_core::tsc::sync::corrected_base(state.tsc_base, offset);
+/// Keep this processor's software TSC correction: its raw counter reads
+/// `offset` ticks behind the BSP's. From then on [`rdtsc`] reads the BSP's
+/// counter here (`tsc::sync::shared_tsc`), and native count reads, which
+/// take the raw counter, count from a base moved by it
+/// ([`State::native_tsc_base`]). Runs on the AP before it is ready.
+pub(crate) fn agree_tsc(offset: i64) {
+    local::set_tsc_offset(offset);
+    if offset != 0 {
+        TSC_OFFSETS.store(true, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Set once an AP agrees with the BSP only through a software offset
+/// ([`agree_tsc`]): until then every core's raw counter is the BSP's.
+static TSC_OFFSETS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// This processor's time-stamp counter as the BSP's reads at the same
+/// instant: the value every TSC stamp one core stores and another compares
+/// must be. A core whose counter agreed only through a software offset
+/// reads it moved by that offset. Cores take it only once their local
+/// record is active, which each AP's is before the first offset is kept.
+pub fn rdtsc() -> u64 {
+    let raw = crate::apic::rdtsc();
+    if TSC_OFFSETS.load(core::sync::atomic::Ordering::Relaxed) {
+        stela_boot_core::tsc::sync::shared_tsc(raw, local::tsc_offset())
+    } else {
+        raw
+    }
+}
+
+impl State {
+    /// The base native count reads, which take this core's raw counter,
+    /// subtract: `tsc_base`, the BSP's, moved by this core's software
+    /// offset (`tsc::sync::corrected_base`).
+    pub(crate) fn native_tsc_base(&self) -> u64 {
+        stela_boot_core::tsc::sync::corrected_base(self.tsc_base, local::tsc_offset())
+    }
 }
 
 fn counter_at_tsc(state: &State, tsc: u64) -> u64 {
@@ -547,8 +578,6 @@ pub struct State {
     pub bounces: u64,
     pub guard_faults: u64,
 }
-
-pub use crate::apic::rdtsc;
 
 fn load_root(root: u64) {
     // SAFETY: every root maps the window, which holds all code and data in use.

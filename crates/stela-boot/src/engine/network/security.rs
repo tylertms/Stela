@@ -43,7 +43,7 @@ struct RtcClock {
 
 impl UtcSource for RtcClock {
     fn interval(&self) -> Result<UtcInterval, TimeError> {
-        let now = crate::apic::rdtsc();
+        let now = crate::engine::host::rdtsc();
         let reading = &self.reading;
         let elapsed = interval::elapsed_ns(
             now.checked_sub(reading.tsc_after)

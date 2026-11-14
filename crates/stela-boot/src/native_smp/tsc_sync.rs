@@ -13,19 +13,20 @@
 //! Otherwise the AP moves its own counter by the warp through
 //! `IA32_TSC_ADJUST`, forward when it saw the counter go back and so ran
 //! behind, else back, and tries again. Linux finds the sync mechanism's own
-//! overhead leaves at most a third round needed. An AP with no
-//! `IA32_TSC_ADJUST`, as every AMD processor, moves the counter itself by
-//! writing `IA32_TIME_STAMP_COUNTER`, so that every raw read on it agrees
-//! too; Linux, which can fall back to another clock, marks such a counter
-//! unstable instead. Where those writes do not converge in [`ROUNDS`], the AP
-//! instead adds a software offset to the counter it reads in further
-//! rounds, and once those agree counts its guest clock from a base moved by
-//! that offset (`tsc::sync::corrected_base`). An AP that agrees in neither
-//! way is refused. Every rendezvous point and turn waits at most a round
-//! and [`POINT_MILLIS`] for the other core; a core that stops mid-round
-//! leaves the other with a refusal instead of a spin with no end.
+//! overhead leaves at most a third round needed. Where those writes do not
+//! converge in [`ROUNDS`], or the AP has no `IA32_TSC_ADJUST`, as every AMD
+//! processor, the AP instead adds a software offset to the counter it reads
+//! in further rounds (`tsc::sync::correction_move`). It never writes
+//! `IA32_TIME_STAMP_COUNTER`: a Zen 2 core took its own count back within
+//! seconds of such a write. Once the rounds agree, the AP keeps the offset
+//! (`host::agree_tsc`): its guest clock counts from a base moved by it
+//! (`tsc::sync::corrected_base`), and every counter value the host reads on
+//! it is the BSP's (`tsc::sync::shared_tsc`). An AP that agrees in neither
+//! way is refused. Every rendezvous point and turn waits at most a
+//! round and [`POINT_MILLIS`] for the other core; a core that stops
+//! mid-round leaves the other with a refusal instead of a spin with no end.
 use crate::Result;
-use crate::cpu::msr::{TSC_ADJUST, wrmsr};
+use crate::cpu::msr::TSC_ADJUST;
 use core::{
     arch::{
         asm,
@@ -33,13 +34,13 @@ use core::{
     },
     sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
 };
-use stela_boot_core::tsc::sync::{FIRST_POINT_MILLIS, POINT_MILLIS, Rendezvous, correction};
+use stela_boot_core::tsc::sync::{
+    FIRST_POINT_MILLIS, Move, POINT_MILLIS, Rendezvous, correction, correction_move,
+};
 use stela_contracts::refuse;
 
-/// Rounds of each correction, in the processor and in software.
+/// Rounds of each correction, through `IA32_TSC_ADJUST` and in software.
 const ROUNDS: u32 = 4;
-/// IA32_TIME_STAMP_COUNTER.
-const TIME_STAMP_COUNTER: u32 = 0x10;
 const BSP: usize = 0;
 const AP: usize = 1;
 
@@ -69,8 +70,7 @@ pub(super) struct Sync {
 /// How an AP's counter came to agree with the BSP's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Outcome {
-    /// Added to its `IA32_TSC_ADJUST`, or to the counter itself where it has
-    /// none.
+    /// Added to its `IA32_TSC_ADJUST`.
     pub(super) adjusted: i64,
     /// Added in software to every value it reads: its counter base moves by
     /// this much.
@@ -168,8 +168,8 @@ impl Sync {
     }
 
     /// The AP's part, on the AP: rounds until its counter agrees with the
-    /// BSP's, correcting it between them in the processor while that
-    /// converges, else in software. Returns the software offset.
+    /// BSP's, correcting it between them through `IA32_TSC_ADJUST` while
+    /// that converges, else in software. Returns the software offset.
     pub(super) fn target(&self) -> Result<i64> {
         // CPUID.(EAX=7,ECX=0):EBX[1] enumerates IA32_TSC_ADJUST.
         let adjustable = __cpuid_count(0, 0).eax >= 7 && __cpuid_count(7, 0).ebx & 1 << 1 != 0;
@@ -208,19 +208,11 @@ impl Sync {
                 )))
             } else {
                 let step = correction(seen_here, seen_by_bsp);
-                match base {
-                    Some(base) if round < ROUNDS => {
+                match (base, correction_move(adjustable, round, ROUNDS)) {
+                    (Some(base), Move::Adjust) => {
                         adjusted = adjusted.wrapping_add(step);
                         // SAFETY: enumerated; Linux writes the same register.
                         unsafe { TSC_ADJUST.write(base.wrapping_add(adjusted as u64)) };
-                    }
-                    None if round < ROUNDS => {
-                        adjusted = adjusted.wrapping_add(step);
-                        // SAFETY: IA32_TIME_STAMP_COUNTER is architectural on
-                        // every processor with RDTSC and writable at CPL 0; this
-                        // AP runs nothing else yet. The write's own time is
-                        // what the next round measures and corrects.
-                        unsafe { wrmsr(TIME_STAMP_COUNTER, ordered().wrapping_add(step as u64)) };
                     }
                     _ => offset = offset.wrapping_add(step),
                 }

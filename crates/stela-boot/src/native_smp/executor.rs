@@ -287,9 +287,9 @@ unsafe extern "sysv64" fn enter(argument: u64) -> ! {
     .and_then(|owner| {
         argument.status.store(SYNCING, Ordering::Release);
         let offset = argument.tsc.target()?;
-        // This AP's 24 MHz counter counts from a base its software
-        // correction moved, so that it reads the BSP's count.
-        host::correct_tsc_base(offset);
+        // This AP reads the BSP's counter, and counts its guest clock,
+        // through its software correction from now on.
+        host::agree_tsc(offset);
         Ok(owner)
     });
     match initialized {
@@ -747,12 +747,14 @@ fn serve(
                 static OFFSET_REPORTED: core::sync::atomic::AtomicBool =
                     core::sync::atomic::AtomicBool::new(false);
                 if outcome.offset != 0 && !OFFSET_REPORTED.swap(true, Ordering::Relaxed) {
-                    // Only the guest counter's base takes the offset: raw
-                    // counter reads on this core, such as cross-PE deadlines,
-                    // stay off by it.
+                    // The guest clock and the host's counter reads
+                    // (`host::rdtsc`) take the offset; the raw counter
+                    // stays apart, and only durations measured on one core
+                    // read it.
                     crate::output::arguments(format_args!(
-                        "UNSUPPORTED host TSC agreement in software: slot={slot} offset={}; \
-                         raw counter reads on that core stay off by it\n",
+                        "NATIVE TSC slot={slot} agrees through a software offset of {}: \
+                     its counter has no IA32_TSC_ADJUST or did not converge, and is \
+                     never written\n",
                         outcome.offset,
                     ));
                 }

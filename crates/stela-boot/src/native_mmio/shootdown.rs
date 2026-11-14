@@ -165,7 +165,7 @@ pub(crate) fn service() {
 /// Note what this processor does until the returned guard drops.
 fn doing(doing: Doing) -> Option<Restore> {
     let slot = crate::engine::host::shootdown().0?;
-    let previous = PROCESSORS.set_doing(slot, doing, crate::apic::rdtsc());
+    let previous = PROCESSORS.set_doing(slot, doing, crate::engine::host::rdtsc());
     Some(Restore(slot, previous))
 }
 
@@ -173,7 +173,7 @@ struct Restore(usize, Doing);
 
 impl Drop for Restore {
     fn drop(&mut self) {
-        PROCESSORS.set_doing(self.0, self.1, crate::apic::rdtsc());
+        PROCESSORS.set_doing(self.0, self.1, crate::engine::host::rdtsc());
     }
 }
 
@@ -255,7 +255,7 @@ pub(super) fn retire(tsc_hz: u64, retired: Option<Range<u64>>) -> bool {
     service();
     // Counted from the first doorbell: under a hypervisor each ICR access
     // exits, so sending to every processor is a cost of its own.
-    let start = crate::apic::rdtsc();
+    let start = crate::engine::host::rdtsc();
     let _counted = Counted(start);
     let _doing = doing(Doing::Retiring);
     for (slot, apic) in PROCESSORS.sharers() {
@@ -276,7 +276,7 @@ pub(super) fn retire(tsc_hz: u64, retired: Option<Range<u64>>) -> bool {
     // finish until this processor acknowledges its generation.
     while !PROCESSORS.flushed(generation, me) {
         service();
-        let now = crate::apic::rdtsc();
+        let now = crate::engine::host::rdtsc();
         let waited = now.wrapping_sub(start);
         if waited >= limit {
             report_unacknowledged(generation, me, now, tsc_hz, "the mapping stays reserved");
@@ -303,7 +303,10 @@ struct Counted(u64);
 impl Drop for Counted {
     fn drop(&mut self) {
         WAITS[0].fetch_add(1, Ordering::Relaxed);
-        WAITS[1].fetch_add(crate::apic::rdtsc().wrapping_sub(self.0), Ordering::Relaxed);
+        WAITS[1].fetch_add(
+            crate::engine::host::rdtsc().wrapping_sub(self.0),
+            Ordering::Relaxed,
+        );
     }
 }
 

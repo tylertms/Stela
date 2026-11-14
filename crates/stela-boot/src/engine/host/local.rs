@@ -9,7 +9,7 @@ use core::{
     cell::UnsafeCell,
     marker::PhantomData,
     ptr::NonNull,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 #[repr(C, align(64))]
@@ -35,6 +35,9 @@ pub(crate) struct Local {
     declarations: UnsafeCell<Option<stela_engine::NativeCpuOwner>>,
     /// This processor's place in the order they became active.
     index: u32,
+    /// What this processor adds to its raw counter to read the BSP's
+    /// (`host::agree_tsc`), zero on the BSP and on a core that agreed.
+    tsc_offset: AtomicI64,
 }
 
 impl Local {
@@ -56,6 +59,7 @@ impl Local {
             worker: UnsafeCell::new(None),
             declarations: UnsafeCell::new(None),
             index: 0,
+            tsc_offset: AtomicI64::new(0),
         }
     }
 }
@@ -402,6 +406,18 @@ pub(super) fn irq_active() -> bool {
 pub(super) fn interrupt() {
     // SAFETY: one processor owns this record for the handler's whole lifetime.
     unsafe { &(*current()).interrupted }.store(true, Ordering::Release);
+}
+
+/// What this processor adds to its raw counter to read the BSP's.
+pub(super) fn tsc_offset() -> i64 {
+    // SAFETY: as in doorbell_counter.
+    unsafe { &(*current()).tsc_offset }.load(Ordering::Relaxed)
+}
+
+/// Keep what this processor adds to its raw counter to read the BSP's.
+pub(super) fn set_tsc_offset(offset: i64) {
+    // SAFETY: as in doorbell_counter.
+    unsafe { &(*current()).tsc_offset }.store(offset, Ordering::Relaxed);
 }
 
 pub(super) fn doorbell_counter() -> &'static AtomicU64 {

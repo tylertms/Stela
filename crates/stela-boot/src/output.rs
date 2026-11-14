@@ -524,9 +524,10 @@ const MACHINE_FLUSH_SECONDS: u64 = 5;
 /// Seconds between the USB log's stores while the engine runs.
 const USB_FLUSH_SECONDS: u64 = 10;
 
+/// The BSP's counter on any core (`engine::host::rdtsc`): log times and
+/// flush deadlines are compared across cores.
 fn rdtsc() -> u64 {
-    // SAFETY: RDTSC has no memory effects.
-    unsafe { core::arch::x86_64::_rdtsc() }
+    crate::engine::host::rdtsc()
 }
 
 pub use stela_boot_core::log_sinks::Log;
