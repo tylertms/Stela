@@ -143,6 +143,88 @@ fn disjoint_ecam_windows_share_one_complete_segment_inventory() {
     );
 }
 
+/// Two laptops' fabrics: functions that read vendor ID 0000 beside a
+/// device's function 0 (00:00.3, 00:03.2 to 00:03.4), an idle CardBus
+/// header (00:00.5), a repeat of a single-function device's function 0
+/// (00:04.1) and a function behind a bridge whose buses are not used
+/// (05:00.0). The containment census leaves each out; the inventory after
+/// it reads them as absent and finds exactly the functions the fabric
+/// holds, where each one was refused as a function containment did not
+/// hold and the GPU with it.
+#[test]
+fn the_inventory_after_containment_passes_over_what_the_census_left_out() {
+    use crate::ecam::census::LeftOut;
+    use stela_drivers::bus::pci::Address;
+    let windows = [EcamWindow {
+        base: 0xe000_0000,
+        segment: 0,
+        start_bus: 0,
+        end_bus: 5,
+    }];
+    let mut config = space(&[
+        (0x0000, [6, 0, 0], true, None),
+        (0x0008, [6, 4, 0], false, Some((1, 1))),
+        (0x0018, [6, 0, 0], true, None),
+        (0x0020, [6, 0, 0], false, None),
+        (0x0028, [6, 4, 0], false, Some((5, 5))),
+        (0x0100, [3, 0, 0], false, None),
+        (0x0500, [2, 0, 0], false, None),
+    ]);
+    for rid in [0x0003, 0x001a, 0x001b, 0x001c] {
+        config.insert((rid, VENDOR), 0);
+        config.insert((rid, CLASS), 0);
+        config.insert((rid, HEADER), 0);
+    }
+    config.insert((0x0005, VENDOR), 0x1234_8086);
+    config.insert((0x0005, CLASS), 0x0607_0000);
+    config.insert((0x0005, HEADER), 2 << 16);
+    config.insert((0x0021, VENDOR), 0x1234_8086);
+    config.insert((0x0021, CLASS), 0x0600_0000);
+    config.insert((0x0021, HEADER), 0);
+    let at = |rid: u16| Address {
+        segment: 0,
+        bus: (rid >> 8) as u8,
+        device: (rid >> 3) as u8 & 0x1f,
+        function: rid as u8 & 7,
+    };
+    let mut left_out = LeftOut::default();
+    for rid in [0x0003, 0x0005, 0x001a, 0x001b, 0x001c, 0x0021] {
+        left_out.function(at(rid)).unwrap();
+    }
+    left_out.bus(0, 5).unwrap();
+    // What the boot's inventory read does with the census's record: a
+    // function the fabric does not hold refuses.
+    let held = [0x0000, 0x0008, 0x0018, 0x0020, 0x0028, 0x0100];
+    let inventories = try_enumerate_segments(&windows, |_, rid, offset| {
+        if left_out.holds(at(rid)) {
+            return Ok(None);
+        }
+        let value = config.get(&(rid, offset)).copied();
+        if offset == VENDOR && value.is_some() && !held.contains(&rid) {
+            return Err(rid);
+        }
+        Ok(value)
+    });
+    let found = inventories.map(|segments| {
+        segments[0]
+            .1
+            .iter()
+            .map(|function| function.rid)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(found, Ok(held.to_vec()));
+    // Without the record a function left out refuses the inventory: the
+    // last bus is read first.
+    let refused = try_enumerate_segments(&windows, |_, rid, offset| {
+        let value = config.get(&(rid, offset)).copied();
+        if offset == VENDOR && value.is_some() && !held.contains(&rid) {
+            return Err(rid);
+        }
+        Ok(value)
+    });
+    assert_eq!(refused, Err(0x0500));
+}
+
 #[test]
 fn a_failed_configuration_read_refuses_the_entire_segment_census() {
     let windows = [EcamWindow {

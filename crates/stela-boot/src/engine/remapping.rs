@@ -271,14 +271,10 @@ impl Remappers {
             mmio.with_config_inventory(|windows, reader| {
                 let inventories =
                     remapping::try_enumerate_segments(windows, |window, rid, offset| {
-                        let address = address(window.segment, rid);
-                        let value = reader.read32(address, offset)?;
                         // The original containment census validated the
-                        // bridge layout and bus route before sealing them.
-                        if offset != 0 || value as u16 != u16::MAX {
-                            pci.check_observation(address, offset, value)?;
-                        }
-                        Ok::<_, MappingError>(Some(value))
+                        // bridge layout and bus route before sealing them;
+                        // what it left out reads as absent here too.
+                        pci.inventory_read(reader, address(window.segment, rid), offset)
                     })?;
                 let functions: Vec<_> = inventories
                     .iter()

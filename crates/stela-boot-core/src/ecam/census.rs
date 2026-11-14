@@ -1,6 +1,7 @@
 //! Classify the configuration words the census reads, as Linux's scan does:
 //! what counts as no function, which header layouts the fabric can drive,
 //! and which bridge bus fields it can trust.
+use alloc::{collections::TryReserveError, vec::Vec};
 use core::ops::RangeInclusive;
 use stela_drivers::bus::pci::Address;
 
@@ -218,6 +219,42 @@ pub fn alias(first: &[u32; 9], candidate: &[u32; 9]) -> bool {
     !multifunction(first[2]) && first == candidate
 }
 
+/// What the census leaves out of the fabric although something answers
+/// there: each function it reads as no function (no vendor, not ready, a
+/// repeat of function 0) or leaves idle (a CardBus or unknown header), and
+/// each bus it does not read because only an undriven bridge forwards to
+/// it. A later read-only inventory of the same fabric passes over exactly
+/// these, as the census did, and still refuses any other function the
+/// fabric does not hold: one that appeared after the census.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LeftOut {
+    functions: Vec<Address>,
+    buses: Vec<(u16, u8)>,
+}
+
+impl LeftOut {
+    /// The census read the function at `address` as no function, or left
+    /// it idle.
+    pub fn function(&mut self, address: Address) -> Result<(), TryReserveError> {
+        self.functions.try_reserve(1)?;
+        self.functions.push(address);
+        Ok(())
+    }
+
+    /// The census did not read `bus` of `segment`.
+    pub fn bus(&mut self, segment: u16, bus: u8) -> Result<(), TryReserveError> {
+        self.buses.try_reserve(1)?;
+        self.buses.push((segment, bus));
+        Ok(())
+    }
+
+    /// Whether the census left out the function at `address`, alone or
+    /// with its bus.
+    pub fn holds(&self, address: Address) -> bool {
+        self.functions.contains(&address) || self.buses.contains(&(address.segment, address.bus))
+    }
+}
+
 /// Census oddities that leave the segment usable. Each is logged once.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -257,6 +294,29 @@ impl Oddity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_the_census_left_out_holds_its_functions_and_whole_buses_only() {
+        let at = |bus, device, function| Address {
+            segment: 0,
+            bus,
+            device,
+            function,
+        };
+        let mut left_out = LeftOut::default();
+        left_out.function(at(0, 3, 2)).unwrap();
+        left_out.bus(0, 5).unwrap();
+        assert!(left_out.holds(at(0, 3, 2)));
+        assert!(!left_out.holds(at(0, 3, 0)));
+        assert!(!left_out.holds(at(0, 3, 3)));
+        assert!(left_out.holds(at(5, 0, 0)));
+        assert!(left_out.holds(at(5, 31, 7)));
+        assert!(!left_out.holds(at(4, 0, 0)));
+        assert!(!left_out.holds(Address {
+            segment: 1,
+            ..at(5, 0, 0)
+        }));
+    }
 
     #[test]
     fn vendor_ids_ffff_0001_and_0000_are_no_function() {

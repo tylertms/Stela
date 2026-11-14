@@ -130,6 +130,40 @@ impl<'a> ContainedPci<'a> {
         Ok(())
     }
 
+    /// The dword at `offset` of `address` for a read-only inventory of this
+    /// fabric through `reader`: None where the census left the function or
+    /// its bus out (`census::LeftOut`), as it read them, else the value,
+    /// which must match the parked header where the census held a function.
+    /// A function that answers where the census held none refuses, naming
+    /// its address.
+    pub(crate) fn inventory_read(
+        &self,
+        reader: &mut ConfigInventory<'_>,
+        address: Address,
+        offset: u16,
+    ) -> Result<Option<u32>, ContainmentError> {
+        let mut read = || {
+            if !core::ptr::eq(self.source, reader.source) {
+                return Err(Error::InvalidPlatformReply);
+            }
+            {
+                let cohort = self.source.pci_slots.0.borrow();
+                let Cohort::Parked(fabric) = &*cohort else {
+                    return Err(Error::Unavailable);
+                };
+                if fabric.left_out.holds(address) {
+                    return Ok(None);
+                }
+            }
+            let value = reader.read32(address, offset)?;
+            if offset != 0 || value as u16 != u16::MAX {
+                self.check_observation(address, offset, value)?;
+            }
+            Ok(Some(value))
+        };
+        read().map_err(|error| ContainmentError::from(error).at(address))
+    }
+
     /// Observe the parked functions in `scope` through the same read-only
     /// census.
     pub(crate) fn check_stopped(
@@ -523,6 +557,8 @@ struct Fabric {
     refusal: Option<SlotRefusal>,
     /// See [`ContainedPci::unstopped_master`].
     unstopped_master: Option<Address>,
+    /// What answered at the census but is not in `slots`.
+    left_out: census::LeftOut,
 }
 
 impl Fabric {
@@ -736,7 +772,11 @@ struct Input {
 }
 
 enum Observed {
+    /// Nothing answers.
     Absent,
+    /// Something answers that the census reads as no function
+    /// (`census::LeftOut`).
+    Skipped,
     Function(Input),
     /// A function the fabric does not drive, left idle with the buses
     /// behind it, and its layout dword.
@@ -778,7 +818,7 @@ impl Input {
             census::Found::Absent => return Ok(Observed::Absent),
             census::Found::Skipped(oddity) => {
                 report_oddity(oddity, address);
-                return Ok(Observed::Absent);
+                return Ok(Observed::Skipped);
             }
             census::Found::ActiveWithoutVendor => {
                 return Err(topology::Error::ActiveWithoutVendor(address).into());
@@ -789,7 +829,7 @@ impl Input {
             && repeats(reader, first, address)?
         {
             report_oddity(census::Oddity::Alias, address);
-            return Ok(Observed::Absent);
+            return Ok(Observed::Skipped);
         }
         let class_revision = reader.read32(address, 8)?;
         if class_revision == u32::MAX {
@@ -858,8 +898,10 @@ impl Input {
 fn census(
     windows: &[EcamWindow],
     reader: &mut ConfigInventory<'_>,
-) -> Result<Vec<Input>, ContainmentError> {
+) -> Result<(Vec<Input>, census::LeftOut), ContainmentError> {
     let mut inputs: Vec<Input> = Vec::new();
+    // What answers but is not in `inputs`, for a later inventory.
+    let mut left_out = census::LeftOut::default();
     // Every bridge admitted so far with the buses it forwards, CardBus
     // bridges included (`census::admit`).
     let mut admitted: Vec<(Address, RangeInclusive<u8>)> = Vec::new();
@@ -885,6 +927,9 @@ fn census(
             // bridge left undriven claims it too, so every function there
             // is stopped.
             if root_bus && left.iter().any(|buses| buses.contains(&bus)) {
+                left_out
+                    .bus(window.segment, bus)
+                    .map_err(|_| Error::Exhausted)?;
                 continue;
             }
             for device in 0..32 {
@@ -904,6 +949,10 @@ fn census(
                         .map_err(|error| error.at(address))?;
                     let layout = match observed {
                         Observed::Absent => continue,
+                        Observed::Skipped => {
+                            left_out.function(address).map_err(|_| Error::Exhausted)?;
+                            continue;
+                        }
                         Observed::Function(input) => {
                             let layout = input.header.layout;
                             let behind = input
@@ -924,6 +973,7 @@ fn census(
                             layout
                         }
                         Observed::Left { layout, behind } => {
+                            left_out.function(address).map_err(|_| Error::Exhausted)?;
                             if let Some(buses) = behind {
                                 admitted.try_reserve(1).map_err(|_| Error::Exhausted)?;
                                 admitted.push((address, buses.clone()));
@@ -940,7 +990,7 @@ fn census(
             }
         }
     }
-    Ok(inputs)
+    Ok((inputs, left_out))
 }
 
 #[derive(Clone)]
@@ -1314,13 +1364,13 @@ impl Source {
         }
         // SAFETY: the caller keeps the complete captured topology exclusive.
         // with_config_inventory retires the last read-only map before return.
-        let inputs = unsafe { self.with_config_inventory(census) }?;
+        let (inputs, left_out) = unsafe { self.with_config_inventory(census) }?;
         let count = inputs.len();
         let mut order = Vec::new();
         order
             .try_reserve_exact(count)
             .map_err(|_| Error::Exhausted)?;
-        self.prepare_fabric(inputs)?;
+        self.prepare_fabric(inputs, left_out)?;
         order.extend(0..count);
         // Stop endpoints while their bridges still forward. Stop downstream
         // bridges before their upstream parents.
@@ -1417,7 +1467,11 @@ impl Source {
         })
     }
 
-    fn prepare_fabric(&self, mut inputs: Vec<Input>) -> Result<(), ContainmentError> {
+    fn prepare_fabric(
+        &self,
+        mut inputs: Vec<Input>,
+        left_out: census::LeftOut,
+    ) -> Result<(), ContainmentError> {
         let roots = self.platform.wire().roots();
         let mut observed = Vec::new();
         observed
@@ -1436,7 +1490,10 @@ impl Source {
         let parents = topology::resolve(roots, &observed)?;
         inputs.sort_unstable_by_key(|input| input.address);
 
-        let mut fabric = Fabric::default();
+        let mut fabric = Fabric {
+            left_out,
+            ..Fabric::default()
+        };
         fabric
             .roots
             .try_reserve_exact(roots.len())
