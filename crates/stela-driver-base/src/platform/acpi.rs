@@ -106,7 +106,9 @@ pub const SERVICES_ABI_BYTES: u32 = core::mem::size_of::<Services>() as u32;
 /// `allocate` returns at least 16-byte aligned storage, `free` accepts its pointers.
 /// `map` owns each exact address/length lease until matching `unmap`, including
 /// overlapping/repeated table mappings; firmware RAM and MMIO require appropriate
-/// cache attributes and lifetime after ExitBootServices. Lock acquisition disables
+/// cache attributes and lifetime after ExitBootServices. `read_memory` and
+/// `write_memory` serve hardware registers and every AML SystemMemory field
+/// access, which never goes through `map`. Lock acquisition disables
 /// local interrupts and restores their previous flags on release. Callbacks must
 /// not panic/unwind. Unsupported fallible operations return a real failure status;
 /// mandatory void operations must complete, never silently do nothing.

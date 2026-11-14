@@ -781,8 +781,8 @@ fn acpica_abi_namespace_dsm_regions_failures_notify_and_cleanup() {
     );
     assert_eq!(
         ucsi.evaluate(Some("BARD"), &[]),
-        Err(Error(4)),
-        "unmapped AML memory must not return fabricated data"
+        Err(SUPPORT),
+        "memory the provider refuses must not return fabricated data"
     );
     assert!(
         ucsi.evaluate(Some("ECRD"), &[]).is_err(),
@@ -857,10 +857,15 @@ fn acpica_abi_namespace_dsm_regions_failures_notify_and_cleanup() {
     assert_eq!(ucsi.dsm(&uuid, 1, 0).unwrap(), Some(Value::Buffer(vec![7])));
     assert_eq!(ucsi.dsm(&uuid, 1, 1).unwrap(), Some(Value::Integer(1)));
     assert_eq!(counts.memory.load(Ordering::SeqCst), 0x11223344);
+    // SystemMemory fields reach the provider's scalar memory services, which
+    // can serve what it lends no mapping of, never a mapping lease.
+    let accesses = counts.memory_accesses.load(Ordering::SeqCst);
+    assert!(accesses > 0);
     assert_eq!(
         ucsi.dsm(&uuid, 1, 2).unwrap(),
         Some(Value::Integer(0x11223344))
     );
+    assert!(counts.memory_accesses.load(Ordering::SeqCst) > accesses);
     assert_eq!(
         ucsi.dsm(&[0; 16], 1, 0).unwrap(),
         Some(Value::Buffer(vec![0]))

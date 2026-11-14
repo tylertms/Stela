@@ -164,6 +164,23 @@ acpi_status stela_acpi_preflight_wait_events(void) {
     if (!active) return AE_NOT_EXIST;
     return services.preflight_wait_events(CTX);
 }
+/* AML SystemMemory fields go through the provider's scalar memory services,
+ * as hardware registers do, never through a lent mapping: the provider can
+ * then serve an address it maps for no one, such as configuration space a
+ * native PCI owner holds, by the accesses it decodes to. */
+static acpi_status system_memory(u32 function, acpi_physical_address address, u32 width, u64 *value, void *handler_context, void *region_context) {
+    (void)handler_context; (void)region_context;
+    if (!value) return AE_BAD_PARAMETER;
+    switch (function & ACPI_IO_MASK) {
+    case ACPI_READ:
+        *value = 0;
+        return services.read_memory(CTX, address, value, width);
+    case ACPI_WRITE:
+        return services.write_memory(CTX, address, *value, width);
+    default:
+        return AE_BAD_PARAMETER;
+    }
+}
 acpi_status stela_acpi_start(const struct stela_acpi_services *input, u8 hardware) {
     if (active) return AE_ALREADY_EXISTS;
     if (!input || input->abi_version != STELA_ACPI_SERVICES_ABI_VERSION ||
@@ -187,6 +204,10 @@ acpi_status stela_acpi_start(const struct stela_acpi_services *input, u8 hardwar
     status = acpi_initialize_subsystem();
     if (ACPI_FAILURE(status)) return status;
     status = acpi_install_table_handler(namespace_table_event, 0);
+    if (ACPI_FAILURE(status)) return status;
+    /* Before acpi_load_tables, which keeps this handler as the default and
+     * runs the tables' module-level code; there is no _REG to run yet. */
+    status = acpi_install_address_space_handler_no_reg(ACPI_ROOT_OBJECT, ACPI_ADR_SPACE_SYSTEM_MEMORY, system_memory, 0, 0);
     if (ACPI_FAILURE(status)) return status;
     status = acpi_initialize_tables(0, 32, TRUE);
     if (ACPI_FAILURE(status)) return status;

@@ -1,6 +1,7 @@
 //! Pure geometry for original captured ECAM/RootBridge descriptions.
 //! This module creates no Resource, mapping, device exclusion or root permission.
 pub mod census;
+pub mod memory;
 pub mod topology;
 use alloc::vec::Vec;
 use core::ops::RangeInclusive;

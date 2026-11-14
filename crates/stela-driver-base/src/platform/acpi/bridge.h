@@ -32,6 +32,7 @@ struct stela_acpi_services {
     void (*stall)(void *, u32);
     acpi_status (*read_port)(void *, u64, u32 *, u32);
     acpi_status (*write_port)(void *, u64, u32, u32);
+    /* Hardware registers and every AML SystemMemory field access. */
     acpi_status (*read_memory)(void *, u64, u64 *, u32);
     acpi_status (*write_memory)(void *, u64, u64, u32);
     acpi_status (*read_pci)(void *, struct acpi_pci_id *, u32, u64 *, u32);

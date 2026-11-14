@@ -14,7 +14,9 @@
 //! write-back; any other address, device registers, through an identity
 //! mapping the provider adds to the loader root uncached on first use. When
 //! the native PCI source takes configuration custody, AML has scoped scalar
-//! reads through that source. Otherwise the firmware provider uses PCI
+//! reads through that source, for its PCI_Config fields and for its
+//! SystemMemory fields that land in an ECAM window, which ACPICA reaches
+//! through [`read_memory`]. Otherwise the firmware provider uses PCI
 //! configuration mechanism #1 and the MCFG's ECAM windows.
 pub(super) mod sci;
 use super::{
@@ -35,6 +37,7 @@ use core::{
     ptr::{self, NonNull},
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
+use stela_boot_core::ecam::memory as ecam_memory;
 use stela_drivers::{
     bus::pci::{Address, EcamWindow},
     platform::acpi::{
@@ -78,6 +81,10 @@ enum Gap {
     Address = 4,
     /// Access that would bypass the native PCI configuration owner.
     PciCustody = 8,
+    /// An AML SystemMemory read in ECAM the native PCI owner refused.
+    EcamRead = 16,
+    /// An AML SystemMemory write in ECAM, under native PCI custody.
+    EcamWrite = 32,
 }
 
 struct Provider {
@@ -111,18 +118,14 @@ impl Provider {
 
     /// `bytes` at `physical` under the loader root: through the physmap
     /// where it maps every page (RAM), else by identity, mapping the pages
-    /// not yet mapped uncached.
+    /// not yet mapped uncached. No ECAM page is lent under native custody:
+    /// its scalar accesses go through [`Self::configuration_owner`].
     fn reach(&self, physical: u64, bytes: u64) -> Option<*mut u8> {
         let end = physical.checked_add(bytes.max(1))?;
-        if self.pci.is_some()
-            && self.ecam.iter().any(|window| {
-                let range = window.range();
-                physical < range.end && range.start < end
-            })
-        {
+        if self.configuration_owner(physical, bytes).is_some() {
             self.report(
                 Gap::PciCustody,
-                format_args!("native PCI configuration owns the requested ECAM range"),
+                format_args!("native PCI configuration lends no mapping of ECAM at {physical:#x}"),
             );
             return None;
         }
@@ -151,6 +154,65 @@ impl Provider {
             }
         }
         Some(physical as *mut u8)
+    }
+
+    /// The native PCI owner, when `bytes` at `physical` touch an ECAM window
+    /// under its custody.
+    fn configuration_owner(
+        &self,
+        physical: u64,
+        bytes: u64,
+    ) -> Option<&'static native_mmio::Source> {
+        self.pci
+            .filter(|_| ecam_memory::touches(&self.ecam, physical, bytes))
+    }
+
+    /// AML's read of `bytes` at `physical` in an ECAM window, as the
+    /// configuration reads of the functions it decodes to, which the native
+    /// owner serves as it serves PCI_Config fields; `None`, reported once,
+    /// when a read is refused.
+    fn read_configuration(
+        &self,
+        pci: &native_mmio::Source,
+        physical: u64,
+        bytes: u64,
+    ) -> Option<u64> {
+        let read = ecam_memory::read(&self.ecam, physical, bytes, |address, offset, width| {
+            pci.read_firmware_config(address, offset, width)
+        });
+        match read {
+            Ok(value) => Some(value),
+            Err(ecam_memory::Refusal::Config {
+                address,
+                offset,
+                error,
+            }) => {
+                self.report(
+                    Gap::EcamRead,
+                    format_args!(
+                        "native PCI read of {address} register {offset:#x} through ECAM at \
+                         {physical:#x} refused: {error:?}"
+                    ),
+                );
+                None
+            }
+            Err(ecam_memory::Refusal::Outside { physical: outside }) => {
+                self.report(
+                    Gap::EcamRead,
+                    format_args!(
+                        "AML read of {bytes} bytes at {physical:#x} leaves ECAM at {outside:#x}"
+                    ),
+                );
+                None
+            }
+            Err(ecam_memory::Refusal::Width) => {
+                self.report(
+                    Gap::EcamRead,
+                    format_args!("AML read of {bytes} bytes at {physical:#x} in ECAM"),
+                );
+                None
+            }
+        }
     }
 
     /// Whether the loader root maps `address`.
@@ -622,6 +684,8 @@ unsafe fn write(pointer: *mut u8, value: u64, width: u32) -> bool {
     true
 }
 
+/// A hardware register or an AML SystemMemory field: the bridge routes
+/// every SystemMemory region access here.
 unsafe extern "C" fn read_memory(
     context: *mut c_void,
     physical: u64,
@@ -629,20 +693,30 @@ unsafe extern "C" fn read_memory(
     width: u32,
 ) -> Status {
     // SAFETY: ACPICA passes the session's provider.
-    let Some(pointer) = unsafe { provider(context) }.reach(physical, u64::from(width / 8)) else {
-        return AE_ERROR;
-    };
-    // SAFETY: the firmware's register, now mapped; the output is writable.
-    match unsafe { read(pointer, width) } {
-        Some(read) => {
-            // SAFETY: as above.
-            unsafe { value.write(read) };
-            AE_OK
-        }
-        None => AE_BAD_PARAMETER,
+    let provider = unsafe { provider(context) };
+    if !matches!(width, 8 | 16 | 32 | 64) {
+        return AE_BAD_PARAMETER;
     }
+    let bytes = u64::from(width / 8);
+    let found = if let Some(pci) = provider.configuration_owner(physical, bytes) {
+        provider.read_configuration(pci, physical, bytes)
+    } else {
+        let Some(pointer) = provider.reach(physical, bytes) else {
+            return AE_ERROR;
+        };
+        // SAFETY: the firmware's register, now mapped; the width was checked.
+        unsafe { read(pointer, width) }
+    };
+    let Some(found) = found else {
+        return AE_SUPPORT;
+    };
+    // SAFETY: ACPICA's writable output.
+    unsafe { value.write(found) };
+    AE_OK
 }
 
+/// As [`read_memory`]. Native PCI custody excludes AML configuration
+/// writes, through ECAM as through PCI_Config fields ([`write_pci`]).
 unsafe extern "C" fn write_memory(
     context: *mut c_void,
     physical: u64,
@@ -650,7 +724,18 @@ unsafe extern "C" fn write_memory(
     width: u32,
 ) -> Status {
     // SAFETY: ACPICA passes the session's provider.
-    let Some(pointer) = unsafe { provider(context) }.reach(physical, u64::from(width / 8)) else {
+    let provider = unsafe { provider(context) };
+    if provider
+        .configuration_owner(physical, u64::from(width / 8))
+        .is_some()
+    {
+        provider.report(
+            Gap::EcamWrite,
+            format_args!("native PCI configuration excludes AML writes to ECAM at {physical:#x}"),
+        );
+        return AE_SUPPORT;
+    }
+    let Some(pointer) = provider.reach(physical, u64::from(width / 8)) else {
         return AE_ERROR;
     };
     // SAFETY: the firmware's register, now mapped.

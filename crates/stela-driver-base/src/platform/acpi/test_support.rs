@@ -23,6 +23,7 @@ pub(crate) struct Counts {
     pub(crate) mappings: AtomicUsize,
     pub(crate) destroyed: AtomicBool,
     pub(crate) memory: AtomicU64,
+    pub(crate) memory_accesses: AtomicUsize,
     pub(crate) port_writes: AtomicUsize,
     pub(crate) preflight_status: AtomicU32,
     pub(crate) flush_status: AtomicU32,
@@ -334,6 +335,11 @@ pub(crate) unsafe extern "C" fn read_memory(
     value: *mut u64,
     width: u32,
 ) -> Status {
+    // SAFETY: ACPICA passes back the provider context, a live `TestPlatform` until `destroy`.
+    unsafe { platform(p) }
+        .counts
+        .memory_accesses
+        .fetch_add(1, Ordering::SeqCst);
     if address != 0x9000 || width != 32 {
         return SUPPORT.0;
     }
@@ -348,6 +354,11 @@ pub(crate) unsafe extern "C" fn write_memory(
     value: u64,
     width: u32,
 ) -> Status {
+    // SAFETY: ACPICA passes back the provider context, a live `TestPlatform` until `destroy`.
+    unsafe { platform(p) }
+        .counts
+        .memory_accesses
+        .fetch_add(1, Ordering::SeqCst);
     if address != 0x9000 || width != 32 {
         return SUPPORT.0;
     }
