@@ -36,6 +36,10 @@ pub(super) struct EngineMemory {
     pub trampoline: u64,
     pub root: u64,
     pub loader_tables: crate::paging::loader::Builder,
+    /// The startup page (`NativeResources::sipi`) is boot services memory,
+    /// used only once the firmware's processors are stopped
+    /// ([`boot_services_sipi_page`]).
+    pub sipi_taken: bool,
 }
 
 /// Copy and relocate the pristine image into the selected host window.
@@ -100,20 +104,30 @@ pub(super) fn prepare_image(snapshot: &Snapshot) -> Result<EngineImage> {
 }
 
 /// Reserve the engine's working memory and each physical worker's resources.
-/// The other cores start from a page below 1 MiB, taken first; firmware
-/// that left none free boots on one core.
+/// The other cores start from a page below 1 MiB, taken first: a free one,
+/// or else a boot services page; firmware that left neither boots on one
+/// core.
 pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemory> {
-    let (cores, sipi) = match cores {
-        1 => (1, 0),
+    let (cores, sipi, sipi_taken) = match cores {
+        1 => (1, 0, false),
         _ => match sipi_page() {
-            Some(page) => (cores, page),
-            None => {
-                crate::status::info(&format!(
-                    "the firmware left no free memory below 1 MiB to start the other cores from, \
-                     so macOS runs on one of this PC's {cores}"
-                ));
-                (1, 0)
-            }
+            Some(page) => (cores, page, false),
+            None => match boot_services_sipi_page() {
+                Some(page) => {
+                    output::arguments(format_args!(
+                        "HOST STARTUP PAGE {page:#x} taken from boot services memory: the \
+                         firmware left no free page below 1 MiB\n"
+                    ));
+                    (cores, page, true)
+                }
+                None => {
+                    crate::status::info(&format!(
+                        "the firmware left no free memory below 1 MiB to start the other cores \
+                         from, so macOS runs on one of this PC's {cores}"
+                    ));
+                    (1, 0, false)
+                }
+            },
         },
     };
     let free = free_ram()?;
@@ -197,6 +211,7 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
         trampoline,
         root,
         loader_tables,
+        sipi_taken,
     })
 }
 
@@ -220,6 +235,19 @@ fn sipi_page() -> Option<u64> {
         page.as_ptr().write_bytes(0, PAGE as usize);
     }
     Some(physical)
+}
+
+/// A boot services page below 1 MiB for the other cores to start from,
+/// when the firmware left no free one (`startup_page`), as Linux takes
+/// one. Nothing touches it before boot services end and the firmware's
+/// processors are stopped; the final map is checked to still hold it
+/// (`startup_page::kept`).
+fn boot_services_sipi_page() -> Option<u64> {
+    let map = boot::memory_map(MemoryType::LOADER_DATA).ok()?;
+    stela_boot_core::startup_page::boot_services_page(
+        map.entries()
+            .map(|entry| (entry.ty.0, entry.phys_start, entry.page_count)),
+    )
 }
 
 /// Build the identity root and shared engine window over those reservations.

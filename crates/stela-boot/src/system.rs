@@ -816,6 +816,7 @@ fn load(
         trampoline,
         root,
         loader_tables,
+        sipi_taken,
     } = memory;
     let loader_tables = loader_tables
         .retain()
@@ -975,6 +976,24 @@ fn load(
         count,
         installed,
     } = handoff_phase::guest_memory(exit.map());
+    // The other cores' startup page must still be Stela's in the final map:
+    // a boot services page taken from an earlier map that something
+    // allocated since would be overwritten by the engine.
+    let sipi = native_resources.sipi;
+    if sipi != 0
+        && !stela_boot_core::startup_page::kept(
+            exit.map()
+                .entries()
+                .map(|entry| (entry.ty.0, entry.phys_start, entry.page_count)),
+            sipi,
+            sipi_taken,
+        )
+    {
+        output::fatal(format_args!(
+            "the page below 1 MiB the other cores start from ({sipi:#x}) was allocated to \
+             something else before the firmware exited"
+        ));
+    }
     // The lines since the firmware's log closed, which no log stored, for
     // the engine's record: the USB's log takes them when it resumes.
     let loader_lines = {
