@@ -76,7 +76,7 @@ impl Stick {
             None => "Stela".into(),
         };
         match &self.state {
-            State::Empty if self.disk.bytes != 0 && self.disk.bytes < NETWORK_MIN => {
+            State::Empty if self.disk.bytes < NETWORK_MIN => {
                 "too small: an installer needs 8 GB or more".into()
             }
             State::Empty if self.disk.partitions.is_empty() => "empty".into(),
@@ -116,15 +116,12 @@ impl Stick {
     /// `several` fit.
     pub(super) fn next(&self, several: bool) -> Option<String> {
         match &self.state {
-            State::Empty if self.disk.bytes != 0 && self.disk.bytes < NETWORK_MIN => None,
+            State::Empty if self.disk.bytes < NETWORK_MIN => None,
             // Without a terminal, erasing needs the stick typed back.
             State::Empty => Some(format!(
                 "stela create {} --confirm-disk {}",
                 self.path(),
-                match self.disk.bytes {
-                    0 => super::quoted(&self.disk.name),
-                    bytes => host::size_text(bytes).replace(' ', ""),
-                }
+                host::size_text(self.disk.bytes).replace(' ', "")
             )),
             _ => self.due().map(|action| match several {
                 true => format!("stela {} {}", super::command_words(&action), self.path()),
@@ -164,13 +161,16 @@ pub(super) fn macos_name(build: &str) -> String {
     }
 }
 
-/// Every removable disk of this computer, classified; Stela sticks first.
+/// Every removable disk of this computer with a medium in it, classified;
+/// Stela sticks first. A card reader without a card lists as a disk of no
+/// size (Linux's `lsblk`, a Windows geometry query that fails): it is no
+/// stick.
 pub(super) fn sticks(environment: &Environment<'_>) -> Result<Vec<Stick>> {
     let mut sticks: Vec<Stick> = environment
         .host
         .disks()?
         .into_iter()
-        .filter(host::Disk::erasable)
+        .filter(|disk| disk.erasable() && disk.bytes != 0)
         .map(|disk| classify(environment, disk))
         .collect();
     // Sticks that hold or may hold Stela first.
@@ -618,7 +618,7 @@ fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<
         ask(ui, question, &stick, &offers, &choices, Choice::Quit, true)
     };
     let choice = match &stick.state {
-        State::Empty if stick.disk.bytes != 0 && stick.disk.bytes < NETWORK_MIN => {
+        State::Empty if stick.disk.bytes < NETWORK_MIN => {
             ui.warning(&format!(
                 "This stick holds {}; an installer needs one of 8 GB or more.",
                 host::size_text(stick.disk.bytes)

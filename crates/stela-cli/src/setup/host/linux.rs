@@ -378,6 +378,20 @@ fn whole_disks(devices: Vec<Device>, system: &SystemDevices) -> Vec<Disk> {
         .collect()
 }
 
+/// Why the whole disk `disk` cannot be opened to erase it: rights only
+/// when the system says so, else what it said.
+fn erase_access_error(disk: &str, error: std::io::Error) -> anyhow::Error {
+    match error.raw_os_error() {
+        Some(libc::EACCES | libc::EPERM) => {
+            anyhow::Error::new(error).context(format!("USB access requires {ADMIN}"))
+        }
+        Some(libc::ENOMEDIUM) => {
+            anyhow::anyhow!("/dev/{disk} has no medium in it: put the card in, or plug in a stick")
+        }
+        _ => anyhow::Error::new(error).context(format!("cannot open /dev/{disk} to erase it")),
+    }
+}
+
 /// The vendor and device IDs of this computer's PCI devices of base class
 /// `class`.
 fn pci_devices(class: u32) -> Result<Vec<(u16, u16)>> {
@@ -603,7 +617,7 @@ impl Host for System {
             .read(true)
             .write(true)
             .open(format!("/dev/{disk}"))
-            .with_context(|| format!("USB access requires {ADMIN}"))?;
+            .map_err(|error| erase_access_error(disk, error))?;
         Ok(())
     }
 
@@ -822,6 +836,27 @@ mod tests {
                 ("sdc".into(), false, Removal::Unsure),
             ]
         );
+    }
+
+    #[test]
+    fn erase_access_names_rights_only_when_they_are_missing() {
+        let text = |code| {
+            format!(
+                "{:#}",
+                erase_access_error("sdb", std::io::Error::from_raw_os_error(code))
+            )
+        };
+        assert!(text(libc::EACCES).starts_with("USB access requires sudo"));
+        assert!(text(libc::EPERM).starts_with("USB access requires sudo"));
+        let empty = text(libc::ENOMEDIUM);
+        assert!(empty.contains("/dev/sdb has no medium"), "{empty}");
+        assert!(!empty.contains("sudo"), "{empty}");
+        let busy = text(libc::EBUSY);
+        assert!(
+            busy.starts_with("cannot open /dev/sdb to erase it: "),
+            "{busy}"
+        );
+        assert!(!busy.contains("sudo"), "{busy}");
     }
 
     #[test]

@@ -1046,7 +1046,7 @@ impl Request {
                 );
                 let sticks: Vec<_> = home::sticks(environment)?
                     .into_iter()
-                    .filter(|stick| stick.disk.bytes == 0 || stick.disk.bytes >= home::NETWORK_MIN)
+                    .filter(|stick| stick.disk.bytes >= home::NETWORK_MIN)
                     .collect();
                 ensure!(
                     !sticks.is_empty(),

@@ -7049,6 +7049,34 @@ fn home_create_dispatches_create_after_wizard_confirmation() {
 }
 
 #[test]
+fn a_card_reader_without_a_card_is_no_stick() {
+    // Linux lists an empty reader with size 0, and Windows gives it no
+    // size when its geometry cannot be read.
+    let mut f = fixture(64 * GIB, false);
+    let usb = f
+        .host
+        .disks
+        .iter_mut()
+        .find(|d| d.identifier == "disk5")
+        .unwrap();
+    usb.name = "Generic- SD/MMC".into();
+    usb.bytes = 0;
+    usb.partitions.clear();
+    let (text, due) = home::report(&home::sticks(&environment(&f.host)).unwrap());
+    assert!(!due, "{text}");
+    assert_eq!(
+        text,
+        "No USB stick found. Plug in a stick of 8 GB or more.\n"
+    );
+    let (shown, result, done) = plain_stela(&f, &["Quit"], &[]);
+    result.unwrap();
+    assert!(done, "{shown}");
+    assert!(shown.contains("▲ No USB stick found."), "{shown}");
+    assert!(!shown.contains("? Installer"), "{shown}");
+    assert!(f.host.erased.borrow().is_empty());
+}
+
+#[test]
 fn a_stick_whose_record_cannot_be_read_is_never_taken_for_one_without_stela() {
     let newer_schema = format!(
         "{{\"kind\": \"{RECORD_KIND}\", \"schema_version\": {}}}",
