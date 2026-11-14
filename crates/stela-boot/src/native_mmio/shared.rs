@@ -787,6 +787,15 @@ fn in8(port: u16) -> u8 {
     value
 }
 
+/// Log an interrupt-path refusal's own cause at the step that refused,
+/// before it becomes the MMIO service's `Unavailable`.
+fn refused<E: core::fmt::Debug>(step: &'static str) -> impl FnOnce(E) -> Error {
+    move |error| {
+        crate::output::arguments(format_args!("HOST {step} refused: {error:?}\n"));
+        Error::Unavailable
+    }
+}
+
 /// A mapping kept by every pin using the controller. Unit serializes
 /// selector/window pairs with local interrupt exclusion.
 pub(crate) struct IoapicRegisters {
@@ -882,15 +891,25 @@ impl InitialPciLines {
         if !core::ptr::eq(self.source, source) {
             return Err(Error::OutsideResource);
         }
-        source.identity.check_irq_cpu().map_err(failed)?;
+        source
+            .identity
+            .check_irq_cpu()
+            .map_err(refused("PCI interrupt paths: CPU and root check"))?;
         for routes in &self.controllers.routes {
-            routes.verify_contained().map_err(failed)?;
+            routes
+                .verify_contained()
+                .map_err(refused("PCI interrupt paths: IOAPIC recheck"))?;
         }
         // The IOAPIC's programming permission does not cover the PIC.
         // Observe its two original interrupt masks without acknowledging or
         // reprogramming either controller.
-        if self.legacy_pic && (in8(0x21) != u8::MAX || in8(0xa1) != u8::MAX) {
-            return Err(Error::Unavailable);
+        if self.legacy_pic {
+            let masks = (in8(0x21), in8(0xa1));
+            if masks != (u8::MAX, u8::MAX) {
+                return Err(refused("PCI interrupt paths: legacy PIC not fully masked")(
+                    masks,
+                ));
+            }
         }
         Ok(())
     }
@@ -942,9 +961,14 @@ impl Source {
         &'static self,
         modes: Vec<ModePin>,
     ) -> Result<usize, Error> {
-        self.identity.check_current().map_err(failed)?;
-        let platform = crate::native_irq::NativePlatform::current().map_err(failed)?;
-        platform.check_process().map_err(failed)?;
+        self.identity
+            .check_current()
+            .map_err(refused("IOAPIC: source context"))?;
+        let platform = crate::native_irq::NativePlatform::current()
+            .map_err(refused("IOAPIC: native interrupt platform"))?;
+        platform
+            .check_process()
+            .map_err(refused("IOAPIC: process context"))?;
         {
             let mut state = self.ioapics.borrow_mut();
             match &*state {
@@ -955,18 +979,28 @@ impl Source {
                 _ => return Err(Error::Busy),
             }
         }
-        let routing = self.routing()?;
+        let routing = crate::native_irq::madt::parse(
+            self.platform.wire().madt(),
+            self.platform.space.physical_bits,
+        )
+        .map_err(refused("IOAPIC: MADT interrupt routing"))?;
         // An NMI source pin is contained like any other: masked when
         // firmware left it masked, refused when left delivering NMIs
         // (`maskable_firmware_mode`), and never routed (`Routing::owner`).
         if modes.is_empty() || routing.units.is_empty() {
-            return Err(Error::Unavailable);
+            return Err(refused("IOAPIC: inventory")(format_args!(
+                "{} remapper modes, {} MADT controllers",
+                modes.len(),
+                routing.units.len()
+            )));
         }
         let domain: Arc<dyn NotificationDomain> = Arc::new(MountedNotification {
             identity: self.identity.clone(),
             modes,
         });
-        domain.check().map_err(failed)?;
+        domain
+            .check()
+            .map_err(refused("IOAPIC: remapper notification mode"))?;
         let mut units = Vec::new();
         let mut spans = Vec::new();
         units
@@ -988,7 +1022,8 @@ impl Source {
             )?;
             let address = mapping.address(0, 68)?.as_ptr() as usize;
             // SAFETY: the exact full controller's exclusive all-root UC mapping.
-            let mmio = unsafe { crate::native_irq::ioapic::Mmio::new(address) }.map_err(failed)?;
+            let mmio = unsafe { crate::native_irq::ioapic::Mmio::new(address) }
+                .map_err(refused("IOAPIC: register window"))?;
             let registers = IoapicRegisters {
                 mapping: core::mem::ManuallyDrop::new(mapping),
                 mmio,
@@ -997,21 +1032,25 @@ impl Source {
             let unit = unsafe {
                 IoapicUnit::attach(
                     registers,
-                    crate::native_irq::NativePlatform::current().map_err(failed)?,
+                    crate::native_irq::NativePlatform::current()
+                        .map_err(refused("IOAPIC: native interrupt platform"))?,
                     domain.clone(),
                     crate::native_irq::CONTROLLER.identity(),
                     descriptor.id,
                     descriptor.gsi_base,
                 )
             }
-            .map_err(failed)?;
+            .map_err(refused("IOAPIC: controller attach"))?;
             spans.push((descriptor, unit.pins()));
             units.push((descriptor, unit));
         }
-        routing.validate_units(&spans).map_err(failed)?;
+        routing
+            .validate_units(&spans)
+            .map_err(refused("IOAPIC: MADT controller spans"))?;
         // SAFETY: exact complete inventory with NMI source pins unrouted, original
         // mode pins, and the caller's exclusive controller handoff.
-        let routes = unsafe { crate::native_irq::plan_firmware_lines(&units) }.map_err(failed)?;
+        let routes = unsafe { crate::native_irq::plan_firmware_lines(&units) }
+            .map_err(refused("IOAPIC: firmware route snapshot"))?;
         let count = units.len();
         let controllers = Rc::new(MountedControllers {
             units,
@@ -1025,7 +1064,7 @@ impl Source {
         let contained = unsafe { crate::native_irq::contain_firmware_lines(&controllers.routes) };
         if let Err(error) = contained {
             controllers.failure.set(Some(error));
-            return Err(failed(error));
+            return Err(refused("IOAPIC: firmware route containment")(error));
         }
         // Containment withholds an SMI pin as Unsupported, a pin whose
         // Remote IRR, Delivery Status or old vector stayed pending as Drain,
