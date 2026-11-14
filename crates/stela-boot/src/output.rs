@@ -974,13 +974,18 @@ pub fn terminate(code: u32) -> ! {
 
 /// Stop before allocator initialization. UART/record formatting and UEFI's
 /// stack-buffered text writer need no Rust allocation; neither log flushing nor
-/// the allocating status/panic presentation path is entered here. Call only
-/// while firmware boot services and its system table remain live.
+/// the allocating status/panic presentation path is entered here. No log is
+/// open yet, so the lines go to the firmware's variables, which need no
+/// allocation either, for the next start to copy into the log
+/// (`stop_record::carry`). Call only while firmware boot services and its
+/// system table remain live.
 pub(crate) fn early_fatal(message: &str) -> ! {
     arguments(format_args!("\nSTELA FATAL {message}\n"));
     firmware_console("\nStela stopped: ");
     firmware_console(message);
     firmware_console("\n");
+    crate::stop_record::arm(crate::stop_record::Services::capture_without_heap(), None);
+    keep_stop_record(Some(message));
     arguments(format_args!(
         "STELA STOPPED code=0x11; power off to continue\n"
     ));

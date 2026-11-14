@@ -52,6 +52,23 @@ impl Services {
     /// The firmware's, read while its boot services run. Firmware older
     /// than UEFI 2.0 has no `QueryVariableInfo`, and gets no record.
     pub(crate) fn capture() -> Self {
+        let services = Self::capture_without_heap();
+        if services.set_variable == 0 {
+            return services;
+        }
+        let entry = runtime::get_variable_boxed(
+            uefi::cstr16!("BootCurrent"),
+            &VariableVendor::GLOBAL_VARIABLE,
+        )
+        .ok()
+        .and_then(|(value, _)| <[u8; 2]>::try_from(&*value).ok())
+        .map_or(0, |value| u64::from(u16::from_le_bytes(value)) + 1);
+        Self { entry, ..services }
+    }
+
+    /// [`Self::capture`] without the firmware entry this start came from,
+    /// whose read needs the heap: for a stop before the heap exists.
+    pub(crate) fn capture_without_heap() -> Self {
         let Some(table) = uefi::table::system_table_raw() else {
             return Self::default();
         };
@@ -65,18 +82,11 @@ impl Services {
         if runtime.header.revision < Revision::EFI_2_00 {
             return Self::default();
         }
-        let entry = runtime::get_variable_boxed(
-            uefi::cstr16!("BootCurrent"),
-            &VariableVendor::GLOBAL_VARIABLE,
-        )
-        .ok()
-        .and_then(|(value, _)| <[u8; 2]>::try_from(&*value).ok())
-        .map_or(0, |value| u64::from(u16::from_le_bytes(value)) + 1);
         Self {
             set_variable: runtime.set_variable as usize as u64,
             query_variable_info: runtime.query_variable_info as usize as u64,
             boot: 0,
-            entry,
+            entry: 0,
         }
     }
 }
