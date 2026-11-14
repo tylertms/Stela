@@ -26,7 +26,10 @@
 //! Each device's first polling and LED failure is reported once. A device
 //! that stops is reported and dropped, so re-plugged keyboards do not pile
 //! up as stopped devices polled for the rest of the boot, and the guest
-//! gets a release of every key and button it held ([`HeldInputs`]).
+//! gets a release of every key and button it held ([`HeldInputs`]). The
+//! guest has one keyboard and one pointer for all host devices, so each
+//! device's keys and buttons are kept apart and joined: a touchpad's report
+//! does not let go of a mouse's drag, nor one keyboard's Shift the other's.
 use super::storage::{Inputs, RestoreRoot};
 use crate::output;
 use alloc::vec::Vec;

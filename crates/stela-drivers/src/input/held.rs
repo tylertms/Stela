@@ -87,22 +87,83 @@ impl HeldInputs {
         &mut self.devices[index].1
     }
 
-    /// Device `device` gave `inputs[from..]`: note what it holds.
+    /// Whether a device other than the one at `index` holds key `usage`.
+    fn others_hold(&self, index: usize, usage: u8) -> bool {
+        let (word, bit) = Held::key(usage);
+        self.devices
+            .iter()
+            .enumerate()
+            .any(|(other, (_, held))| other != index && held.keys[word] & bit != 0)
+    }
+
+    /// The pointer's and the mouse's buttons all devices hold.
+    fn buttons(&self) -> (u8, u8) {
+        self.devices
+            .iter()
+            .fold((0, 0), |(buttons, mouse), (_, held)| {
+                (buttons | held.buttons, mouse | held.mouse_buttons)
+            })
+    }
+
+    /// Device `device` gave `inputs[from..]`: note what it holds, and make
+    /// those inputs what the guest's one keyboard and pointer should see of
+    /// all devices together, as Linux and macOS keep each device's state
+    /// and join them: a button mask is every device's buttons, and a key
+    /// another device holds neither goes down again nor comes up. With no
+    /// other device holding anything they stay as they are.
     pub fn polled(&mut self, device: u64, inputs: &mut Vec<Input>, from: usize) {
-        let held = self.held(device);
-        for &input in &inputs[from..] {
-            held.note(input);
+        self.held(device);
+        let index = self
+            .devices
+            .iter()
+            .position(|(id, _)| *id == device)
+            .expect("the device was just added");
+        let alone = self
+            .devices
+            .iter()
+            .enumerate()
+            .all(|(other, (_, held))| other == index || *held == Held::default());
+        if alone {
+            let held = &mut self.devices[index].1;
+            for &input in &inputs[from..] {
+                held.note(input);
+            }
+            return;
+        }
+        let gave: Vec<Input> = inputs.drain(from..).collect();
+        for input in gave {
+            self.devices[index].1.note(input);
+            match input {
+                Input::Key { usage, .. } if self.others_hold(index, usage) => {}
+                Input::Buttons(_) => inputs.push(Input::Buttons(self.buttons().0)),
+                Input::MouseButtons(_) => inputs.push(Input::MouseButtons(self.buttons().1)),
+                input => inputs.push(input),
+            }
         }
     }
 
-    /// Device `device` stopped: append a release for every key and button
-    /// it held to `out`, and forget it. Once for each device; a device that
+    /// Device `device` stopped: append to `out` a release of every key it
+    /// held that no other device holds, and the button masks the other
+    /// devices leave, and forget it. Once for each device; a device that
     /// held nothing adds nothing.
     pub fn stopped(&mut self, device: u64, out: &mut Vec<Input>) {
-        if let Some(index) = self.devices.iter().position(|(id, _)| *id == device) {
-            let (_, held) = self.devices.remove(index);
-            held.releases(out);
+        let Some(index) = self.devices.iter().position(|(id, _)| *id == device) else {
+            return;
+        };
+        let (_, mut held) = self.devices.remove(index);
+        for (word, keys) in held.keys.iter_mut().enumerate() {
+            for (_, other) in &self.devices {
+                *keys &= !other.keys[word];
+            }
         }
+        let (buttons, mouse) = self.buttons();
+        let mut releases = Vec::new();
+        held.releases(&mut releases);
+        out.extend(releases.into_iter().map(|release| match release {
+            Input::Buttons(_) => Input::Buttons(buttons),
+            Input::MouseButtons(_) => Input::MouseButtons(mouse),
+            release => release,
+        }));
     }
 }
 
@@ -164,5 +225,62 @@ mod tests {
         out.clear();
         held.stopped(1, &mut out);
         assert_eq!(out, [key(0x04, false)]);
+    }
+
+    #[test]
+    fn a_report_of_one_pointer_keeps_the_buttons_another_holds() {
+        let mut held = HeldInputs::new();
+        let mut mouse = alloc::vec![Input::MouseButtons(1)];
+        held.polled(0, &mut mouse, 0);
+        assert_eq!(mouse, [Input::MouseButtons(1)]);
+        // The touchpad's report with no button keeps the mouse's drag.
+        let mut touchpad = alloc::vec![Input::Motion { dx: 1, dy: 1 }, Input::MouseButtons(0)];
+        held.polled(1, &mut touchpad, 0);
+        assert_eq!(
+            touchpad,
+            [Input::Motion { dx: 1, dy: 1 }, Input::MouseButtons(1)]
+        );
+        // Its own button joins the mouse's.
+        let mut touchpad = alloc::vec![Input::MouseButtons(2)];
+        held.polled(1, &mut touchpad, 0);
+        assert_eq!(touchpad, [Input::MouseButtons(3)]);
+        // The mouse stops: the touchpad's button stays down.
+        let mut out = Vec::new();
+        held.stopped(0, &mut out);
+        assert_eq!(out, [Input::MouseButtons(2)]);
+    }
+
+    #[test]
+    fn a_key_two_keyboards_hold_comes_up_when_both_let_go() {
+        let mut held = HeldInputs::new();
+        let mut first = alloc::vec![key(0xe1, true)];
+        held.polled(0, &mut first, 0);
+        assert_eq!(first, [key(0xe1, true)]);
+        let mut second = alloc::vec![key(0xe1, true), key(0x04, true)];
+        held.polled(1, &mut second, 0);
+        assert_eq!(second, [key(0x04, true)], "Shift is down already");
+        let mut second = alloc::vec![key(0xe1, false)];
+        held.polled(1, &mut second, 0);
+        assert!(second.is_empty(), "the first keyboard still holds Shift");
+        // The second keyboard stops: its A comes up, not Shift.
+        let mut out = Vec::new();
+        let mut first = alloc::vec![key(0x04, true)];
+        held.polled(0, &mut first, 0);
+        assert!(first.is_empty(), "A is down already");
+        held.stopped(1, &mut out);
+        assert!(out.is_empty(), "the first keyboard holds A and Shift");
+        let mut first = alloc::vec![key(0xe1, false), key(0x04, false)];
+        held.polled(0, &mut first, 0);
+        assert_eq!(first, [key(0xe1, false), key(0x04, false)]);
+    }
+
+    #[test]
+    fn inputs_kept_before_the_device_s_own_stay() {
+        let mut held = HeldInputs::new();
+        let mut inputs = alloc::vec![Input::MouseButtons(1)];
+        held.polled(0, &mut inputs, 0);
+        inputs.push(Input::MouseButtons(0));
+        held.polled(1, &mut inputs, 1);
+        assert_eq!(inputs, [Input::MouseButtons(1), Input::MouseButtons(1)]);
     }
 }
