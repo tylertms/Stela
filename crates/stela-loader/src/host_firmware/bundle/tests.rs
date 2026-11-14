@@ -21,8 +21,8 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     assert_eq!(count, objects.len());
     // The RTL8168H and RTL8168M share a file, as the RTL9151A and RTL9151AS do.
     assert_eq!(count + 2, recipes().count());
-    // The recipes' recorded lengths: 86 files, 115.8 MiB.
-    assert_eq!((count, bytes), (86, 121_467_160), "{count} {bytes}");
+    // The recipes' recorded lengths: 87 files, 115.8 MiB.
+    assert_eq!((count, bytes), (87, 121_468_440), "{count} {bytes}");
     // The GPU's large images come last, for a volume short of room.
     assert_eq!(objects.last().unwrap().length, 63_571_696);
     let manifest = manifest(&complete()).unwrap();
@@ -153,6 +153,20 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     ]);
     expected.sort_unstable();
     assert_eq!(members(&ax210), expected);
+    // An RTX 2080 Ti (TU102): its GSP-RM files and the ACR bootloader its
+    // FWSEC boots with.
+    let turing = select(&[pci(0x10de, 0x1e07, 0x03)]);
+    let mut expected: Vec<&str> = USB.to_vec();
+    expected.extend([
+        "nvidia/gp102/acr/bl.bin",
+        "nvidia/tu102/gsp/booter_load-570.144.bin",
+        "nvidia/tu102/gsp/booter_unload-570.144.bin",
+        "nvidia/tu102/gsp/bootloader-570.144.bin",
+        "nvidia/tu102/gsp/gen_bootloader-570.144.bin",
+        "nvidia/tu102/gsp/gsp-570.144.bin",
+    ]);
+    expected.sort_unstable();
+    assert_eq!(members(&turing), expected);
     // An NVIDIA display chip no recipe covers is named once.
     let old = select(&[pci(0x10de, 0x1b80, 0x03), pci(0x10de, 0x1b80, 0x03)]);
     assert_eq!(old.unknown, ["pci 10de:1b80"]);

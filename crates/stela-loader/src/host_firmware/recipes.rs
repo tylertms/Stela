@@ -733,7 +733,8 @@ const fn gsp(member: &'static str, length: usize, sha256: &'static str) -> Recip
     }
 }
 
-/// Every GSP-RM file linux-firmware holds for [`GSP_RELEASE`].
+/// Every GSP-RM file linux-firmware holds for [`GSP_RELEASE`], and the ACR
+/// bootloader a Turing chip's FWSEC boots with ([`select_acr_bootloader`]).
 pub const GSP: &[Recipe] = &[
     gsp(
         "nvidia/ad102/gsp/booter_load-570.144.bin",
@@ -821,6 +822,11 @@ pub const GSP: &[Recipe] = &[
         "f3ce25f3897c860e4cdde183ebf09b254d94a5d8191d666c12afb33cc7121107",
     ),
     gsp(
+        "nvidia/gp102/acr/bl.bin",
+        1280,
+        "01326cc997716bebb0eab9fe1f463fffa0ee586079e4ca0e5bb096ab6fcfedab",
+    ),
+    gsp(
         "nvidia/tu102/gsp/booter_load-570.144.bin",
         59272,
         "7bb181f544a942299bbf4642da6d9bb58bfed8459725094e2ace56647cd3ec8c",
@@ -872,6 +878,26 @@ fn gsp_directory(chip: &str) -> Option<&'static str> {
     })
 }
 
+/// The end of the name of the ACR bootloader nouveau loads beside the GSP-RM
+/// files, as `nvkm_firmware_get(subdev, "acr/bl", 0, ..)` names it:
+/// unversioned and outside the chip's `gsp` directory.
+const ACR_BOOTLOADER: &str = "/acr/bl.bin";
+
+/// The ACR bootloader for `chip`, through `WHENCE`'s links to the one file
+/// every Turing chip's directory links to. A VBIOS whose FWSEC image is
+/// version 2, as Turing's are, boots it with this bootloader
+/// (`nvkm_gsp_fwsec_v2`); a version 3 image (`nvkm_gsp_fwsec_v3`) signs its
+/// own and loads no second file, and linux-firmware links none for later
+/// chips. Without it FWSEC-FRTS and FWSEC-SB fail with -ENOENT and GSP-RM
+/// never boots.
+fn select_acr_bootloader(chip: &str) -> Option<&'static Recipe> {
+    if !matches!(chip, "tu102" | "tu104" | "tu106" | "tu116" | "tu117") {
+        return None;
+    }
+    GSP.iter()
+        .find(|recipe| recipe.image.member == "nvidia/gp102/acr/bl.bin")
+}
+
 /// nouveau's request for a chip's GSP-RM file, through `WHENCE`'s links: the
 /// firmware itself runs on families of chips, and only the signed booters
 /// differ between them.
@@ -879,7 +905,11 @@ fn select_gsp(request: &Request) -> Option<&'static Recipe> {
     if request.target.hardware != "nvidia" || request.target.revision != "linux-firmware" {
         return None;
     }
-    let (chip, file) = request.name.strip_prefix("nvidia/")?.split_once("/gsp/")?;
+    let named = request.name.strip_prefix("nvidia/")?;
+    if let Some(chip) = named.strip_suffix(ACR_BOOTLOADER) {
+        return select_acr_bootloader(chip);
+    }
+    let (chip, file) = named.split_once("/gsp/")?;
     let directory = gsp_directory(chip)?;
     let (kind, release) = file.strip_suffix(".bin")?.split_once('-')?;
     if release != GSP_RELEASE {
@@ -925,7 +955,8 @@ pub fn nvidia_chip(device: u16) -> Option<&'static str> {
 }
 
 /// Requires the GSP-RM files nouveau asks for on `chip`, named as it names
-/// chips: `tu104`, `ga104`, `ad104`.
+/// chips: `tu104`, `ga104`, `ad104`, and the ACR bootloader its FWSEC boots
+/// with where linux-firmware has one ([`select_acr_bootloader`]).
 pub fn require_gsp(inventory: &mut Inventory, chip: &str) -> Result<(), Error> {
     let target = Target {
         driver: "nouveau",
@@ -946,11 +977,19 @@ pub fn require_gsp(inventory: &mut Inventory, chip: &str) -> Result<(), Error> {
             found = true;
         }
     }
-    if found {
-        Ok(())
-    } else {
-        Err(Error(format!("{chip} is no chip nouveau runs GSP-RM on")))
+    if !found {
+        return Err(Error(format!("{chip} is no chip nouveau runs GSP-RM on")));
     }
+    let name = format!("nvidia/{chip}{ACR_BOOTLOADER}");
+    let request = Requirement {
+        name: &name,
+        target,
+        minimum_bytes: 1,
+    };
+    if select_gsp(&Request::from(request)).is_some() {
+        inventory.observe(request)?;
+    }
+    Ok(())
 }
 
 /// Requires what a Wi-Fi adapter with these PCI IDs loads, under the binding
@@ -1597,9 +1636,24 @@ mod tests {
         };
         for name in names("tu104") {
             assert!(gsp_member(&name).is_some(), "{name}");
-            assert!(name.starts_with("nvidia/tu104/gsp/"), "{name}");
+            assert!(
+                name.starts_with("nvidia/tu104/gsp/") || name == "nvidia/tu104/acr/bl.bin",
+                "{name}"
+            );
         }
         assert!(names("tu104").iter().any(|name| name.contains("/gsp-")));
+        // Turing's FWSEC boots with the ACR bootloader; later chips' sign
+        // their own.
+        for chip in ["tu102", "tu104", "tu106", "tu116", "tu117"] {
+            let acr = format!("nvidia/{chip}/acr/bl.bin");
+            assert!(names(chip).contains(&acr), "{chip}");
+        }
+        for chip in ["ga100", "ga104", "ad104", "gh100", "gb203"] {
+            assert!(
+                names(chip).iter().all(|name| name.contains("/gsp/")),
+                "{chip}"
+            );
+        }
         assert!(
             names("ad104")
                 .iter()
@@ -1637,6 +1691,9 @@ mod tests {
                 "nvidia/gb207/gsp/fmc-570.144.bin",
                 "nvidia/gb202/gsp/fmc-570.144.bin",
             ),
+            ("nvidia/tu102/acr/bl.bin", "nvidia/gp102/acr/bl.bin"),
+            ("nvidia/tu106/acr/bl.bin", "nvidia/gp102/acr/bl.bin"),
+            ("nvidia/tu117/acr/bl.bin", "nvidia/gp102/acr/bl.bin"),
         ] {
             assert_eq!(gsp_member(name), Some(member), "{name}");
         }
@@ -1645,6 +1702,14 @@ mod tests {
             "nvidia/gk104/gsp/gsp-570.144.bin",
             "nvidia/ga102/gsp/fmc-570.144.bin",
             "nvidia/ga102/acr/bl-570.144.bin",
+            "nvidia/ga102/acr/bl.bin",
+            "nvidia/ad102/acr/bl.bin",
+            "nvidia/gb202/acr/bl.bin",
+            "nvidia/gp102/acr/bl.bin",
+            "nvidia/acr/bl.bin",
+            "nvidia/tu102/acr/bl.bin.zst",
+            "nvidia/tu102/acr/unload_bl.bin",
+            "nvidia/tu102/sub/acr/bl.bin",
         ] {
             assert_eq!(gsp_member(name), None, "{name}");
         }
@@ -1661,6 +1726,10 @@ mod tests {
         for chip in booters {
             for kind in ["booter_load", "booter_unload", "bootloader", "gsp"] {
                 let name = format!("nvidia/{chip}/gsp/{kind}-570.144.bin");
+                assert!(gsp_member(&name).is_some(), "{name}");
+            }
+            if chip.starts_with("tu") {
+                let name = format!("nvidia/{chip}/acr/bl.bin");
                 assert!(gsp_member(&name).is_some(), "{name}");
             }
         }
