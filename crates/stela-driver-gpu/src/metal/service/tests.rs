@@ -897,3 +897,69 @@ fn connections_hold_their_own_objects_until_they_close() {
     );
     assert_eq!(service.disconnect(first), Err(Fault::CLOSED));
 }
+
+/// A heap with no large free block on the thread that asks for one: every
+/// allocation of at least a size is refused there, for what must work
+/// without such a block. Other threads allocate as usual.
+pub(super) mod heap {
+    extern crate std;
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static REFUSED_FROM: Cell<usize> = const { Cell::new(usize::MAX) };
+        static REFUSED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct Capped;
+
+    #[global_allocator]
+    static ALLOCATOR: Capped = Capped;
+
+    fn refuses(size: usize) -> bool {
+        let refused = REFUSED_FROM
+            .try_with(|from| size >= from.get())
+            .unwrap_or(false);
+        if refused {
+            let _ = REFUSED.try_with(|count| count.set(count.get() + 1));
+        }
+        refused
+    }
+
+    // SAFETY: every call forwards to `System` unchanged, or refuses with null.
+    unsafe impl GlobalAlloc for Capped {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if refuses(layout.size()) {
+                return core::ptr::null_mut();
+            }
+            // SAFETY: the caller's `GlobalAlloc::alloc` contract, forwarded.
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            // SAFETY: `pointer` came from `System` with `layout`.
+            unsafe { std::alloc::System.dealloc(pointer, layout) }
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            if refuses(size) {
+                return core::ptr::null_mut();
+            }
+            // SAFETY: the caller's `GlobalAlloc::realloc` contract, forwarded.
+            unsafe { std::alloc::System.realloc(pointer, layout, size) }
+        }
+    }
+
+    /// Runs `body` with every allocation of `bytes` or more refused on this
+    /// thread, and says how many were.
+    pub(in crate::metal::service) fn without_blocks_of<R>(
+        bytes: usize,
+        body: impl FnOnce() -> R,
+    ) -> (R, usize) {
+        REFUSED.set(0);
+        REFUSED_FROM.set(bytes);
+        let result = body();
+        REFUSED_FROM.set(usize::MAX);
+        (result, REFUSED.get())
+    }
+}

@@ -1,7 +1,7 @@
 extern crate std;
 
 use super::{Memory, MockBackend, MockCompiler, Stream, commit, connect, service};
-use crate::metal::service::shared::UPKEEP_PIECES;
+use crate::metal::service::shared::{LIBRARY_PIECE_BYTES, UPKEEP_PIECES};
 use crate::metal::{
     capabilities::block::Block,
     service::{
@@ -22,8 +22,12 @@ impl CallerMemory for Memory {
             address,
             length: buffer.len() as u64,
         };
-        let bytes = GuestMemory::read(self, span).map_err(|_| CallerFault::Denied { address })?;
-        buffer.copy_from_slice(&bytes);
+        // Copied in place: a read allocates nothing of its length.
+        let range = self
+            .range(span)
+            .map_err(|_| CallerFault::Denied { address })?;
+        self.longest = self.longest.max(span.length);
+        buffer.copy_from_slice(&self.bytes[range]);
         Ok(())
     }
 
@@ -1105,7 +1109,8 @@ fn a_library_is_read_a_piece_at_each_run_and_its_turn_reads_none() {
     shared.set_library_piece(PIECE);
     let connection = connect(&mut shared.try_turn().unwrap());
     let mut memory = Memory::default();
-    let bytes = crate::metal::library::tests::fixture(false);
+    // Not the fixture's library, which the device holds from its start.
+    let bytes = crate::metal::library::tests::padded(256, 0x11);
     let data = memory.put(&bytes);
     let record = library_call(&mut memory, data);
     memory.longest = 0;
@@ -1120,6 +1125,17 @@ fn a_library_is_read_a_piece_at_each_run_and_its_turn_reads_none() {
         );
     }
     drop(held);
+    // The device holds no library of these bytes: they are read again, kept.
+    GateService::serve(&shared, connection, record, &mut memory).unwrap();
+    let call = completed(&mut memory, record);
+    assert_eq!(
+        (call.status, call.reason_length),
+        (Status::Pending.raw(), 0)
+    );
+    for _ in 1..bytes.len().div_ceil(PIECE) {
+        GateService::serve(&shared, connection, record, &mut memory).unwrap();
+        assert_eq!(completed(&mut memory, record).status, Status::Pending.raw());
+    }
     GateService::serve(&shared, connection, record, &mut memory).unwrap();
     let call = completed(&mut memory, record);
     assert_eq!(call.status, Status::Ok.raw());
@@ -1154,4 +1170,62 @@ fn a_library_is_read_a_piece_at_each_run_and_its_turn_reads_none() {
         (call.status, call.reason_length),
         (Status::Unmapped.raw(), 0)
     );
+}
+
+/// Serves the `NewLibrary` call at `record` until it is answered other than
+/// `Pending`, with at most `runs` runs.
+fn serve_library(
+    shared: &SharedService<MockBackend, MockCompiler>,
+    connection: NonZeroU64,
+    record: u64,
+    memory: &mut Memory,
+    runs: usize,
+) -> GateCall {
+    for _ in 0..runs {
+        GateService::serve(shared, connection, record, memory).unwrap();
+        let call = completed(memory, record);
+        if call.status != Status::Pending.raw() {
+            return call;
+        }
+    }
+    panic!("the library call still pending after {runs} runs");
+}
+
+/// A library another process holds is shared by its digest with no
+/// allocation of its size: a heap whose largest free block is far smaller
+/// than the library still serves it. A library the device does not hold
+/// needs one block of its size for the kept copy; without one the call is
+/// answered out of memory.
+#[test]
+fn a_held_library_is_shared_without_a_block_of_its_size() {
+    const LIBRARY: usize = 8 << 20;
+    const LARGEST_BLOCK: usize = 2 << 20;
+    let shared = SharedService::new(service(), HOST);
+    let first = connect(&mut shared.try_turn().unwrap());
+    let mut memory = Memory::default();
+    let bytes = crate::metal::library::tests::padded(LIBRARY, 0x5a);
+    let data = memory.put(&bytes);
+    let record = library_call(&mut memory, data);
+    let runs = 2 * bytes.len().div_ceil(LIBRARY_PIECE_BYTES) + 4;
+    assert_eq!(
+        serve_library(&shared, first, record, &mut memory, runs).status,
+        Status::Ok.raw()
+    );
+
+    let second = connect(&mut shared.try_turn().unwrap());
+    let again = library_call(&mut memory, data);
+    let (call, refused) = super::heap::without_blocks_of(LARGEST_BLOCK, || {
+        serve_library(&shared, second, again, &mut memory, runs)
+    });
+    assert_eq!(call.status, Status::Ok.raw());
+    assert_eq!(refused, 0, "no allocation of a large block was asked for");
+
+    let other = crate::metal::library::tests::padded(LIBRARY, 0xa5);
+    let data = memory.put(&other);
+    let new = library_call(&mut memory, data);
+    let (call, refused) = super::heap::without_blocks_of(LARGEST_BLOCK, || {
+        serve_library(&shared, second, new, &mut memory, runs)
+    });
+    assert_eq!(call.status, Status::OutOfMemory.raw());
+    assert_ne!(refused, 0);
 }

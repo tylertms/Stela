@@ -89,8 +89,11 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 }
                 (Status::Ok, "")
             }
-            // The frontend answers `Unmapped` by mapping the span and retrying.
-            Err(fault) if fault.status == Status::Unmapped => (fault.status, fault.reason),
+            // The frontend answers `Unmapped` by mapping the span and retrying,
+            // and makes a `Pending` call again.
+            Err(fault) if matches!(fault.status, Status::Unmapped | Status::Pending) => {
+                (fault.status, fault.reason)
+            }
             // A heap without room is routine: the device counts it.
             Err(fault) if fault == Fault::HEAP_FULL => (fault.status, fault.reason),
             // Metal's own nil answer is a note, not a refusal; a note the

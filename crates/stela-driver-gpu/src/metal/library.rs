@@ -633,18 +633,43 @@ pub(crate) mod tests {
 
     /// A library of `kind` whose module's wrapper names `cpu_type`.
     pub(crate) fn container(duplicate: bool, kind: u8, cpu_type: u32) -> Vec<u8> {
-        container_named(duplicate, kind, cpu_type, None, &[])
+        container_named(duplicate, kind, cpu_type, None, &[], 32)
+    }
+
+    /// [`fixture`] whose module holds `module_bytes` bytes, its padding
+    /// after the bitcode filled with `fill`: a library of that size.
+    pub(crate) fn padded(module_bytes: usize, fill: u8) -> Vec<u8> {
+        let mut data = container_named(false, 0, u32::MAX, None, &[], module_bytes);
+        let code = u64::from_le_bytes(data[72..80].try_into().unwrap()) as usize;
+        let end = code + module_bytes;
+        data[code + 32..end].fill(fill);
+        // The module's digest covers the padding.
+        let digest = Sha256::digest(&data[code..end]);
+        let at = data
+            .windows(4)
+            .position(|tag| tag == b"HASH")
+            .expect("the entry names its module's digest")
+            + 6;
+        data[at..at + 32].copy_from_slice(&digest);
+        data
     }
 
     /// A dynamic library of the given install name tag value.
     pub(crate) fn dynamic(install_name: &[u8]) -> Vec<u8> {
-        container_named(false, Header::DYNAMIC, u32::MAX, Some(install_name), &[])
+        container_named(
+            false,
+            Header::DYNAMIC,
+            u32::MAX,
+            Some(install_name),
+            &[],
+            32,
+        )
     }
 
     /// An executable library named `file` that links the dynamic libraries
     /// of the install name tag values `linked`, as Metal's linker writes it.
     pub(crate) fn linking(file: &[u8], linked: &[&[u8]]) -> Vec<u8> {
-        container_named(false, 0, u32::MAX, Some(file), linked)
+        container_named(false, 0, u32::MAX, Some(file), linked, 32)
     }
 
     fn container_named(
@@ -653,13 +678,14 @@ pub(crate) mod tests {
         cpu_type: u32,
         install_name: Option<&[u8]>,
         linked: &[&[u8]],
+        module_bytes: usize,
     ) -> Vec<u8> {
         let mut module = vec![];
         for word in [LLVM_WRAPPER_MAGIC, 0, 20, 8, cpu_type] {
             module.extend_from_slice(&word.to_le_bytes());
         }
         module.extend_from_slice(b"BC\xc0\xde\0\0\0\0");
-        module.resize(32, 0);
+        module.resize(module_bytes.max(32), 0);
         let mut entry = vec![0; 4];
         tag(&mut entry, b"NAME", b"kernel\0");
         if duplicate {
@@ -738,6 +764,16 @@ pub(crate) mod tests {
         let block = u64::from_le_bytes(data[40..48].try_into().unwrap()) as usize;
         data[block..block + 4].copy_from_slice(&3u32.to_le_bytes());
         assert_eq!(Library::parse(&data).unwrap_err().kind, ErrorKind::Metadata);
+    }
+
+    #[test]
+    fn a_padded_library_parses_with_a_module_of_its_size() {
+        let data = padded(4096, 0x5a);
+        let library = Library::parse(&data).unwrap();
+        let module = library.functions()[0].module_range();
+        assert_eq!(module.len(), 4096);
+        assert!(data[module][32..].iter().all(|byte| *byte == 0x5a));
+        assert_ne!(data, padded(4096, 0xa5));
     }
 
     #[test]

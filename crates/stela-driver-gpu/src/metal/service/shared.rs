@@ -254,19 +254,32 @@ impl RecentImports {
 /// The bytes of a library a `NewLibrary` call reads and digests at once,
 /// before its turn; a run reads pieces until its budget
 /// ([`SharedService::set_library_budget`]) is spent, at least one.
-const LIBRARY_PIECE_BYTES: usize = 1 << 20;
+pub(super) const LIBRARY_PIECE_BYTES: usize = 1 << 20;
 
 /// Libraries read in part at once; past this the oldest is dropped, and its
 /// call, made again, starts over.
 const STAGED: usize = 4;
 
-/// A `NewLibrary` call's bytes read so far ([`SharedService::stage_library`]).
+/// A `NewLibrary` call's library read so far ([`SharedService::stage_library`]).
+///
+/// A library is first read only to digest it, a piece at a time through one
+/// piece buffer, keeping no byte: the device shares the bytes of a library
+/// it already holds by their digest, and every process loads the same
+/// system libraries of hundreds of megabytes. Only when the turn finds the
+/// device holds no library of that digest is the library read again into
+/// `kept`, digested again as it is copied, so the kept bytes are what the
+/// digest names even when the caller changed them between the reads.
 struct Staging {
     connection: u64,
     record: u64,
     span: Span,
-    bytes: Vec<u8>,
+    /// The bytes read and digested so far.
+    read: usize,
     digest: Sha256,
+    /// The buffer each piece is read into while only digesting.
+    piece: Vec<u8>,
+    /// The bytes, once the turn asked for them.
+    kept: Option<Vec<u8>>,
 }
 
 /// What reading the next piece of a call's library found.
@@ -994,42 +1007,63 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
                 .position(|staged| (staged.connection, staged.record, staged.span) == at)?;
             Some(staging.remove(found))
         });
+        let piece = self.library_piece.load(Ordering::Acquire);
         let mut staged = match kept {
             Some(staged) => staged,
             None => {
-                let mut bytes = Vec::new();
+                let mut buffer = Vec::new();
                 // Without room the turn reports the failure.
-                if bytes.try_reserve_exact(length).is_err() {
+                if buffer.try_reserve_exact(piece.min(length)).is_err() {
                     return Staged::Not;
                 }
                 Staging {
                     connection: connection.get(),
                     record,
                     span,
-                    bytes,
+                    read: 0,
                     digest: Sha256::new(),
+                    piece: buffer,
+                    kept: None,
                 }
             }
         };
+        // The second read keeps every byte: the one allocation of the
+        // library's size, made only for a library the device does not hold.
+        if let Some(kept) = &mut staged.kept
+            && kept.capacity() < length
+            && kept.try_reserve_exact(length).is_err()
+        {
+            return Staged::Not;
+        }
         let budget = self.library_budget.load(Ordering::Acquire);
-        let piece = self.library_piece.load(Ordering::Acquire);
         let began = (self.host.ticks)();
         let found = loop {
-            let start = staged.bytes.len();
+            let start = staged.read;
             if start == length {
                 break Staged::Ready;
             }
             let end = start.saturating_add(piece).min(length);
-            staged.bytes.resize(end, 0);
-            if let Err(error) = caller.read(span.address + start as u64, &mut staged.bytes[start..])
-            {
-                staged.bytes.truncate(start);
+            let target = match &mut staged.kept {
+                Some(kept) => {
+                    kept.resize(end, 0);
+                    &mut kept[start..end]
+                }
+                None => {
+                    staged.piece.resize(end - start, 0);
+                    &mut staged.piece[..end - start]
+                }
+            };
+            if let Err(error) = caller.read(span.address + start as u64, target) {
+                if let Some(kept) = &mut staged.kept {
+                    kept.truncate(start);
+                }
                 match error {
                     CallerFault::Denied { .. } => break Staged::Unmapped,
                     _ => return Staged::Not,
                 }
             }
-            staged.digest.update(&staged.bytes[start..]);
+            staged.digest.update(&*target);
+            staged.read = end;
             if end < length && (self.host.ticks)().wrapping_sub(began) >= budget {
                 break Staged::Pending;
             }
@@ -1048,15 +1082,35 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         let staged = self.staging.with(|staging| {
             let found = staging.iter().position(|staged| {
                 (staged.connection, staged.record) == (connection.get(), record)
-                    && staged.bytes.len() as u64 == staged.span.length
+                    && staged.read as u64 == staged.span.length
             })?;
             Some(staging.remove(found))
         })?;
         Some(StagedLibrary {
             span: staged.span,
-            bytes: staged.bytes,
+            bytes: staged.kept,
             digest: staged.digest.finalize().into(),
         })
+    }
+
+    /// Reads the library of the call at `record` again, keeping its bytes,
+    /// once its turn found the device holds no library of its digest.
+    fn keep_library(&self, connection: NonZeroU64, record: u64, span: Span) {
+        let staged = Staging {
+            connection: connection.get(),
+            record,
+            span,
+            read: 0,
+            digest: Sha256::new(),
+            piece: Vec::new(),
+            kept: Some(Vec::new()),
+        };
+        self.staging.with(|staging| {
+            if staging.len() == STAGED {
+                staging.remove(0);
+            }
+            staging.push(staged);
+        });
     }
 
     /// Queues each of `jobs` unless one of its key is queued, running or
@@ -1505,6 +1559,9 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
             }
             let served = turn.serve(connection, record, &mut deferrable);
             turn.staged_library = None;
+            if let Some(span) = turn.library_wanted.take() {
+                self.keep_library(connection, record, span);
+            }
             let device = turn.device();
             // A call that went on past a deferral may have left both.
             let jobs: Vec<Job> = [

@@ -44,17 +44,22 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 let digest = library_digest(&bytes);
                 StagedLibrary {
                     span: request.data,
-                    bytes,
+                    bytes: Some(bytes),
                     digest,
                 }
             }
         };
-        let length = staged.bytes.len() as u64;
-        let library = match self.device.share_library(length, &staged.digest)? {
-            Some(library) => library,
-            None => self
-                .device
-                .new_library_digested(staged.bytes, staged.digest)?,
+        let length = request.data.length;
+        let shared = self.device.share_library(length, &staged.digest)?;
+        let library = match (shared, staged.bytes) {
+            (Some(library), _) => library,
+            (None, Some(bytes)) => self.device.new_library_digested(bytes, staged.digest)?,
+            // Only digested: the bytes are read again, kept, before the
+            // call's next turn.
+            (None, None) => {
+                self.library_wanted = Some(request.data);
+                return Err(Fault::new(Status::Pending, ""));
+            }
         };
         let handle = self.hold(call.connection, Object::Library(library))?;
         call.reply(&handle)

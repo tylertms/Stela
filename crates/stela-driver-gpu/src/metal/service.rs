@@ -124,13 +124,16 @@ pub trait GuestMemory {
     fn write(&mut self, span: Span, bytes: &[u8]) -> Result<(), Fault>;
 }
 
-/// A `NewLibrary` call's bytes, read from its span and digested
+/// A `NewLibrary` call's library, read from its span and digested
 /// ([`crate::metal::device::pipelines::library_digest`]) a piece at each of its runs
 /// before its turn (`shared.rs`): no turn reads a library of hundreds of
 /// megabytes, and a library of held bytes is shared by its digest.
 pub struct StagedLibrary {
     pub span: Span,
-    pub bytes: Vec<u8>,
+    /// The bytes, when they were kept: a first read only digests them, and
+    /// the call reads them again only for a library the device does not
+    /// hold.
+    pub bytes: Option<Vec<u8>>,
     pub digest: [u8; 32],
 }
 
@@ -345,6 +348,10 @@ pub struct Service<B: Backend, C: Compiler> {
     /// The bytes of the call served now's library, read before its turn
     /// ([`StagedLibrary`]).
     staged_library: Option<StagedLibrary>,
+    /// The span of the call served now's library, which the device does not
+    /// hold: its bytes are read again before the call's next turn, and the
+    /// call is answered `Pending`.
+    library_wanted: Option<Span>,
     reopen: Option<Reopen<B, C>>,
     prepare: Option<Prepare<B, C>>,
 }
@@ -366,6 +373,7 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             loss_described: false,
             pins_reported: false,
             staged_library: None,
+            library_wanted: None,
             reopen: None,
             prepare: None,
         }

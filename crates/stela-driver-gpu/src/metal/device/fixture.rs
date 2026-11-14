@@ -611,7 +611,9 @@ impl Backend for MockBackend {
 /// constant. Library `n` is the `n`-th added, `None` once removed.
 #[derive(Default)]
 pub(crate) struct MockCompiler {
-    pub(crate) libraries: Vec<Option<Vec<u8>>>,
+    /// Each library's bytes; a shared library holds the same ones, as the
+    /// AIR compiler's does.
+    pub(crate) libraries: Vec<Option<alloc::sync::Arc<Vec<u8>>>>,
     pub(crate) compiled: Vec<Specialization>,
     pub(crate) tessellations: Vec<Tessellation>,
     pub(crate) released: Vec<ShaderCode>,
@@ -784,12 +786,15 @@ impl Compiler for MockCompiler {
         self.adopted += 1;
     }
     fn add_library(&mut self, data: Vec<u8>) -> Result<u64> {
-        self.libraries.push(Some(data));
+        self.libraries.push(Some(alloc::sync::Arc::new(data)));
         Ok(self.libraries.len() as u64 - 1)
     }
     fn share_library(&mut self, library: u64) -> Result<u64> {
-        let data = self.library_data(library)?.to_vec();
-        self.add_library(data)
+        let data = self.libraries[library as usize]
+            .clone()
+            .ok_or(Error::Invalid("unknown library"))?;
+        self.libraries.push(Some(data));
+        Ok(self.libraries.len() as u64 - 1)
     }
     fn functions(&mut self, _: &[u8]) -> Result<Vec<(String, FunctionType)>> {
         Ok(alloc::vec![
@@ -806,6 +811,7 @@ impl Compiler for MockCompiler {
     fn library_data(&self, library: u64) -> Result<&[u8]> {
         self.libraries[library as usize]
             .as_deref()
+            .map(Vec::as_slice)
             .ok_or(Error::Invalid("unknown library"))
     }
     fn remove_library(&mut self, library: u64) -> Result<()> {
