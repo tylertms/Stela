@@ -385,9 +385,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.timer_registers = registers;
             self.timers = None;
         }
-        let deadline = *self
-            .timers
-            .get_or_insert_with(|| timer::deadline(&self.cpu));
+        // A timer with an offset is read at the count now, once for each
+        // change of the timers: the answer holds as the count advances
+        // (`timer::deadline`). Without one no count is read.
+        let deadline = match self.timers {
+            Some(deadline) => deadline,
+            None => {
+                let (clock, host) = (&mut self.clock, &mut self.host);
+                let deadline = timer::deadline(&self.cpu, || clock.read(|| host.counter()));
+                *self.timers.insert(deadline)
+            }
+        };
         self.clock.timer_due(deadline)
     }
 

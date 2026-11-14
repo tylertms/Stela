@@ -564,7 +564,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let device = self.device_lines_of(pe, now);
         let parked = self.parked(pe);
-        let timer = timer::deadline(&parked.cpu).is_some_and(|deadline| now >= deadline)
+        let timer = timer::deadline(&parked.cpu, || now).is_some_and(|deadline| now >= deadline)
             || super::monitor_asserted(&parked.cpu, now);
         let lines = parked.cpu.core_lines(Lines {
             irq: device.irq,
@@ -631,7 +631,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 && !self.processor_paused(pe)
                 && !down(parked.waiting)
             {
-                consider(timer::deadline(&parked.cpu));
+                consider(timer::deadline(&parked.cpu, || now));
                 consider(
                     parked
                         .cpu

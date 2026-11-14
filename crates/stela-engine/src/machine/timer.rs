@@ -169,12 +169,38 @@ impl Channel {
             && self.met(cpu, bank, physical)
     }
 
-    /// The system count at which the output can assert.
-    pub fn deadline(&self, cpu: &Cpu, bank: Bank) -> Option<u64> {
+    /// The system count at which the output can assert. Without an offset
+    /// it is the compare value's. With one, the bank's count less the offset
+    /// wraps as the architecture's virtual count does, so the answer is the
+    /// one seen at system count `physical`, read only then: `physical`
+    /// itself while the condition holds ([`Self::met`]: an offset above the
+    /// count leaves the virtual count high), else the count at which the
+    /// virtual count reaches the compare value, none when that is only after
+    /// the count wraps (a compare value plus the offset that overflows,
+    /// which is no deadline in the past). Either stays right as the count
+    /// advances, until the virtual count wraps.
+    pub fn deadline(
+        &self,
+        cpu: &Cpu,
+        bank: Bank,
+        physical: &mut impl FnMut() -> u64,
+    ) -> Option<u64> {
         if self.gated(cpu) || value(cpu, bank, self.control) & (ENABLE | IMASK) != ENABLE {
             return None;
         }
-        let compare = value(cpu, bank, self.compare).wrapping_add(self.offset_of(cpu, bank));
+        let offset = self.offset_of(cpu, bank);
+        let compare = value(cpu, bank, self.compare);
+        if offset == 0 {
+            return Some(system_count(cpu, bank, compare));
+        }
+        let physical = physical();
+        if self.met(cpu, bank, physical) {
+            return Some(physical);
+        }
+        let compare = compare.wrapping_add(offset);
+        if compare < count(cpu, bank, physical) {
+            return None;
+        }
         Some(system_count(cpu, bank, compare))
     }
 }
@@ -206,10 +232,14 @@ pub fn asserted(cpu: &Cpu, physical: u64) -> bool {
     timers(cpu).any(|(bank, channel)| channel.asserted(cpu, bank, physical))
 }
 
-/// The earliest system count at which a timer can signal FIQ.
-pub fn deadline(cpu: &Cpu) -> Option<u64> {
+/// The earliest system count at which a timer can signal FIQ
+/// ([`Channel::deadline`]). `physical` gives the system count now; it is
+/// read at most once, and only for a timer with an offset.
+pub fn deadline(cpu: &Cpu, mut physical: impl FnMut() -> u64) -> Option<u64> {
+    let mut now = None;
+    let mut physical = || *now.get_or_insert_with(&mut physical);
     timers(cpu)
-        .filter_map(|(bank, channel)| channel.deadline(cpu, bank))
+        .filter_map(|(bank, channel)| channel.deadline(cpu, bank, &mut physical))
         .min()
 }
 
@@ -227,7 +257,7 @@ pub(crate) fn epoch_deadline(cpu: &Cpu, physical: u64) -> Option<u64> {
                 || channel.offset_of(cpu, *bank) != 0
                 || !channel.asserted(cpu, *bank, physical)
         })
-        .filter_map(|(bank, channel)| channel.deadline(cpu, bank))
+        .filter_map(|(bank, channel)| channel.deadline(cpu, bank, &mut || physical))
         .min()
 }
 
@@ -344,7 +374,7 @@ mod tests {
         assert_eq!(epoch_deadline(&cpu, 99), Some(100));
         for now in [100, 101, 199] {
             assert!(asserted(&cpu, now));
-            assert_eq!(deadline(&cpu), Some(100));
+            assert_eq!(deadline(&cpu, || now), Some(100));
             assert_eq!(epoch_deadline(&cpu, now), Some(200));
         }
         assert_eq!(epoch_deadline(&cpu, 200), None);
@@ -382,7 +412,7 @@ mod tests {
         assert!(cpu.apple.generic_timer.set(Register::CNTHV_CVAL_EL2, 2));
         assert!(cpu.apple.generic_timer.set(Register::CNTHV_CTL_EL2, ENABLE));
         assert!(asserted(&cpu, 3));
-        assert_eq!(deadline(&cpu), Some(2));
+        assert_eq!(deadline(&cpu, || 0), Some(2));
         assert_eq!(epoch_deadline(&cpu, 3), None);
     }
 
@@ -393,16 +423,16 @@ mod tests {
         let virtual_timer = CHANNELS[1];
         cpu.registers.set(Register::CNTV_CVAL_EL0, 0, 1500);
         cpu.registers.set(Register::CNTVOFF_EL2, 0, 100);
-        assert_eq!(deadline(&cpu), None);
+        assert_eq!(deadline(&cpu, || 0), None);
         cpu.registers.set(Register::CNTV_CTL_EL0, 0, ENABLE);
-        assert_eq!(deadline(&cpu), Some(1600));
+        assert_eq!(deadline(&cpu, || 200), Some(1600));
         assert!(!asserted(&cpu, 1599) && asserted(&cpu, 1600));
         assert_eq!(
             virtual_timer.read_control(&cpu, Bank::Arm, 1600),
             ENABLE | ISTATUS
         );
         cpu.apple.vm_timer_fiq = 0;
-        assert!(!asserted(&cpu, 1600) && deadline(&cpu).is_none());
+        assert!(!asserted(&cpu, 1600) && deadline(&cpu, || 0).is_none());
         assert!(
             virtual_timer.met(&cpu, Bank::Arm, 1600),
             "the condition ignores the gate"
@@ -414,6 +444,37 @@ mod tests {
         assert!(!asserted(&cpu, 20));
         cpu.registers.set(Register::CNTHP_CTL_EL2, 0, ENABLE);
         assert!(asserted(&cpu, 20));
+    }
+
+    /// The virtual count is the count less CNTVOFF, modulo 2^64: a compare
+    /// value plus the offset that overflows is not a deadline in the past,
+    /// and an offset above the count leaves the condition met already. The
+    /// deadline agrees with the condition either way.
+    #[test]
+    fn a_deadline_follows_the_wrapping_virtual_count() {
+        let mut cpu = Cpu::of(Chip::AppleM2, 0, Pstate::reset(1));
+        cpu.registers.set(Register::CNTVOFF_EL2, 0, 100);
+        cpu.registers.set(Register::CNTV_CVAL_EL0, 0, u64::MAX);
+        cpu.registers.set(Register::CNTV_CTL_EL0, 0, ENABLE);
+        // Count past the offset: the virtual count never reaches "never".
+        assert!(!asserted(&cpu, 150));
+        assert_eq!(deadline(&cpu, || 150), None);
+        // Count below it: the virtual count is just below 2^64 and reaches
+        // all ones at count 99.
+        assert!(!asserted(&cpu, 50));
+        assert_eq!(deadline(&cpu, || 50), Some(99));
+        assert!(asserted(&cpu, 99));
+        // A guest hypervisor's VM whose virtual count runs 1000 ahead.
+        cpu.registers
+            .set(Register::CNTVOFF_EL2, 0, 1000u64.wrapping_neg());
+        cpu.registers.set(Register::CNTV_CVAL_EL0, 0, 5000);
+        assert_eq!(deadline(&cpu, || 0), Some(4000));
+        assert!(!asserted(&cpu, 3999) && asserted(&cpu, 4000));
+        // One already due is due now, not after the count wraps.
+        cpu.registers.set(Register::CNTV_CVAL_EL0, 0, 500);
+        assert!(asserted(&cpu, 0));
+        assert_eq!(deadline(&cpu, || 0), Some(0));
+        assert_eq!(deadline(&cpu, || 7), Some(7));
     }
 
     #[test]
@@ -464,13 +525,13 @@ mod tests {
         // 125 Arm ticks are 3 system ticks.
         cpu.registers.set(Register::CNTV_CVAL_EL0, 0, 125);
         cpu.registers.set(Register::CNTV_CTL_EL0, 0, ENABLE);
-        assert_eq!(deadline(&cpu), Some(3));
+        assert_eq!(deadline(&cpu, || 0), Some(3));
         assert!(!asserted(&cpu, 2) && asserted(&cpu, 3));
         let apple = &mut cpu.apple.generic_timer;
         assert!(
             apple.set(Register::CNTHV_CVAL_EL2, 2) && apple.set(Register::CNTHV_CTL_EL2, ENABLE)
         );
-        assert_eq!(deadline(&cpu), Some(2));
+        assert_eq!(deadline(&cpu, || 0), Some(2));
         let el2_virtual = CHANNELS[3];
         assert_eq!(
             el2_virtual.read_control(&cpu, Bank::Apple, 2),
