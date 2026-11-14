@@ -107,6 +107,8 @@ struct Cursors(VecDeque<(String, Progress)>);
 impl Cursors {
     // Each deflate cursor owns a 64 KiB input buffer, a 32 KiB window,
     // and the decoder state. Stored cursors have no inflater allocation.
+    // A cursor whose read is pending also holds that read's bytes so far,
+    // at most MAX_READ_BYTES plus a block.
     const LIMIT: usize = 6;
 
     fn read<R: ReadAt>(
@@ -126,11 +128,19 @@ impl Cursors {
             Some((name, progress)) => (Some(name), Some(progress)),
             None => (None, None),
         };
-        archive
+        let result = archive
             .read_member_resuming(reader, entry, &mut progress, offset, output)
-            .map_err(|error| source_error(reader, error))?;
-        if let Some(progress) = progress
-            && progress.produced() < entry.bytes
+            .map_err(|error| source_error(reader, error));
+        // A pending read keeps its cursor, with the bytes it produced, so
+        // asking again goes on from there instead of inflating the member's
+        // prefix again; any other failure drops it.
+        let keep = match &result {
+            Ok(()) => true,
+            Err(error) => matches!(error, Error::Pending),
+        };
+        if keep
+            && let Some(progress) = progress
+            && progress.resumes_from() < entry.bytes
         {
             if self.0.len() == Self::LIMIT {
                 self.0.pop_front();
@@ -138,7 +148,7 @@ impl Cursors {
             self.0
                 .push_back((name.unwrap_or_else(|| entry.name.clone()), progress));
         }
-        Ok(())
+        result
     }
 }
 

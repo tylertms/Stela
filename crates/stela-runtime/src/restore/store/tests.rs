@@ -591,3 +591,111 @@ fn a_scan_a_pending_read_stops_goes_on_without_reading_again() {
         );
     }
 }
+
+/// A remote image's device-verified members have no scan: their reads go
+/// straight to the cursors. A read longer than a few network refills that
+/// runs out of time again and again still goes on where it stopped, and
+/// reads each compressed byte once; any other failure drops the cursor.
+#[test]
+fn a_pending_device_verified_read_goes_on_from_its_bytes_so_far() {
+    /// Every third read runs out of time once reads are bounded; counts
+    /// the bytes it serves.
+    struct Stalling {
+        source: Memory,
+        reads: usize,
+        served: u64,
+        blocked: bool,
+        bounded: bool,
+        broken: bool,
+    }
+    impl ReadAt for Stalling {
+        type Error = &'static str;
+
+        fn len(&self) -> u64 {
+            self.source.len()
+        }
+
+        fn read_at(
+            &mut self,
+            offset: u64,
+            buffer: &mut [u8],
+        ) -> core::result::Result<(), Self::Error> {
+            self.reads += 1;
+            if self.broken {
+                return Err("connection refused");
+            }
+            if self.bounded && self.reads.is_multiple_of(3) {
+                self.blocked = true;
+                return Err("the read's time ran out");
+            }
+            self.served += buffer.len() as u64;
+            self.source.read_at(offset, buffer)
+        }
+
+        fn blocked(&mut self) -> bool {
+            core::mem::take(&mut self.blocked)
+        }
+    }
+
+    // Barely compressible, so one read spans many input refills.
+    let mut state = 0x1b87_3593_u32;
+    let data: Vec<u8> = (0..3 * MAX_READ_BYTES + 777)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state >> 24) as u8
+        })
+        .collect();
+    for deflate in [false, true] {
+        let (source, mut manifest) = parts(&data, deflate, &[], &[], ERASE);
+        manifest.layout = stela_formats::payload::Layout::Remote {
+            url: "http://updates-http.cdn-apple.com/a.ipsw".into(),
+            etag: "\"e\"".into(),
+        };
+        manifest.source.sha256 = None;
+        manifest.members[0].sha256 = None;
+        let archive = source.len();
+        let reader = Stalling {
+            source,
+            reads: 0,
+            served: 0,
+            blocked: false,
+            bounded: false,
+            broken: false,
+        };
+        let mut store = Store::open(reader, manifest, 0).unwrap();
+        store.prepare().unwrap();
+        store.reader.served = 0;
+        store.reader.bounded = true;
+        let mut pending = 0;
+        let mut offset = 0;
+        while offset < data.len() {
+            let len = MAX_READ_BYTES.min(data.len() - offset);
+            let bytes = loop {
+                match store.read_at("os.dmg", offset as u64, len) {
+                    Ok(bytes) => break bytes,
+                    Err(Error::Pending) => pending += 1,
+                    Err(error) => panic!("deflate={deflate}: {error:?}"),
+                }
+                assert!(pending < 1000, "deflate={deflate}");
+            };
+            assert!(bytes == data[offset..offset + len], "deflate={deflate}");
+            offset += len;
+        }
+        assert!(pending >= 2, "deflate={deflate}");
+        assert!(
+            store.reader.served < archive + 64 * 1024,
+            "deflate={deflate}: served {} of {archive}",
+            store.reader.served
+        );
+        // A failure that is not the source's time running out drops the
+        // cursor: the next read starts the member again.
+        store.reader.bounded = false;
+        assert!(store.read_at("os.dmg", 0, 16).is_ok());
+        store.reader.broken = true;
+        let error = store.read_at("os.dmg", 16, MAX_READ_BYTES);
+        assert!(matches!(error, Err(Error::Payload(_))), "{error:?}");
+        assert!(store.cursors.0.is_empty(), "deflate={deflate}");
+    }
+}
