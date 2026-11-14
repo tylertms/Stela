@@ -1005,11 +1005,13 @@ fn claim(
     };
     let (mut bars, mut resources) = (Vec::new(), ManuallyDrop::new(Vec::new()));
     let function_bars = function.bars().map_err(ServiceError::Config)?;
-    if !matches!(function_bars[0], Some(Bar::Memory { prefetchable: false, size, .. }) if size >= PAGE)
-        || function.config().read16(4).map_err(ServiceError::Config)? & 2 == 0
-    {
+    if let Err(why) = gpu::cold::register_bar(function_bars[0], PAGE) {
+        output::arguments(format_args!(
+            "GPU {address} register BAR refused: {why:?} BAR0={:?}\n",
+            function_bars[0]
+        ));
         return Err(ServiceError::Refused(
-            "the GPU's register BAR does not decode",
+            "the GPU's BAR 0 is not an assigned register window",
         ));
     }
     for (region, bar) in placement.regions.iter_mut().zip(function_bars) {
@@ -1044,6 +1046,21 @@ fn claim(
                 }
                 | if wide { RESOURCE_WIDE } else { 0 },
         };
+    }
+    // Each memory BAR lies in a host aperture: decode it, as Linux
+    // `pci_enable_device` does before the register reads below.
+    let decode = gpu::cold::enable_decode(function, timer.as_ref()).map_err(|error| {
+        output::arguments(format_args!(
+            "GPU {address} memory decoding refused: {error:?}\n"
+        ));
+        ServiceError::Refused("the GPU's memory decoding did not turn on")
+    })?;
+    if decode.power_state != 0 || decode.memory_was_off {
+        output::arguments(format_args!(
+            "GPU {address}: firmware left it in D{} with memory decoding {}; brought to D0 with decoding on, as Linux pci_enable_device does\n",
+            decode.power_state,
+            if decode.memory_was_off { "off" } else { "on" }
+        ));
     }
     let config = function
         .config()

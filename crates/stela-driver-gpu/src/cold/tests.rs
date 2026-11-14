@@ -25,6 +25,8 @@ struct State {
     /// A bus reset is offered, and whether it fails.
     bus_reset: bool,
     fail_bus_reset: bool,
+    /// The Command register drops writes to its memory decoding bit.
+    memory_stuck: bool,
 }
 struct Config {
     words: Box<[u32; 128]>,
@@ -62,6 +64,11 @@ impl ConfigSpace for Config {
     }
     fn write32(&mut self, offset: u16, value: u32) -> Result<(), ConfigError> {
         let before = self.words[usize::from(offset / 4)];
+        let value = if offset == 4 && self.state.borrow().memory_stuck {
+            value & !2 | before & 2
+        } else {
+            value
+        };
         self.words[usize::from(offset / 4)] = value;
         if offset == 0x84 && value & 3 == 3 {
             self.state.borrow_mut().events.push("d3hot");
@@ -515,5 +522,110 @@ fn a_translated_function_without_a_function_reset_still_gets_the_bus_reset() {
     assert_eq!(
         state.borrow().events,
         ["views-seal", "bus-reset", "root-drain", "bind"]
+    );
+}
+
+#[test]
+fn register_bar_names_each_window_nouveau_cannot_map() {
+    let memory = |address, size, prefetchable| {
+        Some(Bar::Memory {
+            address,
+            size,
+            prefetchable,
+            wide: false,
+        })
+    };
+    assert_eq!(
+        register_bar(memory(0xfe00_0000, 1 << 24, false), 4096),
+        Ok(())
+    );
+    assert_eq!(register_bar(None, 4096), Err(RegisterBar::Absent));
+    assert_eq!(
+        register_bar(
+            Some(Bar::Io {
+                port: 0x1000,
+                size: 128
+            }),
+            4096
+        ),
+        Err(RegisterBar::Io)
+    );
+    assert_eq!(
+        register_bar(memory(0xfe00_0000, 1 << 24, true), 4096),
+        Err(RegisterBar::Prefetchable)
+    );
+    assert_eq!(
+        register_bar(memory(0xfe00_0000, 2048, false), 4096),
+        Err(RegisterBar::Small)
+    );
+    assert_eq!(
+        register_bar(memory(0, 1 << 24, false), 4096),
+        Err(RegisterBar::Unassigned)
+    );
+}
+
+/// A hybrid laptop's firmware leaves the discrete GPU's memory decoding off;
+/// Linux `pci_enable_device` turns it on, and so does the claim, leaving bus
+/// mastering and INTx as they were.
+#[test]
+fn decode_firmware_left_off_is_turned_on_alone() {
+    let (mut inputs, state) = inputs();
+    let function = &mut inputs.requester.function;
+    function.config().words[1] = 0x0010_0400;
+    let timer = PhysicalTimer(state.clone());
+    assert_eq!(
+        enable_decode(function, &timer),
+        Ok(Decode {
+            power_state: 0,
+            memory_was_off: true,
+        })
+    );
+    assert_eq!(function.config().words[1] & 0xffff, 0x0402);
+    assert_eq!(state.borrow().minimum_waited_us, 0);
+    // Already on: nothing changes.
+    assert_eq!(
+        enable_decode(function, &timer),
+        Ok(Decode {
+            power_state: 0,
+            memory_was_off: false,
+        })
+    );
+    assert_eq!(function.config().words[1] & 0xffff, 0x0402);
+    assert!(state.borrow().events.is_empty());
+}
+
+/// A function in D3hot comes to D0 first, its BARs restored after the soft
+/// reset, then decodes.
+#[test]
+fn decode_brings_a_d3hot_function_to_d0_first() {
+    let (mut inputs, state) = inputs();
+    let function = &mut inputs.requester.function;
+    function.config().words[1] = 0x0010_0400;
+    function.config().words[0x84 / 4] = 3;
+    let timer = PhysicalTimer(state.clone());
+    assert_eq!(
+        enable_decode(function, &timer),
+        Ok(Decode {
+            power_state: 3,
+            memory_was_off: true,
+        })
+    );
+    assert_eq!(state.borrow().events, ["d0"]);
+    assert!(state.borrow().minimum_waited_us >= 10_000);
+    assert_eq!(function.config().words[0x84 / 4] & 3, 0);
+    assert_eq!(function.config().words[4], 0xfe00_0000);
+    assert_eq!(function.config().words[1] & 0xffff, 0x0402);
+}
+
+#[test]
+fn decode_that_does_not_stick_is_refused() {
+    let (mut inputs, state) = inputs();
+    let function = &mut inputs.requester.function;
+    function.config().words[1] = 0x0010_0400;
+    state.borrow_mut().memory_stuck = true;
+    let timer = PhysicalTimer(state.clone());
+    assert_eq!(
+        enable_decode(function, &timer),
+        Err(DecodeError::Readback { command: 0x0400 })
     );
 }

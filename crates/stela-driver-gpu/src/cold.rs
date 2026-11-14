@@ -5,8 +5,10 @@ use core::mem::ManuallyDrop;
 use stela_driver_base::{
     block::BlockError,
     bus::pci::{
-        CapabilityError, ConfigSpace, Function, ResetMethod, capability,
+        Bar, CAPABILITY_POWER, CapabilityError, ConfigError, ConfigSpace, Function, ResetMethod,
+        capability,
         power::{self, Timer},
+        regs,
         requester::{
             self, ClaimError,
             preparation::{self, BoundRequester, PreparingRequester},
@@ -316,6 +318,113 @@ impl<P: Preparation, V: Views<P::Config>> Cold<P, V> {
             }),
         }
     }
+}
+
+/// Why BAR 0 cannot be the register window nouveau maps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegisterBar {
+    /// BAR 0 decodes nothing: it reads as unimplemented.
+    Absent,
+    /// BAR 0 is an I/O BAR.
+    Io,
+    /// BAR 0 is prefetchable, where NVIDIA's register window is not.
+    Prefetchable,
+    /// BAR 0 is smaller than one page.
+    Small,
+    /// BAR 0 holds no address: firmware assigned it none, and nothing here
+    /// assigns one as Linux's resource allocator would.
+    Unassigned,
+}
+
+/// Check that BAR 0 is NVIDIA's register window: an assigned,
+/// non-prefetchable memory BAR of at least `page` bytes.
+pub fn register_bar(bar: Option<Bar>, page: u64) -> Result<(), RegisterBar> {
+    match bar {
+        None => Err(RegisterBar::Absent),
+        Some(Bar::Io { .. }) => Err(RegisterBar::Io),
+        Some(Bar::Memory {
+            prefetchable: true, ..
+        }) => Err(RegisterBar::Prefetchable),
+        Some(Bar::Memory { size, .. }) if size < page => Err(RegisterBar::Small),
+        Some(Bar::Memory { address: 0, .. }) => Err(RegisterBar::Unassigned),
+        Some(Bar::Memory { .. }) => Ok(()),
+    }
+}
+
+/// What [`enable_decode`] found before it changed anything.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Decode {
+    /// The power state the function was in: 0 for D0, 3 for D3hot.
+    pub power_state: u8,
+    /// Memory decoding was off. Firmware assigns every BAR but turns on
+    /// decoding only for the devices its own drivers start, so a hybrid
+    /// laptop's discrete GPU that shows no boot screen is left with it off.
+    pub memory_was_off: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DecodeError {
+    Capability(CapabilityError),
+    /// The power-up to D0 failed.
+    Power(BlockError),
+    Config(ConfigError),
+    /// The Command register did not keep memory decoding on.
+    Readback {
+        command: u16,
+    },
+}
+
+/// Bring the function to D0 and turn its memory decoding on, as Linux
+/// `pci_enable_device` does before a driver touches a BAR:
+/// `pci_set_power_state(D0)`, whose `pci_power_up` restores the BARs a D3hot
+/// soft reset cleared, then `pci_enable_resources`, which sets the Command
+/// register's memory bit. Bus mastering, I/O decoding and INTx stay as they
+/// are. The caller has checked BAR 0 with [`register_bar`] and every memory
+/// BAR against the host's apertures, where Linux refuses a BAR its resource
+/// tree does not hold.
+pub fn enable_decode<C: ConfigSpace>(
+    function: &mut Function<C>,
+    timer: &dyn Timer,
+) -> Result<Decode, DecodeError> {
+    let mut power_state = 0;
+    for entry in capability::capabilities(function.config()) {
+        let entry = entry.map_err(DecodeError::Capability)?;
+        if entry.id == CAPABILITY_POWER {
+            let control = function
+                .config()
+                .read16(entry.offset + 4)
+                .map_err(DecodeError::Config)?;
+            if control == u16::MAX {
+                return Err(DecodeError::Power(BlockError::Unsupported(
+                    "PCI function does not answer",
+                )));
+            }
+            power_state = (control & 3) as u8;
+            break;
+        }
+    }
+    if power_state != 0 {
+        function.power_up(timer).map_err(DecodeError::Power)?;
+    }
+    let config = function.config();
+    let command = config.read16(regs::COMMAND).map_err(DecodeError::Config)?;
+    if command == u16::MAX {
+        return Err(DecodeError::Readback { command });
+    }
+    let memory_was_off = command & regs::COMMAND_MEMORY == 0;
+    if memory_was_off {
+        config
+            .write16(regs::COMMAND, command | regs::COMMAND_MEMORY)
+            .map_err(DecodeError::Config)?;
+        let observed = config.read16(regs::COMMAND).map_err(DecodeError::Config)?;
+        if observed == u16::MAX || observed & regs::COMMAND_MEMORY == 0 {
+            return Err(DecodeError::Readback { command: observed });
+        }
+    }
+    Ok(Decode {
+        power_state,
+        memory_was_off,
+    })
 }
 
 #[cfg(test)]
