@@ -507,7 +507,15 @@ fn effective_usage(
         )?;
         return Ok(usage);
     }
-    let usage = descriptor.usage;
+    // Metal gives no depth or stencil format shader writes on any family
+    // (its feature set tables list none, and the shading language's depth
+    // textures take no write access), and Apple's drivers make such a
+    // texture whose descriptor asks for them: no shader can use the bit.
+    let usage = if descriptor.pixel_format.describe().is_color() {
+        descriptor.usage
+    } else {
+        descriptor.usage.difference(TextureUsage::SHADER_WRITE)
+    };
     if usage.contains(TextureUsage::SHADER_READ) {
         require(
             format.contains(C::READ),

@@ -249,6 +249,42 @@ fn unsupported_formats_and_uses_are_refused_by_capability() {
     );
 }
 
+/// Metal gives depth and stencil formats no shader writes, and Apple's
+/// drivers make a depth texture whose descriptor asks for them, as Setup
+/// Assistant's Depth32Float texture does: the bit is dropped, its other uses
+/// kept.
+#[test]
+fn shader_writes_asked_of_a_depth_or_stencil_texture_are_dropped() {
+    let capabilities = capabilities();
+    for format in [
+        PixelFormat::Depth32Float,
+        PixelFormat::Depth16Unorm,
+        PixelFormat::Depth32FloatStencil8,
+        PixelFormat::Stencil8,
+    ] {
+        let mut depth = descriptor(TextureType::D2, format);
+        depth.usage =
+            TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE | TextureUsage::RENDER_TARGET;
+        let plan = texture(&capabilities, &depth).unwrap();
+        assert!(
+            !plan.image.usage.contains(ImageUsage::STORAGE),
+            "{format:?}"
+        );
+        assert!(
+            plan.image
+                .usage
+                .contains(ImageUsage::SAMPLED | ImageUsage::DEPTH_STENCIL_ATTACHMENT),
+            "{format:?}"
+        );
+        depth.usage = TextureUsage::SHADER_WRITE;
+        let plan = texture(&capabilities, &depth).unwrap();
+        assert!(
+            !plan.image.usage.contains(ImageUsage::STORAGE),
+            "{format:?}"
+        );
+    }
+}
+
 #[test]
 fn unknown_usage_admits_every_supported_use() {
     let mut unknown = descriptor(TextureType::D2, PixelFormat::R32Uint);
