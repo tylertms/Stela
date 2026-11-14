@@ -98,10 +98,9 @@ fn interrupt(interface: &Interface, input: bool) -> Option<Endpoint> {
 }
 
 /// Fetch the exact descriptor named by this interface's HID descriptor.
-fn read_descriptor(
-    c: &mut Controller,
-    device: &Device,
+async fn read_descriptor(
     interface: &Interface,
+    control: &mut impl AsyncFnMut([u8; 8]) -> Result<Vec<u8>, BlockError>,
 ) -> Result<Vec<u8>, BlockError> {
     let length = descriptor_length(interface).map_err(BlockError::Unsupported)?;
     let request = setup(
@@ -111,7 +110,7 @@ fn read_descriptor(
         u16::from(interface.number),
         length,
     );
-    let bytes = c.device(device.id)?.control(request, &[])?;
+    let bytes = control(request).await?;
     if bytes.len() != usize::from(length) {
         return Err(BlockError::Protocol("short USB HID report descriptor"));
     }
@@ -197,6 +196,14 @@ fn boot_interface(
     }
 }
 
+/// How [`UsbInput::negotiate`] chose to read an interface.
+pub(in crate::usb) struct Negotiated {
+    chosen: u16,
+    reports: Reports,
+    descriptor: Option<Descriptor>,
+    report_descriptor: Vec<u8>,
+}
+
 /// Failed transfers being retried, as Linux `hid_io_error` retries them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Retry {
@@ -271,93 +278,127 @@ impl UsbInput {
         endpoint: Endpoint,
         dma: &mut dyn DmaAllocator,
     ) -> Result<Option<Self>, BlockError> {
-        let index = u16::from(interface.number);
-        let (chosen, reports, descriptor, report_descriptor) = {
+        let negotiated = {
             let mut c = controller.borrow_mut();
-            let protocol = |c: &mut Controller, protocol: u16| -> Result<(), BlockError> {
+            stela_driver_base::stepped::block_on(Self::negotiate(interface, async |request| {
+                c.device(device.id)?.control(request, &[])
+            }))?
+        };
+        Self::start(controller, device, interface, endpoint, negotiated, dma)
+    }
+
+    /// The class requests that choose how an interface is read, each a
+    /// control transfer `control` makes: its report descriptor, then
+    /// SET_PROTOCOL for a boot interface and SET_IDLE.
+    pub(in crate::usb) async fn negotiate(
+        interface: &Interface,
+        mut control: impl AsyncFnMut([u8; 8]) -> Result<Vec<u8>, BlockError>,
+    ) -> Result<Negotiated, BlockError> {
+        let index = u16::from(interface.number);
+        // SET_IDLE reports on change only; a device may refuse.
+        let idle = setup(TYPE_CLASS | RECIPIENT_INTERFACE, SET_IDLE, 0, index, 0);
+        // The generic layout is authoritative for all report kinds. Boot
+        // fallback is allowed only for a boot subclass interface.
+        let raw = read_descriptor(interface, &mut control).await;
+        let described = raw.as_ref().map_err(Clone::clone).and_then(|bytes| {
+            let descriptor = Descriptor::parse(bytes)
+                .map_err(|error| BlockError::Unsupported(error.message()))?;
+            let reports =
+                report::parse(bytes).map_err(|error| BlockError::Unsupported(error.message()))?;
+            Ok((descriptor, reports))
+        });
+        let legacy = described
+            .as_ref()
+            .map(|(_, reports)| reports.clone())
+            .map_err(Clone::clone);
+        let boot = match (interface.subclass, interface.protocol) {
+            (BOOT, KEYBOARD) => Some(boot_interface(
+                legacy.clone(),
+                Reports {
+                    keys: Some(Keys::boot()),
+                    pointer: None,
+                    input_bytes: BOOT_REPORT_BYTES,
+                },
+                |reports| reports.keys.is_some(),
+            )),
+            (BOOT, MOUSE) => Some(boot_interface(
+                legacy.clone(),
+                Reports {
+                    keys: None,
+                    pointer: Some(Pointer::boot()),
+                    input_bytes: BOOT_REPORT_BYTES,
+                },
+                |reports| reports.pointer.is_some(),
+            )),
+            _ => None,
+        };
+        let negotiated = match boot {
+            Some((chosen, reports)) => {
                 let request = setup(
                     TYPE_CLASS | RECIPIENT_INTERFACE,
                     SET_PROTOCOL,
-                    protocol,
+                    chosen,
                     index,
                     0,
                 );
                 // Linux usbhid sends no SET_PROTOCOL: report protocol is the
                 // default after reset, so a device refusing to confirm it
                 // still works. Boot fallback depends on the switch.
-                match c.device(device.id)?.control(request, &[]) {
+                match control(request).await {
                     Ok(_) => {}
-                    Err(BlockError::Device { status: STALL }) if protocol == REPORT_PROTOCOL => {}
+                    Err(BlockError::Device { status: STALL }) if chosen == REPORT_PROTOCOL => {}
                     Err(error) => return Err(error),
                 }
-                // Reports on change only; a device may refuse.
-                match c.device(device.id)?.control(
-                    setup(TYPE_CLASS | RECIPIENT_INTERFACE, SET_IDLE, 0, index, 0),
-                    &[],
-                ) {
+                match control(idle).await {
                     Ok(_) | Err(BlockError::Device { status: STALL }) => {}
                     Err(error) => return Err(error),
                 }
-                Ok(())
-            };
-            // The generic layout is authoritative for all report kinds. Boot
-            // fallback is allowed only for a boot subclass interface.
-            let raw = read_descriptor(&mut c, device, interface);
-            let described = raw.as_ref().map_err(Clone::clone).and_then(|bytes| {
-                let descriptor = Descriptor::parse(bytes)
-                    .map_err(|error| BlockError::Unsupported(error.message()))?;
-                let reports = report::parse(bytes)
-                    .map_err(|error| BlockError::Unsupported(error.message()))?;
-                Ok((descriptor, reports))
-            });
-            let legacy = described
-                .as_ref()
-                .map(|(_, reports)| reports.clone())
-                .map_err(Clone::clone);
-            let boot = match (interface.subclass, interface.protocol) {
-                (BOOT, KEYBOARD) => Some(boot_interface(
-                    legacy.clone(),
-                    Reports {
-                        keys: Some(Keys::boot()),
-                        pointer: None,
-                        input_bytes: BOOT_REPORT_BYTES,
-                    },
-                    |reports| reports.keys.is_some(),
-                )),
-                (BOOT, MOUSE) => Some(boot_interface(
-                    legacy.clone(),
-                    Reports {
-                        keys: None,
-                        pointer: Some(Pointer::boot()),
-                        input_bytes: BOOT_REPORT_BYTES,
-                    },
-                    |reports| reports.pointer.is_some(),
-                )),
-                _ => None,
-            };
-            match boot {
-                Some((chosen, reports)) => {
-                    protocol(&mut c, chosen)?;
-                    let descriptor = if chosen == REPORT_PROTOCOL {
-                        Some(described?.0)
-                    } else {
-                        None
-                    };
-                    (chosen, reports, descriptor, raw.unwrap_or_default())
+                let descriptor = if chosen == REPORT_PROTOCOL {
+                    Some(described?.0)
+                } else {
+                    None
+                };
+                Negotiated {
+                    chosen,
+                    reports,
+                    descriptor,
+                    report_descriptor: raw.unwrap_or_default(),
                 }
-                None => {
-                    let (descriptor, reports) = described?;
-                    // SET_PROTOCOL is only defined for boot-subclass devices.
-                    // SET_IDLE is optional for an ordinary report interface.
-                    let idle = setup(TYPE_CLASS | RECIPIENT_INTERFACE, SET_IDLE, 0, index, 0);
-                    match c.device(device.id)?.control(idle, &[]) {
-                        Ok(_) | Err(BlockError::Device { status: STALL }) => {}
-                        Err(error) => return Err(error),
-                    }
-                    (REPORT_PROTOCOL, reports, Some(descriptor), raw?)
+            }
+            None => {
+                let (descriptor, reports) = described?;
+                // SET_PROTOCOL is only defined for boot-subclass devices.
+                // SET_IDLE is optional for an ordinary report interface.
+                match control(idle).await {
+                    Ok(_) | Err(BlockError::Device { status: STALL }) => {}
+                    Err(error) => return Err(error),
+                }
+                Negotiated {
+                    chosen: REPORT_PROTOCOL,
+                    reports,
+                    descriptor: Some(descriptor),
+                    report_descriptor: raw?,
                 }
             }
         };
+        Ok(negotiated)
+    }
+
+    /// The input owner [`Self::negotiate`] chose, with its transfer buffers.
+    pub(in crate::usb) fn start(
+        controller: Shared,
+        device: &Device,
+        interface: &Interface,
+        endpoint: Endpoint,
+        negotiated: Negotiated,
+        dma: &mut dyn DmaAllocator,
+    ) -> Result<Option<Self>, BlockError> {
+        let Negotiated {
+            chosen,
+            reports,
+            descriptor,
+            report_descriptor,
+        } = negotiated;
         if chosen == REPORT_PROTOCOL && descriptor.as_ref().is_none_or(|d| d.input_bytes() == 0) {
             return Ok(None);
         }
