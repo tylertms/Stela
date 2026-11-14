@@ -1258,6 +1258,40 @@ impl Source {
         result
     }
 
+    /// One register of a bridge whose forwarding is restored, read through
+    /// the configuration owner that keeps its page, beside which no other
+    /// map may open; `None` for any other function.
+    pub(in crate::native_mmio) fn read_forwarding_bridge(
+        &self,
+        address: Address,
+        offset: u16,
+        width: u16,
+    ) -> Option<Result<u32, Error>> {
+        let Ok(cohort) = self.pci_slots.0.try_borrow() else {
+            return Some(Err(Error::Busy));
+        };
+        let Cohort::Parked(fabric) = &*cohort else {
+            return None;
+        };
+        let index = fabric
+            .slots
+            .binary_search_by_key(&address, |slot| slot.address)
+            .ok()?;
+        let Some(Forwarding::Open { config, .. }) = &fabric.slots[index].forwarding else {
+            return None;
+        };
+        let value = match width {
+            1 => config.try_read8(offset).map(u32::from),
+            2 => config.try_read16(offset).map(u32::from),
+            4 => config.try_read32(offset),
+            _ => return Some(Err(Error::InvalidRange)),
+        };
+        Some(value.map_err(|error| match error.reason {
+            ConfigFailure::Mapping(error) => error,
+            _ => Error::Unavailable,
+        }))
+    }
+
     /// # Safety
     /// Caller holds the matching complete fabric and excludes all old PCI
     /// writers. Bridge promotion additionally requires parked descendants.

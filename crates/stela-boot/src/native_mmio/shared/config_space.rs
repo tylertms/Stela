@@ -308,6 +308,9 @@ impl Source {
 
     /// Read an AML PCI operation through a scoped UC map without lending a
     /// writable address or letting the provider change the physical function.
+    /// A bridge whose forwarding is restored is read through the owner that
+    /// keeps its page. A bus of an MCFG window that no root bridge forwards
+    /// reads all ones, as the root complex completes such a request.
     pub(crate) fn read_firmware_config(
         &self,
         address: Address,
@@ -317,8 +320,22 @@ impl Source {
         if !matches!(width, 1 | 2 | 4)
             || offset > PAGE as u16 - width
             || !offset.is_multiple_of(width)
+            || address.device >= 32
+            || address.function >= 8
         {
             return Err(Error::InvalidRange);
+        }
+        let wire = self.platform.wire();
+        let windows = stela_runtime::pc::acpi::mcfg(wire.mcfg()).map_err(failed)?;
+        if windows.iter().any(|window| {
+            window.segment == address.segment
+                && (window.start_bus..=window.end_bus).contains(&address.bus)
+        }) && !stela_boot_core::ecam::root_decodes(wire.roots(), address.segment, address.bus)
+        {
+            return Ok(u32::MAX >> (32 - u32::from(width) * 8));
+        }
+        if let Some(value) = self.read_forwarding_bridge(address, offset, width) {
+            return value;
         }
         let (_, span) = self.config_page(address)?;
         // SAFETY: the original capture supplies this function extent. This
