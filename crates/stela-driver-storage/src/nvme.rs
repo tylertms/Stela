@@ -29,6 +29,7 @@ mod features;
 mod io;
 pub mod owned;
 pub mod parts;
+mod quirks;
 mod recovery;
 pub mod vmd;
 use core::{
@@ -36,6 +37,8 @@ use core::{
     sync::atomic::{Ordering, fence},
 };
 use owned::{Buffer, RegisterIo};
+pub use quirks::Quirks;
+use stela_driver_core::firmware::smbios::SystemIdentity;
 
 pub const CLASS: [u8; 3] = [0x01, 0x08, 0x02];
 
@@ -711,6 +714,8 @@ struct Controller {
     /// The Abort commands sent and not yet completed.
     aborts: Vec<u16>,
     limits: Limits,
+    /// What Linux's quirk tables say of this controller ([`Quirks`]).
+    quirks: Quirks,
 }
 
 /// `nvme_init_non_mdts_limits`: the NVM command set's Write Zeroes and
@@ -892,12 +897,13 @@ pub struct Namespace {
 }
 
 /// Reset `function`'s controller, bring up its queues and return its usable
-/// namespaces.
+/// namespaces. `platform` names the board for Linux's board quirks.
 pub fn attach(
     function: &mut Function,
     handoff: &Handoff,
     dma: &mut dyn DmaAllocator,
     minimum: &(impl crate::bus::pci::power::Timer + ?Sized),
+    platform: &SystemIdentity<'_>,
 ) -> Result<Attached, BlockError> {
     minimum.check().map_err(BlockError::PciPower)?;
     validate_clock(handoff.clock)?;
@@ -960,6 +966,8 @@ pub fn attach(
         events: Events::default(),
         aborts: Vec::new(),
         limits: Limits::default(),
+        quirks: Quirks::for_device(function.vendor, function.device)
+            | Quirks::for_platform(function.vendor, function.device, platform),
     };
     controller.initialize()?;
     discover(controller, format!("{}", function.address), &mut { dma })
@@ -1002,6 +1010,9 @@ fn discover(
     // Linux `nvme_init_identify` takes a present cache as one to flush and
     // leaves the controller's Volatile Write Cache feature as it is.
     let write_cache = identify[CONTROLLER_VOLATILE_CACHE] & 1 != 0;
+    // Linux `nvme_init_identify` adds `core_quirks` once, from the first
+    // Identify Controller.
+    controller.quirks = controller.quirks | Quirks::for_controller(&identify);
     controller.shutdown_timeout_us = shutdown_timeout_us(rtd3_entry_us);
     controller.identified(&identify);
     controller.allocate_host_memory(request, host_memory);
@@ -1037,6 +1048,7 @@ fn discover(
     let mut attached = Attached {
         namespaces: Vec::new(),
         failures: Vec::new(),
+        quirks: controller.quirks,
     };
     let mut found = Vec::new();
     let (max_transfer, max_command_bytes, commands, scans, limits) = (
@@ -1119,19 +1131,29 @@ fn discover(
 }
 
 /// The APST table Linux `nvme_configure_apst` gives a controller that
-/// supports it, or `None`: from the deepest power state up, each state goes
-/// to the deepest usable non-operational state below it once idle for its
-/// timeout, at most one state per latency tolerance.
-fn apst_table(identify: &[u8]) -> Option<[u64; 32]> {
+/// supports it, and whether APST is enabled with it, or `None`: from the
+/// deepest power state up, each state goes to the deepest usable
+/// non-operational state below it once idle for its timeout, at most one
+/// state per latency tolerance. A state whose exit latency exceeds
+/// `default_ps_max_latency_us` is never a target, nor the deepest state
+/// under `NVME_QUIRK_NO_DEEPEST_PS`; `NVME_QUIRK_NO_APST` turns APST off
+/// with an empty table.
+fn apst_table(identify: &[u8], quirks: Quirks) -> Option<([u64; 32], bool)> {
     let deepest = usize::from(identify[CONTROLLER_POWER_STATES]);
     if identify[CONTROLLER_APST] & 1 == 0 || deepest > 31 {
         return None;
     }
     let mut table = [0; 32];
+    if quirks.contains(Quirks::NO_APST) {
+        return Some((table, false));
+    }
     let mut target = 0;
     let mut tolerance = u32::MAX;
     for state in (0..=deepest).rev() {
         table[state] = target;
+        if state == deepest && quirks.contains(Quirks::NO_DEEPEST_POWER_STATE) {
+            continue;
+        }
         let descriptor = &identify[CONTROLLER_POWER_DESCRIPTORS + 32 * state..][..32];
         if descriptor[3] & POWER_NON_OPERATIONAL == 0 {
             continue;
@@ -1155,7 +1177,7 @@ fn apst_table(identify: &[u8]) -> Option<[u64; 32]> {
         };
         target = (state as u64) << 3 | idle << 8;
     }
-    Some(table)
+    Some((table, true))
 }
 
 /// Payload storage and logical command-range limits are separate: a no-data
@@ -1215,10 +1237,12 @@ fn features(
     }
 }
 
-/// The namespaces of one controller, and those it cannot serve.
+/// The namespaces of one controller, those it cannot serve, and the
+/// quirks it runs with.
 pub struct Attached {
     pub namespaces: Vec<Namespace>,
     pub failures: Vec<(u32, BlockError)>,
+    pub quirks: Quirks,
 }
 
 /// A namespace's size and its in-use LBA format.

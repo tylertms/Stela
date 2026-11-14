@@ -66,6 +66,7 @@ impl Fixture {
             events: Events::default(),
             aborts: Vec::new(),
             limits: Limits::default(),
+            quirks: Quirks::NONE,
         };
         Self {
             _registers: registers,
@@ -1121,31 +1122,93 @@ fn due_retries_publish_before_expired_commands_abort_in_tag_order() {
     ));
 }
 
-/// Each state idles into the deepest usable non-operational state below
-/// it, one per latency tolerance, as Linux `nvme_configure_apst`.
-#[test]
-fn apst_follows_linux_tolerances_from_the_deepest_state_up() {
+/// An Identify Controller page with APSTA and NPSS 5, whose (state, entry
+/// us, exit us) non-operational states are `states`.
+fn apst_identify(states: &[(usize, u32, u32)]) -> Vec<u8> {
     let mut identify = vec![0u8; PAGE];
-    assert_eq!(apst_table(&identify), None, "no APST support");
     identify[CONTROLLER_APST] = 1;
     identify[CONTROLLER_POWER_STATES] = 5;
-    // (state, entry us, exit us): PS5's exit is past the latency limit.
-    for (state, entry, exit) in [
-        (2, 500, 500),
-        (3, 2_000, 2_000),
-        (4, 4_000, 30_000),
-        (5, 0, 200_000),
-    ] {
+    for &(state, entry, exit) in states {
         let descriptor = &mut identify[CONTROLLER_POWER_DESCRIPTORS + 32 * state..][..32];
         descriptor[3] = POWER_NON_OPERATIONAL;
         descriptor[4..8].copy_from_slice(&u32::to_le_bytes(entry));
         descriptor[8..12].copy_from_slice(&u32::to_le_bytes(exit));
     }
-    let table = apst_table(&identify).unwrap();
+    identify
+}
+
+/// Each state idles into the deepest usable non-operational state below
+/// it, one per latency tolerance, as Linux `nvme_configure_apst`; a state
+/// whose exit latency is past `default_ps_max_latency_us` is never a target.
+#[test]
+fn apst_follows_linux_tolerances_from_the_deepest_state_up() {
+    let mut identify = vec![0u8; PAGE];
+    assert_eq!(apst_table(&identify, Quirks::NONE), None, "no APST support");
+    identify[CONTROLLER_POWER_STATES] = 5;
+    assert_eq!(apst_table(&identify, Quirks::NO_APST), None);
+    // PS5's exit is past the latency limit.
+    let identify = apst_identify(&[
+        (2, 500, 500),
+        (3, 2_000, 2_000),
+        (4, 4_000, 30_000),
+        (5, 0, 200_000),
+    ]);
+    let (table, enable) = apst_table(&identify, Quirks::NONE).unwrap();
+    assert!(enable);
     let primary = 3 << 3 | APST_PRIMARY_TIMEOUT_MS << 8;
     let secondary = 4 << 3 | APST_SECONDARY_TIMEOUT_MS << 8;
     assert_eq!(table[..6], [primary, primary, primary, secondary, 0, 0]);
     assert!(table[6..].iter().all(|&entry| entry == 0));
+}
+
+/// `NVME_QUIRK_NO_DEEPEST_PS`: no entry targets NPSS; quirks of other
+/// paths leave the table as it was.
+#[test]
+fn apst_never_targets_the_deepest_state_under_its_quirk() {
+    // Non-operational PS3 to PS5, exit latencies 2, 10 and 22 ms.
+    let identify = apst_identify(&[(3, 0, 2_000), (4, 0, 10_000), (5, 0, 22_000)]);
+    let primary = |state: u64| state << 3 | APST_PRIMARY_TIMEOUT_MS << 8;
+    let secondary = |state: u64| state << 3 | APST_SECONDARY_TIMEOUT_MS << 8;
+    // PS4 is the primary target; NPSS the secondary one, from PS4 alone.
+    let (plain, _) = apst_table(&identify, Quirks::NONE).unwrap();
+    assert_eq!(
+        plain[..6],
+        [
+            primary(4),
+            primary(4),
+            primary(4),
+            primary(4),
+            secondary(5),
+            0
+        ]
+    );
+    assert_eq!(
+        apst_table(&identify, Quirks::NO_WRITE_ZEROES | Quirks::BOGUS_IDS),
+        Some((plain, true))
+    );
+    let (table, enable) = apst_table(&identify, Quirks::NO_DEEPEST_POWER_STATE).unwrap();
+    assert!(enable);
+    assert!(table.iter().all(|entry| entry >> 3 & 0x1f != 5));
+    assert_eq!(
+        table[..6],
+        [primary(4), primary(4), primary(4), primary(4), 0, 0]
+    );
+}
+
+/// `NVME_QUIRK_NO_APST` sends an empty table with APSTE clear, so APST the
+/// firmware or the drive left on is turned off.
+#[test]
+fn apst_is_turned_off_under_its_quirk() {
+    let identify = apst_identify(&[(3, 0, 2_000), (4, 0, 10_000)]);
+    assert_eq!(
+        apst_table(&identify, Quirks::NO_APST | Quirks::NO_DEEPEST_POWER_STATE),
+        Some(([0; 32], false))
+    );
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    let command = c.apst_command(&[0; 32], false).unwrap();
+    assert_eq!((command[10], command[11]), (FEATURE_APST, 0));
+    assert!(c.admin_data.bytes()[..256].iter().all(|byte| *byte == 0));
 }
 
 /// A signalled controller's I/O completion queue raises vector 0, and

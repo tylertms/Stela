@@ -248,8 +248,8 @@ impl Controller {
                 Step::Identify => Some(self.identify_command(IDENTIFY_CONTROLLER, 0)?),
                 Step::Limits => self.limits_command()?,
                 Step::HostOptions => self.host_options(&identify)?,
-                Step::Apst => match apst_table(&identify) {
-                    Some(table) => Some(self.apst_command(&table)?),
+                Step::Apst => match apst_table(&identify, self.quirks) {
+                    Some((table, enable)) => Some(self.apst_command(&table, enable)?),
                     None => None,
                 },
                 Step::HostMemory => self.host_memory_command()?,

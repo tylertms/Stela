@@ -16,11 +16,12 @@ pub(crate) unsafe fn attach(
     domain: Arc<dyn DmaDomain>,
     clock: Clock,
     location: String,
+    quirks: Quirks,
 ) -> Result<Attached, BlockError> {
     // SAFETY: forwarded unchanged kept-owner attachment contract.
     unsafe {
         super::super::attach_with_timeout(
-            registers, lifecycle, source, domain, clock, location, 1_000,
+            registers, lifecycle, source, domain, clock, location, 1_000, quirks,
         )
     }
 }

@@ -228,6 +228,9 @@ pub enum Warning {
     Realtek(realtek::Warning),
     /// An Intel xHCI took its switchable ports from EHCI.
     IntelPortSwitch(usb::handoff::Switched),
+    /// An NVMe controller runs with Linux's quirks for its PCI ID, model or
+    /// board.
+    NvmeQuirks(nvme::Quirks),
 }
 
 impl fmt::Display for Warning {
@@ -251,6 +254,7 @@ impl fmt::Display for Warning {
                 "Intel xHCI took its ports from EHCI: SuperSpeed {:#x}, USB 2 {:#x}",
                 switched.superspeed, switched.usb2
             ),
+            Self::NvmeQuirks(quirks) => f.write_str(&quirks.describe()),
         }
     }
 }
@@ -1805,11 +1809,23 @@ pub unsafe fn probe_observed(
                 attached.map(|device| vec![Box::new(device) as Box<dyn BlockDevice>])
             } else if function.class == nvme::CLASS {
                 let minimum = minimum_for_function!().clone();
-                let attached = nvme::attach(&mut function, handoff, dma, minimum.as_ref());
+                // Linux's board quirks read the SMBIOS system and baseboard.
+                let snapshot = crate::firmware::smbios::load(firmware).ok();
+                let platform = snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.identity)
+                    .unwrap_or_default();
+                let attached =
+                    nvme::attach(&mut function, handoff, dma, minimum.as_ref(), &platform);
                 if attached.is_err() {
                     start.quiesce(&mut function);
                 }
                 attached.map(|attached| {
+                    if !attached.quirks.is_empty() {
+                        devices
+                            .warnings
+                            .push((address, Warning::NvmeQuirks(attached.quirks)));
+                    }
                     devices
                         .device_failures
                         .extend(attached.failures.into_iter().map(|(namespace, error)| {
@@ -2503,9 +2519,14 @@ unsafe fn attach_native(
             return;
         }
         native::Kind::Vmd => {
+            let snapshot = crate::firmware::smbios::load(inputs.firmware).ok();
+            let platform = snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.identity)
+                .unwrap_or_default();
             // SAFETY: as for tg3 below; the host's hierarchy is
             // stopped with it.
-            match unsafe { native::vmd(services, address, inputs.handoff.clock) } {
+            match unsafe { native::vmd(services, address, inputs.handoff.clock, &platform) } {
                 Ok(found) => {
                     for child in &found.others {
                         let location = alloc::format!(
@@ -2522,6 +2543,11 @@ unsafe fn attach_native(
                         ));
                     }
                     if let Some(attached) = found.nvme {
+                        if !attached.quirks.is_empty() {
+                            devices
+                                .warnings
+                                .push((address, Warning::NvmeQuirks(attached.quirks)));
+                        }
                         devices
                             .device_failures
                             .extend(attached.failures.into_iter().map(|(namespace, error)| {

@@ -68,6 +68,7 @@ pub unsafe fn attach(
     clock: Clock,
     minimum: Rc<dyn crate::bus::pci::power::Timer>,
     label: String,
+    quirks: super::Quirks,
 ) -> Attachment {
     let registers = |bar: &FirmwareBar| {
         let mapping = bar.map(&authority).map_err(block)?;
@@ -89,6 +90,7 @@ pub unsafe fn attach(
             clock,
             minimum,
             label,
+            quirks,
             (registers, owned::attach),
         )
     }
@@ -101,6 +103,7 @@ type AttachPolicy = unsafe fn(
     Arc<dyn DmaDomain>,
     Clock,
     String,
+    super::Quirks,
 ) -> Result<Attached, BlockError>;
 
 // The native sequence, shared with the composed model test's register peer
@@ -119,6 +122,7 @@ unsafe fn attach_with<R: Registers + 'static>(
     clock: Clock,
     minimum: Rc<dyn crate::bus::pci::power::Timer>,
     label: String,
+    quirks: super::Quirks,
     factories: (
         impl FnOnce(&FirmwareBar) -> Result<Box<dyn owned::Registers>, BlockError>,
         AttachPolicy,
@@ -145,6 +149,7 @@ unsafe fn attach_with<R: Registers + 'static>(
                 domain,
                 clock,
                 label,
+                quirks,
             )
         }
     })();

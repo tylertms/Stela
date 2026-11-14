@@ -395,7 +395,8 @@ pub(super) struct Owner {
 /// exclusive controller, its requester and every DMA alias/root/reset
 /// epoch. Bind that real domain before entry, and keep the complete hierarchy
 /// BME-contained. This identity cannot be established from numeric BDFs or by
-/// combining independently obtained type-erased owners.
+/// combining independently obtained type-erased owners. `quirks` are the
+/// controller's by its PCI ID and board ([`super::Quirks`]).
 pub unsafe fn attach(
     registers: Box<dyn Registers>,
     lifecycle: Box<dyn Lifecycle>,
@@ -403,6 +404,7 @@ pub unsafe fn attach(
     domain: Arc<dyn DmaDomain>,
     clock: Clock,
     location: String,
+    quirks: super::Quirks,
 ) -> Result<Attached, BlockError> {
     // SAFETY: this is the same exclusive original-controller contract; the
     // production command budget is not exposed as an attachment capability.
@@ -415,10 +417,15 @@ pub unsafe fn attach(
             clock,
             location,
             COMMAND_TIMEOUT_US,
+            quirks,
         )
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the independently supplied owners, clock, label, command budget and hardware quirks explicit."
+)]
 unsafe fn attach_with_timeout(
     registers: Box<dyn Registers>,
     lifecycle: Box<dyn Lifecycle>,
@@ -427,6 +434,7 @@ unsafe fn attach_with_timeout(
     clock: Clock,
     location: String,
     command_timeout_us: u64,
+    quirks: super::Quirks,
 ) -> Result<Attached, BlockError> {
     // Install the complete owner before fallible allocation or hardware effects.
     let mut controller = Controller {
@@ -487,6 +495,7 @@ unsafe fn attach_with_timeout(
         events: super::Events::default(),
         aborts: alloc::vec::Vec::new(),
         limits: super::Limits::default(),
+        quirks,
     };
     validate_clock(clock)?;
     controller.teardown = Teardown::Unprepared;

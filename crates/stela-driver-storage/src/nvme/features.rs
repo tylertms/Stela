@@ -32,9 +32,13 @@ impl Controller {
         Ok(Some(command))
     }
 
-    /// The Set Features enabling autonomous power state transitions with
-    /// `table`, written to the admin page.
-    pub(super) fn apst_command(&mut self, table: &[u64; 32]) -> Result<[u32; 16], BlockError> {
+    /// The Set Features setting the autonomous power state transition
+    /// `table`, written to the admin page, and APSTE.
+    pub(super) fn apst_command(
+        &mut self,
+        table: &[u64; 32],
+        enable: bool,
+    ) -> Result<[u32; 16], BlockError> {
         for (index, entry) in table.iter().enumerate() {
             self.admin_data.write(8 * index, *entry);
         }
@@ -44,7 +48,7 @@ impl Controller {
         command[6] = page as u32;
         command[7] = (page >> 32) as u32;
         command[10] = FEATURE_APST;
-        command[11] = 1;
+        command[11] = u32::from(enable);
         Ok(command)
     }
 

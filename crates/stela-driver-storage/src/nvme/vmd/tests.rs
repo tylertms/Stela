@@ -197,6 +197,7 @@ impl Fixture {
                 clock,
                 model_timer(),
                 "composed VMD behind root and bridge".into(),
+                crate::nvme::Quirks::NONE,
                 (|_| Ok(protocol.registers()), protocol::attach),
             )
         }

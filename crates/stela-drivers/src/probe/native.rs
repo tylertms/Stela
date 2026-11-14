@@ -888,6 +888,7 @@ pub(super) unsafe fn vmd(
     services: &dyn NativeServices,
     address: Address,
     clock: Clock,
+    platform: &crate::firmware::smbios::SystemIdentity<'_>,
 ) -> Result<Vmd, Failure> {
     let minimum = services
         .minimum_delay()
@@ -985,6 +986,8 @@ pub(super) unsafe fn vmd(
         });
     };
     let child = others.remove(index);
+    let quirks = nvme::Quirks::for_device(child.vendor, child.device)
+        | nvme::Quirks::for_platform(child.vendor, child.device, platform);
     let bytes = match host.memory_bar_bytes(child.address) {
         Ok(bytes) => bytes,
         Err(error) => return Err(failed(error, Box::new((host, attachment)))),
@@ -1014,6 +1017,7 @@ pub(super) unsafe fn vmd(
             clock,
             minimum.clone(),
             label,
+            quirks,
         )
     } {
         Ok((attached, hierarchy)) => Ok(Vmd {
@@ -1471,7 +1475,7 @@ mod tests {
         ));
         assert_eq!(*services.preparations.borrow(), [address(); 2]);
         // SAFETY: as above.
-        let vmd = unsafe { vmd(&services, address(), clock) };
+        let vmd = unsafe { vmd(&services, address(), clock, &Default::default()) };
         assert!(matches!(
             vmd,
             Err((Error::Native(ServiceError::Unavailable), None))

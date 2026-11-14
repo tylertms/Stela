@@ -136,10 +136,13 @@ struct Model {
     host_memory: (u32, u32, u32, u16),
     host_memory_sets: Vec<([u32; 5], (u64, u32))>,
     refuse_host_memory: bool,
-    /// APSTA with a non-operational PS1; the first entry of each APST
-    /// table set.
+    /// APSTA with a non-operational PS1; APSTE and the first entry of each
+    /// APST table set.
     apst: bool,
-    apst_sets: Vec<u64>,
+    apst_sets: Vec<(bool, u64)>,
+    /// Identify Controller's VID and model, the model space-padded.
+    vendor: u16,
+    model: &'static str,
     /// OAES; the held Asynchronous Event Request; Asynchronous Event
     /// Configurations set and log pages read.
     async_events: u32,
@@ -245,6 +248,8 @@ impl Model {
             refuse_host_memory: false,
             apst: false,
             apst_sets: Vec::new(),
+            vendor: 0,
+            model: "",
             async_events: 0,
             event_request: None,
             event_configs: Vec::new(),
@@ -448,8 +453,13 @@ impl Model {
                 let mut data = vec![0; 4096];
                 match command[10] {
                     1 => {
+                        data[..2].copy_from_slice(&self.vendor.to_le_bytes());
                         data[4..24].fill(b'S');
                         data[24..64].fill(b'M');
+                        if !self.model.is_empty() {
+                            data[24..64].fill(b' ');
+                            data[24..24 + self.model.len()].copy_from_slice(self.model.as_bytes());
+                        }
                         data[77] = self.mdts;
                         data[516..520].copy_from_slice(&1u32.to_le_bytes());
                         data[520..522].copy_from_slice(&self.oncs.to_le_bytes());
@@ -531,10 +541,12 @@ impl Model {
                 self.logs.push(command[10] & 0xff);
             }
             (0, 9) if command[10] == 0x0c => {
-                assert_eq!(command[11], 1);
+                assert!(command[11] <= 1);
                 let table = self.read_iova(u64::from(command[6]) | u64::from(command[7]) << 32, 8);
-                self.apst_sets
-                    .push(u64::from_le_bytes(table[..8].try_into().unwrap()));
+                self.apst_sets.push((
+                    command[11] == 1,
+                    u64::from_le_bytes(table[..8].try_into().unwrap()),
+                ));
             }
             (0, 9) => {
                 assert_eq!(command[10], 0x16);
@@ -944,6 +956,8 @@ unsafe impl Lifecycle for Life {
 struct Fixture {
     model: Arc<Mutex<Model>>,
     source: Source,
+    /// The quirks the controller's PCI ID and board give it.
+    quirks: Quirks,
 }
 impl Fixture {
     fn new() -> Self {
@@ -953,6 +967,7 @@ impl Fixture {
                 next: AtomicU64::new(0x9000_0000),
                 released: Arc::new(AtomicUsize::new(0)),
             },
+            quirks: Quirks::NONE,
         }
     }
     fn attach(&self) -> Result<Attached, BlockError> {
@@ -969,6 +984,7 @@ impl Fixture {
                 },
                 "VMD model requester".into(),
                 1000,
+                self.quirks,
             )
         }
     }
@@ -1106,6 +1122,7 @@ fn invalid_clock_keeps_unadmitted_original_owners_without_any_effect() {
                     ticks_per_microsecond,
                 },
                 "unadmitted original NVMe".into(),
+                Quirks::NONE,
             )
         };
         assert!(result.is_err());
@@ -1539,7 +1556,40 @@ fn apst_is_configured_at_attach_and_after_resets() {
     drop(m);
     a.namespaces[0].flush().unwrap();
     // PS0 idles into PS1 after 100 ms, at attach and after the reset.
-    assert_eq!(f.model.lock().unwrap().apst_sets, [1 << 3 | 100 << 8; 2]);
+    assert_eq!(
+        f.model.lock().unwrap().apst_sets,
+        [(true, 1 << 3 | 100 << 8); 2]
+    );
+    a.namespaces[0].retire_owned().unwrap();
+}
+
+/// A PCI ID with `NVME_QUIRK_NO_DEEPEST_PS` keeps APST out of PS1, here the
+/// deepest state; a model `core_quirks` names turns APST off, at attach and
+/// after a reset, and the attachment reports both.
+#[test]
+fn apst_quirks_from_the_pci_id_and_the_model_apply_at_attach_and_after_resets() {
+    let mut f = Fixture::new();
+    f.model.lock().unwrap().apst = true;
+    f.quirks = Quirks::for_device(0x2646, 0x2263);
+    let a = f.attach().unwrap();
+    assert_eq!(a.quirks, Quirks::NO_DEEPEST_POWER_STATE);
+    assert_eq!(f.model.lock().unwrap().apst_sets, [(true, 0)]);
+    drop(a);
+
+    let f = Fixture::new();
+    {
+        let mut m = f.model.lock().unwrap();
+        m.apst = true;
+        (m.vendor, m.model) = (0x1179, "THNSF5256GPUK TOSHIBA");
+    }
+    let mut a = f.attach().unwrap();
+    assert_eq!(a.quirks, Quirks::NO_APST);
+    let mut m = f.model.lock().unwrap();
+    m.delay_io = 1;
+    m.abortable = false;
+    drop(m);
+    a.namespaces[0].flush().unwrap();
+    assert_eq!(f.model.lock().unwrap().apst_sets, [(false, 0); 2]);
     a.namespaces[0].retire_owned().unwrap();
 }
 
