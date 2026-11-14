@@ -1329,7 +1329,7 @@ pub(super) fn apply(environment: &Environment<'_>, plan: Plan) -> Result<()> {
     apply_install(environment, &mut record, &plan.ipsw, plan.install)?;
     let checked = &plan.installed;
     if let Some(region) = &checked.foreign {
-        installed::erase_foreign(environment.host, region)?;
+        installed::erase_foreign(environment.host, region, checked.disk.machine_state_offset)?;
     }
     if let Some(nor) = &checked.nor_image {
         installed::initialize_nor(environment.host, &checked.disk, nor)?;

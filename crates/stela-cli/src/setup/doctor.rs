@@ -1145,7 +1145,7 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
                 "  disks          erase the file system on {}, install \"{}\"'s SSD partition",
                 region.identifier, install.name
             )?;
-            foreign.push(region);
+            foreign.push((region, install.disk.machine_state_offset));
         } else {
             notes.push(format!(
                 "{}: {} erases it",
@@ -1182,8 +1182,8 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
     {
         store.repair()?;
     }
-    for region in &foreign {
-        installed::erase_foreign(environment.host, region)?;
+    for (region, state_offset) in &foreign {
+        installed::erase_foreign(environment.host, region, *state_offset)?;
     }
     for fresh in &reinitialize {
         fresh.area.write(environment.host, 0, &fresh.bytes)?;

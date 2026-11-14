@@ -346,7 +346,7 @@ pub(super) fn add(environment: &Environment<'_>, command: &Request) -> Result<St
     };
     apply_install(environment, &mut next, &obtained.path, plan)?;
     if let Some(region) = &checked.foreign {
-        installed::erase_foreign(host, region)?;
+        installed::erase_foreign(host, region, checked.disk.machine_state_offset)?;
     }
     if let Some(image) = &checked.nor_image {
         installed::initialize_nor(host, &checked.disk, image)?;

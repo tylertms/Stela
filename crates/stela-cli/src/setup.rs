@@ -78,6 +78,7 @@ mod prepare;
 mod record;
 mod release;
 mod settings;
+mod signatures;
 mod sources;
 mod state;
 mod translations;

@@ -28,22 +28,17 @@ use stela_loader::{
     mount_interface::CHOSEN_DISK,
 };
 use {
-    stela_formats::payload::gpt::DEFAULT_MIN_APPLE_BYTES,
-    stela_formats::payload::gpt::SIGNATURE as GPT_SIGNATURE, stela_runtime::pc::board_flash,
+    stela_formats::payload::gpt::DEFAULT_MIN_APPLE_BYTES, stela_runtime::pc::board_flash,
     stela_runtime::pc::boot_log, stela_runtime::pc::machine_state,
     stela_runtime::pc::storage::Target, stela_soc::machine::sep_state,
     stela_soc_data::nor::CAPACITY, stela_soc_data::nor::Image, stela_soc_data::nor::SECTOR_SIZE,
     stela_soc_data::nor::nvram::Partition, stela_soc_data::nor::nvram::Variables,
 };
 
-/// LBA 1 at 512-byte or 4096-byte blocks.
-const GPT_HEADER_OFFSETS: [u64; 2] = [512, 4096];
+use super::signatures::{self, Found, GPT_HEADER_OFFSETS};
+
+/// The bytes a guest disk's GPT header is read from.
 const PROBE_BYTES: usize = 8192;
-/// The bytes at the start of an Apple region that `--erase-target` clears
-/// of another file system: the signatures every host OS finds one by (APFS's
-/// container superblock in block 0, HFS+'s and ext4's at 1 KiB, NTFS's and
-/// FAT's boot sector) lie in its first MiB.
-const FOREIGN_HEAD_BYTES: usize = 1 << 20;
 
 /// The installed disk, as `stela.cfg` names it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -359,8 +354,8 @@ pub(super) enum Contents {
     /// A guest disk with a partition table: an installed or installing
     /// system, kept.
     GuestDisk,
-    /// Anything else, such as a host file system.
-    Other,
+    /// Anything else, such as a host file system: what it is.
+    Other(&'static str),
 }
 
 /// The choices the command line makes for the installed disk.
@@ -395,18 +390,21 @@ pub(super) struct Checked {
     pub(super) notes: Vec<String>,
 }
 
-fn contents(host: &dyn Host, partition: &str) -> Result<Contents> {
-    let head = host.read(partition, 0, PROBE_BYTES)?;
-    if head.iter().all(|&b| b == 0) {
-        return Ok(Contents::Blank);
-    }
-    let gpt = GPT_HEADER_OFFSETS.iter().any(|&offset| {
-        head.get(offset as usize..offset as usize + GPT_SIGNATURE.len()) == Some(GPT_SIGNATURE)
-    });
-    Ok(if gpt {
-        Contents::GuestDisk
-    } else {
-        Contents::Other
+/// What the first `bytes` of `partition` hold, the bytes a guest disk may
+/// span: a known signature at its documented offset, near the start or
+/// the end, is that kind of data (`signatures::probe`); only zeros
+/// wherever one can sit are blank. A partition that cannot be read is
+/// refused, never taken for blank.
+fn contents(host: &dyn Host, partition: &str, bytes: u64) -> Result<Contents> {
+    let found = signatures::probe(bytes, &mut |offset, length| {
+        host.read(partition, offset, length)
+    })
+    .with_context(|| format!("cannot tell what {partition} holds"))?;
+    Ok(match found {
+        Found::Blank => Contents::Blank,
+        Found::Gpt => Contents::GuestDisk,
+        Found::Known(name) => Contents::Other(name),
+        Found::Unknown => Contents::Other("data"),
     })
 }
 
@@ -416,7 +414,7 @@ fn contents(host: &dyn Host, partition: &str) -> Result<Contents> {
 fn guest_disk_bytes(head: &[u8]) -> Option<u64> {
     GPT_HEADER_OFFSETS.iter().find_map(|&block| {
         let header = head.get(block as usize..block as usize + 56)?;
-        if &header[..GPT_SIGNATURE.len()] != GPT_SIGNATURE {
+        if &header[..signatures::GPT_HEADER.len()] != signatures::GPT_HEADER {
             return None;
         }
         let word = |at: usize| u64::from_le_bytes(header[at..at + 8].try_into().unwrap());
@@ -528,8 +526,8 @@ pub(super) fn check(host: &dyn Host, request: &Request) -> Result<Checked> {
         },
         bytes_text(DEFAULT_MIN_APPLE_BYTES)
     );
-    let found = contents(host, &region.identifier)?;
-    let foreign = matches!(found, Contents::Other).then(|| region.clone());
+    let found = contents(host, &region.identifier, ssd_bytes)?;
+    let foreign = matches!(found, Contents::Other(_)).then(|| region.clone());
     match found {
         Contents::GuestDisk => {
             if let Some(split) = split {
@@ -552,13 +550,20 @@ pub(super) fn check(host: &dyn Host, request: &Request) -> Result<Checked> {
             ))
         }
         Contents::Blank => notes.push(format!("{} is blank", region.identifier)),
-        Contents::Other if request.erase_target => notes.push(format!(
-            "{} holds other data; --erase-target erases it",
+        Contents::Other(what) if request.erase_target => notes.push(format!(
+            "{} holds {what}; --erase-target erases it",
             region.identifier
         )),
-        Contents::Other => bail!(
-            "{} holds data that is not a Stela macOS disk; installing macOS onto it would erase \
-             it. Pass --erase-target to use it anyway.",
+        // A partition of the stick itself: `--target` names the PC's disks
+        // only, so `--erase-target` cannot reach it.
+        Contents::Other(what) if request.external_disks => bail!(
+            "{} on the stick holds {what}, not a Stela macOS disk; installing macOS onto it \
+             would erase it. Copy off what you keep, then delete or wipe that partition.",
+            region.identifier
+        ),
+        Contents::Other(what) => bail!(
+            "{} holds {what}, not a Stela macOS disk; installing macOS onto it would erase it. \
+             Pass --erase-target to use it anyway.",
             region.identifier
         ),
     }
@@ -721,20 +726,40 @@ pub(super) fn foreign(host: &dyn Host, disk: &InstalledDisk) -> Result<Option<Pa
         return Ok(None);
     }
     let identifier = confirm(host, disk, Role::AppleRegion, None)?;
-    Ok(match contents(host, &identifier)? {
-        Contents::Other => Some(host.partition(&identifier)?),
+    let info = host.partition(&identifier)?;
+    // A machine state in the region's tail is Stela's, not the guest's.
+    let guest_bytes = disk.machine_state_offset.unwrap_or(info.bytes);
+    Ok(match contents(host, &identifier, guest_bytes)? {
+        Contents::Other(_) => Some(info),
         Contents::Blank | Contents::GuestDisk => None,
     })
 }
 
-/// Clear the other file system at the start of `region`, unmounting it
-/// first, which `--erase-target` gave up.
-pub(super) fn erase_foreign(host: &dyn Host, region: &PartitionInfo) -> Result<()> {
+/// Clear the other file system of `region`, unmounting it first, which
+/// `--erase-target` gave up: zeros over every byte a signature can sit in
+/// (`signatures::HEAD_BYTES` and `signatures::TAIL_BYTES`) of the bytes the
+/// guest disk spans, up to the machine state at `state_offset` when it
+/// lives in the region's tail.
+pub(super) fn erase_foreign(
+    host: &dyn Host,
+    region: &PartitionInfo,
+    state_offset: Option<u64>,
+) -> Result<()> {
     if region.mount.is_some() || region.container.is_some() {
         host.unmount(region)?;
     }
-    host.write(&region.identifier, 0, &vec![0; FOREIGN_HEAD_BYTES])
-        .with_context(|| format!("erasing the file system on {}", region.identifier))
+    let guest = state_offset.unwrap_or(region.bytes);
+    let head = guest.min(signatures::HEAD_BYTES);
+    let tail = guest.saturating_sub(signatures::TAIL_BYTES).max(head);
+    for (offset, end) in [(0, head), (tail, guest)] {
+        host.write(
+            &region.identifier,
+            offset,
+            &vec![0; usize::try_from(end - offset)?],
+        )
+        .with_context(|| format!("erasing the file system on {}", region.identifier))?;
+    }
+    Ok(())
 }
 
 /// Write the machine-state bytes `check` planned: a fresh NOR image, a

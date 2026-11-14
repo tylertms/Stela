@@ -133,17 +133,23 @@ impl Host for FakeHost {
         Ok(self.serials.get(disk).cloned())
     }
     // Images may be sparse files as large as the partition, so they
-    // are read and written in place.
+    // are read and written in place. An image may also hold only the
+    // partition's first bytes: the rest reads as zeros, as a sparse file's
+    // would, and takes only zeros.
     fn read(&self, identifier: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = fs::File::open(self.image(identifier)?)?;
+        let held = file.metadata()?.len();
         ensure!(
-            offset + length as u64 <= file.metadata()?.len(),
+            offset + length as u64 <= held.max(self.partitions[identifier].0.bytes),
             "read past the partition"
         );
-        file.seek(SeekFrom::Start(offset))?;
         let mut bytes = vec![0; length];
-        file.read_exact(&mut bytes)?;
+        if offset < held {
+            let inside = usize::try_from((held - offset).min(length as u64))?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut bytes[..inside])?;
+        }
         Ok(bytes)
     }
     fn write(&self, identifier: &str, offset: u64, data: &[u8]) -> Result<()> {
@@ -151,10 +157,21 @@ impl Host for FakeHost {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .open(self.image(identifier)?)?;
-        ensure!(
-            offset + data.len() as u64 <= file.metadata()?.len(),
-            "write past the partition"
-        );
+        let held = file.metadata()?.len();
+        let end = offset + data.len() as u64;
+        if end > held {
+            ensure!(
+                end <= self.partitions[identifier].0.bytes,
+                "write past the partition"
+            );
+            let inside = usize::try_from(held.saturating_sub(offset))?.min(data.len());
+            ensure!(
+                data[inside..].iter().all(|&b| b == 0),
+                "write past the test image"
+            );
+            file.seek(SeekFrom::Start(offset))?;
+            return Ok(file.write_all(&data[..inside])?);
+        }
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(data)?;
         Ok(())
@@ -1071,6 +1088,50 @@ fn install_maps_usb_partition_as_guest_ssd() {
     let opted = command(&f, &f.esp);
     let error = setup(&environment(&f.host), opted).unwrap_err().to_string();
     assert!(error.contains("several unmounted partitions"), "{error}");
+}
+
+#[test]
+fn a_partition_with_a_file_system_past_its_first_8_kib_is_never_taken_for_blank() {
+    // btrfs, whose first 64 KiB are zeros, on the stick's unmounted
+    // partition: create on its mounted volume refuses it, naming it.
+    let mut f = fixture(64 * GIB, false);
+    add_stick_ssd(&mut f, "disk5s4", REGION_GUID);
+    f.host.write("disk5s4", 0x1_0040, b"_BHRfS_M").unwrap();
+    let error = setup(&environment(&f.host), command(&f, &f.esp))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("disk5s4 on the stick holds btrfs"),
+        "{error}"
+    );
+    assert!(!error.contains("--erase-target"), "{error}");
+    assert!(!f.esp.join(RECORD).exists());
+    // Linux RAID metadata at the end of a PC partition named with --target.
+    let mut f = fixture(64 * GIB, false);
+    add_installed_disk(&mut f, &[], &[]);
+    let bytes = f.host.partitions[REGION].0.bytes;
+    let md10 = (((bytes >> 9) - 16) & !7) << 9;
+    let path = f.host.partitions[REGION].1.clone();
+    sparse_image(&path, bytes);
+    f.host
+        .write(REGION, md10, &[0xfc, 0x4e, 0x2b, 0xa9])
+        .unwrap();
+    let mut dry = installed_command(&f);
+    dry.dry_run = true;
+    let error = setup(&environment(&f.host), dry).unwrap_err().to_string();
+    assert!(error.contains("holds Linux RAID"), "{error}");
+    assert!(error.contains("--erase-target"), "{error}");
+    // --erase-target clears it, the end as well as the start.
+    let mut erase = installed_command(&f);
+    erase.erase_target = true;
+    setup(&environment(&f.host), erase).unwrap();
+    assert!(
+        f.host
+            .read(REGION, md10, 4)
+            .unwrap()
+            .iter()
+            .all(|&b| b == 0)
+    );
 }
 
 #[test]
