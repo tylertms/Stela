@@ -270,27 +270,40 @@ fn every_ancestor_window_and_unique_firmware_bus_route_is_required() {
 }
 
 #[test]
-fn stopped_siblings_remain_contained_and_a_second_nvme_is_explicitly_refused() {
+fn stopped_siblings_and_a_second_nvme_remain_contained() {
+    // Two NVMe controllers behind one VMD, as laptops with two SSD slots
+    // have: the endpoint is the one its BAR was claimed from, and the other
+    // stays a sibling without decode or bus mastering, as any other class.
     for extra_class in [0x0200_0000, 0x0108_0200] {
         let model = Model::default();
         let extra = NVME + (1 << 15);
-        model
-            .state
-            .lock()
-            .unwrap()
-            .add_function(extra, extra_class, 0, 0);
+        {
+            let mut state = model.state.lock().unwrap();
+            state.add_function(extra, extra_class, 0, 0);
+            // Firmware left its memory decode on.
+            state.set(
+                extra + COMMAND_OFFSET,
+                2,
+                u32::from(regs::COMMAND_INTX_DISABLE | regs::COMMAND_MEMORY),
+            );
+        }
         let state = model.state.clone();
         let (mut host, bar) = fixture(model);
-        let result = Hierarchy::discover(&mut host, &bar, NVME_CLASS);
-        if extra_class == 0x0108_0200 {
-            assert!(matches!(result, Err(Error::UnsupportedDevice)));
-        } else {
-            let mut hierarchy = result.unwrap();
-            hierarchy.prepare(&mut host, &*model_timer()).unwrap();
-            hierarchy.enable(&mut host).unwrap();
-            assert_eq!(state.lock().unwrap().child(extra + 4, 2) & 7, 0);
-        }
+        let mut hierarchy = Hierarchy::discover(&mut host, &bar, NVME_CLASS).unwrap();
+        hierarchy.prepare(&mut host, &*model_timer()).unwrap();
+        hierarchy.enable(&mut host).unwrap();
+        assert_eq!(state.lock().unwrap().child(extra + 4, 2) & 7, 0);
+        assert_ne!(state.lock().unwrap().child(NVME + 4, 2) & 6, 0);
+        hierarchy.disable(&mut host).unwrap();
+        hierarchy.recheck(&mut host, false).unwrap();
     }
+    // A BAR claimed from a function of another class is no endpoint.
+    let model = Model::default();
+    let (mut host, bar) = fixture(model);
+    assert!(matches!(
+        Hierarchy::discover(&mut host, &bar, [0x02, 0x00, 0x00]),
+        Err(Error::UnsupportedDevice)
+    ));
 }
 
 /// Give `base` an MSI capability after its PCIe one, enabled as firmware

@@ -216,19 +216,19 @@ impl Hierarchy {
             host.stop_child(child.address)?;
             children.push(capture(host, child)?);
         }
-        let candidates: Vec<_> = children
+        // The endpoint is the function `bar` was claimed from. Another
+        // function of the same class, such as a second NVMe controller, is
+        // a sibling like any other: stopped above and kept without decode
+        // or bus mastering for this hierarchy's lifetime.
+        let selected = children
             .iter()
-            .enumerate()
-            .filter(|(_, function)| function.child.class == class)
-            .map(|(index, _)| index)
-            .collect();
-        if candidates.len() != 1 {
+            .position(|function| function.child.address == bar.child)
+            .ok_or(Error::InvalidResource)?;
+        let endpoint = &children[selected];
+        if endpoint.child.class != class {
             return Err(Error::UnsupportedDevice);
         }
-        let selected = candidates[0];
-        let endpoint = &children[selected];
-        if endpoint.child.address != bar.child
-            || endpoint.child.header != 0
+        if endpoint.child.header != 0
             || !endpoint.capabilities.is_pcie()
             || endpoint.bars[0] != bar.low
             || (bar.low & 6 == 4 && endpoint.bars[1] != bar.high)

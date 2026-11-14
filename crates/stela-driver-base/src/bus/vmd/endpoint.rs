@@ -220,8 +220,9 @@ impl<R: Registers> Endpoint<R> {
         (endpoint, handle)
     }
 
-    /// Capture the hierarchy above `bar`'s function, the only one of `class`
-    /// below this host, refusing any foreign or active sibling.
+    /// Capture the hierarchy above `bar`'s function, which must be of
+    /// `class`, refusing any foreign or active sibling. Every other function
+    /// below this host, of any class, stays stopped.
     pub fn discover(&mut self, bar: &FirmwareBar, class: [u8; 3]) -> Result<(), Error> {
         if self.phase != Phase::Claimed || self.hierarchy.is_some() {
             return Err(Error::ActiveChild);
