@@ -176,3 +176,26 @@ fn the_exit_line_checks_every_exit_against_the_target() {
         "GPU EXIT longest_us=138606@0x40b over=2/3 target_us=5000 check=over gave_up=0"
     );
 }
+
+#[test]
+fn a_long_copy_is_reported_each_time_and_other_phases_once() {
+    let mut call = CallPhases::new(Timed::GetBytes);
+    call.total = 300;
+    // The copy took longest.
+    call.phases[1] = 200;
+    call.phases[4] = 50;
+    assert_eq!(call.longest_phase(), ("copy", 200));
+    assert!(call.reported_each_time());
+    // The write took longest.
+    call.phases[4] = 250;
+    assert_eq!(call.longest_phase(), ("write", 250));
+    assert!(!call.reported_each_time());
+    // Time no phase accounts for.
+    call.total = 2000;
+    assert_eq!(call.longest_phase().0, "other");
+    assert!(!call.reported_each_time());
+    let mut commit = CallPhases::new(Timed::Commit);
+    commit.total = 10;
+    commit.phases[0] = 10;
+    assert!(!commit.reported_each_time());
+}

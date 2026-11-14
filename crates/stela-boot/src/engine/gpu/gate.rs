@@ -623,8 +623,10 @@ fn note_exit(served: &Served) {
 }
 
 /// `GPU LONG TURN operation=… phase=… held_us=…`, once for each operation
-/// and phase whose turn reached [`LONG_TURN_MILLIS`]: the phase is the timed
-/// operation's longest, `untimed` for an operation timed by no phase.
+/// and phase whose turn reached [`LONG_TURN_MILLIS`], and each time for a
+/// phase that copies through a texture's memory
+/// (`CallPhases::reported_each_time`): the phase is the timed operation's
+/// longest, `untimed` for an operation timed by no phase.
 fn report_long_turn(served: &Served) {
     static SEEN: Seen<128> = Seen::new();
     let tsc_hz = installed().map_or(0, |gpu| gpu.tsc_hz);
@@ -636,7 +638,15 @@ fn report_long_turn(served: &Served) {
         .as_ref()
         .map_or("untimed", |phases| phases.longest_phase().0);
     let key = format!("{:#x} {phase}", served.operation);
-    if let Some(unheld) = SEEN.first_time(&key) {
+    let each_time = served
+        .phases
+        .as_ref()
+        .is_some_and(|phases| phases.reported_each_time());
+    let shown = match each_time {
+        true => Some(Unheld(0)),
+        false => SEEN.first_time(&key),
+    };
+    if let Some(unheld) = shown {
         let detail = served
             .phases
             .as_ref()

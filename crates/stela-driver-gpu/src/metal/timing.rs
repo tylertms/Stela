@@ -173,6 +173,15 @@ impl Phase {
         matches!(self, Self::CommitCompile)
     }
 
+    /// Whether every turn this phase held past the platform's limit is
+    /// reported, rather than the first for its operation: a CPU copy through
+    /// a texture's memory holds every process's calls for as long as it
+    /// runs, so each one is a stall of the display. Each report needs a
+    /// turn that long, which bounds how many there are.
+    pub const fn reported_each_time(self) -> bool {
+        matches!(self, Self::BytesCopy)
+    }
+
     pub const fn name(self) -> &'static str {
         use Phase::*;
         match self {
@@ -331,13 +340,29 @@ impl CallPhases {
 
     /// The phase that took longest, and its ticks.
     pub fn longest_phase(&self) -> (&'static str, u64) {
+        let (phase, ticks) = self.longest();
+        (phase.map_or("other", Phase::name), ticks)
+    }
+
+    /// Whether a long turn of this call is reported each time
+    /// ([`Phase::reported_each_time`]): by its longest phase.
+    pub fn reported_each_time(&self) -> bool {
+        self.longest().0.is_some_and(Phase::reported_each_time)
+    }
+
+    /// The phase that took longest, `None` for the time no phase accounts
+    /// for, and its ticks.
+    fn longest(&self) -> (Option<Phase>, u64) {
         let phases = self.operation.phases().iter().zip(self.phases);
         phases
-            .map(|(phase, ticks)| (phase.name(), ticks))
-            .chain([("other", self.other())])
-            .fold(("other", 0), |longest, phase| {
-                if phase.1 > longest.1 { phase } else { longest }
-            })
+            .map(|(&phase, ticks)| (Some(phase), ticks))
+            .chain([(None, self.other())])
+            .fold(
+                (None, 0),
+                |longest, phase| {
+                    if phase.1 > longest.1 { phase } else { longest }
+                },
+            )
     }
 
     /// `GPU SLOW operation took_us=… most=phase/…us phase_us=… … detail`,
