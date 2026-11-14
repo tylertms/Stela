@@ -99,6 +99,31 @@ fn a_bundle_repair_is_a_preboot_macos_boot() {
 }
 
 #[test]
+fn the_installed_macos_never_sees_the_agx_model_and_other_boots_keep_it_without_a_gpu() {
+    use stela_loader::boot_selection::{
+        BUNDLE_REPAIR_OPTION, PAIRED_RECOVERY_OPTION, UPGRADE_OPTION,
+    };
+    // A single-user or repair boot continues without a GPU: no Metal device
+    // rather than the model, whose work never completes.
+    for flag in ["", SINGLE_USER, BUNDLE_REPAIR_OPTION] {
+        let installed = round_trip(&format!("--system --preboot {DISK} {flag}"));
+        assert!(installed.hides_agx(false), "{flag}");
+        assert!(installed.hides_agx(true), "{flag}");
+    }
+    // The installer's restore, recoveryOS and a staged update open no host
+    // GPU and keep the model.
+    for line in [
+        String::from("--system"),
+        format!("--system --preboot {DISK} {PAIRED_RECOVERY_OPTION}"),
+        format!("--system --preboot {DISK} {UPGRADE_OPTION}"),
+    ] {
+        let other = round_trip(&line);
+        assert!(!other.hides_agx(false), "{line}");
+        assert!(other.hides_agx(true), "{line}");
+    }
+}
+
+#[test]
 fn scanout_mirror_round_trips() {
     assert!(!round_trip("--system").scanout_mirror);
     assert!(round_trip(&format!("--system {SCANOUT_MIRROR}")).scanout_mirror);

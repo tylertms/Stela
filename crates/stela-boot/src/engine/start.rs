@@ -134,7 +134,8 @@ pub extern "sysv64" fn entry(handoff: u64) -> ! {
     } = start(handoff);
     let mut host = open_host(handoff, &mut options, host_firmware, native_processors);
     let storage = open_storage(handoff, &options, &mut host);
-    // A single-user boot is a console, which draws through no GPU.
+    // A single-user boot is a console, which draws through no GPU; without
+    // one it gives macOS no Metal device (`System::hides_agx`).
     if options.boots_macos()
         && !options.single_user
         && !options.bundle_repair
@@ -881,19 +882,32 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         ..
     } = storage;
     let mut bare = host_owner.host();
-    #[cfg_attr(not(feature = "nvk"), allow(unused_mut))]
     let mut assigned = assign(boot, &roster, topology_source.as_ref(), &full_profile);
     #[cfg(feature = "nvk")]
     let gpu_gates = assigned
         .as_mut()
-        .map(|assigned| {
-            let gates = gpu::gate::place(&mut assigned.tree);
-            if !gates.is_empty() {
-                hidden_devices.extend(stela_loader::devices::hide_agx(&mut assigned.tree));
-            }
-            gates
-        })
+        .map(|assigned| gpu::gate::place(&mut assigned.tree))
         .unwrap_or_default();
+    #[cfg(feature = "nvk")]
+    let metal_device = !gpu_gates.is_empty();
+    #[cfg(not(feature = "nvk"))]
+    let metal_device = false;
+    if let Some(assigned) = &mut assigned
+        && options.hides_agx(metal_device)
+    {
+        hidden_devices.extend(stela_loader::devices::hide_agx(&mut assigned.tree));
+        if !metal_device {
+            output::arguments(format_args!(
+                "GPU none: this {} boot gives macOS no Metal device; the AGX model, which runs \
+                 no GPU work, is hidden from it\n",
+                if options.bundle_repair {
+                    "Metal plugin repair"
+                } else {
+                    "single-user"
+                }
+            ));
+        }
+    }
     // SAFETY: all raw guest input copies have ended, AP executors are waiting
     // for their guest contexts, and no guest/device DMA producer has entered.
     // The same loader bytes are for every subsequent native CPU and synchronous device writer.

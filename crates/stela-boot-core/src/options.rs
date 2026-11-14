@@ -552,6 +552,24 @@ impl System {
         self.preboot.is_some() && self.recovery.is_none() && !self.upgrade
     }
 
+    /// Whether this boot hides the guest's AGX model (`sgx` and its `gfx-asc`
+    /// coprocessor) from macOS, `metal_device` saying whether a host GPU
+    /// serves macOS's Metal through StelaGPU.
+    ///
+    /// The model runs no GPU work: a Metal client's command buffers on it
+    /// never complete, so Apple's GPU kext stops its firmware for recovery,
+    /// and macOS panics when the model cannot follow that stop (a kext
+    /// revision whose initdata layout it has not checked). The installed
+    /// macOS therefore never sees it: with a host GPU StelaGPU is its only
+    /// Metal device, and a single-user or repair boot that continues without
+    /// one has no Metal device at all, which its console does not need. A
+    /// restore, recoveryOS or staged update keeps the model as it always has:
+    /// those boots open no host GPU, and the model's firmware start is all
+    /// they have of a GPU.
+    pub fn hides_agx(&self, metal_device: bool) -> bool {
+        metal_device || self.boots_macos()
+    }
+
     /// Select the exact number of host processors the loader reserves.
     /// A disk-derived count is rechecked against the live source before SIPI.
     pub fn assigned_native_cores(
