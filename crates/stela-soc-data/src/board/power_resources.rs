@@ -633,7 +633,9 @@ fn inventory_with_nodes<'a>(root: &Node<'a>) -> Result<ResourceInventory<'a>> {
                 super::UART => &["debug-console"][..],
                 super::SPI => &[super::NOR][..],
                 super::NOR => &[super::NVRAM, super::SYSCFG][..],
-                super::I2C => &[super::HPM_MANAGER][..],
+                name if super::usb_topology::i2c_compatible(name, node.property("compatible")) => {
+                    &[super::HPM_MANAGER][..]
+                }
                 super::HPM_MANAGER => &[super::HPM][..],
                 _ => &[],
             });

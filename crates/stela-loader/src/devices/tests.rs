@@ -1395,6 +1395,25 @@ fn original_direct_memory_preserves_source_while_pmp_dma_stays_hidden() {
 }
 
 #[test]
+fn t6020_mcc_retains_the_compatible_needed_by_the_pmgr_function_provider() {
+    let mcc = phandle(node("mcc", Some(b"mcc,t6020\0"), vec![]), 0xa3);
+    let mut pmgr = node("pmgr", Some(b"pmgr,t6020\0"), vec![]);
+    pmgr.set_property("function-mcc_ctrl", b"\xa3\0\0\0$meM".to_vec())
+        .unwrap();
+    let mut tree = DeviceTree {
+        root: node(
+            "",
+            None,
+            vec![node("arm-io", None, vec![mcc.clone(), pmgr])],
+        ),
+    };
+
+    let hidden = hide_unmodeled(&mut tree);
+    assert!(!hidden.iter().any(|path| path == "/arm-io/mcc"));
+    assert_eq!(tree.node("/arm-io/mcc"), Some(&mcc));
+}
+
+#[test]
 fn a_modeled_serial_device_stays_selected() {
     let mut tree = DeviceTree {
         root: node(

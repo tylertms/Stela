@@ -79,6 +79,20 @@ pub(super) fn iommu(node: &Node<'_>, translate: &dyn Fn(u64, u64) -> Option<u64>
         ));
     }
     let mut instances = Vec::new();
+    let flush_by_dva = node
+        .property("flush-by-dva")
+        .is_some_and(|bytes| bytes.len() == 4);
+    let vm_base = match node.property("vm-base") {
+        None => 0,
+        Some(bytes) if !profile.is_t8110() => u64::from(u32::from_le_bytes(
+            bytes.try_into().expect("validated legacy vm-base"),
+        )),
+        Some(bytes) => u64::from_le_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| refuse!("{path} vm-base is not one 64-bit address", path))?,
+        ),
+    };
     let mut apf = None;
     let mut smmu = None;
     for (reg_index, (descriptor, &(offset, bytes))) in descriptors
@@ -101,7 +115,7 @@ pub(super) fn iommu(node: &Node<'_>, translate: &dyn Fn(u64, u64) -> Option<u64>
                 // 0xc000- and 0x20000-byte windows of revision 2.2).
                 let (physical, revision) = translate(offset, bytes)
                     .filter(|at| at.is_multiple_of(crate::dart::DAPF_BYTES))
-                    .zip(profile.for_translation_window(bytes))
+                    .zip(profile.for_device_window(bytes, flush_by_dva, vm_base))
                     .ok_or_else(|| refuse!("{path} DART instance is not one translated aligned register window of a modelled revision", path))?;
                 if !instances.is_empty() && revision != profile {
                     return Err(refuse!("{path} mixes DART register-file revisions", path));
@@ -270,17 +284,6 @@ pub(super) fn iommu(node: &Node<'_>, translate: &dyn Fn(u64, u64) -> Option<u64>
     profile
         .validate_remaps(usize::from(streams), &remap)
         .within(|| refuse!("{path}", path))?;
-    let vm_base = match node.property("vm-base") {
-        None => 0,
-        Some(bytes) if !profile.is_t8110() => u64::from(u32::from_le_bytes(
-            bytes.try_into().expect("validated legacy vm-base"),
-        )),
-        Some(bytes) => u64::from_le_bytes(
-            bytes
-                .try_into()
-                .map_err(|_| refuse!("{path} vm-base is not one 64-bit address", path))?,
-        ),
-    };
     if mappers.iter().any(|&(_, sid)| sid >= u32::from(streams)) {
         return Err(refuse!(
             "{path} mapper SID exceeds its native DART profile",

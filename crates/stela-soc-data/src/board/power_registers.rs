@@ -213,6 +213,32 @@ pub(super) fn pmgr_registers(
                 .ok_or_else(|| refuse!("/arm-io/pmgr reg[{index}] is not the eFuse block", index))
         })
         .transpose()?;
+    if chip_id == 0x6020 {
+        // The 26B123 J414S pmgr reg property identifies the complete bank
+        // roster. Other builds may use the same layout.
+        const J414S_REG: &str = "26f89207f9e50f84d42962b502bf78a92b4da73f0808ae912361de56c82fd6ba";
+        if node
+            .property("reg")
+            .is_some_and(|raw| stela_formats::sha256(raw) == J414S_REG)
+        {
+            // getCPUVoltageRailIDS and getVoltageRailIDS read three words here.
+            result.rail_calibration = reg[1].and_then(|(base, _)| base.checked_add(0x4c1f0));
+            if let Some(words) = t6020_perf_boot(&reg, soc.cores) {
+                result.t6020_perf_boot = words;
+            } else {
+                refuse(
+                    PmgrBank::Performance,
+                    "J414S PMGR complex banks do not match their source layout",
+                );
+            }
+            result.t6020_unmodeled_pmgr = t6020_unmodeled_pmgr(&reg);
+        } else {
+            refuse(
+                PmgrBank::Performance,
+                "T6020 PMGR register roster is unqualified",
+            );
+        }
+    }
     if node.property("bridge-reg-index").is_some() && soc.bridge_fields.is_none() {
         refuse(
             PmgrBank::Bridges,
@@ -298,6 +324,108 @@ pub(super) fn pmgr_registers(
         );
     }
     Ok(result)
+}
+
+/// J414S has one E and two P complexes. Each maps a command/status bank and
+/// a separate table. XNU 26B123 `cpuComplexIdleEnter` polls bit 31 of the
+/// command word; `getDVMRMaxWeight` reads bits 41:38 of a 0x40-byte table row.
+fn t6020_perf_boot(reg: &[Option<(u64, u64)>], cores: &[super::CoreType]) -> Option<Vec<u64>> {
+    let mut words = Vec::new();
+    for (cluster, (command, table)) in [(8, 12), (17, 21), (26, 30)].into_iter().enumerate() {
+        let Some((base, 0x15000)) = reg.get(command).copied().flatten() else {
+            return None;
+        };
+        let Some((table, 0x90000)) = reg.get(table).copied().flatten() else {
+            return None;
+        };
+        if base.checked_add(0x5_0000) != Some(table) {
+            return None;
+        }
+        let first = if cluster == 0 { 2 } else { 1 };
+        let points = cores.get(usize::from(cluster != 0))?.operating_points?;
+        words.push(base + 0x20);
+        // getTunedDVMRWeightType's E immediate and P lookup table. The
+        // frontend has no physical DVMR weight tuning to hand off.
+        let tuning: &[u64] = if cluster == 0 {
+            &[0x6a8]
+        } else {
+            &[0x6a8, 0x6b0, 0x6e0, 0x6e8]
+        };
+        words.extend(tuning.iter().map(|offset| base + offset));
+        for row in first..first + points.len() as u64 {
+            words.push(table + 0x8008 + row * 0x40);
+            // getFANEIndex reads word 2 of P-complex rows. There is no
+            // native ANE clock selection in the cacheless frontend.
+            if cluster != 0 {
+                words.push(table + 0x8010 + row * 0x40);
+            }
+        }
+    }
+    Some(words)
+}
+
+/// The J414S 26B123 PMGR driver accesses these pages through its own reg
+/// maps while programming counters, bridge tunables and CPU power settings.
+/// This describes only bus ownership for the unsupported remainder. Keep
+/// other pages unmapped; this does not supply effects for any register.
+fn t6020_unmodeled_pmgr(reg: &[Option<(u64, u64)>]) -> Vec<(u64, u64)> {
+    const PAGES: &[(usize, &[u64])] = &[
+        (0, &[0x8, 0xc, 0x38, 0x4c, 0x60, 0x61, 0x68, 0x69, 0x6a]),
+        (1, &[0x8, 0x48]),
+        (2, &[0x22, 0x2c, 0x30]),
+        (4, &[0x70]),
+        (5, &[0x40]),
+        (7, &[0]),
+        (8, &[0]),
+        (10, &[4, 8]),
+        (17, &[0]),
+        (19, &[4, 8]),
+        (21, &[8]),
+        (26, &[0]),
+        (28, &[4, 8]),
+        (30, &[8]),
+        (40, &[0]),
+        (41, &[2]),
+        (43, &[0, 2, 3, 4]),
+        (44, &[0x10]),
+        (54, &[0]),
+        (55, &[0]),
+        (56, &[0]),
+        (57, &[0]),
+        (59, &[0]),
+        // J414S 26B123 reads the first word while starting the USB controllers.
+        (60, &[0]),
+        (61, &[0]),
+        (63, &[0]),
+        (64, &[0]),
+        (69, &[0]),
+        (70, &[0]),
+        (71, &[0]),
+    ];
+    let mut result = Vec::new();
+    for &(index, pages) in PAGES {
+        let Some((base, bytes)) = reg.get(index).copied().flatten() else {
+            continue;
+        };
+        for &page in pages {
+            let offset = page << 12;
+            if offset + 0x1000 <= bytes
+                && base.is_multiple_of(0x1000)
+                && let Some(physical) = base.checked_add(offset)
+            {
+                result.push((physical, 0x1000));
+            }
+        }
+    }
+    // J414S hw-dpe-reg locates two 64-bit energy words per core.
+    for index in (13..=16).chain(22..=25).chain(31..=34) {
+        if let Some((base, energy::CORE_BYTES)) = reg[index] {
+            result.push((base + energy::CORE_OFFSET, energy::COUNTER_BYTES));
+        }
+    }
+    result.sort_unstable();
+    result.dedup();
+    result
 }
 
 fn validate_clusters(reg: &[Option<(u64, u64)>], clusters: &[CpuCluster]) -> Result<()> {
@@ -765,6 +893,9 @@ pub(super) struct PmgrRegisters {
     pub(super) energy: Vec<EnergyBank>,
     pub(super) clusters: Vec<CpuCluster>,
     pub(super) aon_fuses: Option<(u64, u64)>,
+    pub(super) rail_calibration: Option<u64>,
+    pub(super) t6020_perf_boot: Vec<u64>,
+    pub(super) t6020_unmodeled_pmgr: Vec<(u64, u64)>,
 }
 
 #[cfg(test)]

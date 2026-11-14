@@ -13,6 +13,7 @@ const MAX_CONFIGURATIONS: u8 = 8;
 const MAX_TRANSFERS: usize = 8;
 pub const MAX_TRANSFER: usize = 65536;
 const REQUEST_TIMEOUT: u64 = 5 * crate::counter::FREQUENCY_HZ;
+pub(crate) const CONTROL_TIMEOUT: &str = "USB control request timed out";
 const RESET_RECOVERY: u64 = crate::counter::FREQUENCY_HZ / 100;
 const GET_DESCRIPTOR: u8 = 6;
 const SET_ADDRESS: u8 = 5;
@@ -199,7 +200,16 @@ impl Control {
     }
     fn step(&mut self, peer: &mut impl BusPeer, now: u64) -> Result<bool> {
         if now >= self.deadline {
-            return Err(refuse!("USB control request timed out"));
+            return Err(refuse!(
+                CONTROL_TIMEOUT,
+                stage = ?self.stage,
+                request_type = self.setup.request_type,
+                request = self.setup.request,
+                value = self.setup.value,
+                index = self.setup.index,
+                length = self.setup.length,
+                received = self.data.len(),
+            ));
         }
         let (endpoint, token, mut packet) = match self.stage {
             Stage::Setup => (0, Token::Setup, self.setup.bytes().to_vec()),

@@ -270,6 +270,7 @@ pub fn devices_with_memory<C: ConsoleSink + 'static>(
     if let Some(gfx) = board.gfx.as_ref() {
         devices.add_gfx(gfx, build)?;
     }
+    devices.add_t6020_unmodeled_pmgr(&board.t6020_unmodeled_pmgr)?;
     // Finalize only after every native constructor, including SGX's final
     // overlapping-window placement, has registered its banks.
     connect_power(&mut devices, board, &darts, log)?;
@@ -839,6 +840,12 @@ fn add_soc_banks(devices: &mut AppleDevices, board: &Board) -> Result<()> {
     }
     if let Some((physical, _)) = board.aon_fuses {
         devices.add_aon_fuses(physical)?;
+    }
+    if let Some(physical) = board.rail_calibration {
+        devices.add_rail_calibration(physical)?;
+    }
+    if !board.t6020_perf_boot.is_empty() {
+        devices.add_t6020_perf_boot(&board.t6020_perf_boot)?;
     }
     Ok(())
 }

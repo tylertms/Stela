@@ -257,7 +257,9 @@ impl Dart {
         let (format, bits) = match self.profile {
             Profile::T8020 => (Format::Dart1, T8020_PA_BITS),
             Profile::T6000 => (Format::Dart2, T6000_PA_BITS),
-            Profile::T8110 | Profile::T8110Rev22 => unreachable!("legacy format"),
+            Profile::T8110 | Profile::T8110Rev20 | Profile::T8110Rev22 => {
+                unreachable!("legacy format")
+            }
         };
         format.target(entry, bits, self.page(), leaf)
     }

@@ -413,3 +413,22 @@ fn t8110_windows_select_one_register_file_revision_per_node() {
         }
     }
 }
+
+#[test]
+fn t8110_small_window_with_dva_flush_selects_revision_2_0() {
+    let tree = encode(
+        &[
+            ("name", b"dart-usb0\0"),
+            ("compatible", b"dart,t8110\0"),
+            ("instance", b"TRAD\0\0\0\0DART\0\0\0\0"),
+            ("reg", &bytes64(&[0x7_0300_0000, 0x4000])),
+            ("interrupts", &1u32.to_le_bytes()),
+            ("vm-base", &(1u64 << 40).to_le_bytes()),
+            ("flush-by-dva", &[0; 4]),
+        ],
+        &[],
+    );
+    let bank = iommu(&Node::root(&tree).unwrap(), &flat_fixture_extent(&Some)).unwrap();
+    assert_eq!(bank.profile, Profile::T8110Rev20);
+    assert_eq!(bank.vm_base, 1 << 40);
+}

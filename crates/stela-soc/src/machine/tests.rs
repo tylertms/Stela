@@ -32,6 +32,19 @@ fn a_board_entry_given_an_earlier_count_is_named_in_the_stop_reason() {
 }
 
 #[test]
+fn t6020_pmgr_refusals_cover_only_gaps_and_keep_existing_owners() {
+    let mut devices = AppleDevices::new();
+    devices.add_rail_calibration(0x1010).unwrap();
+    let rail = devices.bus.route(0x1010, Width::Word).unwrap();
+    devices.add_t6020_unmodeled_pmgr(&[(0x1010, 0x20)]).unwrap();
+    assert_eq!(devices.bus.route(0x1010, Width::Word).unwrap(), rail);
+    assert_eq!(devices.read(0, 0x1010, 4, 0), Ok(0));
+    let unsupported = devices.read(0, 0x1020, 4, 0);
+    assert!(matches!(unsupported, Err(DeviceError::Refused(_))));
+    assert_eq!(devices.read(0, 0x1030, 4, 0), Err(DeviceError::NoDevice));
+}
+
+#[test]
 fn native_dart_mounts_program_the_selected_register_bank_and_transfer_real_dma_bytes() {
     use {
         stela_contracts::dma::Memory as _, stela_contracts::dma::Port,

@@ -82,11 +82,9 @@ impl Dart {
         Ok(Self {
             profile,
             model: match profile {
-                Profile::T8110 | Profile::T8110Rev22 => Model::T8110(t8110::Dart::for_version(
-                    t8110::version(profile),
-                    streams,
-                    irq,
-                )),
+                Profile::T8110 | Profile::T8110Rev20 | Profile::T8110Rev22 => Model::T8110(
+                    t8110::Dart::for_version(t8110::version(profile), streams, irq),
+                ),
                 Profile::T8020 | Profile::T6000 => {
                     Model::Legacy(legacy::Dart::new(profile, streams, irq))
                 }
@@ -131,7 +129,7 @@ impl Dart {
         }
         Self::for_profile(profile, streams, irq)?;
         Ok(match profile {
-            Profile::T8110 | Profile::T8110Rev22 => {
+            Profile::T8110 | Profile::T8110Rev20 | Profile::T8110Rev22 => {
                 t8110::Dart::group_for_version(t8110::version(profile), streams, irq, count)
                     .into_iter()
                     .map(|model| Self {
