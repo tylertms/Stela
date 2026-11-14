@@ -297,6 +297,11 @@ fn unload(request: &Request, seconds: u64) -> bool {
     let Some(gpu) = installed() else {
         return true;
     };
+    // The GPUs unload one after another, each bounded by nouveau in time:
+    // each has its own `seconds`, so one that does not answer leaves the
+    // next its whole share.
+    let gpus = gpu.start._attached.len().max(1) as u64;
+    let seconds = seconds.saturating_mul(gpus);
     let deadline = host::rdtsc().saturating_add(seconds.saturating_mul(gpu.tsc_hz));
     wait(gpu, request, deadline);
     request.done.load(Ordering::Acquire) != 0

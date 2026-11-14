@@ -52,7 +52,7 @@ const STACK_BYTES: usize = 16 << 20;
 /// How long a GPU's accepted work may go without progress as the PC stops:
 /// with the guest stopped, an event it waits on will never signal.
 const STOP_STALL_SECONDS: u64 = 5;
-/// How long the stop waits for a GSP to unload.
+/// How long the stop waits for each GPU's GSP to unload.
 const STOP_UNLOAD_SECONDS: u64 = 10;
 
 /// The services for the kernel's interrupts, once all are open.
@@ -1263,7 +1263,7 @@ pub(in crate::engine) fn stop(close_gates: impl FnOnce() -> u64) {
         output::arguments(format_args!("GPU drivers stopped\n"));
     } else {
         output::arguments(format_args!(
-            "GPU drivers still stopping after {STOP_UNLOAD_SECONDS} s\n"
+            "GPU drivers still stopping after {STOP_UNLOAD_SECONDS} s for each GPU\n"
         ));
         // The calls still running, the stop among them, and for how long.
         if let Some(line) = client::pool_report(gpu.tsc_hz) {
@@ -1289,7 +1289,7 @@ pub(in crate::engine) fn stop_for_fatal() {
         output::arguments(format_args!("GPU drivers stopped before the fatal stop\n"));
     } else {
         output::arguments(format_args!(
-            "GPU drivers still stopping after {STOP_UNLOAD_SECONDS} s; the firmware may still run\n"
+            "GPU drivers still stopping after {STOP_UNLOAD_SECONDS} s for each GPU; the firmware may still run\n"
         ));
     }
 }
