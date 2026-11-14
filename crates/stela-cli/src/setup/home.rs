@@ -366,6 +366,188 @@ fn quit(ui: &dyn Ui) -> Result<()> {
     ui.cancel("Nothing was changed.")
 }
 
+/// What can be done with a Stela stick from plain `stela`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Choice {
+    /// Finish an interrupted create.
+    Finish,
+    /// Finish an interrupted macOS switch.
+    FinishSwitch,
+    Update,
+    Repair,
+    /// Use the newest tested macOS for new installs.
+    Macos,
+    Settings,
+    /// `status --full`: read every macOS piece.
+    Check,
+    Status,
+    Logs,
+    Erase,
+    /// The other choices.
+    Other,
+    Quit,
+}
+
+/// What a stick's choices say, worked out once.
+struct Offers {
+    /// What finishing a create downloads, when known.
+    finish_bytes: Option<u64>,
+    finish: String,
+    update: String,
+    macos: Option<(&'static builds::Build, MacosText)>,
+}
+
+impl Offers {
+    fn of(environment: &Environment<'_>, stick: &Stick) -> Self {
+        let record = stick.record.as_ref();
+        let finish_bytes = match (&stick.state, record) {
+            (State::Interrupted, Some(record)) => {
+                super::resume_bytes(environment, record, None, None).filter(|&b| b > 0)
+            }
+            _ => None,
+        };
+        let finish = match finish_bytes {
+            Some(bytes) => format!(
+                "Keeps what is written, checks it, and downloads the rest ({})",
+                host::size_text(bytes)
+            ),
+            None => "Keeps what is written, checks it, and writes the rest".into(),
+        };
+        let update = match stick.state {
+            State::Older => update_text(environment, record),
+            _ => String::new(),
+        };
+        let macos = record
+            .filter(|_| settled(stick))
+            .and_then(|record| Some((newer_macos(record)?, record)))
+            .map(|(newest, record)| (newest, macos_text(environment, record, newest.build)));
+        Self {
+            finish_bytes,
+            finish,
+            update,
+            macos,
+        }
+    }
+}
+
+/// A complete stick that this stela may change.
+fn settled(stick: &Stick) -> bool {
+    matches!(
+        stick.state,
+        State::Older | State::Damaged(_) | State::Healthy
+    )
+}
+
+/// Every choice for `stick` in its state, in the menu's order: what its
+/// state calls for first, then the same rows for every state, each where
+/// it applies.
+fn choices(stick: &Stick, offers: &Offers) -> Vec<Choice> {
+    let mut all = match &stick.state {
+        State::Interrupted => vec![Choice::Finish],
+        State::Replacing(_) => vec![Choice::FinishSwitch],
+        State::Older => vec![Choice::Update, Choice::Repair],
+        State::Damaged(_) | State::Healthy => vec![Choice::Repair],
+        State::Empty | State::Newer(_) => Vec::new(),
+    };
+    // Only an Online installer's install uses the stick's network settings.
+    let offline = stick
+        .record
+        .as_ref()
+        .is_some_and(|r| r.active_medium().is_some_and(|m| !m.remote));
+    if offers.macos.is_some() {
+        all.push(Choice::Macos);
+    }
+    if settled(stick) && !offline {
+        all.push(Choice::Settings);
+    }
+    if offline {
+        all.push(Choice::Check);
+    }
+    all.extend([Choice::Status, Choice::Logs]);
+    // A newer Stela's stick is changed by that Stela only.
+    if !matches!(stick.state, State::Newer(_)) {
+        all.push(Choice::Erase);
+    }
+    all.push(Choice::Quit);
+    all
+}
+
+/// The menu row of `choice`; `first` for the short question a state asks
+/// first, where a row is named for that question.
+fn row(choice: Choice, stick: &Stick, offers: &Offers, first: bool) -> super::wizard::menu::Item {
+    let (label, hint): (String, &str) = match choice {
+        Choice::Finish if first => ("Finish it".into(), offers.finish.as_str()),
+        Choice::Finish => ("Finish the create".into(), offers.finish.as_str()),
+        Choice::FinishSwitch => {
+            let next = match &stick.state {
+                State::Replacing(next) => macos_name(next),
+                _ => String::new(),
+            };
+            (
+                format!("Finish the switch to macOS {next}"),
+                "Writes the rest of the new copy",
+            )
+        }
+        Choice::Update if first => ("Update".into(), ""),
+        Choice::Update => (
+            format!("Update to Stela {}", release::CURRENT),
+            offers.update.as_str(),
+        ),
+        Choice::Repair => (
+            "Repair".into(),
+            "Puts back what is damaged or missing; asks before a download over 1 GB",
+        ),
+        Choice::Macos => match &offers.macos {
+            Some((newest, offer)) => (
+                format!("Use macOS {} for new installs", newest.version),
+                offer.text.as_str(),
+            ),
+            None => unreachable!("offered with a build"),
+        },
+        Choice::Settings => (
+            "Change Wi-Fi or network settings".into(),
+            "For an install that downloads macOS",
+        ),
+        Choice::Check => (
+            "Check every file".into(),
+            "Reads every macOS piece and changes nothing; takes a few minutes",
+        ),
+        Choice::Status => ("Show status".into(), "Changes nothing"),
+        Choice::Logs => ("Save the boot logs for a bug report".into(), ""),
+        Choice::Erase if first => ("Start over".into(), "Erases the stick"),
+        Choice::Erase => ("Erase it and make a new installer".into(), ""),
+        Choice::Other => ("Other choices".into(), ""),
+        Choice::Quit => ("Quit".into(), ""),
+    };
+    super::wizard::menu::Item {
+        value: choice as usize,
+        label,
+        hint: hint.into(),
+        enabled: true,
+    }
+}
+
+/// Ask `question` with `choices`, Enter taking `initial`.
+fn ask(
+    ui: &dyn Ui,
+    question: &str,
+    stick: &Stick,
+    offers: &Offers,
+    choices: &[Choice],
+    initial: Choice,
+    first: bool,
+) -> Result<Choice> {
+    let rows: Vec<_> = choices
+        .iter()
+        .map(|&choice| row(choice, stick, offers, first))
+        .collect();
+    let value = ui.select(question, &rows, initial as usize)?;
+    Ok(*choices
+        .iter()
+        .find(|&&choice| choice as usize == value)
+        .expect("a row's value is its choice"))
+}
+
 /// Offer the next step for `stick`, then the other choices.
 fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<()> {
     let ui = environment.ui;
@@ -373,49 +555,29 @@ fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<
     if let Some(details) = stick.details() {
         ui.info(&details)?;
     }
-    let volume = stick.volume.clone().unwrap_or_default();
-    let maintenance = |action: Action| maintenance(&request, &stick, action);
-    match &stick.state {
+    let offers = Offers::of(environment, &stick);
+    // The question a state asks first, and its choices.
+    let first = |question: &str, choices: &[Choice]| -> Result<Choice> {
+        let mut choices = choices.to_vec();
+        choices.extend([Choice::Other, Choice::Quit]);
+        ask(ui, question, &stick, &offers, &choices, choices[0], true)
+    };
+    let choice = match &stick.state {
         State::Empty if stick.disk.bytes != 0 && stick.disk.bytes < NETWORK_MIN => {
             ui.warning(&format!(
                 "This stick holds {}; an installer needs one of 8 GB or more.",
                 host::size_text(stick.disk.bytes)
             ))?;
-            quit(ui)
+            return quit(ui);
         }
-        State::Empty => create(environment, request, &stick),
+        State::Empty => return create(environment, request, &stick),
         State::Interrupted => {
             let record = stick.record.as_ref().expect("a setup has its record");
             ui.warning(&format!(
                 "A create stopped part way: {}.",
                 record.resume_summary()
             ))?;
-            let named = super::resume_bytes(environment, record, None, None).filter(|&b| b > 0);
-            let finish = match named {
-                Some(bytes) => format!(
-                    "Keeps what is written, checks it, and downloads the rest ({})",
-                    host::size_text(bytes)
-                ),
-                None => "Keeps what is written, checks it, and writes the rest".into(),
-            };
-            let rows = super::ui::rows(&[
-                ("Finish it", &finish),
-                ("Start over", "Erases the stick"),
-                ("Quit", ""),
-            ]);
-            match ui.select("Finish the create?", &rows, 0)? {
-                // The choice named what it downloads, when that was known:
-                // that download is not asked about again, any other is.
-                0 => perform(
-                    environment,
-                    Request {
-                        accepted_download: named,
-                        ..maintenance(Action::Repair)
-                    },
-                ),
-                1 => create(environment, request, &stick),
-                _ => quit(ui),
-            }
+            first("Finish the create?", &[Choice::Finish, Choice::Erase])?
         }
         State::Replacing(next) => {
             ui.warning(&format!(
@@ -423,17 +585,7 @@ fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<
                  install macOS until it is.",
                 macos_name(next)
             ))?;
-            let finish = format!("Finish the switch to macOS {}", macos_name(next));
-            let rows = super::ui::rows(&[
-                (&finish, "Writes the rest of the new copy"),
-                ("Show status", "Changes nothing"),
-                ("Quit", ""),
-            ]);
-            match ui.select("What next?", &rows, 0)? {
-                0 => perform(environment, maintenance(Action::Repair)),
-                1 => perform(environment, maintenance(Action::Status)),
-                _ => quit(ui),
-            }
+            first("Finish the switch?", &[Choice::FinishSwitch])?
         }
         State::Newer(version) => {
             ui.warning(&format!(
@@ -441,50 +593,92 @@ fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<
                  {version} or newer to change it.",
                 release::CURRENT
             ))?;
-            let rows = super::ui::rows(&[
-                ("Show status", "Changes nothing"),
-                ("Save the boot logs", "For a bug report"),
-                ("Quit", ""),
-            ]);
-            match ui.select("What next?", &rows, 0)? {
-                0 => perform(environment, maintenance(Action::Status)),
-                1 => perform(environment, log_request(&volume)),
-                _ => quit(ui),
-            }
+            Choice::Other
         }
         State::Older => {
-            let question = format!("Update this stick to Stela {}?", release::CURRENT);
-            ui.info(&update_text(environment, stick.record.as_ref()))?;
-            let rows = super::ui::rows(&[("Update", ""), ("Other choices", ""), ("Quit", "")]);
-            match ui.select(&question, &rows, 0)? {
-                0 => {
-                    act_on(environment, maintenance(Action::UpdateStela))?;
-                    offer_macos(environment, &request, &volume)
-                }
-                1 => menu(environment, request, &stick),
-                _ => quit(ui),
-            }
+            ui.info(&offers.update)?;
+            first(
+                &format!("Update this stick to Stela {}?", release::CURRENT),
+                &[Choice::Update],
+            )?
         }
         State::Damaged(problems) => {
             ui.warning(&format!(
                 "This stick needs repair:\n{}",
                 problems.join("\n")
             ))?;
-            let rows = super::ui::rows(&[
-                (
-                    "Repair",
-                    "Puts back what is damaged or missing; asks before a download over 1 GB",
-                ),
-                ("Other choices", ""),
-                ("Quit", ""),
-            ]);
-            match ui.select("Repair this stick?", &rows, 0)? {
-                0 => perform(environment, maintenance(Action::Repair)),
-                1 => menu(environment, request, &stick),
-                _ => quit(ui),
+            first("Repair this stick?", &[Choice::Repair])?
+        }
+        State::Healthy => {
+            ui.info("This stick is ready.")?;
+            Choice::Other
+        }
+    };
+    let choice = match choice {
+        // Quit is the choice Enter takes: no row that writes the stick is.
+        Choice::Other => ask(
+            ui,
+            "What next?",
+            &stick,
+            &offers,
+            &choices(&stick, &offers),
+            Choice::Quit,
+            false,
+        )?,
+        choice => choice,
+    };
+    run_choice(environment, request, &stick, offers, choice)
+}
+
+/// Do `choice` for `stick`.
+fn run_choice(
+    environment: &Environment<'_>,
+    request: Request,
+    stick: &Stick,
+    offers: Offers,
+    choice: Choice,
+) -> Result<()> {
+    let maintenance = |action: Action| maintenance(&request, stick, action);
+    let volume = stick.volume.clone().unwrap_or_default();
+    match choice {
+        // The choice named what it downloads, when that was known: that
+        // download is not asked about again, any other is.
+        Choice::Finish => perform(
+            environment,
+            Request {
+                accepted_download: offers.finish_bytes,
+                ..maintenance(Action::Repair)
+            },
+        ),
+        Choice::FinishSwitch | Choice::Repair => perform(environment, maintenance(Action::Repair)),
+        Choice::Update => {
+            act_on(environment, maintenance(Action::UpdateStela))?;
+            offer_macos(environment, &request, &volume)
+        }
+        Choice::Macos => {
+            let (newest, offer) = offers.macos.expect("offered with a build");
+            change_macos(environment, &request, &volume, newest.build, offer.named)
+        }
+        Choice::Settings => {
+            let mut settings = maintenance(Action::Configure);
+            match super::settings::ask(environment, &mut settings, stick.record.as_ref())? {
+                true => perform(environment, settings),
+                // The settings' own question said that nothing was changed.
+                false => Ok(()),
             }
         }
-        State::Healthy => menu(environment, request, &stick),
+        // Reads every piece and changes nothing, as its row says.
+        Choice::Check => perform(
+            environment,
+            Request {
+                full: true,
+                ..maintenance(Action::Status)
+            },
+        ),
+        Choice::Status => perform(environment, maintenance(Action::Status)),
+        Choice::Logs => perform(environment, log_request(&volume)),
+        Choice::Erase => create(environment, request, stick),
+        Choice::Other | Choice::Quit => quit(environment.ui),
     }
 }
 
@@ -620,87 +814,6 @@ fn change_macos(
             ..Request::default()
         },
     )
-}
-
-/// The other choices for a Stela stick, only those that apply.
-fn menu(environment: &Environment<'_>, request: Request, stick: &Stick) -> Result<()> {
-    let ui = environment.ui;
-    let volume = stick.volume.clone().unwrap_or_default();
-    let record = stick.record.as_ref();
-    let newest = record.and_then(newer_macos);
-    let offline = record.is_some_and(|r| r.active_medium().is_some_and(|m| !m.remote));
-    const MACOS: usize = 1;
-    const SETTINGS: usize = 2;
-    const CHECK: usize = 3;
-    const LOGS: usize = 4;
-    const ERASE: usize = 5;
-    const QUIT: usize = 6;
-    let mut rows = Vec::new();
-    let mut row = |value: usize, label: String, hint: &str| {
-        rows.push(super::wizard::menu::Item {
-            value,
-            label,
-            hint: hint.into(),
-            enabled: true,
-        })
-    };
-    let offer = newest
-        .zip(record)
-        .map(|(newest, record)| macos_text(environment, record, newest.build));
-    if let (Some(newest), Some(offer)) = (newest, &offer) {
-        row(
-            MACOS,
-            format!("Use macOS {} for new installs", newest.version),
-            &offer.text,
-        );
-    }
-    row(
-        SETTINGS,
-        "Change Wi-Fi or network settings".into(),
-        "For an install that downloads macOS",
-    );
-    if offline {
-        row(
-            CHECK,
-            "Check every file".into(),
-            "Reads every macOS piece; takes a few minutes",
-        );
-    }
-    row(LOGS, "Save the boot logs for a bug report".into(), "");
-    row(ERASE, "Erase it and make a new installer".into(), "");
-    row(QUIT, "Quit".into(), "");
-    let maintenance = |action: Action| maintenance(&request, stick, action);
-    if matches!(stick.state, State::Healthy) {
-        ui.info("This stick is ready.")?;
-    }
-    // Quit is the choice Enter takes: no row that writes the stick is.
-    match ui.select("What next?", &rows, QUIT)? {
-        MACOS => change_macos(
-            environment,
-            &request,
-            &volume,
-            newest.expect("offered with a build").build,
-            offer.is_some_and(|offer| offer.named),
-        ),
-        SETTINGS => {
-            let mut settings = maintenance(Action::Configure);
-            match super::settings::ask(environment, &mut settings, record)? {
-                true => perform(environment, settings),
-                // The settings' own Cancel said that nothing was changed.
-                false => Ok(()),
-            }
-        }
-        CHECK => perform(
-            environment,
-            Request {
-                full: true,
-                ..maintenance(Action::Repair)
-            },
-        ),
-        LOGS => perform(environment, log_request(&volume)),
-        ERASE => create(environment, request, stick),
-        _ => quit(ui),
-    }
 }
 
 /// `log` of the stick at `volume`, saved to a file in this folder.

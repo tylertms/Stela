@@ -5808,6 +5808,17 @@ fn made_by(release: Option<&str>) -> Fixture {
     f
 }
 
+/// A ready Online installer made by this Stela.
+fn made_online() -> Fixture {
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    let mut online = command(&f, &f.esp);
+    online.install_image = Some(InstallImage::Network);
+    setup(&environment(&f.host), online).unwrap();
+    assert_eq!(record(&f).install_kind(), InstallImage::Network);
+    f
+}
+
 #[test]
 fn a_stick_records_its_stela_version_and_an_update_brings_an_older_one_to_this_one() {
     let f = made_by(None);
@@ -6522,7 +6533,7 @@ fn journey_f_an_interrupted_macos_switch_offers_to_finish_it() {
     assert_eq!(stick_files(&f), before);
     // Its status names the stopped switch and closes with the summary, not
     // with an error.
-    let (shown, result, done) = plain_stela(&f, &["Show status"], &[]);
+    let (shown, result, done) = plain_stela(&f, &["Other choices", "Show status"], &[]);
     result.unwrap();
     assert!(done, "{shown}");
     assert!(
@@ -6649,9 +6660,132 @@ fn yes_makes_plain_stela_do_what_is_due_and_accept_what_an_action_asks() {
     );
 }
 
+/// The rows of the last question `shown` asked, by label.
+fn last_rows(shown: &str) -> Vec<String> {
+    let asked = shown.rfind("\n? ").expect("a question");
+    shown[asked + 1..]
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.strip_prefix("● ").or_else(|| line.strip_prefix("○ ")))
+        .map(|row| row.split(" · ").next().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn every_state_asks_with_other_choices_that_list_the_same_rows_where_they_apply() {
+    let other = |f: &Fixture| {
+        let (shown, result, done) = plain_stela(f, &["Other choices", "Quit"], &[]);
+        result.unwrap();
+        assert!(done, "{shown}");
+        last_rows(&shown)
+    };
+    let common = [
+        "Show status",
+        "Save the boot logs for a bug report",
+        "Erase it and make a new installer",
+        "Quit",
+    ];
+    let ends_with = |rows: &[String], tail: &[&str]| {
+        assert!(
+            rows.ends_with(&tail.iter().map(|row| row.to_string()).collect::<Vec<_>>()),
+            "{rows:?}"
+        );
+    };
+    // An older stick: Update and Repair are there as well.
+    let f = made_by(None);
+    let rows = other(&f);
+    let update = format!("Update to Stela {}", release::CURRENT);
+    assert_eq!(rows[..2], [update.as_str(), "Repair"], "{rows:?}");
+    ends_with(&rows, &common);
+    // An Offline stick installs without a network: no network settings,
+    // and its pieces can be checked.
+    assert!(!rows.iter().any(|row| row.contains("Wi-Fi")), "{rows:?}");
+    assert!(rows.iter().any(|row| row == "Check every file"), "{rows:?}");
+    // A damaged stick.
+    let f = made_by(Some(release::CURRENT));
+    fs::remove_file(f.esp.join(LOADER_PATH)).unwrap();
+    let rows = other(&f);
+    assert_eq!(rows[0], "Repair", "{rows:?}");
+    ends_with(&rows, &common);
+    // A stopped create and a stopped switch: finishing it, and the rest.
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    interrupt_setup(&f);
+    let rows = other(&f);
+    assert_eq!(rows[0], "Finish the create", "{rows:?}");
+    ends_with(&rows, &common);
+    let f = made_by(Some(release::CURRENT));
+    let mut switching = record(&f);
+    switching.replacing = Some("STELA2".into());
+    record::write_record(&f.esp, &switching).unwrap();
+    let rows = other(&f);
+    assert_eq!(rows[0], "Finish the switch to macOS STELA2", "{rows:?}");
+    ends_with(&rows, &common);
+    // A ready Online stick: its network settings, and no pieces to check.
+    let f = made_online();
+    let (shown, result, _) = plain_stela(&f, &["Quit"], &[]);
+    result.unwrap();
+    let rows = last_rows(&shown);
+    assert!(
+        rows.iter()
+            .any(|row| row == "Change Wi-Fi or network settings"),
+        "{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row == "Check every file"),
+        "{rows:?}"
+    );
+    assert_eq!(rows[0], "Repair", "{rows:?}");
+    ends_with(&rows, &common);
+    // A newer Stela's stick: only what reads it.
+    let f = made_by(Some("99.0.0"));
+    let (shown, result, _) = plain_stela(&f, &["Quit"], &[]);
+    result.unwrap();
+    assert_eq!(
+        last_rows(&shown),
+        [
+            "Check every file",
+            "Show status",
+            "Save the boot logs for a bug report",
+            "Quit"
+        ]
+    );
+}
+
+#[test]
+fn check_every_file_reads_every_piece_and_changes_nothing() {
+    let f = made_by(Some(release::CURRENT));
+    let before = stick_files(&f);
+    let (shown, result, done) = plain_stela(&f, &["Check every file"], &[]);
+    result.unwrap();
+    assert!(done, "{shown}");
+    assert!(shown.ends_with("└ No problems found."), "{shown}");
+    assert_eq!(stick_files(&f), before);
+    // A piece damaged in place passes the quick checks; reading it finds
+    // it, and it is left for Repair.
+    let medium = record(&f).active_medium().cloned().unwrap();
+    let first = medium
+        .directory()
+        .join(stela_formats::payload::piece_name(0));
+    let mut piece = fs::read(&first).unwrap();
+    piece[0] ^= 0xff;
+    fs::write(&first, &piece).unwrap();
+    let before = stick_files(&f);
+    let (shown, result, done) = plain_stela(&f, &["Check every file"], &[]);
+    result.unwrap();
+    assert!(done, "{shown}");
+    assert!(shown.contains("● This stick is ready."), "{shown}");
+    assert!(
+        shown.ends_with("└ 1 problem; the report above names its fix"),
+        "{shown}"
+    );
+    assert_eq!(stick_files(&f), before);
+}
+
 #[test]
 fn journey_settings_change_the_wifi_and_cancel_changes_nothing() {
-    let f = made_by(Some(release::CURRENT));
+    let f = made_online();
     let before = stick_files(&f);
     let (shown, result, done) = plain_stela(
         &f,
