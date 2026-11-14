@@ -246,3 +246,15 @@ fn a_monitor_connected_later_without_the_size_is_tried_once_per_connection() {
     assert_eq!(display.outputs(), 1);
     assert!(display.drm.set_40.is_none());
 }
+
+#[test]
+fn a_released_display_turns_every_output_off_and_gives_its_buffers_back() {
+    let mut card = two_monitors();
+    let display = Display::take(&mut card, (4, 2)).unwrap();
+    assert_eq!(display.outputs(), 2);
+    let _node = display.release();
+    assert_eq!((card.set_40, card.set), (None, None));
+    assert_eq!(card.destroyed.len(), 3);
+    assert_eq!(card.removed.len(), 3);
+    assert_eq!(card.unmapped, 3);
+}

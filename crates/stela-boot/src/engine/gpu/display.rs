@@ -253,14 +253,17 @@ impl KmsScanout {
                     return;
                 }
                 Ok(display) => {
-                    // No scaler exists; the output keeps the black frame
-                    // the take showed, and the GPU is looked on no more.
+                    // No scaler exists; the outputs are turned off, their
+                    // buffers and the node given back, and the GPU is
+                    // looked on no more.
                     let (width, height) = display.size();
                     output::arguments(format_args!(
                         "GPU {name}: display detected after start has no {}x{} mode, \
                          which macOS draws, only {width}x{height}: not shown\n",
                         wanted.0, wanted.1
                     ));
+                    let Node(fd) = display.release();
+                    client::close_descriptor(fd);
                     self.waiting.swap_remove(index);
                 }
                 Err(DisplayError::NoOutput) => index += 1,
@@ -283,9 +286,18 @@ fn report_watched(name: &str, display: &Display<Node>, watched: Watched) {
         (watched.lost, "display disconnected"),
         (watched.restored, "display connected again"),
         (watched.joined, "display added on a new output"),
-        (watched.unshown, "new output has no free mode or controller in the display's size"),
-        (watched.modeless, "display connected again has no mode of the display's size: left dark"),
-        (watched.refused, "display connected again refused its mode: left dark"),
+        (
+            watched.unshown,
+            "new output has no free mode or controller in the display's size",
+        ),
+        (
+            watched.modeless,
+            "display connected again has no mode of the display's size: left dark",
+        ),
+        (
+            watched.refused,
+            "display connected again refused its mode: left dark",
+        ),
     ];
     for (count, what) in lines {
         if count != 0 {

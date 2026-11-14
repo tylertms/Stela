@@ -1169,6 +1169,18 @@ impl<D: Drm> Display<D> {
         Ok(true)
     }
 
+    /// Give the outputs back: each controller turned off, then the buffers,
+    /// their mappings and framebuffers, and the node, for its owner to
+    /// close. A refused request leaves what it names with the node, whose
+    /// close frees it.
+    pub fn release(mut self) -> D {
+        for index in 0..self.heads.len() {
+            let _ = self.crtc_off(index);
+        }
+        release_all(&mut self.drm, &self.buffers);
+        self.drm
+    }
+
     /// How many outputs show the picture.
     pub fn outputs(&self) -> usize {
         self.heads.len()
