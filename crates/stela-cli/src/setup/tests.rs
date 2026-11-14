@@ -6111,6 +6111,102 @@ fn finishing_a_create_asks_before_downloading_more_than_a_gigabyte() {
     home::run(&environment, request).unwrap();
     let shown = person.transcript();
     assert!(shown.contains("downloads the rest (3.0 GB)"), "{shown}");
+    // Finish it, with the size named, is not asked about again.
+    let person = ui::tests::Scripted::new(&["Finish it"]);
+    let request = Request {
+        efi: Some(f.efi.clone()),
+        ..Request::home(command::Global::default())
+    };
+    let error = home::run(
+        &Environment {
+            image_size: &size,
+            fetch_image: &fetch,
+            ui: &person,
+            ..self::environment(&f.host)
+        },
+        request,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(!error.contains("this downloads"), "{error}");
+    assert!(
+        !person.transcript().contains("from Apple"),
+        "{}",
+        person.transcript()
+    );
+    // When the size was unknown as Finish it was offered, the download is
+    // asked about once it is known, and a no changes nothing.
+    let known = std::cell::Cell::new(false);
+    let late = |_: &str, _: &str| -> Result<(u64, u64)> {
+        ensure!(known.get(), "Apple's server did not answer");
+        Ok((1_000_000, 3_000_000_000))
+    };
+    let person = ui::tests::Scripted::with_hook(&["Finish it", "no"], |_| known.set(true));
+    let request = Request {
+        efi: Some(f.efi.clone()),
+        ..Request::home(command::Global::default())
+    };
+    home::run(
+        &Environment {
+            image_size: &late,
+            fetch_image: &fetch,
+            ui: &person,
+            ..self::environment(&f.host)
+        },
+        request,
+    )
+    .unwrap();
+    let shown = person.transcript();
+    assert!(person.done(), "{shown}");
+    assert!(
+        shown.contains("● Finish it · Keeps what is written, checks it, and writes the rest"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("This downloads 3.0 GB from Apple"),
+        "{shown}"
+    );
+    assert!(shown.ends_with("■ Nothing was changed."), "{shown}");
+    assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
+}
+
+#[test]
+fn a_macos_switch_offered_without_its_size_asks_once_the_size_is_known() {
+    let f = made_by(None);
+    let known = std::cell::Cell::new(false);
+    let late = |_: &str, _: &str| -> Result<(u64, u64)> {
+        ensure!(known.get(), "Apple's server did not answer");
+        Ok((1_000_000, 3_000_000_000))
+    };
+    let fetch = |_: &Path, _: &str, _: &str, need: sources::Need| -> Result<sources::Fetched> {
+        anyhow::bail!("asked for {need:?}")
+    };
+    let person = ui::tests::Scripted::with_hook(&["Update", "Yes", "no"], |answer| {
+        known.set(answer == "Yes")
+    });
+    let request = Request {
+        efi: Some(f.efi.clone()),
+        ..Request::home(command::Global::default())
+    };
+    home::run(
+        &Environment {
+            image_size: &late,
+            builds: builds::SUPPORTED,
+            fetch_image: &fetch,
+            ui: &person,
+            ..environment(&f.host)
+        },
+        request,
+    )
+    .unwrap();
+    let shown = person.transcript();
+    assert!(person.done(), "{shown}");
+    assert!(shown.contains("Apple's server did not answer"), "{shown}");
+    assert!(
+        shown.contains("This downloads 3.0 GB from Apple"),
+        "{shown}"
+    );
+    assert!(shown.ends_with("■ Nothing was changed."), "{shown}");
 }
 
 /// Plain `stela` on `f`'s computer, answered by `answers`; what it showed

@@ -465,6 +465,10 @@ pub(crate) struct Request {
     /// `--yes`: without a terminal, accept what a terminal run asks about,
     /// erasing aside.
     pub(crate) yes: bool,
+    /// The bytes of a download plain `stela`'s choice named and the person
+    /// chose: a download of that size is not asked about again, any other
+    /// is.
+    accepted_download: Option<u64>,
     target: Option<String>,
     nor: Option<String>,
     disk_serial: Option<String>,
@@ -1241,7 +1245,7 @@ impl Request {
         {
             consent_download(
                 environment,
-                self.yes,
+                self.yes || self.accepted_download == Some(bytes),
                 false,
                 bytes,
                 &format!("the rest of macOS {}", record.build),

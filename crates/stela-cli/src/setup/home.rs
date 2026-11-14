@@ -390,12 +390,13 @@ fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<
                 "A create stopped part way: {}.",
                 record.resume_summary()
             ))?;
-            let finish = match super::resume_bytes(environment, record, None, None) {
-                Some(bytes) if bytes > 0 => format!(
+            let named = super::resume_bytes(environment, record, None, None).filter(|&b| b > 0);
+            let finish = match named {
+                Some(bytes) => format!(
                     "Keeps what is written, checks it, and downloads the rest ({})",
                     host::size_text(bytes)
                 ),
-                _ => "Keeps what is written, checks it, and writes the rest".into(),
+                None => "Keeps what is written, checks it, and writes the rest".into(),
             };
             let rows = super::ui::rows(&[
                 ("Finish it", &finish),
@@ -403,11 +404,12 @@ fn act(environment: &Environment<'_>, request: Request, stick: Stick) -> Result<
                 ("Quit", ""),
             ]);
             match ui.select("Finish the create?", &rows, 0)? {
-                // The choice named what it downloads.
+                // The choice named what it downloads, when that was known:
+                // that download is not asked about again, any other is.
                 0 => perform(
                     environment,
                     Request {
-                        yes: true,
+                        accepted_download: named,
                         ..maintenance(Action::Repair)
                     },
                 ),
@@ -531,22 +533,31 @@ fn offer_macos(environment: &Environment<'_>, request: &Request, volume: &Path) 
     let Some(newest) = newer_macos(&record) else {
         return ui.outro(DONE);
     };
-    let (text, large) = macos_text(environment, &record, newest.build);
-    ui.info(&text)?;
+    let offer = macos_text(environment, &record, newest.build);
+    ui.info(&offer.text)?;
     let rows = super::ui::rows(&[("Yes", ""), ("Not now", "")]);
     let question = format!(
         "macOS {} is available. Use it for new installs?",
         newest.version
     );
-    match ui.select(&question, &rows, usize::from(large))? {
-        0 => change_macos(environment, request, volume, newest.build),
+    match ui.select(&question, &rows, usize::from(offer.large))? {
+        0 => change_macos(environment, request, volume, newest.build, offer.named),
         _ => ui.outro(DONE),
     }
 }
 
-/// What switching `record`'s stick to `build` downloads and removes, and
-/// whether it downloads more than 1 GB.
-fn macos_text(environment: &Environment<'_>, record: &Record, build: &str) -> (String, bool) {
+/// What switching `record`'s stick to `build` downloads and removes.
+struct MacosText {
+    text: String,
+    /// It downloads more than 1 GB.
+    large: bool,
+    /// The text names the download and the copy removed for room: its
+    /// source was found.
+    named: bool,
+}
+
+/// What switching `record`'s stick to `build` downloads and removes.
+fn macos_text(environment: &Environment<'_>, record: &Record, build: &str) -> MacosText {
     let need = sources::need(record, build, true).unwrap_or(sources::Need::BootFiles);
     let lookup = sources::Lookup {
         need,
@@ -558,8 +569,10 @@ fn macos_text(environment: &Environment<'_>, record: &Record, build: &str) -> (S
     };
     let mut text = String::new();
     let mut large = false;
+    let mut named = false;
     match sources::locate(environment, &lookup) {
         Ok(source) => {
+            named = true;
             let bytes = sources::download_bytes(&source);
             large = bytes > super::LARGE_DOWNLOAD;
             if bytes > 0 {
@@ -582,16 +595,18 @@ fn macos_text(environment: &Environment<'_>, record: &Record, build: &str) -> (S
         }
     }
     text.push_str("The installed macOS is not changed; it updates itself.");
-    (text, large)
+    MacosText { text, large, named }
 }
 
-/// Switch the stick to `build`: the question that offered it named what it
-/// downloads and removes, so the switch asks nothing more.
+/// Switch the stick to `build`: when the question that offered it named
+/// what it downloads and removes (`named`), the switch asks nothing more;
+/// otherwise it asks as `stela update --macos` does.
 fn change_macos(
     environment: &Environment<'_>,
     request: &Request,
     volume: &Path,
     build: &str,
+    named: bool,
 ) -> Result<()> {
     perform(
         environment,
@@ -601,7 +616,7 @@ fn change_macos(
             build: build.into(),
             dry_run: request.dry_run,
             efi: request.efi.clone(),
-            yes: true,
+            yes: request.yes || named,
             ..Request::default()
         },
     )
@@ -629,13 +644,14 @@ fn menu(environment: &Environment<'_>, request: Request, stick: &Stick) -> Resul
             enabled: true,
         })
     };
-    let macos_hint;
-    if let (Some(newest), Some(record)) = (newest, record) {
-        macos_hint = macos_text(environment, record, newest.build).0;
+    let offer = newest
+        .zip(record)
+        .map(|(newest, record)| macos_text(environment, record, newest.build));
+    if let (Some(newest), Some(offer)) = (newest, &offer) {
         row(
             MACOS,
             format!("Use macOS {} for new installs", newest.version),
-            &macos_hint,
+            &offer.text,
         );
     }
     row(
@@ -664,6 +680,7 @@ fn menu(environment: &Environment<'_>, request: Request, stick: &Stick) -> Resul
             &request,
             &volume,
             newest.expect("offered with a build").build,
+            offer.is_some_and(|offer| offer.named),
         ),
         SETTINGS => {
             let mut settings = maintenance(Action::Configure);
