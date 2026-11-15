@@ -939,6 +939,13 @@ pub(super) struct Claimed {
     link: Option<PcieLink>,
 }
 
+/// Called only between GPU operations, with no storage driver borrowed.
+fn claim_stage(address: stela_drivers::bus::pci::Address, stage: &str) {
+    output::arguments(format_args!("GPU HANDOFF v17 {address}: {stage}\n"));
+    crate::status::progress(&format!("GPU {address}: {stage}"));
+    super::storage::store_usb_log_in_gpu_start();
+}
+
 fn claim(
     services: &dyn NativeServices,
     adapter: &gpu::Adapter,
@@ -948,6 +955,7 @@ fn claim(
 ) -> Result<Claimed, ServiceError> {
     use crate::pci_io::ScreenOwner;
     let address = adapter.address;
+    claim_stage(address, "checking timer and original requester");
     let timer = services.minimum_delay()?;
     let mut requester = services.prepare_requester(address)?;
     let bus_reset = requester.bus_reset_available();
@@ -956,6 +964,7 @@ fn claim(
     {
         return Err(ServiceError::Refused("the GPU's original identity changed"));
     }
+    claim_stage(address, "checking function-level reset capability");
     let translated = services.dma_translated(address);
     gpu::cold::check_candidate(function, timer.as_ref(), translated, bus_reset)
         .map_err(|error| cold_refusal(address, error))?;
@@ -998,6 +1007,7 @@ fn claim(
         ..Placement::default()
     };
     let (mut bars, mut resources) = (Vec::new(), ManuallyDrop::new(Vec::new()));
+    claim_stage(address, "probing and restoring PCI BARs");
     let function_bars = function.bars().map_err(ServiceError::Config)?;
     if !matches!(function_bars[0], Some(Bar::Memory { prefetchable: false, size, .. }) if size >= PAGE)
         || function.config().read16(4).map_err(ServiceError::Config)? & 2 == 0
@@ -1039,6 +1049,7 @@ fn claim(
                 | if wide { RESOURCE_WIDE } else { 0 },
         };
     }
+    claim_stage(address, "mapping register BAR and checking chipset");
     let config = function
         .config()
         .retain_epoch()
@@ -1069,6 +1080,7 @@ fn claim(
         alloc::format!("GPU{line}PCIID"),
         alloc::format!("10de:{:04x}", adapter.device),
     );
+    claim_stage(address, "resetting GPU and binding original DMA owner");
     let mut cold = gpu::cold::Cold::new(gpu::cold::Inputs {
         requester,
         views: GpuViews {
@@ -1096,6 +1108,7 @@ fn claim(
         )),
         Some(gpu::cold::Reset::Function(_)) => {}
     }
+    claim_stage(address, "reset and DMA binding completed");
     // SAFETY: both original owners transfer into this retained function
     // lifetime before Linux probe. Only the temporary UC observation is retired.
     let (bound, views) = unsafe { ready.into_parts() };
@@ -1108,7 +1121,9 @@ fn claim(
     if let Some(chip) =
         gpu::nouveau_chip::Chip::from_boot0(boot0).filter(|chip| chip.waits_for_firmware_boot())
     {
+        claim_stage(address, "waiting for GPU firmware boot");
         wait_for_firmware_boot(services, &resources[0], chip)?;
+        claim_stage(address, "GPU firmware boot completed");
     }
     // SAFETY: this scoped BAR observation was the sole user of the UC mapping.
     unsafe { views.registers.retire() }.map_err(ServiceError::Mapping)?;
@@ -1298,6 +1313,7 @@ pub(super) struct Refused {
     pub(super) address: String,
     pub(super) device: u16,
     pub(super) reason: stela_boot_core::gpu_status::Reason,
+    pub(super) detail: Option<String>,
 }
 
 /// Claim every NVIDIA adapter, each reported if it cannot be, and the ones
@@ -1313,6 +1329,7 @@ pub(super) fn claim_all(
         address: format!("{}", adapter.address),
         device: adapter.device,
         reason,
+        detail: None,
     };
     for adapter in adapters
         .iter()
@@ -1340,6 +1357,12 @@ pub(super) fn claim_all(
         }
         return (Vec::new(), refused);
     }
+    output::arguments(format_args!(
+        "GPU PCI configuration extent qualification v15\n"
+    ));
+    output::arguments(format_args!("GPU interrupt handoff diagnostics v16\n"));
+    output::arguments(format_args!("GPU display and durable progress v17\n"));
+    output::arguments(format_args!("GPU firmware DMA page allocation v18\n"));
     let mut claimed = Vec::new();
     let mut refused = Vec::new();
     let source = match gop {
@@ -1347,7 +1370,9 @@ pub(super) fn claim_all(
         Err(why) => {
             for adapter in nvidia {
                 output::arguments(format_args!("GPU {} refused: {why}\n", adapter.address));
-                refused.push(refused_as(adapter, Reason::Other));
+                let mut refusal = refused_as(adapter, Reason::Other);
+                refusal.detail = Some(why.clone());
+                refused.push(refusal);
             }
             return (claimed, refused);
         }
@@ -1368,11 +1393,14 @@ pub(super) fn claim_all(
             Ok(function) => claimed.push(function),
             Err(error) => {
                 output::arguments(format_args!("GPU {} refused: {error:?}\n", adapter.address));
+                let detail = format!("{error:?}");
                 let reason = match error {
                     ServiceError::Refused(NO_FIRMWARE) => Reason::MissingFirmware,
                     _ => Reason::Other,
                 };
-                refused.push(refused_as(adapter, reason));
+                let mut refusal = refused_as(adapter, reason);
+                refusal.detail = Some(detail);
+                refused.push(refusal);
             }
         }
     }
@@ -1887,6 +1915,9 @@ fn wait_for_child(
                 "GPU START waiting for {stage}: {waited_ms} ms by the counter, {} ms by \
                  Linux's clock, {steps} steps\n",
                 now.saturating_sub(began_ns) / 1_000_000,
+            ));
+            crate::status::progress(&format!(
+                "{stage}: waiting {waited_ms} ms, {steps} service steps"
             ));
             super::storage::store_usb_log_in_gpu_start();
         }

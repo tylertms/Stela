@@ -1071,6 +1071,11 @@ pub fn fatal(message: impl core::fmt::Display) -> ! {
     arguments(format_args!("\nSTELA FATAL {message}\n"));
     // The reason reaches the port before any later step can stop for good.
     unqueue_serial();
+    // A GPU reset may have removed the only screen. Keep the stop reason
+    // before trying to unload its firmware or draw a fatal message.
+    if crate::engine::inside_host_drivers() {
+        flush_log();
+    }
     crate::engine::stop_gpus_for_fatal();
     // Inside the host drivers no store goes through them, or only the USB's
     // log the GPU's start drives. The lines go to the stick where they can

@@ -15,6 +15,8 @@ pub(super) struct Ring {
     pub descriptors: DmaBuffer,
     buffers: DmaBuffer,
     next: usize,
+    pub packets: u64,
+    pub discarded: u64,
 }
 impl Ring {
     pub fn new(dma: &mut dyn DmaAllocator, wide: bool) -> Result<Self, BlockError> {
@@ -31,9 +33,13 @@ impl Ring {
             descriptors,
             buffers,
             next: 0,
+            packets: 0,
+            discarded: 0,
         })
     }
+    /// Call only before DMA starts, or after a completed controller reset.
     pub fn initialize(&mut self, receive: bool) {
+        self.next = 0;
         for index in 0..DESCRIPTORS {
             let offset = index * DESCRIPTOR;
             self.descriptors.write(
@@ -56,6 +62,14 @@ impl Ring {
     pub fn available(&self) -> bool {
         self.descriptors.read::<u32>(self.next * DESCRIPTOR) & OWN == 0
     }
+    pub fn next_status(&self) -> u32 {
+        self.descriptors.read(self.next * DESCRIPTOR)
+    }
+    pub fn owned(&self) -> usize {
+        (0..DESCRIPTORS)
+            .filter(|index| self.descriptors.read::<u32>(index * DESCRIPTOR) & OWN != 0)
+            .count()
+    }
     pub fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
         if !(14..=MAX_FRAME).contains(&frame.len()) {
             return Err(LinkError::Invalid("frame length is outside 14..=1514"));
@@ -74,6 +88,7 @@ impl Ring {
         self.descriptors
             .write(offset, OWN | end(self.next) | FIRST | LAST | length as u32);
         self.next = (self.next + 1) % DESCRIPTORS;
+        self.packets = self.packets.saturating_add(1);
         Ok(())
     }
     #[cfg(test)]
@@ -105,6 +120,11 @@ impl Ring {
             let frame = received_length(status).map(|length| {
                 take(&self.buffers.bytes()[self.next * BUFFER..self.next * BUFFER + length])
             });
+            if frame.is_some() {
+                self.packets = self.packets.saturating_add(1);
+            } else {
+                self.discarded = self.discarded.saturating_add(1);
+            }
             self.offer(self.next);
             self.next = (self.next + 1) % DESCRIPTORS;
             if frame.is_some() {

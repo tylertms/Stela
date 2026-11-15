@@ -1,3 +1,21 @@
+> ## 这是 H610I 非官方修改版（v22）
+>
+> 本分支 `h610i-v22` 在 `main`（上游 **v0.4.1**，commit `9840885`）之上只有**一个提交**：
+> 保留 2026-11-13 ~ 11-15 针对一台 JGINYUE H610I-GAMING / i5-12400F / RTX 4060
+> 测试机所做的本地修改（相对上游 **57 个文件，+3030 / −90 行**）。**与上游作者无关。**
+>
+> ✅ **已编译并写入 U 盘**（2026-11-15 09:35，`stela-deploy.efi` 49,181,184 字节，
+> sha256 `6536817f…`）。⚠️ **尚未实机启动验证**，也没跑过测试全量。
+>
+> - 改动清单、43 个冲突块的逐条决策、许可声明：[H610I-CHANGES.md](H610I-CHANGES.md)
+> - 早期 21 版（基于上游 `25f661c`）：[`h610i-v21`](https://github.com/yzgmc/Stela/tree/h610i-v21) 分支
+> - 上游原始说明保留在下方分隔线之后
+>
+> EFI 为 GPL-2.0-only、CLI 为 GPL-3.0-or-later；`LICENSE`、`NOTICE`、
+> `LICENSES/` 及第三方许可材料原样保留。
+
+---
+
 <h1 align="center">
   <img src="assets/stela-icon.png" alt="" width="96"><br>
   Stela

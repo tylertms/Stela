@@ -249,6 +249,9 @@ impl HostNetwork {
                 link.mac()
             ));
             crate::status::progress(&format!("adapter {location}"));
+            if matches!(&*link.device, Adapter::Realtek(_)) && link.due_us().is_some() {
+                crate::status::info("RTL8168H network v5: polling + bounded RX recovery");
+            }
             let mut seed = [0u8; 8];
             crate::random::fill(&mut seed)
                 .map_err(|_| refuse!("secure host entropy is unavailable for the network stack"))?;
@@ -294,12 +297,28 @@ impl HostNetwork {
                         frames.sent.get(),
                         frames.received.get()
                     ));
+                    // MMIO and DMA are mapped only in the loader root. Capture
+                    // the device before dropping it or leaving this root.
+                    let diagnostic = {
+                        let link = stack.link_mut();
+                        // SAFETY: as in RootLink::receive; this live adapter
+                        // retains the loader root's MMIO and DMA mappings.
+                        let _root = unsafe { RestoreRoot::enter(link.root) };
+                        match &*link.device {
+                            Adapter::Realtek(device) => Some(device.diagnostics()),
+                            _ => None,
+                        }
+                    };
                     failures.push(match error {
                         stela_runtime::net::NetError::NoCarrier => {
                             stela_drivers::probe::no_link(&location, wireless)
                         }
                         error => format!("{location}: no address ({error})."),
                     });
+                    if let Some(diagnostic) = diagnostic {
+                        output::arguments(format_args!("NETWORK {diagnostic}\n"));
+                        failures.push(diagnostic);
+                    }
                     // Its driver stops it, in the loader's root (`RootLink`).
                     drop(stack);
                     output::arguments(format_args!("NETWORK adapter {location} released\n"));
@@ -322,6 +341,18 @@ impl HostNetwork {
     /// The address and adapter, as the screen names them.
     pub fn describe(&self) -> &str {
         &self.description
+    }
+
+    /// Capture the native adapter state while its MMIO mappings are active.
+    pub fn adapter_diagnostics(&mut self) -> Option<String> {
+        let link = self.stack.link_mut();
+        // SAFETY: as in RootLink::receive; this live adapter retains the
+        // loader root's MMIO and DMA mappings.
+        let _root = unsafe { RestoreRoot::enter(link.root) };
+        match &*link.device {
+            Adapter::Realtek(device) => Some(device.diagnostics()),
+            _ => None,
+        }
     }
 
     /// The connectivity check's POST (`--network-check`), waiting for its

@@ -726,7 +726,9 @@ impl KernelWork {
     ) -> Result<T, Error> {
         let clock = self.installed_clock.ok_or(Error::Clock)?;
         let identity = &self.reservation.identity;
-        identity.check_irq_cpu().map_err(Error::Work)?;
+        identity
+            .check_irq_cpu()
+            .map_err(|e| Error::At("Linux dispatch origin v19", Box::new(Error::Work(e))))?;
         if identity.in_interrupt() {
             return Err(Error::Work(WorkError::InterruptContext));
         }
@@ -736,12 +738,13 @@ impl KernelWork {
         self.dispatch(|_| {
             // SAFETY: dispatch entered the kept loader root on the owning
             // BSP. This scope ends after every active frame returns or parks.
-            let execution = unsafe { clock.enter_driver_execution()? };
+            let execution = unsafe { clock.enter_driver_execution() }
+                .map_err(|e| Error::At("Linux driver execution v19", Box::new(Error::Work(e))))?;
             self.linux_execution.set(Some(NonNull::from(&execution)));
             let _clear = ClearLinuxExecution(&self.linux_execution);
             body(self.executor.runtime())
+                .map_err(|e| Error::At("Linux dispatcher body v19", Box::new(Error::Work(e))))
         })?
-        .map_err(Error::Work)
     }
 
     /// Lend the actual dispatch segment for one synchronous Linux metadata leaf.
@@ -775,8 +778,12 @@ impl KernelWork {
         // frame, which the checks below refuse.
         let _root = unsafe { RestoreRoot::enter(self.root) };
         let identity = &self.reservation.identity;
-        identity.check_clock_root().map_err(Error::Work)?;
-        identity.check_dispatch().map_err(Error::Work)?;
+        identity
+            .check_clock_root()
+            .map_err(|e| Error::At("dispatcher clock root v19", Box::new(Error::Work(e))))?;
+        identity
+            .check_dispatch()
+            .map_err(|e| Error::At("dispatcher entry v19", Box::new(Error::Work(e))))?;
         Ok(body(self.executor.runtime()))
     }
 

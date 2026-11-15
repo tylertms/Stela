@@ -45,19 +45,29 @@ const TEXT_INDENT: &str = "           ";
 const DETAIL_LOG_MILLIS: u64 = 250;
 
 /// Text formatted on the stack: drawing a timer tick allocates nothing.
-#[derive(Default)]
-struct Short {
-    bytes: [u8; 32],
+struct StackText<const N: usize> {
+    bytes: [u8; N],
     len: usize,
 }
 
-impl Short {
+type Short = StackText<32>;
+
+impl<const N: usize> Default for StackText<N> {
+    fn default() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+}
+
+impl<const N: usize> StackText<N> {
     fn as_str(&self) -> &str {
         core::str::from_utf8(&self.bytes[..self.len]).unwrap_or_default()
     }
 }
 
-impl fmt::Write for Short {
+impl<const N: usize> fmt::Write for StackText<N> {
     fn write_str(&mut self, text: &str) -> fmt::Result {
         let end = self.len + text.len();
         if end > self.bytes.len() {
@@ -344,6 +354,25 @@ pub fn begin(title: &str) {
         state.draw_running();
     });
     output::flush_log();
+}
+
+/// Report the EBS handoff without allocating or touching firmware services.
+/// The ticker must already be stopped. Unlike `progress`, this does not
+/// grow the running step's String, or require a running step to exist.
+/// The console updates only its existing cell buffers and framebuffer.
+pub fn handoff_progress(detail: fmt::Arguments<'_>) {
+    let mut text = StackText::<160>::default();
+    let _ = text.write_fmt(detail);
+    // A later failure must not attribute this phase to a stale pre-EBS
+    // detail. Clearing existing storage cannot allocate.
+    with(|state| {
+        if let Some(running) = state.running.as_mut() {
+            running.detail.clear();
+            running.percentage = None;
+        }
+    });
+    output::arguments(format_args!("HOST HANDOFF {}\n", text.as_str()));
+    console::rewrite(&[(" [ ***  ]  ", Color::Busy), (text.as_str(), Color::Text)]);
 }
 
 /// Show how far the running step has come, such as `182 of 484 MB`.

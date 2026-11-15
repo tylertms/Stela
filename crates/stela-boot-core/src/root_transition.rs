@@ -94,3 +94,42 @@ mod tests {
         assert_eq!(same_backing(&[(u64::MAX, 1)], &[]), Err(Error::Overflow));
     }
 }
+
+/// Admit IRQ/queue identity in a retained root, including its exact guest PCID.
+/// This grants no continuation switch: execution still enters the loader guard.
+/// Loader PCID 1 is deliberately absent from the guest catalog.
+pub fn irq_root_allowed(current: u64, roots: &[u64], tagged_roots: &[u64]) -> bool {
+    const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
+    if current & !(ADDRESS | 0xfff) != 0 {
+        return false;
+    }
+    if current & 0xfff == 0 {
+        return roots.contains(&current);
+    }
+    current & 0xfff >= 2 && tagged_roots.binary_search(&current).is_ok()
+}
+
+#[cfg(test)]
+mod irq_tests {
+    use super::irq_root_allowed;
+    #[test]
+    fn tagged_guest_irq_retains_exact_root_and_context_identity() {
+        let roots = [0x1000, 0x2000, 0x3000];
+        let tagged = [0x2002, 0x3003];
+        assert!(irq_root_allowed(0x1000, &roots, &tagged));
+        assert!(irq_root_allowed(0x2002, &roots, &tagged));
+        assert!(irq_root_allowed(0x3003, &roots, &tagged));
+        for bad in [
+            0x2001,
+            0x2003,
+            0x3002,
+            0x1002,
+            0x4000,
+            0x4002,
+            0x8000_0000_0000_2002,
+            0x0010_0000_0000_2002,
+        ] {
+            assert!(!irq_root_allowed(bad, &roots, &tagged), "{bad:#x}");
+        }
+    }
+}

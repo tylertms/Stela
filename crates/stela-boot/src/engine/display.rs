@@ -34,6 +34,17 @@ fn present_took(_ticks: u64) {}
 /// screen from Stela's console.
 static DCP_PRESENTED: AtomicBool = AtomicBool::new(false);
 
+/// An install keeps the host console visible, including the guest UART.
+/// Set before any guest PE runs, so framebuffer writers never race it.
+static INSTALL_CONSOLE: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn install_console() {
+    INSTALL_CONSOLE.store(true, Ordering::Release);
+    output::arguments(format_args!(
+        "DISPLAY install diagnostics v7: guest UART and restore heartbeat stay visible\n"
+    ));
+}
+
 /// The host scanout the modeled DCP presents completed swaps to: the UEFI GOP
 /// framebuffer at its own mode. The DCP model composes each swap's layers in
 /// this scanout's pixel order (blue-low, which `Framebuffer::show_row` writes,
@@ -152,6 +163,9 @@ pub enum Turn {
 /// Give the screen the rows its kept frame changed, holding no lock of the
 /// devices', as `turn` does; the ticks it took.
 pub fn flush(turn: Turn) -> u64 {
+    if INSTALL_CONSOLE.load(Ordering::Acquire) {
+        return 0;
+    }
     let begun = super::host::rdtsc();
     loop {
         if STAGED.held.load(Ordering::Relaxed) {

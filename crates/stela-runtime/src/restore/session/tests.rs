@@ -741,3 +741,103 @@ fn fdr_commit_is_durable_before_acknowledgement_and_keeps_binding() {
         answers.fdr_diagnostic.as_ref().unwrap().reply()
     );
 }
+
+#[test]
+fn file_progress_excludes_queued_bytes_and_framing_and_survives_segment_changes() {
+    let mut store = fixture(b"payload", false);
+    let mut job = Job::new(
+        99,
+        None,
+        Value::dict([
+            ("DataType", Value::from("SourceBootObjectV4")),
+            (
+                "Arguments",
+                Value::dict([("ImageName", Value::from("Cryptex1,RosettaOS"))]),
+            ),
+        ]),
+        Plan::File(vec![
+            Segment::Bytes(vec![1; 17]),
+            Segment::Bytes(vec![2; 31]),
+        ]),
+    );
+    let mut sink = Memory::new(Vec::new(), 1);
+    let initial = job.file_progress().unwrap();
+    assert_eq!(
+        (initial.sent, initial.total, initial.complete),
+        (0, 48, false)
+    );
+    assert_eq!(initial.name, "Cryptex1,RosettaOS");
+    assert!(job.poll(&mut sink, &mut store).is_pending());
+    assert_eq!(job.file_progress().unwrap().sent, 0);
+    let mut previous = 0;
+    let mut complete = false;
+    for _ in 0..2000 {
+        let result = job.poll(&mut sink, &mut store);
+        let progress = job.file_progress().unwrap();
+        assert!(progress.sent >= previous && progress.sent <= 48);
+        previous = progress.sent;
+        if let Poll::Ready(result) = result {
+            result.unwrap();
+            assert!(progress.complete);
+            assert_eq!(progress.sent, 48);
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete);
+    let mut wire = Memory::new(sink.output, usize::MAX);
+    let mut frame = Framed::new(Endian::Big, Limits::default());
+    assert_eq!(
+        receive(&mut frame, &mut wire)
+            .unwrap()
+            .required("FileData")
+            .unwrap()
+            .data()
+            .unwrap()
+            .len(),
+        17
+    );
+    assert_eq!(
+        receive(&mut frame, &mut wire)
+            .unwrap()
+            .required("FileData")
+            .unwrap()
+            .data()
+            .unwrap()
+            .len(),
+        31
+    );
+    assert!(
+        receive(&mut frame, &mut wire)
+            .unwrap()
+            .required("FileDataDone")
+            .unwrap()
+            .boolean()
+            .unwrap()
+    );
+}
+
+#[test]
+fn file_progress_keeps_64_bit_sizes_without_reading_the_member() {
+    let mut job = Job::new(
+        1,
+        None,
+        Value::dict([]),
+        Plan::File(vec![
+            Segment::Bytes(vec![0; 17]),
+            Segment::Member {
+                path: "large.dmg".into(),
+                offset: 0,
+                bytes: 6_484_393_984,
+            },
+        ]),
+    );
+    job.index = 1;
+    job.offset = 5_000_000_000;
+    job.file_pending = FILE_BATCH_BYTES;
+    let progress = job.file_progress().unwrap();
+    assert_eq!(progress.total, 6_484_394_001);
+    assert_eq!(progress.sent, 5_000_000_017);
+    assert_eq!(progress.member, "large.dmg");
+    assert!(!progress.complete);
+}

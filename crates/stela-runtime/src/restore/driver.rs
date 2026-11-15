@@ -7,7 +7,7 @@ use super::{
     plist::Limits,
     plist::Value,
     route::Route,
-    session::{Action, Job, PORT, Phase, Session},
+    session::{Action, FileProgress, Job, PORT, Phase, Session},
     stream::{ByteStream, Endian, Framed},
 };
 use alloc::{boxed::Box, vec::Vec};
@@ -66,6 +66,7 @@ pub struct Driver<R, H> {
     starting: bool,
     failure: Option<Error>,
     complete: bool,
+    last_file: Option<FileProgress>,
     /// The job [`Self::prefetch`] reads for first: the one a call left
     /// unread when its time was over.
     prefetch_next: usize,
@@ -88,6 +89,7 @@ impl<R: ReadAt, H: Copy + Eq> Driver<R, H> {
             starting: false,
             failure: None,
             complete: false,
+            last_file: None,
             prefetch_next: 0,
         })
     }
@@ -323,6 +325,9 @@ impl<R: ReadAt, H: Copy + Eq> Driver<R, H> {
                     }
                 }
             }
+            if let Some(progress) = t.job.file_progress() {
+                self.last_file = Some(progress);
+            }
             self.session.finish_job(t.job.id, Ok(()))?;
             self.jobs.remove(at);
             if self.jobs.is_empty() {
@@ -376,6 +381,13 @@ impl<R: ReadAt, H: Copy + Eq> Driver<R, H> {
                 }
             }
         }
+    }
+    /// At most MAX_JOBS active files plus the most recently completed file.
+    pub fn file_progress(&self) -> impl Iterator<Item = FileProgress> + '_ {
+        self.jobs
+            .iter()
+            .filter_map(|t| t.job.file_progress())
+            .chain(self.last_file.iter().cloned())
     }
     /// The ASR sender of the job that sends the image, while one does.
     pub fn asr(&self) -> Option<&super::asr::Sender> {

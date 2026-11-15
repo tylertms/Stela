@@ -269,6 +269,7 @@ mod tests {
             &["status"],
             &["status", "/dev/sdb", "--full"],
             &["repair", "--ipsw", "a.ipsw", "--full"],
+            &["repair", "--ipsw", "a.ipsw", "--installer", "offline"],
             &["repair", "--erase-target", "--initialize-nor", "-n"],
             &["update", "/Volumes/STELA", "--macos", "27.2"],
             &["update", "--efi", "stela.efi"],

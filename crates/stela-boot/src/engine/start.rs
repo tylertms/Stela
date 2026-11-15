@@ -998,14 +998,17 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         crate::status::done("");
     }
     let restore = source.map(|source| {
-        prepare_restore(
+        crate::status::begin("Preparing macOS restore (file progress v14)");
+        let restore = prepare_restore(
             boot,
             source,
             restore_usb.unwrap(),
             tree,
             &host_network,
             fdr_device.take(),
-        )
+        );
+        crate::status::done("");
+        restore
     });
     // All source/resource preparation precedes the first publication.
     // A reached write failure is terminal before any guest entry.
@@ -1340,7 +1343,11 @@ fn open_gpus(
     let tsc_hz = handoff.tsc_hz;
     #[cfg(feature = "nvk")]
     let heap_bytes = heap.end - heap.start;
+    crate::status::info(
+        "GPU handoff v17: the display may lose signal during reset; stages are saved on the USB",
+    );
     crate::status::begin("Starting the GPU");
+    output::flush_log();
     let gop = if handoff.screen.is_some() {
         mmio.verified_framebuffer()
     } else {
@@ -1357,10 +1364,12 @@ fn open_gpus(
             .ok()
             .and_then(|entropy| stela_linux::random::Seeded::from_entropy(&*entropy).ok());
         let (claimed, refused) = random.as_ref().map_or_else(Default::default, |_| {
-            gpu::claim_all(&services, &adapters, gop, firmware.as_ref())
+            storage::in_gpu_start(|| gpu::claim_all(&services, &adapters, gop, firmware.as_ref()))
         });
         (claimed, refused, random)
     });
+    // Also preserve a rejected or timed-out claim, before any early return.
+    output::flush_log();
     let (claimed, random) = match claimed {
         Ok((claimed, _, Some(random))) if !claimed.is_empty() => (claimed, random),
         Ok((_, refused, _)) => {
@@ -1374,12 +1383,21 @@ fn open_gpus(
                         first.device,
                         first.reason,
                     ));
+                    if let Some(detail) = &first.detail {
+                        crate::status::info(&alloc::format!("GPU v16 {}: {detail}", first.address));
+                    }
                     for gpu in rest {
                         crate::status::info(&gpu_status::refused(
                             &gpu.address,
                             gpu.device,
                             gpu.reason,
                         ));
+                        if let Some(detail) = &gpu.detail {
+                            crate::status::info(&alloc::format!(
+                                "GPU v16 {}: {detail}",
+                                gpu.address
+                            ));
+                        }
                     }
                 }
             }
@@ -1427,6 +1445,7 @@ fn open_gpus(
         ms(probe),
         ms(host::rdtsc().wrapping_sub(claiming)),
     ));
+    output::flush_log();
     match opened {
         Ok(()) => {
             crate::status::done("started");
@@ -2178,8 +2197,24 @@ fn prepare_restore(
         },
     )
     .unwrap_or_else(|error| {
-        output::arguments(format_args!("restore preparation refusal: {error}\n"));
-        output::fatal("restore preparation failed")
+        // The native USB log may be unavailable after ExitBootServices.
+        // Keep the actual refusal and adapter state on the failure screen.
+        let diagnostic = host_network
+            .as_ref()
+            .and_then(|network| network.as_ref().ok())
+            .and_then(|network| {
+                network
+                    .0
+                    .try_borrow_mut()
+                    .ok()
+                    .and_then(|mut network| network.adapter_diagnostics())
+            });
+        match diagnostic {
+            Some(diagnostic) => output::fatal(format_args!(
+                "restore preparation failed: {error}\n{diagnostic}"
+            )),
+            None => output::fatal(format_args!("restore preparation failed: {error}")),
+        }
     })
 }
 

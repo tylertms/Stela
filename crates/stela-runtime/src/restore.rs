@@ -12,6 +12,7 @@ pub mod fdr;
 pub mod native;
 pub mod plist;
 pub mod proxy;
+pub mod progress;
 pub mod route;
 pub mod session;
 pub mod source;

@@ -29,6 +29,7 @@ fn modelled(registers: &mut [u32], memory: &mut [u64], signalled: bool) -> Realt
         function: 0,
         location: "model".into(),
         signalled,
+        receive_watch: recovery::ReceiveWatch::default(),
     }
 }
 
@@ -85,6 +86,37 @@ fn transmit_without_carrier_is_refused_and_leaves_the_ring_untouched() {
     assert_eq!(net.transmit(&[0; 60]), Err(LinkError::NoCarrier));
     assert_eq!(net.transmit.descriptors.bytes(), descriptors);
     assert_eq!(registers[TX_POLL / 4], 0);
+}
+
+#[test]
+fn h_receive_has_a_timer_even_when_msi_is_enabled_and_silent() {
+    let mut registers = vec![0u32; 64];
+    let mut memory = vec![0u64; 262_144];
+    let mut net = modelled(&mut registers, &mut memory, true);
+    assert_eq!(net.due_us(), None); // Other revisions retain their policy.
+    net.revision = revision(46);
+    for signalled in [true, false] {
+        net.signalled = signalled;
+        let before = net.clock.now_us();
+        let due = net.due_us().unwrap();
+        let after = net.clock.now_us();
+        assert!(due >= before.saturating_add(10_000));
+        assert!(due <= after.saturating_add(10_000));
+    }
+    net.receive.initialize(true);
+    net.transmit.initialize(false);
+    net.transmit.transmit(&[0; 60]).unwrap();
+    assert_eq!(net.transmit.owned(), 1);
+    net.receive.deliver(&[0x5a; 60]); // A packet with no interrupt raised.
+    assert_eq!(net.receive.receive(), Some(vec![0x5a; 60]));
+    let snapshot = net.diagnostics();
+    assert!(
+        snapshot.contains("tx=1 pending=1 rx=1 dropped=0"),
+        "{snapshot}"
+    );
+    // A read-only snapshot must not release a queued TX descriptor.
+    assert_eq!(net.transmit.owned(), 1);
+    assert_eq!(net.device.read16(INTERRUPT_STATUS), 0);
 }
 
 /// A descriptor the controller still owns makes the next send busy at once,

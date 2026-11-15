@@ -1077,6 +1077,9 @@ fn run_machine<H: Host>(
         host_acpi,
         mut boot_progress,
     } = io;
+    if restore.is_some() {
+        display::install_console();
+    }
     crate::status::begin(match restore {
         Some(_) => "Starting the macOS installer",
         None => "Starting macOS",

@@ -459,3 +459,23 @@ fn an_evicted_compilation_is_found_again_in_what_this_boot_serialized() {
     assert!(compiler.serialized(&[3; 32]).is_none());
     assert!(compiler.report().ends_with("recalled=0"));
 }
+
+#[test]
+fn repeated_llvm_deferral_never_waits_inside_a_service_turn() {
+    fn must_not_wait() {
+        panic!("a deferred service turn waited for LLVM");
+    }
+    let lock = CompileLock::new();
+    let held = lock.hold(core::hint::spin_loop);
+    let mut waiting = Waiting::default();
+    for _ in 0..3 {
+        assert!(
+            matches!(AirCompiler::llvm(&lock, &mut waiting, true, must_not_wait), Err(error) if error == DEFERRED)
+        );
+        assert_eq!(waiting.count, 1);
+        assert!(waiting.job.is_some());
+        assert!(lock.is_held());
+    }
+    drop(held);
+    assert!(AirCompiler::llvm(&lock, &mut waiting, true, must_not_wait).is_ok());
+}

@@ -65,6 +65,8 @@ pub(crate) struct RootIdentity {
     idt: u64,
     task: u16,
     ram_generation: AtomicU64,
+    /// Exact retained guest-root/PCID pairs; loader PCID 1 still needs its guard.
+    irq_tagged_roots: alloc::vec::Vec<u64>,
 }
 /// Borrowed immutable root-read scope. It is neither an execution/stack loan
 /// nor a firmware/controller capability. Every observation checks its live CPU,
@@ -191,11 +193,20 @@ impl RootIdentity {
     pub(crate) fn check_irq_cpu(&self) -> Result<(), WorkError> {
         self.affinity()?;
         let current = root();
-        if current & !ADDRESS != 0 || !self.roots.roots().contains(&current) {
+        if !stela_boot_core::root_transition::irq_root_allowed(
+            current,
+            self.roots.roots(),
+            &self.irq_tagged_roots,
+        ) {
             // Preserve the existing pinned guest IRQ roots above. The only
             // additional tagged root is this manager's entered loader
             // root, backed by its original allocation owner and same CPU guard.
             if !crate::engine::storage::entered_loader_root(self.loader_tables) {
+                crate::output::arguments(format_args!(
+                    "NATIVE ADMISSION v19 irq-root rejected cr3={current:#x} host={:#x} loader={:#x}\n",
+                    self.snapshot.cr3,
+                    self.loader_tables.root(),
+                ));
                 return Err(WorkError::CorruptContext);
             }
             let saved = disable();
@@ -371,6 +382,17 @@ impl Owner {
         if roots.iter().any(|r| *r == 0 || r & !ADDRESS != 0) {
             return Err(WorkError::CorruptContext);
         }
+        let mut irq_tagged_roots = alloc::vec::Vec::new();
+        irq_tagged_roots
+            .try_reserve_exact(super::super::ROOTS * (1 + super::super::BANKS))
+            .map_err(unavailable)?;
+        irq_tagged_roots.extend(
+            state.all_roots().enumerate().map(|(index, root)| {
+                root | super::super::view_context(index % super::super::ROOTS)
+            }),
+        );
+        irq_tagged_roots.sort_unstable();
+        irq_tagged_roots.dedup();
         let mut ram = alloc::vec::Vec::new();
         ram.try_reserve_exact(state.ram.len())
             .map_err(unavailable)?;
@@ -389,6 +411,7 @@ impl Owner {
             gdt: observed.gdt,
             idt: observed.idt,
             task: observed.task,
+            irq_tagged_roots,
             ram_generation: AtomicU64::new(0),
         });
         identity.check_current()?;

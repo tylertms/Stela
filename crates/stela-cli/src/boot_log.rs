@@ -415,14 +415,14 @@ pub(crate) fn disk_logs(host: &dyn Host, disk: &Disk) -> Result<Logs> {
 }
 
 /// Every boot log on `host`'s disks, each placed by its disk and partition:
-/// the disks that do not run this computer first and, when they hold none,
-/// the system disks too. No log anywhere is refused with the disks looked
-/// at and what to try.
+/// the disks that do not run this computer first, then the system disks,
+/// even when the USB has an earlier log. No log anywhere is refused with
+/// the disks looked at and what to try.
 pub(crate) fn scan(host: &dyn Host) -> Result<Vec<(String, Log)>> {
     let disks = host.disks()?;
     let (mut looked, mut unread) = (String::new(), String::new());
+    let mut logs = Vec::new();
     for system in [false, true] {
-        let mut logs = Vec::new();
         for disk in disks.iter().filter(|disk| disk.system == system) {
             let name = describe(disk);
             let _ = writeln!(looked, "  {name}");
@@ -438,9 +438,9 @@ pub(crate) fn scan(host: &dyn Host) -> Result<Vec<(String, Log)>> {
                 }
             }
         }
-        if !logs.is_empty() {
-            return Ok(logs);
-        }
+    }
+    if !logs.is_empty() {
+        return Ok(logs);
     }
     let rights = if cfg!(windows) {
         format!("from {}", host::ADMIN)

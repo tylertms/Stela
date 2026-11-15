@@ -162,6 +162,15 @@ fn transcript_short_io_concurrent_control_jobs_and_final_ack_write() {
     }
     assert_eq!(d.session.ledger().len(), 6);
     assert_eq!(d.session.outstanding(), 0);
+    // A removed job must retain its host-send completion in telemetry; this
+    // still does not complete the restore before the final guest status.
+    let files: Vec<_> = d.file_progress().collect();
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        (files[0].sent, files[0].total, files[0].complete),
+        (7, 7, true)
+    );
+    assert_eq!(d.session.phase(), Phase::Restoring);
     assert_eq!(h.opens, vec![PORT, 2345]);
     assert_eq!(h.closed, vec![2345]);
     let s = h.streams.get_mut(&2345).unwrap();

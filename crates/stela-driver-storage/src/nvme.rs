@@ -30,6 +30,7 @@ mod io;
 pub mod owned;
 pub mod parts;
 mod recovery;
+mod takeover;
 pub mod vmd;
 use core::{
     cell::RefCell,
@@ -711,6 +712,9 @@ struct Controller {
     /// The Abort commands sent and not yet completed.
     aborts: Vec<u16>,
     limits: Limits,
+    /// Exact-model/firmware minimal bring-up for a recorded admin-stage stall.
+    /// Mandatory Identify, queue creation, completions and DMA rules are kept.
+    minimal_startup: bool,
 }
 
 /// `nvme_init_non_mdts_limits`: the NVM command set's Write Zeroes and
@@ -902,10 +906,25 @@ pub fn attach(
     minimum.check().map_err(BlockError::PciPower)?;
     validate_clock(handoff.clock)?;
     function.power_up(minimum)?;
+    let conservative_takeover = function.vendor == 0x2646 && function.device == 0x5027;
     let bars = function.bars()?;
     let registers = RegisterIo::Legacy(registers(handoff, bars[0], 0, 0x2000)?);
-    function.enable_polled()?;
-    let signalled = match (handoff.completion, function.interrupts()?.msix) {
+    if let Err(error) = takeover::prepare(
+        function,
+        &registers,
+        handoff.clock,
+        minimum,
+        conservative_takeover,
+    ) {
+        takeover::report_pci(function, "prepare-failed");
+        return Err(error);
+    }
+    let completion = if conservative_takeover {
+        None
+    } else {
+        handoff.completion
+    };
+    let signalled = match (completion, function.interrupts()?.msix) {
         (Some(message), Some(msix)) => {
             let table = crate::registers(
                 handoff,
@@ -960,9 +979,13 @@ pub fn attach(
         events: Events::default(),
         aborts: Vec::new(),
         limits: Limits::default(),
+        minimal_startup: false,
     };
-    controller.initialize()?;
-    discover(controller, format!("{}", function.address), &mut { dma })
+    let result = controller
+        .initialize()
+        .and_then(|()| discover(controller, format!("{}", function.address), &mut { dma }));
+    takeover::report_pci(function, if result.is_ok() { "attached" } else { "failed" });
+    result
 }
 
 /// Linux `nvme_wait_ready`'s bound for a ready timeout in 500 ms units:

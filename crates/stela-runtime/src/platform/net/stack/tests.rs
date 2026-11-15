@@ -1,4 +1,5 @@
 mod clock;
+mod dns_fallback;
 mod http_flow;
 #[cfg(all(not(target_os = "uefi"), feature = "native-reference-peer"))]
 mod tls;
@@ -114,6 +115,9 @@ struct Lan {
     ipv6: bool,
     dns_listener: Option<SocketHandle>,
     dns_queries: Vec<u16>,
+    dns_truncated: bool,
+    dns_tcp_reply: Option<Vec<u8>>,
+    dns_tcp_partial: bool,
 }
 
 fn pattern(offset: u64) -> u8 {
@@ -173,6 +177,9 @@ impl Lan {
             ipv6: false,
             dns_listener: None,
             dns_queries: Vec::new(),
+            dns_truncated: false,
+            dns_tcp_reply: None,
+            dns_tcp_partial: false,
         }
     }
 
@@ -216,6 +223,12 @@ impl Lan {
                 reply[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
                 reply[6..8].copy_from_slice(&1u16.to_be_bytes());
                 reply[8..12].fill(0);
+                if self.dns_truncated {
+                    reply[2..4].copy_from_slice(&0x8380u16.to_be_bytes());
+                    reply[6..8].fill(0);
+                    dns.send_slice(&reply, endpoint).unwrap();
+                    continue;
+                }
                 reply.extend_from_slice(&[0xc0, 0x0c]);
                 reply.extend_from_slice(&kind.to_be_bytes());
                 reply.extend_from_slice(&[0, 1, 0, 0, 0, 60]);
@@ -234,7 +247,26 @@ impl Lan {
                 })
                 .unwrap();
         }
-        if self.raw {
+        if let Some(reply) = &self.dns_tcp_reply {
+            if self.request.len() >= 2 {
+                let length = u16::from_be_bytes([self.request[0], self.request[1]]) as usize;
+                if self.request.len() >= length + 2 {
+                    // Match the unpredictable query ID and split the reply to
+                    // exercise both length-prefix and DNS-message framing.
+                    let mut framed = (reply.len() as u16).to_be_bytes().to_vec();
+                    framed.extend_from_slice(reply);
+                    framed[2..4].copy_from_slice(&self.request[2..4]);
+                    if socket.can_send() && self.raw_sent < framed.len() {
+                        let end = if self.dns_tcp_partial {
+                            (self.raw_sent + 1).min(framed.len())
+                        } else {
+                            framed.len()
+                        };
+                        self.raw_sent += socket.send_slice(&framed[self.raw_sent..end]).unwrap();
+                    }
+                }
+            }
+        } else if self.raw {
             while self.raw_sent < self.request.len() && socket.can_send() {
                 let n = socket.send_slice(&self.request[self.raw_sent..]).unwrap();
                 self.raw_sent += n;
@@ -572,6 +604,61 @@ fn a_signalling_link_sleeps_until_the_deadline_when_nothing_arrives() {
     stack.poll().unwrap();
     stack.wait(1_000_000).unwrap();
     assert_eq!(clock.0.get(), due);
+}
+
+#[test]
+fn receive_timer_polls_a_packet_when_its_interrupt_is_lost() {
+    #[derive(Clone, Default)]
+    struct Sleeping(Rc<Cell<u64>>);
+    impl Clock for Sleeping {
+        fn now_us(&self) -> Result<u64, ClockError> {
+            Ok(self.0.get())
+        }
+        fn sleep(&self, until: u64) -> Result<(), ClockError> {
+            self.0.set(until);
+            Ok(())
+        }
+    }
+    struct SilentMsi {
+        clock: Sleeping,
+        delivered: bool,
+    }
+    impl Link for SilentMsi {
+        fn mac(&self) -> Mac {
+            CLIENT
+        }
+        fn transmit(&mut self, _: &[u8]) -> Result<(), LinkError> {
+            Ok(())
+        }
+        fn signals(&self) -> bool {
+            true
+        }
+        fn due_us(&self) -> Option<u64> {
+            Some(self.clock.0.get() + 10_000)
+        }
+        fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
+            if !self.delivered && self.clock.0.get() >= 5_000 {
+                self.delivered = true;
+                // An unrelated Ethernet frame is enough to exercise draining
+                // the queue; no completion signal wakes Sleeping::sleep.
+                Ok(Some(vec![0; 60]))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+    let clock = Sleeping::default();
+    let link = SilentMsi {
+        clock: clock.clone(),
+        delivered: false,
+    };
+    let mut stack = Stack::new(link, clock.clone(), 7).unwrap();
+    stack.poll().unwrap();
+    stack.wait(30_000_000).unwrap();
+    assert_eq!(clock.0.get(), 10_000);
+    stack.poll().unwrap();
+    assert!(stack.link_mut().delivered);
+    assert!(stack.phy.received);
 }
 
 #[test]

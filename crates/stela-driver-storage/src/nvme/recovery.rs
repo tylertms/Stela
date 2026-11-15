@@ -200,8 +200,26 @@ impl Controller {
                 deadline,
                 mut identify,
             }) => {
+                // A fatal controller cannot complete this admin command.
+                // Report CFS immediately instead of disguising it as a timeout;
+                // keep all DMA owned until the normal teardown acknowledges stop.
+                if status & FATAL != 0 {
+                    stela_driver_base::working(&format!(
+                        "NVMe recovery fatal step={step:?} cid={id} csts={status:#x} cc={:?}",
+                        self.registers.read32(CONFIGURATION)
+                    ));
+                    return Err(BlockError::Device { status });
+                }
                 let Some((_, code)) = self.admin_completion(Some((id, true)))? else {
                     if deadline.passed() {
+                        stela_driver_base::working(&format!(
+                            "NVMe timeout step={step:?} cid={id} csts={:?} cc={:?} sq_tail={} cq_head={} phase={}",
+                            self.registers.read32(STATUS),
+                            self.registers.read32(CONFIGURATION),
+                            self.admin.tail,
+                            self.admin.head,
+                            self.admin.phase
+                        ));
                         return Err(BlockError::Timeout.at(step.name()));
                     }
                     self.recovery = Some(Recovery::Admin {
@@ -244,6 +262,14 @@ impl Controller {
     pub(super) fn bring_up(&mut self, from: Step, identify: Vec<u8>) -> Result<(), BlockError> {
         let first = STEPS.iter().position(|each| *each == from).unwrap();
         for &step in &STEPS[first..] {
+            if self.minimal_startup
+                && !matches!(
+                    step,
+                    Step::Identify | Step::CreateCompletion | Step::CreateSubmission
+                )
+            {
+                continue;
+            }
             let command = match step {
                 Step::Identify => Some(self.identify_command(IDENTIFY_CONTROLLER, 0)?),
                 Step::Limits => self.limits_command()?,
@@ -264,6 +290,10 @@ impl Controller {
             let Some(command) = command else {
                 continue;
             };
+            stela_driver_base::working(&format!(
+                "NVMe bring-up {step:?} opcode={:#x} cdw10={:#x}",
+                command[0], command[10]
+            ));
             let id = self.publish(false, command, Data::Admin)?;
             let deadline = self.deadline(self.admin_timeout_us)?;
             self.recovery = Some(Recovery::Admin {
@@ -302,6 +332,14 @@ impl Controller {
     /// retry delays, transfer limits and the events to enable. A reset's fresh
     /// Identify updates both limits before namespace features are rescanned.
     pub(super) fn identified(&mut self, identify: &[u8]) {
+        self.minimal_startup = u16::from_le_bytes([identify[0], identify[1]]) == 0x2646
+            && ascii(&identify[CONTROLLER_MODEL]) == "KINGSTON SNV3S1000G"
+            && &identify[64..72] == b"ERFK1N.3";
+        if self.minimal_startup {
+            stela_driver_base::working(
+                "NVMe Kingston NV3 ERFK1N.3 minimal startup v9 (optional features off)",
+            );
+        }
         let mdts = identify[CONTROLLER_MAXIMUM_TRANSFER];
         let bytes = if mdts == 0 {
             usize::MAX
@@ -317,7 +355,11 @@ impl Controller {
             let at = CONTROLLER_RETRY_DELAYS + 2 * index;
             *delay = u16::from_le_bytes([identify[at], identify[at + 1]]);
         }
-        self.events = Events::from_identify(identify);
+        self.events = if self.minimal_startup {
+            Events::default()
+        } else {
+            Events::from_identify(identify)
+        };
     }
 
     /// The NVM Identify Controller of `nvme_init_non_mdts_limits`, which

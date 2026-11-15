@@ -27,12 +27,45 @@ impl Controller {
         if self.signalled {
             return Ok(());
         }
-        self.registers.write32(INTERRUPT_MASK_SET, u32::MAX)
+        self.registers.write32(INTERRUPT_MASK_SET, u32::MAX)?;
+        self.verify_admin_configuration()?;
+        stela_driver_base::working(&format!(
+            "NVMe admin queues asq={:#x} acq={:#x} data={:#x} entries={} cap={:#x}",
+            self.admin.submissions.address()?,
+            self.admin.completions.address()?,
+            self.admin_data.address()?,
+            self.admin.entries,
+            self.registers.read64(CAPABILITIES)?
+        ));
+        Ok(())
     }
 
-    /// Linux `nvme_enable_ctrl`: set CC.EN, returning how long CSTS.RDY may
-    /// take, CAP.TO or a longer CRTO.CRWMT. CRIME stays clear, as in Linux.
+    /// Flush posted queue register writes and refuse a truncated/missing BAR
+    /// update before enabling DMA command processing. These registers are
+    /// readable while CC.EN is clear; never repair them on a live controller.
+    pub(super) fn verify_admin_configuration(&self) -> Result<(), BlockError> {
+        let entries = u32::from(self.admin.entries - 1);
+        let expected_aqa = entries << 16 | entries;
+        let expected_asq = self.admin.submissions.address()?;
+        let expected_acq = self.admin.completions.address()?;
+        let aqa = self.registers.read32(ADMIN_ATTRIBUTES)?;
+        let asq = self.registers.read64(ADMIN_SUBMISSION)?;
+        let acq = self.registers.read64(ADMIN_COMPLETION)?;
+        if (aqa, asq, acq) != (expected_aqa, expected_asq, expected_acq) {
+            stela_driver_base::working(&format!(
+                "NVMe queue readback mismatch aqa={aqa:#x}/{expected_aqa:#x} asq={asq:#x}/{expected_asq:#x} acq={acq:#x}/{expected_acq:#x}"
+            ));
+            return Err(BlockError::Protocol("NVMe admin queue register readback"));
+        }
+        Ok(())
+    }
+
+    /// Follow Linux nvme_enable_ctrl: write the queue format with EN clear,
+    /// reread CAP/CRTO (CAP can change with CC), then set EN. Queue/data DMA
+    /// ownership and the caller's RDY/CFS wait remain unchanged.
     pub(super) fn enable(&mut self) -> Result<u64, BlockError> {
+        let configuration = self.configuration & !ENABLE;
+        self.registers.write32(CONFIGURATION, configuration)?;
         let capabilities = self.registers.read64(CAPABILITIES)?;
         let mut timeout = capabilities >> 24 & 0xff;
         if capabilities & CAPABILITY_READY_WITH_MEDIA != 0 {
@@ -41,7 +74,12 @@ impl Controller {
         }
         self.independent_identify = capabilities & CAPABILITY_READY_INDEPENDENT != 0;
         self.registers
-            .write32(CONFIGURATION, self.configuration | ENABLE)?;
+            .write32(CONFIGURATION, configuration | ENABLE)?;
+        stela_driver_base::working(&format!(
+            "NVMe staged enable v11 cc={:?} csts={:?} cap={capabilities:#x}",
+            self.registers.read32(CONFIGURATION),
+            self.registers.read32(STATUS)
+        ));
         Ok(ready_wait_us(timeout))
     }
 
@@ -88,7 +126,11 @@ impl Controller {
         if capabilities & CAPABILITY_COMMAND_SETS != 0 {
             self.configuration |= COMMAND_SETS_ALL;
         }
-        self.registers.write32(CONFIGURATION, 0)?;
+        // Preserve queue-format/command-set fields while clearing EN,
+        // as Linux and EDK II do when taking over a firmware controller.
+        let previous = self.registers.read32(CONFIGURATION)?;
+        self.registers
+            .write32(CONFIGURATION, previous & !(ENABLE | SHUTDOWN_NOTIFICATION))?;
         self.wait_status(self.ready_timeout_us, |status| status & READY == 0)
             .map_err(|error| error.at(DISABLE_WAIT))?;
         self.configure_admin()?;
@@ -204,6 +246,10 @@ impl Controller {
             }
             _ => {}
         }
+        stela_driver_base::working(&format!(
+            "NVMe admin opcode={:#x} cdw10={:#x}",
+            command[0], command[10]
+        ));
         let memory = if data { Data::Admin } else { Data::None };
         let id = self.publish(false, command, memory).map_err(Lost::Fatal)?;
         let (clock, timeout) = (self.clock, self.admin_timeout_us);
@@ -217,6 +263,11 @@ impl Controller {
                 let lost = match self.registers.read32(STATUS) {
                     Ok(REMOVED) => Some(Lost::Fatal(removed())),
                     Ok(status) if self.fails(status) => {
+                        stela_driver_base::working(&format!(
+                            "NVMe admin fatal cid={id} opcode={:#x} csts={status:#x} cc={:?}",
+                            command[0],
+                            self.registers.read32(CONFIGURATION)
+                        ));
                         Some(Lost::Reset(BlockError::Device { status }))
                     }
                     Ok(_) => None,
@@ -239,7 +290,54 @@ impl Controller {
                 }
             }
         });
-        observed.unwrap_or(Err(Lost::Reset(BlockError::Timeout)))
+        let result = observed.unwrap_or(Err(Lost::Reset(BlockError::Timeout)));
+        if result.is_err() {
+            self.report_admin_failure(id, command);
+        } else if command[0] == u32::from(ADMIN_IDENTIFY) && command[10] == 1 {
+            stela_driver_base::working(&format!(
+                "NVMe Identify controller completed v12 cid={id} result={result:?}",
+                result = result.as_ref().map_err(|_| "lost")
+            ));
+        }
+        result
+    }
+
+    /// Fixed-size queue/register evidence before recovery overwrites it.
+    /// Only coherent word reads are used, including on an owned DMA lease;
+    /// read refusals are logged rather than taking live device memory.
+    fn report_admin_failure(&self, id: u16, command: [u32; 16]) {
+        let slot = if self.admin.tail == 0 {
+            self.admin.entries - 1
+        } else {
+            self.admin.tail - 1
+        };
+        let sq = core::array::from_fn::<_, 16, _>(|word| {
+            self.admin
+                .submissions
+                .coherent(usize::from(slot) * 64 + word * 4)
+        });
+        let cq = core::array::from_fn::<_, 4, _>(|word| {
+            self.admin
+                .completions
+                .coherent(usize::from(self.admin.head) * 16 + word * 4)
+        });
+        stela_driver_base::working(&format!(
+            "NVMe failure v12 cid={id} opcode={:#x} nsid={:#x} prp={:08x}{:08x} cdw10={:#x} cc={:?} csts={:?} aqa={:?} asq={:?} acq={:?}",
+            command[0],
+            command[1],
+            command[7],
+            command[6],
+            command[10],
+            self.registers.read32(CONFIGURATION),
+            self.registers.read32(STATUS),
+            self.registers.read32(ADMIN_ATTRIBUTES),
+            self.registers.read64(ADMIN_SUBMISSION),
+            self.registers.read64(ADMIN_COMPLETION)
+        ));
+        stela_driver_base::working(&format!(
+            "NVMe queues v12 sq_slot={slot} tail={} cq_head={} consumed={} phase={} sq={sq:x?} cq={cq:x?}",
+            self.admin.tail, self.admin.head, self.admin.consumed, self.admin.phase
+        ));
     }
 
     /// Take the admin completions the controller has posted, one doorbell

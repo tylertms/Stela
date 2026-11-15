@@ -521,6 +521,10 @@ impl Update {
 /// `stela repair`.
 #[derive(Args)]
 pub(crate) struct Repair {
+    /// Switch the existing USB to an offline or online installer
+    /// without formatting it.
+    #[arg(long, value_enum, value_name = "offline|online", hide_possible_values = true)]
+    installer: Option<super::InstallImage>,
     #[command(flatten)]
     stick: Stick,
     /// Read every macOS piece (slow). Done by itself when the last
@@ -566,6 +570,7 @@ impl Repair {
             ipsw: self.ipsw,
             wifi_passphrase_file: self.wifi_passphrase_file,
             download_dir: self.download_dir,
+            install_image: self.installer,
             erase_target: self.erase_target,
             initialize_nor: self.initialize_nor,
             ecid: self.ecid,

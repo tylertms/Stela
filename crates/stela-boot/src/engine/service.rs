@@ -431,11 +431,11 @@ impl Service {
             }
         }
         if now.wrapping_sub(*reported) >= REPORT_SECONDS * *tsc_hz {
-            if let Some(line) = restore
-                .as_ref()
-                .and_then(|experiment| experiment.asr_report())
-            {
+            super::run::report_stall(*tsc_hz);
+            if let Some(experiment) = restore.as_mut() {
+                let line = experiment.asr_report();
                 output::arguments(format_args!("{line}\n"));
+                crate::status::stream(line.lines());
             }
             if let Some(network) = network.as_ref() {
                 network.report();

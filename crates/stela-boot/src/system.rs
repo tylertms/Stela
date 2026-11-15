@@ -874,10 +874,19 @@ fn load(
         ));
     }
     crate::status::begin("Taking control of the other processors");
+    // Keep the last pre-EBS marker in the USB log. After EBS, report each
+    // handoff phase through the existing framebuffer and UART without heap
+    // allocation or firmware calls, so an H610I freeze has a visible stop point.
+    crate::status::progress("the firmware's drivers are being disconnected");
+    output::arguments(format_args!("HOST EBS leaving boot services now\n"));
+    // leave_boot_services stops the ticker and flushes/closes firmware logs.
     crate::output::leave_boot_services();
     // SAFETY: no protocol or pool allocation outlives this call; every page
     // Stela keeps is LOADER_DATA or LOADER_CODE.
     let map = unsafe { boot::exit_boot_services(None) };
+    crate::status::handoff_progress(format_args!(
+        "boot services are off; releasing the firmware's DMA remapping"
+    ));
     let mut exit = SuccessfulExit {
         map: core::mem::ManuallyDrop::new(map),
         ownership: Some(EbsOwnership { _private: () }),
@@ -905,7 +914,9 @@ fn load(
     // firmware code, and no Stela driver or memory reuse has started.
     let inactive_firmware_units =
         unsafe { crate::native_dma::release_firmware_units(remapping, tsc_hz) };
-    crate::status::progress("the final memory map");
+    crate::status::handoff_progress(format_args!(
+        "DMA remapping is off; sealing the final memory map"
+    ));
     let native_mmio_capture = match native_mmio {
         Ok(prepared) => match prepared.finish(&mut exit) {
             Ok(sealed) => crate::native_mmio::CaptureHandoff::new(sealed),
@@ -916,6 +927,9 @@ fn load(
         },
         Err(why) => crate::native_mmio::CaptureHandoff::refused(&why),
     };
+    crate::status::handoff_progress(format_args!(
+        "the final memory map is sealed; choosing the APIC mode"
+    ));
     // SAFETY: Stop every enabled firmware AP before offering its former code/data to
     // guest RAM, including workers that will later receive their owned SIPI.
     // The BSP alone sends ICR commands, with firmware IRQ handlers excluded.
@@ -928,6 +942,14 @@ fn load(
     // SAFETY: CPL0, interrupts masked, no APIC handle of this processor made.
     let apic_base = unsafe { crate::apic::prefer_x2apic() };
     let sender = crate::apic::Apic::new(apic_base, apic_base & crate::apic::BASE_ADDRESS);
+    crate::status::handoff_progress(format_args!(
+        "{}",
+        if sender.is_x2apic() {
+            "APIC is in x2 mode; stopping the firmware's other processors"
+        } else {
+            "APIC is in the classic mode; stopping the firmware's other processors"
+        }
+    ));
     output::arguments(format_args!(
         "HOST APIC {}\n",
         if sender.is_x2apic() {
@@ -1020,6 +1042,9 @@ fn load(
     }
     // SAFETY: boot services ended; the completed root maps this code and
     // trampoline, and all engine-window reservations remain allocated.
+    crate::status::handoff_progress(format_args!(
+        "the handoff is written; entering the system engine"
+    ));
     unsafe {
         handoff_phase::Transfer {
             placement,

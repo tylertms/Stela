@@ -36,6 +36,7 @@ mod power;
 #[cfg(feature = "native-acpi")]
 pub use power::{EmbeddedControllerInstallation, Power, install_embedded_controller};
 pub mod native;
+mod nvme_path;
 #[cfg(any(test, feature = "native-acpi"))]
 mod platform;
 pub mod services;
@@ -414,6 +415,7 @@ impl Link for Adapter {
     }
     fn due_us(&self) -> Option<u64> {
         match self {
+            Self::Realtek(device) => device.due_us(),
             #[cfg(feature = "native-acpi")]
             Self::IntelWifi(device) => device.due_us(),
             Self::MediatekWifi(device) => device.due_us(),
@@ -1570,7 +1572,12 @@ pub unsafe fn probe_observed(
     // Every window is enumerated before any driver runs, as Linux finds
     // every device before its fixups: the Intel xHCI port switch asks
     // whether an Intel EHCI exists anywhere.
-    let (scanned, pci_scan_complete) = scan(handoff, &mut devices);
+    let (mut scanned, pci_scan_complete) = scan(handoff, &mut devices);
+    let nvme_path_failures = if legacy_pci_writes {
+        nvme_path::prepare(&mut scanned)
+    } else {
+        Vec::new()
+    };
     let mut abandoned = Vec::new();
     let intel_ehci = scanned.iter().flatten().any(|function| {
         function.vendor == 0x8086
@@ -1639,6 +1646,11 @@ pub unsafe fn probe_observed(
             seen += 1;
             let address = function.address;
             devices.classes.push((address, function.class));
+            if let Some((_, error)) = nvme_path_failures.iter().find(|(at, _)| *at == address) {
+                devices.failures.push((address, error.clone().into()));
+                devices.owners.push(Box::new(function));
+                continue;
+            }
             if scan_starts(&function.identity(), &software_usb4) {
                 claimed.begin(address, recorded!());
             }

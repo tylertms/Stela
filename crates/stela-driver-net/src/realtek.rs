@@ -79,6 +79,7 @@ use core::{
 mod firmware;
 mod hardware;
 mod phy;
+mod recovery;
 mod registers;
 mod revision;
 mod ring;
@@ -89,6 +90,9 @@ use registers::*;
 pub use revision::{PCI_DEVICES, Revision};
 use ring::Ring;
 const NBASE_LINK_POLL_US: u64 = 10_000;
+// Firmware handoff may leave a working MAC behind an undelivered MSI.
+// Keep receiving on MAC46 even when its completion vector never wakes us.
+const H_RECEIVE_POLL_US: u64 = 10_000;
 /// The events that send the completion signal: rtl8169's RTL_EVENT_NAPI_RX
 /// and its link change.
 const SIGNALLED_EVENTS: u16 = RX_OK | RX_ERROR | LINK_CHANGE;
@@ -258,8 +262,37 @@ pub struct Realtek {
     pub location: String,
     /// Whether the function's vector sends the handoff's completion signal.
     signalled: bool,
+    receive_watch: recovery::ReceiveWatch,
 }
 impl Realtek {
+    /// Read-only failure snapshot; submitted TX frames are not proof of delivery.
+    pub fn diagnostics(&self) -> String {
+        let irq = if self.revision.nbase() {
+            self.device.read32(NBASE_INTERRUPT_STATUS)
+        } else {
+            u32::from(self.device.read16(INTERRUPT_STATUS))
+        };
+        format!(
+            "Realtek link={} tx={} pending={} rx={} dropped={} cmd={:#04x} phy={:#04x} irq={irq:#06x} rxdesc={:#010x} poll={}ms recoveries={} rxowned={} rxcfg={:#010x}",
+            if self.device.read8(PHY_STATUS) & LINK_STATUS != 0 {
+                "up"
+            } else {
+                "down"
+            },
+            self.transmit.packets,
+            self.transmit.owned(),
+            self.receive.packets,
+            self.receive.discarded,
+            self.device.read8(COMMAND),
+            self.device.read8(PHY_STATUS),
+            self.receive.next_status(),
+            if self.revision.version == 46 { 10 } else { 0 },
+            self.receive_watch.restarts,
+            self.receive.owned(),
+            self.device.read32(RX_CONFIG),
+        )
+    }
+
     /// What the start tolerated, each said once.
     pub fn warnings(&self) -> &[Warning] {
         &self.warnings
@@ -369,6 +402,7 @@ impl Realtek {
                 function.address, revision.name, revision.xid
             ),
             signalled,
+            receive_watch: recovery::ReceiveWatch::default(),
         };
         net.receive.initialize(true);
         net.transmit.initialize(false);
@@ -887,6 +921,9 @@ impl Link for Realtek {
     fn signals(&self) -> bool {
         self.signalled
     }
+    fn due_us(&self) -> Option<u64> {
+        (self.revision.version == 46).then(|| self.clock.now_us().saturating_add(H_RECEIVE_POLL_US))
+    }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
         self.receive_frame(<[u8]>::to_vec)
     }
@@ -908,7 +945,7 @@ impl Realtek {
         &mut self,
         mut take: impl FnMut(&[u8]) -> T,
     ) -> Result<Option<T>, LinkError> {
-        self.update_link()?;
+        let carrier = self.update_link()?;
         let frame = self.receive.receive_with(&mut take);
         if frame.is_some() {
             return Ok(frame);
@@ -924,7 +961,44 @@ impl Realtek {
             self.link.last_phy_poll = None;
             self.update_link()?;
         }
-        Ok(self.receive.receive_with(take))
+        let frame = self.receive.receive_with(take);
+        // A full ring can accumulate while the loader is busy starting CPUs or
+        // preparing the restore. A link-up and completed TX do not establish RX
+        // progress. Recover only MAC46, after draining RX and completed TX, and
+        // never rewrite live DMA until a bounded MAC reset has succeeded.
+        if frame.is_none() && self.revision.version == 46 && carrier {
+            match self.receive_watch.check(
+                self.clock.now_us(),
+                self.receive.packets.saturating_add(self.receive.discarded),
+                self.transmit.packets,
+                self.transmit.owned(),
+            ) {
+                recovery::Decision::Wait => {}
+                recovery::Decision::Restart => {
+                    let mut hardware =
+                        Hardware::new(&self.device, &self.clock, self.revision, self.function);
+                    recovery::restart(
+                        &mut hardware,
+                        &mut self.receive,
+                        &mut self.transmit,
+                        self.mac,
+                        self.signalled,
+                    )
+                    .map_err(|error| {
+                        LinkError::Adapter(format!("{} receive recovery: {error}", self.location,))
+                    })?;
+                    self.link.last_phy_poll = None;
+                }
+                recovery::Decision::Exhausted => {
+                    return Err(LinkError::Adapter(format!(
+                        "{} receive stalled after three MAC restarts: {}",
+                        self.location,
+                        self.diagnostics(),
+                    )));
+                }
+            }
+        }
+        Ok(frame)
     }
 }
 

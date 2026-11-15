@@ -106,6 +106,22 @@ impl Remote {
         Ok(Self(Ranges::new(http, manifest.source.bytes)))
     }
 
+    /// Called between restore polls, outside the guest devices' lock.
+    pub fn diagnostics(&mut self) -> String {
+        let mut line = alloc::format!(
+            "source=remote ranges={} buffered={} kept={}",
+            self.0.ranges(),
+            self.0.buffered(),
+            self.0.kept()
+        );
+        if let Ok(mut network) = self.0.source_mut().network.0.try_borrow_mut()
+            && let Some(nic) = network.adapter_diagnostics()
+        {
+            line.push_str(&alloc::format!(" {nic}"));
+        }
+        line
+    }
+
     /// Have every later read wait for the network at most
     /// `ranges::BUDGET_MS`: from when the restore host serves on a PE.
     pub fn bound(&mut self) {

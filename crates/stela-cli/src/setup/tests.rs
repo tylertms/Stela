@@ -5596,14 +5596,16 @@ fn boot_log_scan_reads_the_usb_raw_before_the_system_disk() {
     );
     assert_eq!(
         logs.len(),
-        1,
-        "the system disk waits while the USB has a log"
+        2,
+        "the system log must not be hidden by the USB's pre-EBS log"
     );
     assert_eq!(
         logs[0].0,
         format!("{usb}: partition disk5s1, EFI/stela/boot.log")
     );
     assert_eq!(logs[0].1.boots, 1);
+    assert!(logs[1].1.stream.ends_with(b"NOR persistent\n"));
+    assert!(logs[1].0.contains("partition disk0s1"));
     // A USB without a log: the system disk is read too.
     raw_partition(&mut host, dir.path(), "disk5s1", &fat_volume(None));
     let logs = crate::boot_log::scan(&host).unwrap();

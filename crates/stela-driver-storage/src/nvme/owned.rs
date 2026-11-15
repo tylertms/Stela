@@ -487,6 +487,7 @@ unsafe fn attach_with_timeout(
         events: super::Events::default(),
         aborts: alloc::vec::Vec::new(),
         limits: super::Limits::default(),
+        minimal_startup: false,
     };
     validate_clock(clock)?;
     controller.teardown = Teardown::Unprepared;

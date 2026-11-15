@@ -1663,6 +1663,29 @@ pub unsafe fn open(
     // transfer timeout's cancel, then reads its context instead of faulting.
     // SAFETY: the caller owns the handoff's DMA pages and controllers; the
     // loader refused a DMA range its physmap does not cover (`system::memory`).
+    // Qualify the exact legacy arena, as native owned DMA allocations do.
+    // Reading PAT/MTRRs/page tables allocates no DMA and changes no policy.
+    let dma_bytes = usize::try_from(handoff.dma.end - handoff.dma.start)
+        .map_err(|_| refuse!("host DMA reservation size is not representable"))?;
+    if dma_bytes != 0 {
+        let mapping = unsafe {
+            crate::native_memory::qualify_reserved_writeback(
+                crate::layout::physical(handoff.dma.start),
+                handoff.dma.start,
+                dma_bytes,
+            )
+        };
+        output::arguments(format_args!(
+            "HOST DMA v12 physical={:#x}..{:#x} cpu={:#x} WB={mapping:?}\n",
+            handoff.dma.start,
+            handoff.dma.end,
+            crate::layout::physical(handoff.dma.start)
+        ));
+        // Diagnostic only: this decoder qualifies WB, not every coherent
+        // cache policy a legacy arena can legitimately use. A refusal is
+        // evidence to inspect, not proof that DMA is unusable. Keep USB/log
+        // startup available so a failed check is actually recorded.
+    }
     let mut dma = unsafe {
         RegionAllocator::with_cpu_offset(handoff.dma.clone(), crate::layout::physical(0))
     };

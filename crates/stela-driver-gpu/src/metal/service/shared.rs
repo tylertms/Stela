@@ -871,7 +871,9 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         (self.host.run)(stack, &mut || {
             done = job.take().map(|job| job.run(&held));
         });
-        drop(held);
+        // Publish completion before another worker can claim the compiler.
+        // Releasing first lets this worker clear the next worker's `running`
+        // key, so a parked guest can retry while its job is still running.
         let ran = (self.host.ticks)().wrapping_sub(now);
         self.jobs.with(|jobs| {
             jobs.running = None;
@@ -882,6 +884,7 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             report.longest = report.longest.max(ran);
             report.longest_queued = report.longest_queued.max(now.wrapping_sub(queued));
         });
+        drop(held);
         true
     }
 
@@ -1882,5 +1885,83 @@ mod tests {
         lock.set_deferred_for_tests(true);
         deferrable.write(0, &[1]).unwrap();
         assert_eq!(writes.0, 1);
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    extern crate std;
+    use super::*;
+    use crate::metal::{
+        device::fixture::{MockBackend, MockCompiler, device_on},
+        service::{ServiceHost, identity::DeviceEpoch},
+    };
+    use core::cell::{Cell, RefCell};
+
+    type Shared = SharedService<MockBackend, MockCompiler>;
+    std::thread_local! {
+        static PROBE: RefCell<Option<Arc<Shared>>> = const { RefCell::new(None) };
+        static TICKS: Cell<u8> = const { Cell::new(0) };
+    }
+
+    // The second clock read is the completion boundary. Force a second PE
+    // to try taking the next job at precisely that boundary.
+    fn completion_ticks() -> u64 {
+        let call = TICKS.get();
+        TICKS.set(call + 1);
+        if call == 1 {
+            let shared = PROBE.with_borrow(|probe| probe.clone());
+            if let Some(shared) = shared {
+                let ran = std::thread::spawn(move || shared.run_job(0))
+                    .join()
+                    .unwrap();
+                assert!(
+                    !ran,
+                    "another worker started before completion was published"
+                );
+            }
+        }
+        1
+    }
+
+    #[test]
+    fn completion_is_published_before_the_next_worker_can_start() {
+        let service = Service::new(
+            device_on(MockBackend::new()),
+            DeviceEpoch::from_registered(NonZeroU64::MIN),
+        );
+        let shared = Arc::new(SharedService::new(
+            service,
+            ServiceHost {
+                relax: core::hint::spin_loop,
+                relax_within: || true,
+                stack: 1,
+                run: |_, body| body(),
+                report: |_| {},
+                note: |_| {},
+                ticks: completion_ticks,
+                served: |_| {},
+                wake: || {},
+                bundle: |_| {},
+            },
+        ));
+        shared.compile_stack.store(1, Ordering::Release);
+        shared.jobs.with(|jobs| {
+            for key in [1, 2] {
+                jobs.queued
+                    .push_back((Job::new([key; 32], Owner::Compiler, || Box::new(())), 0));
+            }
+        });
+        TICKS.set(0);
+        PROBE.with_borrow_mut(|probe| *probe = Some(shared.clone()));
+        assert!(shared.run_job(0));
+        PROBE.with_borrow_mut(|probe| *probe = None);
+        shared.jobs.with(|jobs| {
+            assert_eq!(jobs.running, None);
+            assert_eq!(jobs.done.len(), 1);
+            assert_eq!(jobs.queued.len(), 1);
+        });
+        assert!(shared.run_job(0));
+        shared.jobs.with(|jobs| assert_eq!(jobs.done.len(), 2));
     }
 }

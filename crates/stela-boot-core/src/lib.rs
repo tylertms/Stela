@@ -17,6 +17,7 @@ pub mod assigned_topology;
 pub mod audio_check_samples;
 pub mod bluetooth_dsbr;
 pub mod boot_progress;
+pub mod stall_watch;
 pub mod bounded_spin;
 pub mod bundle;
 pub mod bundle_repair;

@@ -942,6 +942,7 @@ impl Source {
         &'static self,
         modes: Vec<ModePin>,
     ) -> Result<usize, Error> {
+        crate::output::arguments(format_args!("HOST IOAPIC Linux pin containment v16\n"));
         self.identity.check_current().map_err(failed)?;
         let platform = crate::native_irq::NativePlatform::current().map_err(failed)?;
         platform.check_process().map_err(failed)?;
@@ -960,6 +961,11 @@ impl Source {
         // firmware left it masked, refused when left delivering NMIs
         // (`maskable_firmware_mode`), and never routed (`Routing::owner`).
         if modes.is_empty() || routing.units.is_empty() {
+            crate::output::arguments(format_args!(
+                "HOST IOAPIC inventory refused: modes={} controllers={}\n",
+                modes.len(),
+                routing.units.len()
+            ));
             return Err(Error::Unavailable);
         }
         let domain: Arc<dyn NotificationDomain> = Arc::new(MountedNotification {
@@ -976,6 +982,10 @@ impl Source {
             .try_reserve_exact(routing.units.len())
             .map_err(|_| Error::Exhausted)?;
         for &descriptor in &routing.units {
+            crate::output::arguments(format_args!(
+                "HOST IOAPIC attach id={} base={:#x} gsi={}\n",
+                descriptor.id, descriptor.base, descriptor.gsi_base
+            ));
             let span = PhysicalSpan::new(descriptor.base, PAGE)?;
             // SAFETY: explicit exclusive handoff and exact original MADT unit.
             let resource = unsafe { self.claim_platform(span) }?;
@@ -993,6 +1003,24 @@ impl Source {
                 mapping: core::mem::ManuallyDrop::new(mapping),
                 mmio,
             };
+            // Read only through the retained exclusive selector/window owner.
+            // Keep the old entries in the boot log before Linux-style clearing.
+            use crate::native_irq::ioapic::Registers;
+            let version = registers.read(1);
+            let pins = ((version >> 16) & 255) + 1;
+            crate::output::arguments(format_args!(
+                "HOST IOAPIC version={version:#010x} pins={pins}\n"
+            ));
+            if version != u32::MAX && pins <= 120 {
+                for pin in 0..pins as u8 {
+                    let low = registers.read(0x10 + pin * 2);
+                    let high = registers.read(0x11 + pin * 2);
+                    crate::output::arguments(format_args!(
+                        "HOST IOAPIC firmware gsi={} low={low:#010x} high={high:#010x}\n",
+                        descriptor.gsi_base + u32::from(pin)
+                    ));
+                }
+            }
             // SAFETY: same original controller and complete direct-mode owner.
             let unit = unsafe {
                 IoapicUnit::attach(
@@ -1004,11 +1032,20 @@ impl Source {
                     descriptor.gsi_base,
                 )
             }
-            .map_err(failed)?;
+            .map_err(|error| {
+                crate::output::arguments(format_args!(
+                    "HOST IOAPIC attach refused id={}: {error:?}\n",
+                    descriptor.id
+                ));
+                failed(error)
+            })?;
             spans.push((descriptor, unit.pins()));
             units.push((descriptor, unit));
         }
-        routing.validate_units(&spans).map_err(failed)?;
+        routing.validate_units(&spans).map_err(|error| {
+            crate::output::arguments(format_args!("HOST IOAPIC spans refused: {error:?}\n"));
+            failed(error)
+        })?;
         // SAFETY: exact complete inventory with NMI source pins unrouted, original
         // mode pins, and the caller's exclusive controller handoff.
         let routes = unsafe { crate::native_irq::plan_firmware_lines(&units) }.map_err(failed)?;

@@ -384,9 +384,19 @@ pub(crate) unsafe fn quiesce_firmware_aps(
         destination(index)?;
     }
     let mut delivered = 0;
+    // Report the destination before INIT: if delivery hangs, the screen names
+    // the attempted processor, not the previous successful destination.
+    // No allocation is allowed at this firmware ownership boundary.
+    let target_count = targets.clone().count();
     for index in targets {
         let processor = source[index];
         let id = destination(index)?;
+        crate::status::handoff_progress(format_args!(
+            "INIT {}/{} cpu={} apic={id:#x}",
+            delivered + 1,
+            target_count,
+            processor.processor_number,
+        ));
         // SAFETY: source identity, BSP exclusion, full destination set
         // and source clock were checked before any effect. No SIPI is sent.
         unsafe { sender.init_only(id, tsc_hz) }.map_err(|cause| StartupFailure::FirmwareInit {

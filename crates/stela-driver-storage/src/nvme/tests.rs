@@ -66,6 +66,7 @@ impl Fixture {
             events: Events::default(),
             aborts: Vec::new(),
             limits: Limits::default(),
+            minimal_startup: false,
         };
         Self {
             _registers: registers,
@@ -1451,4 +1452,221 @@ fn a_batch_of_starts_rings_the_submission_doorbell_once() {
     let fourth = disk.start(Command::Read { lba: 0, bytes: 512 }).unwrap();
     assert_eq!(doorbell(disk), 4);
     let _ = fourth;
+}
+
+#[test]
+fn nv3_erfk1n3_minimal_startup_keeps_mandatory_queues_and_io() {
+    let _clock = crate::test_clock::virtualize();
+    let mut fixture = Fixture::new();
+    let mut identify = vec![0u8; PAGE];
+    identify[..2].copy_from_slice(&0x2646u16.to_le_bytes());
+    identify[24..64].fill(b' ');
+    identify[24..43].copy_from_slice(b"KINGSTON SNV3S1000G");
+    identify[64..72].copy_from_slice(b"ERFK1N.3");
+    identify[CONTROLLER_MAXIMUM_TRANSFER] = 5;
+    identify[CONTROLLER_RETRY_DELAYS] = 1;
+    identify[CONTROLLER_APST] = 1;
+    identify[CONTROLLER_EVENTS..CONTROLLER_EVENTS + 4].copy_from_slice(&(1u32 << 8).to_le_bytes());
+    let mut guard = fixture.disk.controller.borrow_mut();
+    let controller = &mut *guard;
+    controller.version = VERSION_2_0;
+    controller.identified(&identify);
+    controller.bring_up(Step::Limits, identify.clone()).unwrap();
+    // Optional feature negotiation is absent; both mandatory queue commands
+    // still need successful real completions before the disk can be used.
+    for (step, opcode) in [
+        (Step::CreateCompletion, ADMIN_CREATE_COMPLETION),
+        (Step::CreateSubmission, ADMIN_CREATE_SUBMISSION),
+    ] {
+        let Some(Recovery::Admin {
+            step: actual, id, ..
+        }) = controller.recovery
+        else {
+            panic!("no queue command")
+        };
+        assert_eq!(actual, step);
+        let entry = usize::from(controller.admin.tail - 1) * 64;
+        assert_eq!(controller.admin.submissions.bytes()[entry], opcode);
+        post_admin(controller, id, 0);
+        controller.recover().unwrap();
+    }
+    assert!(controller.recovery.is_none());
+    assert!(controller.events.request.is_none());
+    assert_eq!(controller.max_transfer, BOUNCE_BYTES);
+    struct NoHostMemory;
+    impl HostMemorySource for NoHostMemory {
+        fn allocate(&mut self, _: usize, _: bool) -> Result<Buffer, BlockError> {
+            panic!("minimal profile must not allocate HMB");
+        }
+    }
+    controller.allocate_host_memory(
+        HostMemoryRequest {
+            preferred: 16 * PAGE as u64,
+            minimum: 0,
+            descriptor_minimum: 0,
+            descriptors: 0,
+        },
+        &mut NoHostMemory,
+    );
+    assert!(controller.host_memory.is_none());
+    // Another firmware, model or vendor must retain normal negotiation.
+    for at in [0, 24, 64] {
+        let mut other = identify.clone();
+        other[at] ^= 1;
+        controller.identified(&other);
+        assert!(!controller.minimal_startup);
+        assert_ne!(controller.events.supported, 0);
+    }
+    controller.identified(&identify);
+    let scanned = controller.scans;
+    drop(guard);
+    // discover normally constructs the namespace at the completed scan epoch.
+    fixture.disk.scanned = scanned;
+    let read = fixture
+        .disk
+        .start(Command::Read { lba: 0, bytes: 512 })
+        .unwrap();
+    {
+        let mut controller = fixture.disk.controller.borrow_mut();
+        controller.tag_page(read as usize, 0).bytes_mut().fill(0x5a);
+        let id = running_id(&controller, read);
+        post(&mut controller, id, 0);
+    }
+    assert_eq!(fixture.disk.finish(read), Some(Ok(Some(vec![0x5a; 512]))));
+}
+
+#[test]
+fn fatal_during_admin_recovery_is_reported_before_timeout_without_resubmission() {
+    let _clock = crate::test_clock::virtualize();
+    let mut fixture = Fixture::new();
+    let mut controller = fixture.disk.controller.borrow_mut();
+    controller.bring_up(Step::Identify, Vec::new()).unwrap();
+    let id = controller.command_id;
+    let address = controller.admin_data.address().unwrap();
+    controller.registers.write32(STATUS, READY).unwrap();
+    controller.recover().unwrap();
+    assert!(matches!(controller.recovery, Some(Recovery::Admin { .. })));
+    assert_eq!(controller.command_id, id);
+    // The deadline has not passed. CFS must be reported as a device error,
+    // with no reset/retry or completion that could authorize buffer reuse.
+    controller.registers.write32(STATUS, READY | FATAL).unwrap();
+    assert_eq!(
+        controller.recover(),
+        Err(BlockError::Device {
+            status: READY | FATAL
+        })
+    );
+    assert_eq!(controller.command_id, id);
+    assert_eq!((controller.admin.tail, controller.admin.head), (1, 0));
+    assert_eq!(controller.admin_data.address().unwrap(), address);
+    assert_eq!(controller.registers.read32(DOORBELLS).unwrap(), 1);
+    assert_eq!(controller.registers.read32(CONFIGURATION).unwrap(), 0);
+}
+
+#[test]
+fn enable_programs_disabled_format_before_reading_updated_cap_and_setting_en() {
+    struct Registers(Rc<RefCell<Vec<(usize, u32)>>>);
+    // SAFETY: a kept deterministic register model; no hardware or DMA exists.
+    unsafe impl owned::Registers for Registers {
+        fn read32(&self, offset: usize) -> Result<u32, BlockError> {
+            if offset == CAPABILITIES {
+                // Model Linux's documented CAP change after writing CC.
+                return Ok(if self.0.borrow().is_empty() {
+                    2 << 24
+                } else {
+                    4 << 24
+                });
+            }
+            Ok(0)
+        }
+        fn write32(&self, offset: usize, value: u32) -> Result<(), BlockError> {
+            self.0.borrow_mut().push((offset, value));
+            Ok(())
+        }
+        unsafe fn retire(&mut self) -> Result<(), BlockError> {
+            Ok(())
+        }
+    }
+    let mut fixture = Fixture::new();
+    let writes = Rc::new(RefCell::new(Vec::new()));
+    let mut c = fixture.disk.controller.borrow_mut();
+    c.registers = RegisterIo::Owned(Some(Box::new(Registers(writes.clone()))));
+    assert_eq!(c.enable().unwrap(), 2_000_000);
+    assert_eq!(
+        *writes.borrow(),
+        vec![
+            (CONFIGURATION, CONFIGURATION_VALUE & !ENABLE),
+            (CONFIGURATION, CONFIGURATION_VALUE),
+        ]
+    );
+}
+
+#[test]
+fn corrupted_admin_queue_registers_are_refused_before_enabling_or_submitting() {
+    for offset in [ADMIN_ATTRIBUTES, ADMIN_SUBMISSION, ADMIN_COMPLETION] {
+        let mut fixture = Fixture::new();
+        let mut c = fixture.disk.controller.borrow_mut();
+        c.configure_admin().unwrap();
+        c.verify_admin_configuration().unwrap();
+        let value = c.registers.read32(offset).unwrap();
+        c.registers.write32(offset, value ^ 0x1000).unwrap();
+        assert_eq!(
+            c.verify_admin_configuration(),
+            Err(BlockError::Protocol("NVMe admin queue register readback"))
+        );
+        assert_eq!(c.registers.read32(CONFIGURATION).unwrap(), 0);
+        assert_eq!(c.registers.read32(DOORBELLS).unwrap(), 0);
+        assert_eq!(c.command_id, 0);
+    }
+}
+
+#[test]
+fn normal_reset_preserves_format_and_clears_shutdown_without_submitting() {
+    let fixture = Fixture::new();
+    let c = fixture.disk.controller.borrow_mut();
+    c.registers
+        .write32(CONFIGURATION, CONFIGURATION_VALUE | SHUTDOWN_NOTIFICATION)
+        .unwrap();
+    c.registers.write32(CAPABILITIES, 1 << 24).unwrap();
+    takeover::stop(&c.registers, c.clock).unwrap();
+    assert_eq!(
+        c.registers.read32(CONFIGURATION).unwrap(),
+        CONFIGURATION_VALUE & !ENABLE
+    );
+    assert_eq!(c.registers.read32(DOORBELLS).unwrap(), 0);
+    assert_eq!(c.registers.read64(ADMIN_SUBMISSION).unwrap(), 0);
+}
+#[test]
+fn firmware_reset_timeout_and_removal_never_publish_new_queue_addresses() {
+    let _clock = crate::test_clock::virtualize();
+    for status in [READY, REMOVED] {
+        let fixture = Fixture::new();
+        let mut c = fixture.disk.controller.borrow_mut();
+        c.clock = Clock {
+            ticks_per_microsecond: 1,
+        };
+        c.registers.write32(CAPABILITIES, 1 << 24).unwrap();
+        c.registers
+            .write32(CONFIGURATION, CONFIGURATION_VALUE)
+            .unwrap();
+        c.registers.write32(STATUS, status).unwrap();
+        let error = takeover::stop(&c.registers, c.clock).unwrap_err();
+        assert_eq!(
+            error,
+            if status == REMOVED {
+                removed()
+            } else {
+                BlockError::Timeout
+            }
+        );
+        assert_eq!(c.registers.read64(ADMIN_SUBMISSION).unwrap(), 0);
+        assert_eq!(c.registers.read64(ADMIN_COMPLETION).unwrap(), 0);
+        assert_eq!(c.registers.read32(DOORBELLS).unwrap(), 0);
+        if status == REMOVED {
+            assert_eq!(
+                c.registers.read32(CONFIGURATION).unwrap(),
+                CONFIGURATION_VALUE
+            );
+        }
+    }
 }

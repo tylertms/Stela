@@ -590,11 +590,15 @@ impl AirCompiler {
         if let Some(held) = lock.try_hold() {
             return Ok(held);
         }
-        if may_defer && waiting.job.is_none() {
-            waiting.count += 1;
-            let mut key = [0xff; 32];
-            key[..8].copy_from_slice(&waiting.count.to_le_bytes());
-            waiting.job = Some(Job::new(key, Owner::Compiler, || Box::new(()) as Made));
+        if may_defer {
+            // A retry in the same turn must not wait for LLVM while holding
+            // the service lock. Keep the existing wake-up job and its key.
+            if waiting.job.is_none() {
+                waiting.count += 1;
+                let mut key = [0xff; 32];
+                key[..8].copy_from_slice(&waiting.count.to_le_bytes());
+                waiting.job = Some(Job::new(key, Owner::Compiler, || Box::new(()) as Made));
+            }
             lock.set_deferred(true);
             return Err(DEFERRED);
         }

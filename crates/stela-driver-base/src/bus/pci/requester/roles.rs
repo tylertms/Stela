@@ -5,7 +5,7 @@
 //! PF/VF classification across a complete, stable PCI configuration inventory.
 //! These observations grant no configuration, reset or DMA ownership.
 use super::{Address, CapabilityError, FunctionRole};
-use crate::bus::pci::capability::{ExtendedCapabilities, Transport};
+use crate::bus::pci::capability::{Capabilities, ExtendedCapabilities, Transport};
 use alloc::{collections::BTreeMap, vec::Vec};
 const SRIOV: u16 = 0x10;
 
@@ -201,6 +201,44 @@ fn fields(
         (geometry >> 16) as u16,
     ])
 }
+// Conventional PCI functions (including chipset SMBus) need not decode
+// configuration bytes above 0xff: some return aliased vendor/device words.
+// Follow Linux pci_cfg_space_size: host bridges, PCIe and PCI-X 2 qualify.
+// Local absence never decides VF status; Inventory still examines all PFs.
+fn has_extended_configuration(
+    address: Address,
+    read32: &mut impl FnMut(Address, u16) -> Result<Option<u32>, crate::bus::pci::ConfigError>,
+) -> Result<bool, Issue> {
+    let host_bridge = read(read32, address, 8)? >> 16 == 0x0600;
+    let transport = Transport(|offset: u16, bytes: u8| {
+        let value = read32(address, offset & !3)
+            .map_err(|error| CapabilityError::Config { offset, error })?
+            .filter(|value| *value != u32::MAX)
+            .ok_or(CapabilityError::FailedRead { offset })?;
+        Ok::<_, CapabilityError>(match bytes {
+            1 => value >> ((offset & 3) * 8) & 0xff,
+            2 => value >> ((offset & 2) * 8) & 0xffff,
+            _ => value,
+        })
+    });
+    let mut extended = host_bridge;
+    let entries = Capabilities::new(transport)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| match error {
+            CapabilityError::Config { error, .. } => Issue::Config { address, error },
+            error => Issue::Capability { address, error },
+        })?;
+    for entry in entries {
+        if entry.id == 0x10 {
+            extended = true;
+        } else if entry.id == 0x07 {
+            let status = read(read32, address, entry.offset + 4)?;
+            extended |= status & 0xc0000000 != 0;
+        }
+    }
+    Ok(extended)
+}
+
 fn function(
     address: Address,
     read32: &mut impl FnMut(Address, u16) -> Result<Option<u32>, crate::bus::pci::ConfigError>,
@@ -209,6 +247,9 @@ fn function(
     if matches!(identity as u16, 0 | 1 | u16::MAX) || address.device >= 32 || address.function >= 8
     {
         return Err(Issue::Sriov(address));
+    }
+    if !has_extended_configuration(address, read32)? {
+        return Ok(None);
     }
     // An all-ones first extended header denotes no extended configuration,
     // including conventional PCI. Classification still examines every PF,
@@ -324,6 +365,57 @@ mod tests {
                 .map(|words| words[usize::from(offset) / 4]))
         })
         .unwrap()
+    }
+    #[test]
+    fn legacy_smbus_alias_does_not_poison_gpu_or_read_extended_space() {
+        let smbus = at(0, 0xfc);
+        let gpu = at(0, 0x100);
+        let mut legacy = plain();
+        legacy[0] = 0x7aa38086;
+        legacy[2] = 0x0c050000;
+        legacy[0x100 / 4] = legacy[0]; // Produces bogus next pointer 0x7aa.
+        let mut endpoint = pf(0, 0, 0);
+        endpoint[0x100 / 4] = 0; // A GPU endpoint without SR-IOV.
+        let spaces = BTreeMap::from([(smbus, legacy), (gpu, endpoint)]);
+        let functions: Vec<_> = spaces.keys().copied().collect();
+        let inventory = Inventory::capture(&functions, |address, offset| {
+            assert!(address != smbus || offset < 0x100);
+            Ok(Some(spaces[&address][usize::from(offset) / 4]))
+        })
+        .unwrap();
+        assert!(inventory.issues().is_empty());
+        assert_eq!(inventory.role(gpu), FunctionRole::Physical);
+    }
+    #[test]
+    fn malformed_extended_space_on_pcie_still_refuses_the_segment() {
+        let mut pcie = pf(0, 0, 0);
+        pcie[0x100 / 4] = 0x7aa38086;
+        let inventory = capture(&BTreeMap::from([(PF, pcie), (at(0, 0x100), plain())]));
+        assert!(!inventory.issues().is_empty());
+        assert_eq!(inventory.role(at(0, 0x100)), FunctionRole::Unverified);
+    }
+    #[test]
+    fn legacy_local_absence_does_not_hide_a_vf_from_its_pf() {
+        let mut legacy = plain();
+        legacy[0x100 / 4] = 0x7aa38086;
+        let inventory = capture(&BTreeMap::from([(PF, pf(1, 8, 1)), (at(0, 0x100), legacy)]));
+        assert!(inventory.issues().is_empty());
+        assert_eq!(inventory.role(at(0, 0x100)), FunctionRole::Virtual);
+    }
+    #[test]
+    fn host_bridges_and_pcix2_still_have_extended_configuration_checked() {
+        let mut host = plain();
+        host[2] = 0x06000000;
+        let mut pcix = plain();
+        pcix[1] = 1 << 20;
+        pcix[0x34 / 4] = 0x40;
+        pcix[0x40 / 4] = 0x07;
+        pcix[0x44 / 4] = 0x40000000;
+        for mut words in [host, pcix] {
+            words[0x100 / 4] = 0x7aa38086;
+            let inventory = capture(&BTreeMap::from([(PF, words)]));
+            assert!(!inventory.issues().is_empty());
+        }
     }
     #[test]
     fn transport_denial_aborts_without_absence_or_a_physical_role() {

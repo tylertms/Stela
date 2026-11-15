@@ -100,7 +100,7 @@ impl Controller {
         request: HostMemoryRequest,
         source: &mut dyn HostMemorySource,
     ) {
-        if request.preferred == 0 || request.minimum > HOST_MEMORY_MAXIMUM {
+        if self.minimal_startup || request.preferred == 0 || request.minimum > HOST_MEMORY_MAXIMUM {
             return;
         }
         let preferred = request.preferred.min(HOST_MEMORY_MAXIMUM);

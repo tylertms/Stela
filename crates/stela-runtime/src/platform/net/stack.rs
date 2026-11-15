@@ -6,6 +6,7 @@ mod automatic;
 mod client;
 pub use client::{HttpPost, HttpRequest, HttpTransfer, TlsUnavailable};
 mod dad;
+mod dns_tcp;
 mod rdnss;
 mod tls;
 use super::{Clock, ClockError, Ipv4, NetError, http};
@@ -203,6 +204,7 @@ impl<L: Link, C: Clock> Stack<L, C> {
             buffer: 0,
             raw: false,
             query: None,
+            tcp: None,
             ipv4_only: false,
             deadline: 0,
         };
@@ -229,6 +231,7 @@ struct Lookup {
     /// An opaque stream, which no idle time ends.
     raw: bool,
     query: Option<(dns::QueryHandle, DnsQueryType)>,
+    tcp: Option<alloc::boxed::Box<dns_tcp::Lookup>>,
     /// An IPv6 lookup failed, so only IPv4 is asked.
     ipv4_only: bool,
     /// When the address family, server or answer being waited for is late.
@@ -531,6 +534,7 @@ impl<L: Link, C: Clock> Stack<L, C> {
             .iter()
             .position(|(name, ..)| *name == lookup.name);
         if lookup.query.is_none()
+            && lookup.tcp.is_none()
             && let Some(index) = known
             && self.address_usable(self.resolved[index].1)
             && now.wrapping_sub(self.resolved[index].2) < RESOLVED_US
@@ -558,6 +562,9 @@ impl<L: Link, C: Clock> Stack<L, C> {
     }
 
     fn lookup(&mut self, lookup: &mut Lookup, now: u64) -> Result<Option<IpAddress>, NetError> {
+        if lookup.tcp.is_some() {
+            return self.lookup_tcp(lookup, now);
+        }
         let Some((query, kind)) = lookup.query else {
             let kind = if !lookup.ipv4_only && self.ipv6_ready() {
                 DnsQueryType::Aaaa
@@ -585,7 +592,11 @@ impl<L: Link, C: Clock> Stack<L, C> {
                 .start_query(self.iface.context(), &lookup.name, kind)
                 .map_err(|error| NetError::Dns(alloc::format!("{}: {error:?}", lookup.name)))?;
             lookup.query = Some((query, kind));
-            lookup.deadline = now.saturating_add(DNS_WAIT_US);
+            // smoltcp spends up to ten seconds on each configured server.
+            // Do not cancel the whole lookup before it tries server two.
+            let wait =
+                DNS_WAIT_US.max(self.dns_servers.len().min(3) as u64 * 10_000_000 + 1_000_000);
+            lookup.deadline = now.saturating_add(wait);
             return Ok(None);
         };
         let socket = self.sockets.get_mut::<dns::Socket>(self.dns);
@@ -609,7 +620,7 @@ impl<L: Link, C: Clock> Stack<L, C> {
             lookup.ipv4_only = true;
             return Ok(None);
         }
-        Err(failure)
+        self.start_dns_tcp(lookup, kind, failure, now)
     }
 
     /// Opens a transfer to `host` (`name` or `name:port`, port 80 by
@@ -641,6 +652,7 @@ impl<L: Link, C: Clock> Stack<L, C> {
                 buffer,
                 raw,
                 query: None,
+                tcp: None,
                 ipv4_only: false,
                 deadline: 0,
             }),
@@ -650,7 +662,11 @@ impl<L: Link, C: Clock> Stack<L, C> {
         };
         let started = self.now().and_then(|now| {
             if let Endpoint::Resolving(lookup) = &mut transfer.endpoint {
-                lookup.deadline = now.saturating_add(DNS_WAIT_US);
+                // smoltcp spends up to ten seconds on each configured server.
+                // Do not cancel the whole lookup before it tries server two.
+                let wait =
+                    DNS_WAIT_US.max(self.dns_servers.len().min(3) as u64 * 10_000_000 + 1_000_000);
+                lookup.deadline = now.saturating_add(wait);
             }
             self.connect(&mut transfer)
         });
@@ -810,14 +826,18 @@ impl<L: Link, C: Clock> Stack<L, C> {
                 let _ = self.poll();
                 self.sockets.remove(socket);
             }
-            Endpoint::Resolving(Lookup {
-                query: Some((query, _)),
-                ..
-            }) => self
-                .sockets
-                .get_mut::<dns::Socket>(self.dns)
-                .cancel_query(query),
-            Endpoint::Resolving(_) => {}
+            Endpoint::Resolving(mut lookup) => {
+                if let Some((query, _)) = lookup.query.take() {
+                    self.sockets
+                        .get_mut::<dns::Socket>(self.dns)
+                        .cancel_query(query);
+                }
+                if let Some(mut lookup) = lookup.tcp.take()
+                    && let Some(transfer) = lookup.transfer.take()
+                {
+                    self.close(*transfer);
+                }
+            }
         }
     }
 

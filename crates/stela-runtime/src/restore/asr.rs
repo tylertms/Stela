@@ -627,6 +627,69 @@ mod tests {
         assert!(stream.output[end..].iter().all(u8::is_ascii_whitespace));
     }
 
+    /// Remote range reads may yield while their network work continues.
+    /// Exercise both OOB validation and checksummed payload across yields.
+    #[test]
+    fn deferred_image_reads_resume_without_poisoning_asr_or_repeating_bytes() {
+        struct Deferred {
+            bytes: Vec<u8>,
+            wait: bool,
+            pending: usize,
+        }
+        impl ImageSource for Deferred {
+            fn size(&self, _: &str) -> Result<u64> {
+                Ok(self.bytes.len() as u64)
+            }
+            fn read_at(&mut self, _: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+                self.wait = !self.wait;
+                if self.wait {
+                    self.pending += 1;
+                    return Err(Error::Pending);
+                }
+                Ok(self.bytes[offset as usize..offset as usize + len].to_vec())
+            }
+        }
+        let data: Vec<_> = (0..CHUNK_BYTES + 17).map(|i| (i * 13) as u8).collect();
+        let mut source = Deferred {
+            bytes: data.clone(),
+            wait: false,
+            pending: 0,
+        };
+        let mut input = xml(Value::dict([
+            ("Command", Value::from("Initiate")),
+            ("Checksum Chunks", Value::Boolean(true)),
+        ]));
+        input.extend(xml(Value::dict([
+            ("Command", Value::from("OOBData")),
+            ("OOB Offset", Value::Integer(0)),
+            ("OOB Length", Value::Integer(data.len() as u64)),
+        ])));
+        input.extend(xml(Value::dict([("Command", Value::from("Payload"))])));
+        let mut stream = Memory::new(input, 30000);
+        let mut sender = Sender::new("os.dmg".into(), &source).unwrap();
+        for _ in 0..100_000 {
+            if let Poll::Ready(result) = sender.poll(&mut stream, &mut source) {
+                result.unwrap();
+                break;
+            }
+            assert_ne!(sender.phase(), Phase::Failed);
+        }
+        assert_eq!(sender.phase(), Phase::Complete);
+        assert_eq!(source.pending, 4);
+        let start = stream
+            .output
+            .windows(8)
+            .position(|w| w == b"</plist>")
+            .unwrap()
+            + 9;
+        let mut expected = data.clone(); // OOB bytes, without checksums.
+        for chunk in data.chunks(CHUNK_BYTES) {
+            expected.extend_from_slice(chunk);
+            expected.extend_from_slice(&Sha1::digest(chunk));
+        }
+        assert_eq!(&stream.output[start..], expected);
+    }
+
     #[test]
     fn malformed_ranges_and_commands_are_terminal() {
         for v in [

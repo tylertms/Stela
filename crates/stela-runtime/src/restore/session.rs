@@ -525,6 +525,18 @@ fn next_segment<'a>(
     None
 }
 
+/// A host-side payload snapshot. Sent counts fully drained FileData batches,
+/// excludes framing overhead, and does not imply guest verification or install success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileProgress {
+    pub id: u64,
+    pub name: String,
+    pub member: String,
+    pub sent: u64,
+    pub total: u64,
+    pub complete: bool,
+}
+
 /// The scheduler owns the stream and close/reconnect policy. `port=None` uses
 /// the control stream; serialize its outbound frames with all other writers.
 /// DataPort jobs can run concurrently with progress/control reads.
@@ -639,6 +651,43 @@ impl Job {
             Plan::Asr(sender) => Some(sender),
             _ => None,
         }
+    }
+    /// Diagnostic only: never advances an offset or reads the source.
+    pub fn file_progress(&self) -> Option<FileProgress> {
+        let Plan::File(segments) = &self.plan else {
+            return None;
+        };
+        let total = segments
+            .iter()
+            .fold(0u64, |sum, s| sum.saturating_add(s.len()));
+        let sent = segments
+            .iter()
+            .take(self.index)
+            .fold(0u64, |sum, s| sum.saturating_add(s.len()))
+            .saturating_add(self.offset)
+            .min(total);
+        let name = self
+            .request
+            .get("Arguments")
+            .and_then(|v| v.get("ImageName"))
+            .or_else(|| self.request.get("DataType"))
+            .and_then(|v| v.string().ok())
+            .unwrap_or("file");
+        let member = segments
+            .iter()
+            .find_map(|s| match s {
+                Segment::Member { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .unwrap_or("generated");
+        Some(FileProgress {
+            id: self.id,
+            name: name.into(),
+            member: member.into(),
+            sent,
+            total,
+            complete: self.done && !self.failed,
+        })
     }
     fn written(&self) -> u64 {
         self.frame.written() + self.raw.written()

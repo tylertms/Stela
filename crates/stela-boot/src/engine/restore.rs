@@ -306,6 +306,10 @@ pub struct Experiment {
     installed_macos: bool,
     /// The mux's backpressure as the last poll found it.
     backpressure: MuxBackpressure,
+    // Last observed protocol/byte position and its host timestamp.
+    report_progress: Option<(String, u64, u64)>,
+    file_meters: Vec<(u64, stela_runtime::restore::progress::Meter)>,
+    asr_meter: Option<(String, stela_runtime::restore::progress::Meter)>,
     /// The counter's rate, for [`PREFETCH_MICROS`].
     tsc_hz: u64,
 }
@@ -893,6 +897,9 @@ impl Experiment {
             mode,
             installed_macos,
             backpressure: MuxBackpressure::default(),
+            report_progress: None,
+            file_meters: Vec::new(),
+            asr_meter: None,
             tsc_hz: handoff.tsc_hz,
         })
     }
@@ -940,21 +947,118 @@ impl Experiment {
     /// (no chunk read ahead) or the guest was (the mux took no more), while
     /// the restore sends one; and the writes the guest's receive window and
     /// the mux's transmit queue each refused, with the largest window.
-    pub fn asr_report(&self) -> Option<String> {
-        let asr = self.driver.asr()?;
-        let (sent, size) = asr.progress();
-        let backpressure = self.backpressure;
-        Some(format!(
-            "ASR HOST sent={}MiB/{}MiB polls_host_behind={} polls_guest_full={} \
-             refused_window={} refused_queue={} largest_window={}KiB",
-            sent >> 20,
-            size >> 20,
-            asr.starved,
-            asr.full,
-            backpressure.window,
-            backpressure.queue,
-            backpressure.largest_window >> 10
-        ))
+    pub fn asr_report(&mut self) -> String {
+        let now_ms = output::millis_since(0);
+        let asr = self.driver.asr();
+        let phase = format!(
+            "{:?}/{:?}",
+            self.driver.session.phase(),
+            asr.map(|a| a.phase())
+        );
+        let (sent, size) = asr.map(|a| a.progress()).unwrap_or_default();
+        let previous = self.report_progress.as_ref();
+        let idle_ms = match previous {
+            Some((old_phase, old_sent, at)) if old_phase == &phase && *old_sent == sent => {
+                now_ms.saturating_sub(*at)
+            }
+            _ => 0,
+        };
+        if idle_ms == 0 {
+            self.report_progress = Some((phase.clone(), sent, now_ms));
+        }
+        let pressure = self.backpressure;
+        let mut line = format!(
+            "RESTORE t={}s phase={} asr_bytes={}/{} asr_unchanged={}s host_wait={} guest_full={} refused_window={} refused_queue={} max_window={}KiB terminal={}",
+            now_ms / 1000,
+            phase,
+            sent,
+            size,
+            idle_ms / 1000,
+            asr.map_or(0, |a| a.starved),
+            asr.map_or(0, |a| a.full),
+            pressure.window,
+            pressure.queue,
+            pressure.largest_window >> 10,
+            self.terminal
+        );
+        if asr.is_some() {
+            if self.asr_meter.as_ref().is_none_or(|(key, _)| key != &phase) {
+                self.asr_meter = Some((phase.clone(), Default::default()));
+            }
+            let sample = self
+                .asr_meter
+                .as_mut()
+                .unwrap()
+                .1
+                .sample(now_ms, sent, size);
+            let eta = sample.eta_seconds.map_or_else(
+                || String::from("unknown"),
+                |s| format!("{}m{}s", s / 60, s % 60),
+            );
+            let percent = if size == 0 {
+                0
+            } else {
+                sent.saturating_mul(1000) / size
+            };
+            line.push_str(&format!("\nASR host-send={}MiB/{}MiB ({}.{:01}%) rate={}.{:02}MiB/s eta={} (transfer only; guest verification/install follows)",
+                sent >> 20, size >> 20, percent / 10, percent % 10,
+                sample.bytes_per_second >> 20, (sample.bytes_per_second % (1 << 20)) * 100 / (1 << 20), eta));
+        } else {
+            self.asr_meter = None;
+        }
+        let source = self.driver.answers.store.reader_mut();
+        if let Some(remote) = source.remote.as_ref() {
+            if let Ok(mut remote) = remote.try_borrow_mut() {
+                line.push_str(&format!(" {}", remote.diagnostics()));
+            }
+        } else {
+            line.push_str(" source=local-usb");
+        }
+        let files: Vec<_> = self.driver.file_progress().collect();
+        self.file_meters
+            .retain(|(id, _)| files.iter().any(|f| f.id == *id));
+        for file in &files {
+            if !self.file_meters.iter().any(|(id, _)| *id == file.id) {
+                self.file_meters.push((file.id, Default::default()));
+            }
+            let meter = &mut self
+                .file_meters
+                .iter_mut()
+                .find(|(id, _)| *id == file.id)
+                .unwrap()
+                .1;
+            let sample = meter.sample(now_ms, file.sent, file.total);
+            let percent = if file.total == 0 {
+                1000
+            } else {
+                file.sent.saturating_mul(1000) / file.total
+            };
+            let eta = sample.eta_seconds.map_or_else(
+                || String::from("unknown"),
+                |s| format!("{}m{}s", s / 60, s % 60),
+            );
+            let state = if file.complete {
+                "host-send-complete; guest-validation/install-may-continue"
+            } else if file.sent == file.total {
+                "sending-FileDataDone"
+            } else if sample.idle_ms >= 60_000 {
+                "no-send-progress; check-guest/source/backpressure"
+            } else {
+                "sending"
+            };
+            line.push_str(&format!(
+                "\nFILE job={} name={} member={} sent={}MiB/{}MiB bytes={}/{}B ({}.{:01}%) rate={}.{:02}MiB/s eta={} no_send_progress={}s state={}",
+                file.id, file.name, file.member, file.sent >> 20, file.total >> 20, file.sent, file.total,
+                percent / 10, percent % 10,
+                sample.bytes_per_second / (1 << 20),
+                (sample.bytes_per_second % (1 << 20)) * 100 / (1 << 20),
+                eta, if file.complete { 0 } else { sample.idle_ms / 1000 }, state
+            ));
+        }
+        if files.iter().all(|f| f.complete) && self.driver.asr().is_none() && !self.terminal {
+            line.push_str(&format!("\nRESTORE waiting-for-guest/other-protocol-work; no-active-ASR/FileData; outstanding_jobs={} (not an error)", self.driver.session.outstanding()));
+        }
+        line
     }
 
     /// Serve the guest's restore client; [`Self::pump`] read ahead and

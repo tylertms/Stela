@@ -52,10 +52,16 @@ pub(crate) unsafe fn plan_firmware_lines<R: ioapic::Registers>(
     routes
         .try_reserve_exact(units.len())
         .map_err(|_| IrqError::Exhausted)?;
-    for (_, unit) in units {
+    for (descriptor, unit) in units {
         // SAFETY: complete original controller handoff, NMI sources unrouted,
         // and direct delivery, as required by the caller.
-        routes.push(unsafe { unit.firmware_routes() }?);
+        routes.push(unsafe { unit.firmware_routes() }.map_err(|error| {
+            crate::output::arguments(format_args!(
+                "HOST IOAPIC plan refused id={} base={:#x} gsi={}: {error:?}\n",
+                descriptor.id, descriptor.base, descriptor.gsi_base
+            ));
+            error
+        })?);
     }
     Ok(routes)
 }
@@ -66,12 +72,22 @@ pub(crate) unsafe fn plan_firmware_lines<R: ioapic::Registers>(
 pub(crate) unsafe fn contain_firmware_lines<R: ioapic::Registers>(
     routes: &[ioapic::FirmwareRoutes<R, NativePlatform>],
 ) -> Result<(), IrqError> {
-    for plan in routes {
+    for (index, plan) in routes.iter().enumerate() {
         // SAFETY: forwarded original controller and source exclusions.
-        unsafe { plan.contain() }?;
+        unsafe { plan.contain() }.map_err(|error| {
+            crate::output::arguments(format_args!(
+                "HOST IOAPIC contain refused controller={index}: {error:?}\n"
+            ));
+            error
+        })?;
     }
-    for plan in routes {
-        plan.verify_contained()?;
+    for (index, plan) in routes.iter().enumerate() {
+        plan.verify_contained().map_err(|error| {
+            crate::output::arguments(format_args!(
+                "HOST IOAPIC verify refused controller={index}: {error:?}\n"
+            ));
+            error
+        })?;
     }
     Ok(())
 }

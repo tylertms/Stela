@@ -3,6 +3,43 @@
 
 use super::*;
 
+static BOOT_WATCH: stela_boot_core::stall_watch::StallWatch =
+    stela_boot_core::stall_watch::StallWatch::new();
+
+fn mark_boot(phase: u8) {
+    BOOT_WATCH.mark(phase, host::rdtsc());
+}
+
+/// Called by the independent host service, even when the boot PE is stuck.
+/// Only atomics are read: never take the machine, GPU or compiler locks here.
+pub(super) fn report_stall(tsc_hz: u64) {
+    let Some((phase, ticks)) = BOOT_WATCH.stalled(host::rdtsc(), tsc_hz.saturating_mul(5)) else {
+        return;
+    };
+    let name = match phase {
+        1 => "guest-execute",
+        2 => "device-reports",
+        3 => "host-service",
+        4 => "gpu-pump",
+        5 => "display-flush",
+        6 => "disk-service",
+        7 => "gpu-compile",
+        8 => "heartbeat",
+        _ => "unknown",
+    };
+    output::arguments(format_args!(
+        "BOOT STALL v21 phase={name} age_ms={} background-service=alive\n",
+        u128::from(ticks) * 1000 / u128::from(tsc_hz.max(1)),
+    ));
+}
+
+struct BootWatchScope;
+impl Drop for BootWatchScope {
+    fn drop(&mut self) {
+        BOOT_WATCH.mark(0, 0);
+    }
+}
+
 /// Exit kinds by `ExitKind` value, then native faults by cause
 /// (`step_timing::fault_slot`), then System exits at device sites, then the
 /// `fault-check` faults by outcome (`step_timing::Check`), as the PROFILE
@@ -800,6 +837,7 @@ pub(super) fn run<H: Host>(
     boot_progress: &mut progress::BootProgress,
     mut execute: impl FnMut(&mut Machine<H, parallel::Board>, u64) -> Stop,
 ) -> Stop {
+    let _watch_scope = BootWatchScope;
     let mut heartbeat = Heartbeat::new(machine, host::rdtsc());
     let mut service = ServiceTimes::new(heartbeat.beat.at);
     boot_progress.start(heartbeat.beat.at, machine.statistics.blocks);
@@ -818,7 +856,9 @@ pub(super) fn run<H: Host>(
         let slice_started = host::rdtsc();
         service.slice_start(slice_started);
         machine.observe_parallel_source(parallel::SourcePhase::SliceEnter);
+        mark_boot(1);
         let stop = execute(machine, limit);
+        mark_boot(2);
         machine.observe_parallel_source(parallel::SourcePhase::SliceExit);
         let service_now = host::rdtsc();
         let waited = matches!(stop, Stop::Waiting) || machine.yielded_for_interrupt(&stop);
@@ -853,6 +893,7 @@ pub(super) fn run<H: Host>(
             // that serves holds its guest's thread, and at EL1 maybe a lock
             // other PEs time (`clock`). Waiting PEs serve; with none for a while, it takes one
             // bounded step between slices.
+            mark_boot(3);
             if !machine.runs_parallel() || idle {
                 machine.exclude_host_time(|_| service::serve(true, false));
             } else if service::starved(tsc_hz, requested) {
@@ -861,6 +902,7 @@ pub(super) fn run<H: Host>(
             service.parts.lap(ServiceParts::SERVICE, host::rdtsc());
             // The GPUs' work waits for a boot PE that holds no lock, as the
             // service does, for a bounded time (`gpu::pump_due`).
+            mark_boot(4);
             super::gpu::interrupt_window();
             let pump = super::gpu::pump_due(calm(machine, quiet));
             // The frames the DCP model presented reach the screen outside the
@@ -878,7 +920,9 @@ pub(super) fn run<H: Host>(
                     super::gpu::pump();
                 }
                 service.parts.lap(ServiceParts::PUMP, host::rdtsc());
+                mark_boot(5);
                 super::display::flush(turn);
+                mark_boot(6);
                 service.parts.lap(ServiceParts::DISPLAY, host::rdtsc());
                 // A staged guest disk nobody else stepped lately: one step
                 // with guest code to run, more while idle. What it completed
@@ -893,6 +937,7 @@ pub(super) fn run<H: Host>(
                 }
                 service.parts.lap(ServiceParts::DISK, host::rdtsc());
             });
+            mark_boot(3);
             if service::shutdown_pending() {
                 machine.exclude_host_time(|_| service::serve(true, false));
             }
@@ -900,6 +945,7 @@ pub(super) fn run<H: Host>(
             // this PE's guest waits, so the count need not wait for it.
             #[cfg(feature = "nvk")]
             if idle {
+                mark_boot(7);
                 super::gpu::gate::run_job(super::gpu::gate::Taker::Boot);
             }
             service.parts.lap(ServiceParts::SERVICE, host::rdtsc());
@@ -916,6 +962,7 @@ pub(super) fn run<H: Host>(
             output::report_log_stores();
             return stop;
         }
+        mark_boot(8);
         cursor.look(now);
         heartbeat.sample(machine, now, tsc_hz);
         // The heartbeat's reports wait for a quiet boot PE, as the service
