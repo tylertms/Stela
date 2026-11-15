@@ -191,22 +191,26 @@ impl RootIdentity {
     pub(crate) fn check_irq_cpu(&self) -> Result<(), WorkError> {
         self.affinity()?;
         let current = root();
-        if current & !ADDRESS != 0 || !self.roots.roots().contains(&current) {
-            // Preserve the existing pinned guest IRQ roots above. The only
-            // additional tagged root is this manager's entered loader
-            // root, backed by its original allocation owner and same CPU guard.
-            if !crate::engine::storage::entered_loader_root(self.loader_tables) {
-                return Err(WorkError::CorruptContext);
-            }
-            let saved = disable();
-            let result = self.validate_process_root();
-            // SAFETY: read-only validation cannot switch/call/migrate.
-            unsafe {
-                restore(saved);
-            }
-            return result;
+        let base = current & ADDRESS;
+        let context = current & !ADDRESS;
+        if (context == 0 || (context >= 2 && context < super::super::CONTEXTS))
+            && self.roots.roots().contains(&base)
+        {
+            return Ok(());
         }
-        Ok(())
+        // Preserve the existing pinned guest IRQ roots above. The only
+        // additional tagged root is this manager's entered loader
+        // root, backed by its original allocation owner and same CPU guard.
+        if !crate::engine::storage::entered_loader_root(self.loader_tables) {
+            return Err(WorkError::CorruptContext);
+        }
+        let saved = disable();
+        let result = self.validate_process_root();
+        // SAFETY: read-only validation cannot switch/call/migrate.
+        unsafe {
+            restore(saved);
+        }
+        result
     }
     pub(crate) fn in_interrupt(&self) -> bool {
         self.affinity().is_err() || irq_active()
