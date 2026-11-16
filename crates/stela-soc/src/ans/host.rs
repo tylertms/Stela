@@ -26,8 +26,10 @@
 //! it waits that long. A background batch is one command of as many ranges
 //! as the disk takes (256 on NVMe, as Linux's limit), so a read that comes
 //! while it runs waits for one command at most, and the next batch waits for
-//! the next pause. A flush that waits for discards sends them at once, up to
-//! [`DISCARD_COMMANDS`] commands together.
+//! the next pause. A flush that waits for discards sends them at once and
+//! keeps [`DISCARD_COMMANDS`] commands on the disk, starting the next as
+//! soon as one completes rather than once a whole group has: one slow
+//! deallocation does not hold back the rest.
 //! Discards never reorder past
 //! writes. A write takes its blocks back from those waiting and waits out a
 //! batch it overlaps, and a flush waits for all of them where the guest was
@@ -46,8 +48,9 @@ const SHORTEST_POLL: u64 = 240;
 /// finds a lost completion: 1 ms.
 const LOST_SIGNAL: u64 = 24_000;
 
-/// The commands of one discard batch a transfer waits for.
-const DISCARD_COMMANDS: usize = 8;
+/// The discard commands kept on the disk while a transfer waits for
+/// discards or a shutdown hurries them, each one batch.
+const DISCARD_COMMANDS: usize = 16;
 /// How long guest transfers must have paused before a discard batch goes to
 /// the disk: 10 ms.
 const DISCARD_QUIET: u64 = 240_000;
@@ -57,8 +60,9 @@ const DISCARD_QUIET: u64 = 240_000;
 struct Discards {
     /// Merged runs of host blocks: each one's first block and its end.
     waiting: BTreeMap<u64, u64>,
-    /// The batch on the disk and its runs.
-    running: Option<(Submission, Vec<Extent>)>,
+    /// The batches on the disk and their runs: at most one in the
+    /// background, [`DISCARD_COMMANDS`] while urgent.
+    running: Vec<(Submission, Vec<Extent>)>,
     /// Transfers waiting for discards: each one's key, when it was
     /// submitted and its request.
     held: Vec<(u32, u64, Request)>,
@@ -67,8 +71,8 @@ struct Discards {
     failed: Option<BlockError>,
     /// When a guest transfer last started or completed, if one has.
     active: Option<u64>,
-    /// The controller's shutdown waits for these: batches go at once and
-    /// [`DISCARD_COMMANDS`] commands together, as for a waiting transfer.
+    /// The controller's shutdown waits for these: batches go at once,
+    /// [`DISCARD_COMMANDS`] on the disk, as for a waiting transfer.
     hurried: bool,
     /// Runs a shutdown gave up on, which the disk never heard of.
     abandoned: u64,
@@ -91,7 +95,7 @@ impl Discards {
     }
 
     /// A write takes `start..end` back from the waiting runs. Whether it
-    /// overlaps the running batch, which it must wait out.
+    /// overlaps a running batch, which it must wait out.
     fn written(&mut self, start: u64, end: u64) -> bool {
         let before = self
             .waiting
@@ -111,7 +115,7 @@ impl Discards {
                 self.waiting.insert(end, last);
             }
         }
-        self.running.as_ref().is_some_and(|(_, extents)| {
+        self.running.iter().any(|(_, extents)| {
             extents
                 .iter()
                 .any(|extent| extent.lba < end && extent.lba + extent.blocks > start)
@@ -133,18 +137,19 @@ impl Discards {
     }
 
     fn outstanding(&self) -> bool {
-        !self.waiting.is_empty() || self.running.is_some()
+        !self.waiting.is_empty() || !self.running.is_empty()
     }
 
-    /// The commands the next batch may take: one in the background, which
+    /// Whether a transfer waits for discards or a shutdown hurries them.
+    fn urgent(&self) -> bool {
+        !self.held.is_empty() || self.hurried
+    }
+
+    /// The batches the disk may run at once: one in the background, which
     /// a guest read may come to wait behind, and [`DISCARD_COMMANDS`] while
-    /// a transfer waits for discards.
-    fn commands(&self) -> usize {
-        if self.held.is_empty() && !self.hurried {
-            1
-        } else {
-            DISCARD_COMMANDS
-        }
+    /// urgent.
+    fn batches(&self) -> usize {
+        if self.urgent() { DISCARD_COMMANDS } else { 1 }
     }
 
     /// When the next batch may go at counter `now`, at the earliest: at once
@@ -224,7 +229,7 @@ impl HostDisk {
 
     /// Forget the discards not yet sent, and say how many runs they were.
     /// Discards are hints (NVMe 1.4 section 6.7.1.1), and the disk keeps
-    /// those blocks' old contents. The batch on the disk still completes.
+    /// those blocks' old contents. The batches on the disk still complete.
     pub(super) fn abandon_discards(&mut self) -> usize {
         let runs = self.discards.waiting.len();
         self.discards.waiting.clear();
@@ -294,38 +299,64 @@ impl HostDisk {
         done
     }
 
-    /// Reap the running discard batch, start the next once guest transfers
-    /// paused (`Discards::due`), and resubmit what no longer waits for one.
+    /// Start discard batches and reap those the disk completed: in the
+    /// background one, once guest transfers paused (`Discards::due`) and
+    /// none runs; while urgent, a new one in each free slot of
+    /// [`DISCARD_COMMANDS`], so a batch waits for no other. Then resubmit
+    /// the transfers that waited: a write beside the running batches goes,
+    /// a flush waits on until none remains.
     fn advance_discards(&mut self, done: &mut Vec<(u32, Finished)>, now: u64) {
-        if self.discards.running.is_none()
-            && self.running.is_empty()
-            && now >= self.discards.due(now)
-            && let Some(limits) = self.identity().features.discard
-        {
-            let most = limits.ranges.max(1) * self.discards.commands();
-            let extents = self.discards.batch(most);
-            if !extents.is_empty() {
-                let request = Request::Discard {
-                    extents: extents.clone(),
+        loop {
+            self.start_discards(now);
+            let before = self.discards.running.len();
+            let mut index = 0;
+            while index < self.discards.running.len() {
+                let Some(result) = self.discards.running[index].0.poll(&mut *self.device) else {
+                    index += 1;
+                    continue;
                 };
-                match Submission::new(request, self.device.identity()) {
-                    Ok(submission) => self.discards.running = Some((submission, extents)),
-                    Err(error) => self.refuse_discards(error),
+                self.discards.running.swap_remove(index);
+                if let Err(error) = result {
+                    self.refuse_discards(error);
                 }
             }
-        }
-        if let Some((submission, _)) = &mut self.discards.running {
-            let Some(result) = submission.poll(&mut *self.device) else {
-                return;
-            };
-            self.discards.running = None;
-            if let Err(error) = result {
-                self.refuse_discards(error);
+            // A slot an urgent batch freed takes the next at once; with a
+            // disk that runs commands synchronously this ends once none
+            // waits.
+            let freed = self.discards.running.len() < before;
+            if !(freed && self.discards.urgent() && !self.discards.waiting.is_empty()) {
+                break;
             }
         }
         for (key, started, request) in core::mem::take(&mut self.discards.held) {
             if let Some(finished) = self.submit(key, request, started) {
                 done.push((key, finished));
+            }
+        }
+    }
+
+    /// Start the discard batches due at counter `now`: each one command of
+    /// as many ranges as the disk takes.
+    fn start_discards(&mut self, now: u64) {
+        let Some(limits) = self.identity().features.discard else {
+            return;
+        };
+        if !self.discards.urgent() && (!self.running.is_empty() || now < self.discards.due(now)) {
+            return;
+        }
+        while self.discards.running.len() < self.discards.batches()
+            && self.discards.failed.is_none()
+        {
+            let extents = self.discards.batch(limits.ranges.max(1));
+            if extents.is_empty() {
+                return;
+            }
+            let request = Request::Discard {
+                extents: extents.clone(),
+            };
+            match Submission::new(request, self.device.identity()) {
+                Ok(submission) => self.discards.running.push((submission, extents)),
+                Err(error) => self.refuse_discards(error),
             }
         }
     }
@@ -340,7 +371,7 @@ impl HostDisk {
     /// Whether a running transfer's completion is posted, ready for
     /// [`Self::poll`]; a look at memory alone.
     pub(super) fn posted(&self) -> bool {
-        (!self.running.is_empty() || self.discards.running.is_some()) && self.device.posted()
+        (!self.running.is_empty() || !self.discards.running.is_empty()) && self.device.posted()
     }
 
     /// The running transfers at counter `now`, oldest first, each as
@@ -369,8 +400,9 @@ impl HostDisk {
             self.discards.waiting.len(),
             self.discards
                 .running
-                .as_ref()
-                .map_or(0, |(_, runs)| runs.len()),
+                .iter()
+                .map(|(_, runs)| runs.len())
+                .sum::<usize>(),
             self.discards.held.len(),
             self.discards.abandoned,
             self.discards.failed,
@@ -382,7 +414,7 @@ impl HostDisk {
     /// a disk that signals them, only once a signal is overdue.
     pub(super) fn next_look(&self, now: u64) -> u64 {
         // Only discards wait for the pause that sends them.
-        if self.running.is_empty() && self.discards.running.is_none() {
+        if self.running.is_empty() && self.discards.running.is_empty() {
             let due = self.discards.due(now);
             if due > now {
                 return due;
