@@ -39,20 +39,26 @@ fn complete(chip: &Chip) -> Capabilities {
 }
 
 #[test]
-fn the_chip_table_is_nouveaus_turing_and_later_list() {
+fn the_chip_table_is_nouveaus_pascal_and_later_list() {
     assert!(
         CHIPS
             .windows(2)
             .all(|pair| pair[0].chipset < pair[1].chipset)
     );
-    assert!(CHIPS.iter().all(|chip| chip.chipset >= FIRST_GSP_CHIPSET));
+    assert!(CHIPS.iter().all(|chip| chip.chipset >= 0x132));
     let headless: alloc::vec::Vec<_> = CHIPS
         .iter()
         .filter(|chip| !chip.display)
         .map(|chip| chip.name)
         .collect();
     assert_eq!(headless, ["GA100", "GH100", "GB100", "GB102"]);
-    // The GTX 16 series (TU116, TU117) are the oldest admitted chips.
+    // GP106 (GTX 1060) is admitted under Pascal architecture.
+    assert_eq!(Chip::find(0x136).map(|chip| chip.name), Some("GP106"));
+    assert_eq!(
+        Chip::find(0x136).map(|chip| chip.architecture),
+        Some(Architecture::Pascal)
+    );
+    // The GTX 16 series (TU116, TU117) are also present.
     assert_eq!(Chip::find(0x168).map(|chip| chip.name), Some("TU116"));
     assert_eq!(
         Chip::find(0x167).map(|chip| chip.architecture),
@@ -65,6 +71,8 @@ fn admission_requires_an_nvk_discrete_gsp_chip() {
     let chip = Chip::find(0x1b3).unwrap();
     let identity = nvk(chip, 16 << 30).identity;
     assert_eq!(Chip::admit(&identity, 0x1b3), Ok(chip));
+    let gp106 = Chip::find(0x136).unwrap();
+    assert_eq!(Chip::admit(&identity, 0x136), Ok(gp106));
     assert_eq!(
         Chip::admit(&identity, 0x140),
         Err(Refusal::PreTuring { chipset: 0x140 })

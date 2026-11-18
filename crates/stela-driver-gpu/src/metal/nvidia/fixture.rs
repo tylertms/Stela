@@ -335,7 +335,9 @@ fn features(chip: &Chip) -> Features {
         shader_float16_vector_atomics: true,
         memory_budget: true,
         calibrated_timestamps: true,
-        cooperative_matrix: chip.chipset != 0x167 && chip.chipset != 0x168,
+        cooperative_matrix: !matches!(chip.architecture, Architecture::Pascal)
+            && chip.chipset != 0x167
+            && chip.chipset != 0x168,
         ..Features::default()
     }
 }

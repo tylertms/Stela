@@ -615,7 +615,7 @@ pub fn select_for(functions: &[Pci], ports: Ports) -> Selection {
         let mut inventory = Inventory::default();
         if function.vendor == 0x10de && function.class == 0x03 {
             match recipes::nvidia_chip(function.device) {
-                Some(chip) if recipes::require_gsp(&mut inventory, chip).is_ok() => {
+                Some(chip) if recipes::require_nvidia(&mut inventory, chip).is_ok() => {
                     selection.plan(&inventory, &why);
                     driven.push(function.vendor);
                 }

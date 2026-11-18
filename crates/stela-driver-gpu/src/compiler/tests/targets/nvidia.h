@@ -10,6 +10,8 @@
 #include <string.h>
 
 #define STELA_NVIDIA_TARGETS(X)          \
+   X(60, 0xc0c0)                     \
+   X(61, 0xc1c0)                     \
    X(75, TURING_COMPUTE_A)           \
    X(80, AMPERE_COMPUTE_A)           \
    X(86, AMPERE_COMPUTE_B)           \

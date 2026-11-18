@@ -597,8 +597,8 @@ fn a_visible_gpu_or_no_empty_port_reads_no_late_files() {
     assert_eq!(families, ["NVIDIA GSP-RM"]);
     // An NVIDIA chip no recipe covers drives nothing: a second GPU may
     // still answer late.
-    let pascal = select_for(&[pci(0x10de, 0x1b80, 0x03), port(2)], Ports::NONE);
-    assert_eq!(pascal.late.len(), 1);
+    let maxwell = select_for(&[pci(0x10de, 0x13c0, 0x03), port(2)], Ports::NONE);
+    assert_eq!(maxwell.late.len(), 1);
     // No port with nothing below it: nothing can answer later.
     let below = Pci {
         bus: 2,
@@ -615,14 +615,14 @@ fn the_nvidia_notice_claims_no_more_than_the_census_shows() {
         ..pci(0x8086, 0x2725, 0x02)
     };
     let intel = pci(0x8086, 0x46a6, 0x03);
-    let pascal = pci(0x10de, 0x1b80, 0x03);
+    let maxwell = pci(0x10de, 0x13c0, 0x03);
     // A supported NVIDIA GPU answers: nothing to say, empty ports or not.
     assert_eq!(
         nvidia_notice(&[pci(0x10de, 0x2c02, 0x03), port(2)]),
         NvidiaNotice::Driven
     );
     assert_eq!(
-        nvidia_notice(&[pascal, pci(0x10de, 0x2c02, 0x03)]),
+        nvidia_notice(&[maxwell, pci(0x10de, 0x2c02, 0x03)]),
         NvidiaNotice::Driven
     );
     // Every port has something below it: what the census shows is final.
@@ -632,7 +632,7 @@ fn the_nvidia_notice_claims_no_more_than_the_census_shows() {
     );
     assert_eq!(nvidia_notice(&[]), NvidiaNotice::Absent);
     assert_eq!(
-        nvidia_notice(&[pascal, port(2), below(2)]),
+        nvidia_notice(&[maxwell, port(2), below(2)]),
         NvidiaNotice::NotDriven
     );
     // A hybrid laptop whose GPU is in D3cold: its port shows nothing below

@@ -48,6 +48,8 @@ device_limits(const struct nv_device_info *dev, struct qmd_limits *limits)
 {
    bool matches;
    switch (dev->cls_compute) {
+   case 0xc0c0: matches = dev->sm == 60; break;
+   case 0xc1c0: matches = dev->sm == 61 || dev->sm == 62; break;
    case TURING_COMPUTE_A: matches = dev->sm == 75; break;
    case AMPERE_COMPUTE_A: matches = dev->sm == 80; break;
    case AMPERE_COMPUTE_B: matches = dev->sm == 86 || dev->sm == 87; break;
@@ -172,17 +174,18 @@ stela_nvidia_compute_encode(const struct nv_device_info *dev,
 
    if (qmd->num_cbufs > ARRAY_SIZE(qmd->cbufs))
       return reject(error, STELA_NVIDIA_COMPUTE_CONSTANT_BUFFER);
+   const unsigned cbuf_align = dev->cls_compute >= TURING_COMPUTE_A ? CBUF_ALIGNMENT : 256u;
    unsigned cbuf_mask = 0;
    for (unsigned i = 0; i < qmd->num_cbufs; i++) {
       const struct nak_qmd_cbuf *cb = &qmd->cbufs[i];
       if (cb->index >= ARRAY_SIZE(qmd->cbufs) || cbuf_mask & (1u << cb->index) ||
-          !cb->size || cb->size > MAX_CBUF_BYTES || cb->size % CBUF_ALIGNMENT)
+          !cb->size || cb->size > MAX_CBUF_BYTES || cb->size % cbuf_align)
          return reject(error, STELA_NVIDIA_COMPUTE_CONSTANT_BUFFER);
       cbuf_mask |= 1u << cb->index;
       struct nak_qmd_cbuf_desc_layout layout = nak_get_qmd_cbuf_desc_layout(dev, cb->index);
       unsigned bits = layout.addr_shift + layout.addr_lo_end - layout.addr_lo_start +
                       layout.addr_hi_end - layout.addr_hi_start;
-      if (!address_range(cb->addr, cb->size, MIN2(va_bits, bits), CBUF_ALIGNMENT) ||
+      if (!address_range(cb->addr, cb->size, MIN2(va_bits, bits), cbuf_align) ||
           overlap(cb->addr, cb->size, dispatch->qmd_addr, qmd_size_B))
          return reject(error, STELA_NVIDIA_COMPUTE_ADDRESS);
    }

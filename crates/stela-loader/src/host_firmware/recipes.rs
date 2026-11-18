@@ -1945,6 +1945,11 @@ fn select_gsp(request: &Request) -> Option<&'static Recipe> {
 /// out.
 pub fn nvidia_chip(device: u16) -> Option<&'static str> {
     Some(match device {
+        0x1b00..=0x1b7f => "gp102",
+        0x1b80..=0x1bff => "gp104",
+        0x1c00..=0x1c7f => "gp106",
+        0x1c80..=0x1cff => "gp107",
+        0x1d00..=0x1d7f => "gp108",
         0x1e00..=0x1e7f => "tu102",
         0x1e80..=0x1eff => "tu104",
         0x1f00..=0x1f7f => "tu106",
@@ -2012,6 +2017,40 @@ pub fn require_gsp(inventory: &mut Inventory, chip: &str) -> Result<(), Error> {
     } else {
         Err(Error(format!("{chip} is no chip nouveau runs GSP-RM on")))
     }
+}
+
+/// Requires the firmware files for any supported NVIDIA chip, routing Pascal
+/// chipsets (GP102..GP108) to their non-GSP firmware and Turing+ to GSP-RM.
+pub fn require_nvidia(inventory: &mut Inventory, chip: &str) -> Result<(), Error> {
+    match chip {
+        "gp102" | "gp104" | "gp106" | "gp107" | "gp108" => require_pascal(inventory, chip),
+        _ => require_gsp(inventory, chip),
+    }
+}
+
+pub fn require_pascal(inventory: &mut Inventory, chip: &str) -> Result<(), Error> {
+    let target = Target {
+        driver: "nouveau",
+        hardware: "nvidia",
+        revision: "linux-firmware",
+        board: None,
+    };
+    let names = match chip {
+        "gp102" => &["nvidia/gp102/acr/bl.bin", "nvidia/gp102/acr/ucode_load.bin", "nvidia/gp102/gr/fecs_data.bin", "nvidia/gp102/gr/fecs_inst.bin", "nvidia/gp102/gr/gpccs_data.bin", "nvidia/gp102/gr/gpccs_inst.bin", "nvidia/gp102/nvdec/scrubber.bin", "nvidia/gp102/sec2/desc.bin", "nvidia/gp102/sec2/image.bin", "nvidia/gp102/sec2/sig.bin"][..],
+        "gp104" => &["nvidia/gp104/acr/bl.bin", "nvidia/gp104/acr/ucode_load.bin", "nvidia/gp104/gr/fecs_data.bin", "nvidia/gp104/gr/fecs_inst.bin", "nvidia/gp104/gr/gpccs_data.bin", "nvidia/gp104/gr/gpccs_inst.bin", "nvidia/gp104/nvdec/scrubber.bin", "nvidia/gp104/sec2/desc.bin", "nvidia/gp104/sec2/image.bin", "nvidia/gp104/sec2/sig.bin"][..],
+        "gp106" => &["nvidia/gp106/acr/bl.bin", "nvidia/gp106/acr/ucode_load.bin", "nvidia/gp106/gr/fecs_data.bin", "nvidia/gp106/gr/fecs_sig.bin", "nvidia/gp106/gr/gpccs_data.bin", "nvidia/gp106/gr/gpccs_sig.bin", "nvidia/gp106/nvdec/scrubber.bin", "nvidia/gp106/sec2/desc.bin", "nvidia/gp106/sec2/image.bin", "nvidia/gp106/sec2/sig.bin"][..],
+        "gp107" => &["nvidia/gp107/acr/bl.bin", "nvidia/gp107/acr/ucode_load.bin", "nvidia/gp107/gr/fecs_bl.bin", "nvidia/gp107/gr/fecs_data.bin", "nvidia/gp107/gr/fecs_inst.bin", "nvidia/gp107/gr/gpccs_bl.bin", "nvidia/gp107/gr/gpccs_data.bin", "nvidia/gp107/gr/gpccs_inst.bin", "nvidia/gp107/nvdec/scrubber.bin", "nvidia/gp107/sec2/desc.bin", "nvidia/gp107/sec2/image.bin", "nvidia/gp107/sec2/sig.bin"][..],
+        "gp108" => &["nvidia/gp108/acr/bl.bin", "nvidia/gp108/acr/ucode_load.bin", "nvidia/gp108/gr/fecs_bl.bin", "nvidia/gp108/gr/fecs_data.bin", "nvidia/gp108/gr/fecs_inst.bin", "nvidia/gp108/gr/gpccs_bl.bin", "nvidia/gp108/gr/gpccs_data.bin", "nvidia/gp108/gr/gpccs_inst.bin", "nvidia/gp108/nvdec/scrubber.bin", "nvidia/gp108/sec2/desc.bin", "nvidia/gp108/sec2/image.bin", "nvidia/gp108/sec2/sig.bin"][..],
+        _ => return Err(Error(format!("{chip} is no supported Pascal chip"))),
+    };
+    for name in names {
+        inventory.observe(Requirement {
+            name,
+            target,
+            minimum_bytes: 1,
+        })?;
+    }
+    Ok(())
 }
 
 /// Requires what a Wi-Fi adapter with these PCI IDs loads, under the binding

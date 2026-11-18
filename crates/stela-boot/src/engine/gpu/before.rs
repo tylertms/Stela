@@ -97,8 +97,8 @@ static NOUVEAU: Before = Before {
         ))?;
         let name = chip.name.to_ascii_lowercase();
         let mut inventory = Inventory::default();
-        stela_loader::host_firmware::recipes::require_gsp(&mut inventory, &name)
-            .map_err(|_| ServiceError::Refused("the GPU has no pinned GSP recipe"))?;
+        stela_loader::host_firmware::recipes::require_nvidia(&mut inventory, &name)
+            .map_err(|_| ServiceError::Refused("the GPU has no pinned firmware recipe"))?;
         Ok(Identified {
             firmware: select_firmware(&inventory, &name, catalog, None)?,
             identity: Some(boot0),
@@ -588,7 +588,9 @@ fn wait_for_firmware_boot(
     // nouveau's PRAMIN shadow reads the window only with the display fused
     // on (`shadowramin.c` `pramin_init`: 0x820c04 from GA100, else 0x021c04).
     let fuse = read(match chip.architecture {
-        gpu::nouveau_chip::Architecture::Turing => 0x02_1c04,
+        gpu::nouveau_chip::Architecture::Pascal | gpu::nouveau_chip::Architecture::Turing => {
+            0x02_1c04
+        }
         _ => 0x82_0c04,
     });
     let window = fuse
