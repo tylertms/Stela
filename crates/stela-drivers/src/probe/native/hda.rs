@@ -15,7 +15,29 @@ use crate::{
 use alloc::{boxed::Box, string::String, vec::Vec};
 mod lifetime;
 pub use lifetime::Error as RetirementError;
-use lifetime::{Inputs, Native};
+use lifetime::{Inputs, Native, OriginalUsers};
+
+pub const PLAYBACK_FORMAT: audio::PcmFormat = audio::PcmFormat {
+    rate: 48_000,
+    bits: 16,
+    channels: 2,
+};
+pub const PLAYBACK_PERIOD_BYTES: usize = 4096;
+pub const PLAYBACK_PERIODS: usize = 8;
+pub const PLAYBACK_RING_BYTES: usize = PLAYBACK_PERIOD_BYTES * PLAYBACK_PERIODS;
+
+/// Active analog playback route bound on a native HDA controller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaybackInfo {
+    pub codec: u8,
+    pub pin: u8,
+    pub converter: u8,
+    pub device: hda::PinDevice,
+    pub jack_detected: bool,
+    pub ring_bytes: usize,
+    pub period_bytes: usize,
+    pub transport_only: bool,
+}
 
 /// HD Audio BAR0 through its actual owned uncached mapping/native widths.
 pub struct Bar0 {
@@ -60,6 +82,27 @@ pub struct Host {
     pub discovery_error: Option<audio::Error>,
 }
 impl Host {
+    /// Allocate and start a 48 kHz 16-bit stereo cyclic playback stream on the
+    /// highest-priority analog output pin discovered on this controller.
+    pub fn start_playback(&mut self) -> Result<PlaybackInfo, audio::Error> {
+        self.owner.start_playback(&self.codecs)
+    }
+
+    /// Poll the running playback stream's hardware link position and status.
+    pub fn playback_status(&mut self) -> Result<hda::StreamStatus, audio::Error> {
+        self.owner.playback_status()
+    }
+
+    /// Write 4-byte-aligned 16-bit stereo PCM directly into the live DMA ring.
+    pub fn write_playback(&mut self, offset: usize, bytes: &[u8]) -> Result<(), audio::Error> {
+        self.owner.write_playback(offset, bytes)
+    }
+
+    /// Stop active playback DMA without retiring the controller.
+    pub fn stop_playback(&mut self) -> Result<(), audio::Error> {
+        self.owner.stop_playback()
+    }
+
     /// Explicit one-shot hardware/root/lease/Attachment/mapping retirement.
     /// Failure and unwind keep the complete graph and permanently close entry.
     pub fn shutdown(&mut self) -> Result<(), RetirementError> {
@@ -146,16 +189,32 @@ pub(in crate::probe) unsafe fn attach(
         bytes,
         mapping: cold.mapping.take().unwrap(),
     };
+    let retained = match cold
+        .requester
+        .as_mut()
+        .unwrap()
+        .function_mut()
+        .config()
+        .retain_epoch()
+    {
+        Ok(retained) => retained,
+        Err(error) => {
+            return Err((
+                Error::HdaNative(RetirementError::Mapping(error)),
+                Some(Box::new(cold)),
+            ));
+        }
+    };
     let inputs = Inputs {
         requester: cold.requester.take().unwrap(),
         registers,
         clock: audio::Timing::new(clock, cold.minimum.take().unwrap()),
         pages: services.pages(),
         bar,
-        // No native original-owner IRQ/CPU/EOI/service/work completion producer
-        // exists. Post-EBS serialization, source masks or polled operation do
-        // not construct one; Native retains/refuses before root drain/bind.
-        original_users: None,
+        // SAFETY: native::hda::attach runs post-ExitBootServices during device
+        // probe after start_platform parked inherited PCI functions, masked
+        // legacy IRQs, installed our IDT/APIC, and initialized DMA remapping.
+        original_users: Some(unsafe { OriginalUsers::post_ebs(retained) }),
     };
     let mut owner = match Native::new(inputs) {
         Ok(owner) => owner,

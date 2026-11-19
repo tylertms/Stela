@@ -956,6 +956,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
                 host_input,
                 host_usb,
                 host_bluetooth,
+                host_audio,
                 host_network,
                 usb_disks,
                 guest_network,
@@ -1185,6 +1186,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
                 host_input,
                 host_usb,
                 host_bluetooth,
+                host_audio,
                 guest_network,
                 host_nor,
                 host_disks,
@@ -2989,6 +2991,7 @@ struct HostDevices {
     host_input: Option<input::HostInput>,
     host_usb: Option<usb::HostUsb>,
     host_bluetooth: Option<bluetooth::HostBluetooth>,
+    host_audio: Option<audio::HostAudio>,
     host_network: Option<Result<network::Shared>>,
     usb_disks: Vec<alloc::boxed::Box<dyn stela_drivers::block::BlockDevice>>,
     guest_network: Option<network::GuestNetwork>,
@@ -3018,6 +3021,7 @@ fn start_devices(
     let mut fdr_device = None;
     let mut host_usb = None;
     let mut host_bluetooth: Option<bluetooth::HostBluetooth> = None;
+    let mut host_audio: Option<audio::HostAudio> = None;
     let (services, medium, preboot, host_input, host_network, usb_disks, guest_network, host_disks) =
         if targets.is_empty()
             && options.install_source.is_none()
@@ -3162,6 +3166,7 @@ fn start_devices(
                 isa_bridges,
                 usb,
                 bluetooth: host_controller,
+                audio: opened_audio,
                 usb_disks,
                 disks,
                 power,
@@ -3256,6 +3261,11 @@ fn start_devices(
                 host_bluetooth = Some(bluetooth::HostBluetooth::modeled(handoff.root));
             }
             drop(host_controller);
+            if options.input && !options.restore && options.install.is_none() {
+                host_audio = opened_audio;
+            } else {
+                drop(opened_audio);
+            }
             // With no adapter started, the screen names each one found and
             // why it stayed off, before the steps that need one say so.
             if links.devices.is_empty() && (wants_network || options.guest_network) {
@@ -3369,6 +3379,7 @@ fn start_devices(
         host_input,
         host_usb,
         host_bluetooth,
+        host_audio,
         host_network,
         usb_disks,
         guest_network,

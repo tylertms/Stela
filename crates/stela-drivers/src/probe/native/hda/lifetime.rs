@@ -51,6 +51,16 @@ pub(super) struct OriginalUsers {
     retained: ConfigRetention,
 }
 
+impl OriginalUsers {
+    /// # Safety
+    /// Post-ExitBootServices native device probe runs after platform takeover
+    /// has parked inherited PCI functions, masked legacy IRQs, installed the
+    /// engine's IDT/APIC, and initialized DMA remapping domains for the boot.
+    pub(super) unsafe fn post_ebs(retained: ConfigRetention) -> Self {
+        Self { retained }
+    }
+}
+
 #[cfg(test)]
 impl OriginalUsers {
     /// # Safety
@@ -155,6 +165,7 @@ struct Resources<R, T> {
     controller: Option<Core<R, T>>,
     dma: Option<DomainAllocator<'static>>,
     config: Option<hda::Config>,
+    playback_stream: Option<hda::StreamId>,
     _root_failure: Option<preparation::Failure>,
     _binding_failure: Option<BindingFailure<R>>,
     _construction_failure: Option<hda::ConstructionFailure<Shared<Pci<R>>, T>>,
@@ -229,6 +240,7 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
             controller: None,
             dma: None,
             config: None,
+            playback_stream: None,
             _root_failure: None,
             _binding_failure: None,
             _construction_failure: None,
@@ -412,6 +424,209 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
             }
         }
     }
+    pub fn start_playback(&mut self, codecs: &[Codec]) -> Result<super::PlaybackInfo, audio::Error> {
+        if self.phase != Phase::Active {
+            return Err(audio::Error::Shutdown);
+        }
+        let r = self.owner.resources();
+        if r.playback_stream.is_some() {
+            return Err(audio::Error::StreamRunning);
+        }
+        let controller = r.controller.as_mut().ok_or(audio::Error::Shutdown)?;
+
+        struct Candidate<'a> {
+            graph: &'a hda::CodecGraph,
+            route: hda::AnalogRoute,
+            device: hda::PinDevice,
+            jack_detected: bool,
+            rank: (bool, u8, u8, u8, u8, u8),
+        }
+
+        let mut candidates = Vec::new();
+        for codec in codecs {
+            let graph = &codec.graph;
+            if let Ok(endpoints) =
+                graph.analog_endpoints(audio::Direction::Playback, super::PLAYBACK_FORMAT)
+            {
+                for endpoint in endpoints {
+                    let device = endpoint.configuration.device();
+                    let is_jack = matches!(
+                        endpoint.configuration.connection(),
+                        hda::PinConnection::Jack | hda::PinConnection::JackAndFixed
+                    );
+                    let jack_detected = is_jack
+                        && controller
+                            .poll_pin_sense(graph, endpoint.route.pin())
+                            .is_ok_and(|sense| sense.present);
+                    let device_order = if jack_detected {
+                        match device {
+                            hda::PinDevice::Headphone => 0,
+                            hda::PinDevice::LineOut => 1,
+                            hda::PinDevice::Speaker => 2,
+                            _ => 3,
+                        }
+                    } else {
+                        match device {
+                            hda::PinDevice::LineOut => 0,
+                            hda::PinDevice::Speaker => 1,
+                            hda::PinDevice::Headphone => 2,
+                            _ => 3,
+                        }
+                    };
+                    let rank = (
+                        !jack_detected,
+                        device_order,
+                        endpoint.configuration.association(),
+                        endpoint.configuration.sequence(),
+                        endpoint.route.pin(),
+                        endpoint.route.converter(),
+                    );
+                    candidates.push(Candidate {
+                        graph,
+                        route: endpoint.route,
+                        device,
+                        jack_detected,
+                        rank,
+                    });
+                }
+            } else {
+                for group in &graph.groups {
+                    if group.function_type & 0xff != 1 {
+                        continue;
+                    }
+                    for pin in &group.widgets {
+                        if pin.kind != hda::WidgetKind::Pin
+                            || pin.capabilities & (1 << 9) != 0
+                            || pin.pin_capabilities.unwrap_or(0) & (1 << 4) == 0
+                        {
+                            continue;
+                        }
+                        for conv in &group.widgets {
+                            if conv.kind != hda::WidgetKind::Output
+                                || conv.capabilities & (1 << 9) != 0
+                                || conv.channels() < super::PLAYBACK_FORMAT.channels
+                                || !conv.pcm.supports(super::PLAYBACK_FORMAT)
+                            {
+                                continue;
+                            }
+                            if let Ok(route) =
+                                graph.analog_route(audio::Direction::Playback, pin.node, conv.node)
+                            {
+                                candidates.push(Candidate {
+                                    graph,
+                                    route,
+                                    device: hda::PinDevice::LineOut,
+                                    jack_detected: false,
+                                    rank: (true, 4, 0xff, 0xff, pin.node, conv.node),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        candidates.sort_by_key(|c| c.rank);
+        if candidates.is_empty() {
+            return Err(audio::Error::UnsupportedTopology);
+        }
+
+        let mut allocator = RecordingAllocator {
+            inner: r.dma.as_mut().ok_or(audio::Error::NoDmaMemory)?,
+            failure: None,
+        };
+        let stream = controller.allocate_stream(
+            audio::Direction::Playback,
+            super::PLAYBACK_FORMAT,
+            super::PLAYBACK_PERIOD_BYTES,
+            super::PLAYBACK_PERIODS,
+            &mut allocator,
+        )?;
+
+        let mut last_error = audio::Error::UnsupportedTopology;
+        for candidate in candidates {
+            let group = candidate.graph.groups.iter().find(|group| {
+                group
+                    .widgets
+                    .iter()
+                    .any(|widget| widget.node == candidate.route.converter())
+            });
+            let transport_only = group.is_some_and(|g| g.power_states == Some(0));
+            let routed = if transport_only {
+                controller.bind_converter(candidate.graph, candidate.route.converter(), stream, 0)
+            } else {
+                let pin_caps = candidate
+                    .graph
+                    .widget(candidate.route.pin())
+                    .and_then(|w| w.pin_capabilities)
+                    .unwrap_or(0);
+                let headphone =
+                    pin_caps & (1 << 3) != 0 && candidate.device == hda::PinDevice::Headphone;
+                let eapd = (pin_caps & (1 << 16) != 0).then_some(true);
+                controller.configure_analog_route(
+                    candidate.graph,
+                    &candidate.route,
+                    stream,
+                    0,
+                    hda::PinOptions::Playback { headphone, eapd },
+                )
+            };
+            match routed {
+                Ok(()) => {
+                    controller.start(stream)?;
+                    r.playback_stream = Some(stream);
+                    return Ok(super::PlaybackInfo {
+                        codec: candidate.graph.address,
+                        pin: candidate.route.pin(),
+                        converter: candidate.route.converter(),
+                        device: candidate.device,
+                        jack_detected: candidate.jack_detected,
+                        ring_bytes: super::PLAYBACK_RING_BYTES,
+                        period_bytes: super::PLAYBACK_PERIOD_BYTES,
+                        transport_only,
+                    });
+                }
+                Err(error) => {
+                    last_error = error;
+                }
+            }
+        }
+        Err(last_error)
+    }
+    pub fn playback_status(&mut self) -> Result<hda::StreamStatus, audio::Error> {
+        if self.phase != Phase::Active {
+            return Err(audio::Error::Shutdown);
+        }
+        let r = self.owner.resources();
+        let stream = r.playback_stream.ok_or(audio::Error::StreamStopped)?;
+        r.controller
+            .as_mut()
+            .ok_or(audio::Error::Shutdown)?
+            .status(stream)
+    }
+    pub fn write_playback(&mut self, offset: usize, bytes: &[u8]) -> Result<(), audio::Error> {
+        if self.phase != Phase::Active {
+            return Err(audio::Error::Shutdown);
+        }
+        let r = self.owner.resources();
+        let stream = r.playback_stream.ok_or(audio::Error::StreamStopped)?;
+        r.controller
+            .as_mut()
+            .ok_or(audio::Error::Shutdown)?
+            .write_live_pcm(stream, offset, bytes)
+    }
+    pub fn stop_playback(&mut self) -> Result<(), audio::Error> {
+        if self.phase != Phase::Active {
+            return Ok(());
+        }
+        let r = self.owner.resources();
+        let Some(stream) = r.playback_stream.take() else {
+            return Ok(());
+        };
+        r.controller
+            .as_mut()
+            .ok_or(audio::Error::Shutdown)?
+            .stop(stream)
+    }
     pub fn close(&mut self) -> Result<(), Error> {
         self.admit()?;
         // Admission closes BEFORE any protocol/MMIO callback. Unwind leaves
@@ -432,6 +647,9 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
         }
     }
     fn close_inner(r: &mut Resources<R, T>) -> Result<(), Error> {
+        if let Some(stream) = r.playback_stream.take() {
+            let _ = r.controller.as_mut().unwrap().stop(stream);
+        }
         r.controller.as_mut().unwrap().shutdown()?;
         // Independently read back complete engine/source containment, not a
         // stale software stopped bit. INTCTL/WAKEEN and PCI MSI/MSIX remained

@@ -14,6 +14,7 @@ pub mod aperture;
 #[cfg(target_arch = "x86_64")]
 pub mod apic;
 pub mod assigned_topology;
+pub mod audio_bridge;
 pub mod audio_check_samples;
 pub mod beat_pace;
 pub mod bluetooth_dsbr;

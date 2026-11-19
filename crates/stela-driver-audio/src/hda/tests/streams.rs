@@ -423,3 +423,47 @@ fn bandwidth_reserved_before_allocation() {
         })
     );
 }
+
+#[test]
+fn write_live_pcm_refills_running_playback_stream_with_aligned_words() {
+    let mut fixture = Fixture::new();
+    let model = Model::new(16);
+    let mut controller = create(&model, &mut fixture, config()).unwrap();
+    let playback = controller
+        .allocate_stream(Direction::Playback, pcm(), 4096, 2, &mut fixture.allocator)
+        .unwrap();
+    let capture = controller
+        .allocate_stream(Direction::Capture, pcm(), 4096, 2, &mut fixture.allocator)
+        .unwrap();
+    controller.start(playback).unwrap();
+    // Standard write_pcm still refuses while running; write_live_pcm succeeds.
+    assert_eq!(
+        controller.write_pcm(playback, 0, &[1, 2, 3, 4]),
+        Err(Error::StreamRunning)
+    );
+    controller
+        .write_live_pcm(playback, 16, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
+        .unwrap();
+    // Unaligned offset, unaligned length, out-of-bounds, and capture streams are rejected.
+    assert_eq!(
+        controller.write_live_pcm(playback, 2, &[0; 4]),
+        Err(Error::InvalidBuffer)
+    );
+    assert_eq!(
+        controller.write_live_pcm(playback, 0, &[0; 2]),
+        Err(Error::InvalidBuffer)
+    );
+    assert_eq!(
+        controller.write_live_pcm(playback, 8192, &[0; 4]),
+        Err(Error::InvalidBuffer)
+    );
+    assert_eq!(
+        controller.write_live_pcm(capture, 0, &[0; 4]),
+        Err(Error::InvalidBuffer)
+    );
+    controller.stop(playback).unwrap();
+    assert_eq!(
+        &controller.stream(playback).unwrap().buffer.bytes()[16..24],
+        &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
+    );
+}

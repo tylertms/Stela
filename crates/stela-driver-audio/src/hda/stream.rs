@@ -404,6 +404,40 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         Ok(())
     }
 
+    /// Write 4-byte-aligned playback PCM directly into the coherent DMA ring
+    /// using volatile word stores and a `SeqCst` fence (matching
+    /// `refill_hdmi_period`). Safe to call while the playback stream is running
+    /// so a live guest-to-host audio bridge can refill ahead of LPIB without
+    /// creating a mutable slice alias over active DMA memory.
+    pub fn write_live_pcm(
+        &mut self,
+        id: StreamId,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        self.minimum_guard()?;
+        let stream = self.stream(id)?;
+        if stream.direction != Direction::Playback
+            || !offset.is_multiple_of(4)
+            || !bytes.len().is_multiple_of(4)
+            || offset
+                .checked_add(bytes.len())
+                .is_none_or(|end| end > stream.buffer.len())
+        {
+            return Err(Error::InvalidBuffer);
+        }
+        let stream = self.streams[usize::from(id.index)]
+            .as_mut()
+            .ok_or(Error::InvalidStream)?;
+        for (word, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
+            stream
+                .buffer
+                .write(offset + word * 4, u32::from_le_bytes(*chunk).to_le());
+        }
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
     /// Fill a stopped capture ring with a known byte before starting DMA.
     /// This supports buffer sanitization and detecting device writes.
     pub fn fill_capture(&mut self, id: StreamId, value: u8) -> Result<(), Error> {

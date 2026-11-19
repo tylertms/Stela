@@ -16,6 +16,7 @@ use stela_contracts::refuse;
 mod start;
 pub(crate) use start::entry;
 mod aml;
+mod audio;
 mod bluetooth;
 mod boot_image;
 pub(crate) mod bundle;
@@ -1171,6 +1172,7 @@ struct RunIo {
     host_input: Option<input::HostInput>,
     host_usb: Option<usb::HostUsb>,
     host_bluetooth: Option<bluetooth::HostBluetooth>,
+    host_audio: Option<audio::HostAudio>,
     guest_network: Option<network::GuestNetwork>,
     host_nor: Option<nor::HostNor>,
     host_disks: storage::HostDisks,
@@ -1247,6 +1249,7 @@ fn run_machine<H: Host>(
         host_input,
         host_usb,
         host_bluetooth,
+        host_audio,
         guest_network,
         host_nor,
         host_disks,
@@ -1265,6 +1268,7 @@ fn run_machine<H: Host>(
             input: host_input,
             usb: host_usb,
             bluetooth: host_bluetooth,
+            audio: host_audio,
         },
         guest_network,
         host_nor,

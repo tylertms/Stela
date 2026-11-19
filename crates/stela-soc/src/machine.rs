@@ -1386,7 +1386,12 @@ impl Devices for AppleDevices {
         self.usb_masters
             .iter_mut()
             .fold(core::mem::take(&mut self.frame_presented), |due, master| {
-                master.session.take_due() | due
+                let audio_due = master
+                    .peripheral
+                    .as_mut()
+                    .and_then(|hub| hub.ports.audio.as_mut())
+                    .is_some_and(Audio::take_due);
+                master.session.take_due() | audio_due | due
             })
     }
 
