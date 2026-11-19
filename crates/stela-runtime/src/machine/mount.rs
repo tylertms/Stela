@@ -755,7 +755,7 @@ fn add_usbs(
         let id = devices.add_usb(controller, darts.native(controller.iommu, 0)?)?;
         // The native keyboard and pointer plug into the last connector
         // (J473AP usb-drd1), the Mac being the downstream-facing port.
-        let hub = input || !usb.disks.is_empty() || usb.network.is_some();
+        let hub = input || !usb.disks.is_empty() || usb.network.is_some() || usb.audio;
         if hub && index + 1 == usbs && index != 0 {
             let disks = usb.disks.len();
             // Whether a network adapter is attached, never its station
@@ -766,9 +766,10 @@ fn add_usbs(
             } else {
                 "none"
             };
+            let audio = if usb.audio { "uac2" } else { "none" };
             devices.attach_input(controller.port, core::mem::take(&mut usb))?;
             log(format_args!(
-                "INPUT attached to USB-C port {} with {disks} USB disks, network={network}\n",
+                "INPUT attached to USB-C port {} with {disks} USB disks, network={network}, audio={audio}\n",
                 controller.port
             ));
         }

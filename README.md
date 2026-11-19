@@ -34,7 +34,7 @@ and supports the Metal3 and Apple7 GPU families.
 | Ethernet | Intel I225, I226, I210, I211, I350, 82574L, 82575, 82576, 82579, 82580, I217, I218, I219.<br>Realtek RTL8111, RTL8168, RTL8169, RTL8411, RTL8125, RTL8126, Killer E2600, E3000.<br>Broadcom BCM5720, BCM5761, BCM5762.<br>Aquantia AQC100, AQC107, AQC108, AQC109, AQC111, AQC112, AQC113, AQC114, AQC115C, AQC116C.<br>Qualcomm Atheros AR8131, AR8132, AR8151, AR8152, AR8161, AR8162, AR8171, AR8172, Killer E2200, E2400, E2500.<br>USB: Realtek RTL8152, RTL8153, RTL8156, ASIX AX88179, AX88178A, AX88772, CDC ECM and NCM. |
 | Wi-Fi | None currently supported. |
 | Bluetooth | None currently supported. |
-| Audio | None currently supported. |
+| Audio | Stela USB Audio (UAC2 48 kHz stereo output); Intel HD Audio (HDA) / USB Audio host driver stack. |
 | USB | xHCI (USB 3) and EHCI controllers, hubs, USB disks. |
 | Input | USB keyboards and mice. PS/2 keyboards, mice and Synaptics or Elantech touchpads. |
 

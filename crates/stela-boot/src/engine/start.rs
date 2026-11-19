@@ -1781,6 +1781,7 @@ fn place_devices(
                 disks: placement.usb_disks,
                 network: placement.guest_mac,
                 bluetooth: placement.guest_bluetooth,
+                audio: options.input && !options.restore && options.install.is_none(),
             },
             scanout,
             firmware: &firmware,

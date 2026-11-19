@@ -158,8 +158,11 @@ impl AppleDevices {
             disks,
             network,
             bluetooth,
+            audio,
         } = cables;
-        let extras = usize::from(network.is_some()) + usize::from(bluetooth.is_some());
+        let extras = usize::from(network.is_some())
+            + usize::from(bluetooth.is_some())
+            + usize::from(audio);
         if 1 + extras + disks.len() > hub::MAX_PORTS {
             return Err(refuse!("the native hub has seven ports"));
         }
@@ -182,6 +185,7 @@ impl AppleDevices {
                 UsbBluetooth::Host => Hci::new(),
                 UsbBluetooth::Model => Hci::modeled(crate::usb::hci::model::address(self.ecid)),
             }),
+            audio: audio.then(Audio::new),
             disks,
         };
         master.peripheral = Some(Hub::new(attachments, "0001")?);
@@ -268,6 +272,32 @@ impl AppleDevices {
     pub fn bluetooth_status(&mut self) -> Option<(bool, UsbBluetoothCounters)> {
         let hci = self.usb_bluetooth()?;
         Some((hci.up(), hci.counters()))
+    }
+
+    fn usb_audio(&mut self) -> Option<&mut Audio> {
+        self.usb_masters
+            .iter_mut()
+            .find_map(|master| master.peripheral.as_mut()?.ports.audio.as_mut())
+    }
+
+    /// Moves up to `out.len()` stereo 48 kHz frames from the guest's USB
+    /// audio speaker, mute and volume applied.
+    pub fn audio_take(&mut self, out: &mut [[i32; crate::usb::audio::CHANNELS]]) -> usize {
+        self.usb_audio().map_or(0, |audio| audio.take(out))
+    }
+
+    /// Whether enough USB audio frames arrived since the last take that host
+    /// service should run soon; cleared by asking.
+    pub fn audio_take_due(&mut self) -> bool {
+        self.usb_audio().is_some_and(Audio::take_due)
+    }
+
+    /// The guest's USB audio speaker status; `None` without one.
+    pub fn audio_status(&self) -> Option<UsbAudioStatus> {
+        self.usb_masters
+            .iter()
+            .find_map(|master| master.peripheral.as_ref()?.ports.audio.as_ref())
+            .map(Audio::status)
     }
 
     /// Whether the guest has its USB Ethernet link up, and the adapter's
@@ -406,8 +436,25 @@ impl AppleDevices {
                             c.malformed
                         )
                     });
+                let audio = master
+                    .peripheral
+                    .as_ref()
+                    .and_then(|hub| hub.ports.audio.as_ref())
+                    .map_or_else(String::new, |audio| {
+                        let s = audio.status();
+                        format!(
+                            " audio=[bits={} muted={} volume={} queued={} received={} overflowed={} split={}]",
+                            s.bits,
+                            s.muted,
+                            s.volume,
+                            audio.queued(),
+                            s.counters.received,
+                            s.counters.overflowed,
+                            s.counters.split
+                        )
+                    });
                 format!(
-                    "port={} attached={}{why}{host}{hub}{net}",
+                    "port={} attached={}{why}{host}{hub}{net}{audio}",
                     master.number,
                     master.attached || master.peripheral.is_some()
                 )
