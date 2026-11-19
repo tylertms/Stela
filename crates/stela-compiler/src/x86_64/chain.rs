@@ -2248,15 +2248,24 @@ fn point_holds(code: &[u8], at: u64, point: u64, instruction: [u8; PATCH_BYTES])
 fn exit_word_of(bytes: &[u8]) -> Option<u32> {
     let word = u32::from_le_bytes(bytes.get(1..5)?.try_into().ok()?);
     (0..=MAX_PAD)
+        .filter(|&pad| bytes.get(5) == Some(&padded(pad)))
         .any(|pad| bytes == exit_word_bytes(word, pad))
         .then_some(word)
+}
+
+/// The byte after the MOV EDX of a dynamic exit padded by `pad` bytes:
+/// what tells the paddings apart before their exits are compared whole.
+const fn padded(pad: usize) -> u8 {
+    if pad == 0 { RET_ROOM[0] } else { NOPS[pad][0] }
 }
 
 /// Whether `bytes` are the direct exit to `target` of `kind`, of any
 /// padding.
 pub fn is_direct_exit(bytes: &[u8], target: GuestAddress, kind: impl Into<ExitWord>) -> bool {
     let word = kind.into().encoded();
-    (0..=MAX_PAD).any(|pad| bytes == direct_exit_padded(target, word, pad))
+    (0..=MAX_PAD)
+        .filter(|&pad| bytes.get(15) == Some(&padded(pad)))
+        .any(|pad| bytes == direct_exit_padded(target, word, pad))
 }
 
 /// Whether `bytes` are the dynamic exit of `kind`, of any padding.
@@ -2305,11 +2314,10 @@ pub fn align_link_slot(code: &mut [u8], offset: usize, bytes: usize, at: u64) ->
     let Some(slot) = code.get_mut(offset..offset + bytes) else {
         return false;
     };
-    if !(0..8).any(|residue| *slot == empty_link_at(residue, bytes)) {
+    if !(0..8).any(|residue| is_empty_link_at(slot, residue)) {
         return false;
     }
-    let empty = empty_link_at(at + offset as u64, bytes);
-    slot.copy_from_slice(&empty);
+    write_empty_link_at(slot, at + offset as u64);
     true
 }
 
@@ -2349,15 +2357,40 @@ pub(super) fn empty_link(asm: &mut crate::x86_64::asm::Asm, bytes: usize) {
     }
 }
 
-/// The empty link slot of `bytes` at host address `at`: the pad, then the
-/// patch point's jump to the exit after the slot, then INT3s.
+/// The empty link slot of `bytes` at host address `at`
+/// ([`write_empty_link_at`]).
+#[cfg(test)]
 fn empty_link_at(at: u64, bytes: usize) -> Vec<u8> {
-    let pad = patch_pad(at);
-    let mut slot = alloc::vec![0xcc; bytes];
-    slot[..pad].copy_from_slice(NOPS[pad]);
-    let jump = jump(at + pad as u64, at + bytes as u64).expect("an exit right after its slot");
-    slot[pad..pad + PATCH_BYTES].copy_from_slice(&jump);
+    let mut slot = alloc::vec![0; bytes];
+    write_empty_link_at(&mut slot, at);
     slot
+}
+
+/// Make `slot` the empty link slot of its length at host address `at`:
+/// the pad, then the patch point's jump to the exit after the slot, then
+/// INT3s.
+fn write_empty_link_at(slot: &mut [u8], at: u64) {
+    let (pad, jump) = empty_link_parts(at, slot.len());
+    slot[..pad].copy_from_slice(NOPS[pad]);
+    slot[pad..pad + PATCH_BYTES].copy_from_slice(&jump);
+    slot[pad + PATCH_BYTES..].fill(0xcc);
+}
+
+/// Whether `slot` is the empty link slot of its length at host address
+/// `at` ([`write_empty_link_at`]).
+fn is_empty_link_at(slot: &[u8], at: u64) -> bool {
+    let (pad, jump) = empty_link_parts(at, slot.len());
+    slot[..pad] == *NOPS[pad]
+        && slot[pad..pad + PATCH_BYTES] == jump
+        && slot[pad + PATCH_BYTES..].iter().all(|&byte| byte == 0xcc)
+}
+
+/// The pad and the patch point's jump of the empty link slot of `bytes`
+/// at host address `at`.
+fn empty_link_parts(at: u64, bytes: usize) -> (usize, [u8; PATCH_BYTES]) {
+    let pad = patch_pad(at);
+    let jump = jump(at + pad as u64, at + bytes as u64).expect("an exit right after its slot");
+    (pad, jump)
 }
 
 /// The patch that undoes the link of the direct exit at host address
@@ -3553,11 +3586,11 @@ pub fn without_failures(code: &[u8]) -> &[u8] {
 
 /// `jmp rel32` at host address `at` to `to`, or `None` out of reach.
 pub fn jump(at: u64, to: u64) -> Option<[u8; JUMP_BYTES]> {
+    const JMP_REL32: u8 = 0xe9;
     let relative = relative(at + JUMP_BYTES as u64, to)?;
-    let mut code = Code::new();
-    let field = code.asm().jmp();
-    code.patch(field.offset(), relative.to_le_bytes());
-    code.try_into().ok()
+    let mut bytes = [JMP_REL32; JUMP_BYTES];
+    bytes[1..].copy_from_slice(&relative.to_le_bytes());
+    Some(bytes)
 }
 
 /// The rel32 displacement of a branch ending at host address `end` to

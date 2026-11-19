@@ -444,26 +444,10 @@ impl Lifter for Decoder {
             address: pc,
             encoding: word,
         };
-        let width = if word >> 31 == 0 {
-            Width::W32
-        } else {
-            Width::X64
-        };
-        let target = |immediate: u32, bits: u32| {
-            let signed = ((i64::from(immediate) << (64 - bits)) >> (64 - bits)) * 4;
-            pc.0.checked_add_signed(signed)
-                .map(GuestAddress)
-                .ok_or_else(unsupported)
-        };
-        let shift = match (word >> 22) & 3 {
-            0 => Shift::Lsl,
-            1 => Shift::Lsr,
-            2 => Shift::Asr,
-            _ => Shift::Ror,
-        };
-        let amount = ((word >> 10) & 63) as u8;
         let simd_fp = word & SIMD_FP != 0;
-        let operation = if word == 0xd65f03c0 {
+        let operation = if skips_decoders(pc, word) {
+            lift_integer(pc, word)?
+        } else if word == 0xd65f03c0 {
             Operation::Return
         } else if word == 0xd503201f {
             Operation::Nop
@@ -526,240 +510,325 @@ impl Lifter for Decoder {
             Operation::Simd(decoded.map_err(|Unsupported| unsupported())?)
         } else if let Some(decoded) = register_offset::decode(word) {
             Operation::MemoryRegisterOffset(decoded.map_err(|Unsupported| unsupported())?)
-        } else if word & 0x3e000000 == 0x28000000 {
-            // Integer LDP/STP/LDPSW. SIMD, non-temporal pairs, tagged
-            // stores and reserved opcodes are not interchangeable with these accesses.
-            let opcode = word >> 30;
-            let loading = word & (1 << 22) != 0;
-            let bytes = match opcode {
-                0 => 4,
-                1 if loading => 4,
-                2 => 8,
-                _ => return Err(unsupported()),
-            };
-            let mode = match (word >> 23) & 3 {
-                1 => AddressMode::PostIndex,
-                2 => AddressMode::Offset,
-                3 => AddressMode::PreIndex,
-                _ => return Err(unsupported()),
-            };
-            let rn = (word >> 5) & 31;
-            let rt = word & 31;
-            let rt2 = (word >> 10) & 31;
-            debug_assert!(
-                constrained::decode(word).is_none(),
-                "register overlaps are decoded first"
-            );
-            let immediate = ((word >> 15) & 0x7f) as i32;
-            Operation::MemoryPair {
-                transfer: if loading {
-                    MemoryTransfer::Load {
-                        signed: opcode == 1,
-                        width: if opcode == 0 { Width::W32 } else { Width::X64 },
-                    }
-                } else {
-                    MemoryTransfer::Store
-                },
-                bytes,
-                data: [register(rt, false), register(rt2, false)],
-                base: register(rn, true),
-                displacement: ((immediate << 25) >> 25) * i32::from(bytes),
-                mode,
-            }
-        } else if word & 0x3f000000 == 0x39000000 || word & 0x3f200000 == 0x38000000 {
-            // Scalar integer loads/stores only: VR=0. Reject PRFM, reserved
-            // signed sizes, register offsets, atomics and unprivileged forms.
-            let size = word >> 30;
-            let transfer = match (word >> 22) & 3 {
-                0 => MemoryTransfer::Store,
-                1 => MemoryTransfer::Load {
-                    signed: false,
-                    width: if size == 3 { Width::X64 } else { Width::W32 },
-                },
-                2 if size < 3 => MemoryTransfer::Load {
-                    signed: true,
-                    width: Width::X64,
-                },
-                3 if size < 2 => MemoryTransfer::Load {
-                    signed: true,
-                    width: Width::W32,
-                },
-                _ => return Err(unsupported()),
-            };
-            let (displacement, mode) = if word & (1 << 24) != 0 {
-                ((((word >> 10) & 0xfff) << size) as i32, AddressMode::Offset)
-            } else {
-                let immediate = ((word >> 12) & 0x1ff) as i32;
-                let mode = match (word >> 10) & 3 {
-                    0 => AddressMode::Offset,
-                    1 => AddressMode::PostIndex,
-                    3 => AddressMode::PreIndex,
-                    _ => return Err(unsupported()),
-                };
-                ((immediate << 23) >> 23, mode)
-            };
-            let rn = (word >> 5) & 31;
-            let rt = word & 31;
-            debug_assert!(
-                constrained::decode(word).is_none(),
-                "register overlaps are decoded first"
-            );
-            Operation::Memory {
-                transfer,
-                bytes: 1 << size,
-                data: register(rt, false),
-                base: register(rn, true),
-                displacement,
-                mode,
-            }
-        } else if word & 0xfc000000 == 0x14000000 {
-            Operation::Branch {
-                target: target(word & 0x03ffffff, 26)?,
-            }
-        } else if word & CONDITIONAL_BRANCH_MASK == CONDITIONAL_BRANCH_CLASS {
-            // B.cond and enabled FEAT_HBC BC.cond have identical architectural
-            // effects. Bit 4 is only the consistent-direction prediction hint.
-            Operation::BranchCondition {
-                target: target((word >> 5) & 0x7ffff, 19)?,
-                condition: (word & 15) as u8,
-            }
-        } else if word & 0x7e000000 == 0x34000000 {
-            Operation::BranchZero {
-                target: target((word >> 5) & 0x7ffff, 19)?,
-                source: register(word & 31, false),
-                width,
-                nonzero: word & (1 << 24) != 0,
-            }
-        } else if word & 0x7e000000 == 0x36000000 {
-            Operation::BranchBit {
-                target: target((word >> 5) & 0x3fff, 14)?,
-                source: register(word & 31, false),
-                bit: (((word >> 26) & 32) | ((word >> 19) & 31)) as u8,
-                nonzero: word & (1 << 24) != 0,
-            }
-        } else if word & 0x1fe0fc00 == 0x1a000000 {
-            Operation::AddSubCarry {
-                width,
-                subtract: word & (1 << 30) != 0,
-                flags: word & (1 << 29) != 0,
-                destination: register(word & 31, false),
-                left: register((word >> 5) & 31, false),
-                right: register((word >> 16) & 31, false),
-            }
-        } else if word & 0x1fe00000 == 0x0b200000 {
-            let amount = ((word >> 10) & 7) as u8;
-            if amount > 4 {
-                return Err(unsupported());
-            }
-            let flags = word & (1 << 29) != 0;
-            let extend = match (word >> 13) & 7 {
-                0 => RegisterExtend::Uxtb,
-                1 => RegisterExtend::Uxth,
-                2 => RegisterExtend::Uxtw,
-                3 => RegisterExtend::Uxtx,
-                4 => RegisterExtend::Sxtb,
-                5 => RegisterExtend::Sxth,
-                6 => RegisterExtend::Sxtw,
-                _ => RegisterExtend::Sxtx,
-            };
-            Operation::AddSubExtended {
-                width,
-                subtract: word & (1 << 30) != 0,
-                flags,
-                destination: register(word & 31, !flags),
-                left: register((word >> 5) & 31, true),
-                right: register((word >> 16) & 31, false),
-                extend,
-                amount,
-            }
-        } else if word & 0x1f200000 == 0x0b000000 {
-            if shift == Shift::Ror || (width == Width::W32 && amount >= 32) {
-                return Err(unsupported());
-            }
-            Operation::AddSubRegister {
-                width,
-                subtract: word & (1 << 30) != 0,
-                flags: word & (1 << 29) != 0,
-                destination: register(word & 31, false),
-                left: register((word >> 5) & 31, false),
-                right: register((word >> 16) & 31, false),
-                shift,
-                amount,
-            }
-        } else if word & 0x1f000000 == 0x0a000000 {
-            if width == Width::W32 && amount >= 32 {
-                return Err(unsupported());
-            }
-            let opcode = (word >> 29) & 3;
-            Operation::LogicalRegister {
-                width,
-                kind: match opcode {
-                    0 | 3 => Logical::And,
-                    1 => Logical::Or,
-                    _ => Logical::Xor,
-                },
-                invert: word & (1 << 21) != 0,
-                flags: opcode == 3,
-                destination: register(word & 31, false),
-                left: register((word >> 5) & 31, false),
-                right: register((word >> 16) & 31, false),
-                shift,
-                amount,
-            }
-        } else if word & 0x1f800000 == 0x12000000 {
-            let opcode = (word >> 29) & 3;
-            Operation::LogicalImmediate {
-                width,
-                kind: match opcode {
-                    0 | 3 => Logical::And,
-                    1 => Logical::Or,
-                    _ => Logical::Xor,
-                },
-                flags: opcode == 3,
-                destination: register(word & 31, opcode != 3),
-                source: register((word >> 5) & 31, false),
-                immediate: logical_mask(
-                    width,
-                    (word >> 22) & 1,
-                    (word >> 16) & 63,
-                    (word >> 10) & 63,
-                )
-                .ok_or_else(unsupported)?,
-            }
-        } else if word & 0x1f800000 == 0x12800000 {
-            let kind = match (word >> 29) & 3 {
-                0 => WideMove::Not,
-                2 => WideMove::Zero,
-                3 => WideMove::Keep,
-                _ => return Err(unsupported()),
-            };
-            let shift = (((word >> 21) & 3) * 16) as u8;
-            if width == Width::W32 && shift >= 32 {
-                return Err(unsupported());
-            }
-            Operation::MoveWide {
-                width,
-                kind,
-                destination: register(word & 31, false),
-                immediate: ((word >> 5) & 0xffff) as u16,
-                shift,
-            }
-        } else if word & 0x1f800000 == 0x11000000 {
-            let flags = word & (1 << 29) != 0;
-            let immediate = ((word >> 10) & 0xfff) << if word & (1 << 22) != 0 { 12 } else { 0 };
-            Operation::AddSub {
-                width,
-                subtract: word & (1 << 30) != 0,
-                flags,
-                destination: register(word & 31, !flags),
-                source: register((word >> 5) & 31, true),
-                immediate,
-            }
         } else {
-            return Err(unsupported());
+            lift_integer(pc, word)?
         };
         Ok(Instruction { pc, operation })
     }
+}
+
+/// Whether `word` is of the integer classes of [`Decoder::lift`] that no
+/// decoder before [`lift_integer`] in its order takes a word of, nor any of
+/// the block parse's own decoders: the commonest loads, stores, branches and
+/// data processing, which go there directly. A class whose words those
+/// decoders take some of goes there once they take none
+/// (`tests::direct_classes_skip_no_decoder`,
+/// `block::tests::direct_words_skip_the_block_decoders`).
+pub(crate) fn skips_decoders(pc: GuestAddress, word: u32) -> bool {
+    if DIRECT.iter().any(|&(mask, class)| word & mask == class) {
+        true
+    } else if word & 0x3f00_0000 == 0x3900_0000 {
+        // LDR and STR (unsigned offset), but PRFM.
+        prefetch::decode(pc, word).is_none()
+    } else if word & 0x3e00_0000 == 0x2800_0000 {
+        // LDP and STP, but overlaps, the non-temporal pairs and STGP, which
+        // the system-mode parse takes as a tag access.
+        word & 0xc040_0000 != 0x4000_0000
+            && constrained::decode(word).is_none()
+            && non_temporal::decode(word).is_none()
+    } else if word & 0x3f20_0000 == 0x3800_0000 {
+        // LDUR, STUR and the indexed forms, but overlaps, unprivileged
+        // accesses and PRFUM.
+        constrained::decode(word).is_none()
+            && unprivileged::decode(word).is_none()
+            && prefetch::decode(pc, word).is_none()
+    } else {
+        false
+    }
+}
+
+/// The classes ([`skips_decoders`]) of B, B.cond, CBZ and CBNZ, TBZ and
+/// TBNZ, ADC and SBC, ADD and SUB (immediate, shifted and extended
+/// register), the logical operations (immediate and shifted register) and
+/// the wide moves: each mask and its class.
+const DIRECT: [(u32, u32); 10] = [
+    (0xfc00_0000, 0x1400_0000),
+    (CONDITIONAL_BRANCH_MASK, CONDITIONAL_BRANCH_CLASS),
+    (0x7e00_0000, 0x3400_0000),
+    (0x7e00_0000, 0x3600_0000),
+    (0x1fe0_fc00, 0x1a00_0000),
+    (0x1fe0_0000, 0x0b20_0000),
+    (0x1f20_0000, 0x0b00_0000),
+    (0x1f00_0000, 0x0a00_0000),
+    (0x1f00_0000, 0x1200_0000),
+    (0x1f80_0000, 0x1100_0000),
+];
+
+/// [`Decoder::lift`] of a word [`skips_decoders`] sends to
+/// [`lift_integer`].
+pub(crate) fn lift_direct(pc: GuestAddress, word: u32) -> Result<Instruction, UnsupportedReason> {
+    debug_assert!(skips_decoders(pc, word));
+    lift_integer(pc, word).map(|operation| Instruction { pc, operation })
+}
+
+/// The integer loads, stores, branches and data processing that
+/// [`Decoder::lift`] decodes after every other decoder.
+fn lift_integer(pc: GuestAddress, word: u32) -> Result<Operation, UnsupportedReason> {
+    let unsupported = || UnsupportedReason::Instruction {
+        address: pc,
+        encoding: word,
+    };
+    let width = if word >> 31 == 0 {
+        Width::W32
+    } else {
+        Width::X64
+    };
+    let target = |immediate: u32, bits: u32| {
+        let signed = ((i64::from(immediate) << (64 - bits)) >> (64 - bits)) * 4;
+        pc.0.checked_add_signed(signed)
+            .map(GuestAddress)
+            .ok_or_else(unsupported)
+    };
+    let shift = match (word >> 22) & 3 {
+        0 => Shift::Lsl,
+        1 => Shift::Lsr,
+        2 => Shift::Asr,
+        _ => Shift::Ror,
+    };
+    let amount = ((word >> 10) & 63) as u8;
+    let operation = if word & 0x3e000000 == 0x28000000 {
+        // Integer LDP/STP/LDPSW. SIMD, non-temporal pairs, tagged
+        // stores and reserved opcodes are not interchangeable with these accesses.
+        let opcode = word >> 30;
+        let loading = word & (1 << 22) != 0;
+        let bytes = match opcode {
+            0 => 4,
+            1 if loading => 4,
+            2 => 8,
+            _ => return Err(unsupported()),
+        };
+        let mode = match (word >> 23) & 3 {
+            1 => AddressMode::PostIndex,
+            2 => AddressMode::Offset,
+            3 => AddressMode::PreIndex,
+            _ => return Err(unsupported()),
+        };
+        let rn = (word >> 5) & 31;
+        let rt = word & 31;
+        let rt2 = (word >> 10) & 31;
+        debug_assert!(
+            constrained::decode(word).is_none(),
+            "register overlaps are decoded first"
+        );
+        let immediate = ((word >> 15) & 0x7f) as i32;
+        Operation::MemoryPair {
+            transfer: if loading {
+                MemoryTransfer::Load {
+                    signed: opcode == 1,
+                    width: if opcode == 0 { Width::W32 } else { Width::X64 },
+                }
+            } else {
+                MemoryTransfer::Store
+            },
+            bytes,
+            data: [register(rt, false), register(rt2, false)],
+            base: register(rn, true),
+            displacement: ((immediate << 25) >> 25) * i32::from(bytes),
+            mode,
+        }
+    } else if word & 0x3f000000 == 0x39000000 || word & 0x3f200000 == 0x38000000 {
+        // Scalar integer loads/stores only: VR=0. Reject PRFM, reserved
+        // signed sizes, register offsets, atomics and unprivileged forms.
+        let size = word >> 30;
+        let transfer = match (word >> 22) & 3 {
+            0 => MemoryTransfer::Store,
+            1 => MemoryTransfer::Load {
+                signed: false,
+                width: if size == 3 { Width::X64 } else { Width::W32 },
+            },
+            2 if size < 3 => MemoryTransfer::Load {
+                signed: true,
+                width: Width::X64,
+            },
+            3 if size < 2 => MemoryTransfer::Load {
+                signed: true,
+                width: Width::W32,
+            },
+            _ => return Err(unsupported()),
+        };
+        let (displacement, mode) = if word & (1 << 24) != 0 {
+            ((((word >> 10) & 0xfff) << size) as i32, AddressMode::Offset)
+        } else {
+            let immediate = ((word >> 12) & 0x1ff) as i32;
+            let mode = match (word >> 10) & 3 {
+                0 => AddressMode::Offset,
+                1 => AddressMode::PostIndex,
+                3 => AddressMode::PreIndex,
+                _ => return Err(unsupported()),
+            };
+            ((immediate << 23) >> 23, mode)
+        };
+        let rn = (word >> 5) & 31;
+        let rt = word & 31;
+        debug_assert!(
+            constrained::decode(word).is_none(),
+            "register overlaps are decoded first"
+        );
+        Operation::Memory {
+            transfer,
+            bytes: 1 << size,
+            data: register(rt, false),
+            base: register(rn, true),
+            displacement,
+            mode,
+        }
+    } else if word & 0xfc000000 == 0x14000000 {
+        Operation::Branch {
+            target: target(word & 0x03ffffff, 26)?,
+        }
+    } else if word & CONDITIONAL_BRANCH_MASK == CONDITIONAL_BRANCH_CLASS {
+        // B.cond and enabled FEAT_HBC BC.cond have identical architectural
+        // effects. Bit 4 is only the consistent-direction prediction hint.
+        Operation::BranchCondition {
+            target: target((word >> 5) & 0x7ffff, 19)?,
+            condition: (word & 15) as u8,
+        }
+    } else if word & 0x7e000000 == 0x34000000 {
+        Operation::BranchZero {
+            target: target((word >> 5) & 0x7ffff, 19)?,
+            source: register(word & 31, false),
+            width,
+            nonzero: word & (1 << 24) != 0,
+        }
+    } else if word & 0x7e000000 == 0x36000000 {
+        Operation::BranchBit {
+            target: target((word >> 5) & 0x3fff, 14)?,
+            source: register(word & 31, false),
+            bit: (((word >> 26) & 32) | ((word >> 19) & 31)) as u8,
+            nonzero: word & (1 << 24) != 0,
+        }
+    } else if word & 0x1fe0fc00 == 0x1a000000 {
+        Operation::AddSubCarry {
+            width,
+            subtract: word & (1 << 30) != 0,
+            flags: word & (1 << 29) != 0,
+            destination: register(word & 31, false),
+            left: register((word >> 5) & 31, false),
+            right: register((word >> 16) & 31, false),
+        }
+    } else if word & 0x1fe00000 == 0x0b200000 {
+        let amount = ((word >> 10) & 7) as u8;
+        if amount > 4 {
+            return Err(unsupported());
+        }
+        let flags = word & (1 << 29) != 0;
+        let extend = match (word >> 13) & 7 {
+            0 => RegisterExtend::Uxtb,
+            1 => RegisterExtend::Uxth,
+            2 => RegisterExtend::Uxtw,
+            3 => RegisterExtend::Uxtx,
+            4 => RegisterExtend::Sxtb,
+            5 => RegisterExtend::Sxth,
+            6 => RegisterExtend::Sxtw,
+            _ => RegisterExtend::Sxtx,
+        };
+        Operation::AddSubExtended {
+            width,
+            subtract: word & (1 << 30) != 0,
+            flags,
+            destination: register(word & 31, !flags),
+            left: register((word >> 5) & 31, true),
+            right: register((word >> 16) & 31, false),
+            extend,
+            amount,
+        }
+    } else if word & 0x1f200000 == 0x0b000000 {
+        if shift == Shift::Ror || (width == Width::W32 && amount >= 32) {
+            return Err(unsupported());
+        }
+        Operation::AddSubRegister {
+            width,
+            subtract: word & (1 << 30) != 0,
+            flags: word & (1 << 29) != 0,
+            destination: register(word & 31, false),
+            left: register((word >> 5) & 31, false),
+            right: register((word >> 16) & 31, false),
+            shift,
+            amount,
+        }
+    } else if word & 0x1f000000 == 0x0a000000 {
+        if width == Width::W32 && amount >= 32 {
+            return Err(unsupported());
+        }
+        let opcode = (word >> 29) & 3;
+        Operation::LogicalRegister {
+            width,
+            kind: match opcode {
+                0 | 3 => Logical::And,
+                1 => Logical::Or,
+                _ => Logical::Xor,
+            },
+            invert: word & (1 << 21) != 0,
+            flags: opcode == 3,
+            destination: register(word & 31, false),
+            left: register((word >> 5) & 31, false),
+            right: register((word >> 16) & 31, false),
+            shift,
+            amount,
+        }
+    } else if word & 0x1f800000 == 0x12000000 {
+        let opcode = (word >> 29) & 3;
+        Operation::LogicalImmediate {
+            width,
+            kind: match opcode {
+                0 | 3 => Logical::And,
+                1 => Logical::Or,
+                _ => Logical::Xor,
+            },
+            flags: opcode == 3,
+            destination: register(word & 31, opcode != 3),
+            source: register((word >> 5) & 31, false),
+            immediate: logical_mask(
+                width,
+                (word >> 22) & 1,
+                (word >> 16) & 63,
+                (word >> 10) & 63,
+            )
+            .ok_or_else(unsupported)?,
+        }
+    } else if word & 0x1f800000 == 0x12800000 {
+        let kind = match (word >> 29) & 3 {
+            0 => WideMove::Not,
+            2 => WideMove::Zero,
+            3 => WideMove::Keep,
+            _ => return Err(unsupported()),
+        };
+        let shift = (((word >> 21) & 3) * 16) as u8;
+        if width == Width::W32 && shift >= 32 {
+            return Err(unsupported());
+        }
+        Operation::MoveWide {
+            width,
+            kind,
+            destination: register(word & 31, false),
+            immediate: ((word >> 5) & 0xffff) as u16,
+            shift,
+        }
+    } else if word & 0x1f800000 == 0x11000000 {
+        let flags = word & (1 << 29) != 0;
+        let immediate = ((word >> 10) & 0xfff) << if word & (1 << 22) != 0 { 12 } else { 0 };
+        Operation::AddSub {
+            width,
+            subtract: word & (1 << 30) != 0,
+            flags,
+            destination: register(word & 31, !flags),
+            source: register((word >> 5) & 31, true),
+            immediate,
+        }
+    } else {
+        return Err(unsupported());
+    };
+    Ok(operation)
 }
 
 #[cfg(test)]

@@ -92,6 +92,10 @@ pub(crate) struct VectorCache {
     /// Whether that home's old value is gone: a destination written whole,
     /// whose vector no recipe may read until the write ends.
     fresh: bool,
+    /// The pool registers that have an owner and the bank registers that
+    /// hold a derived value, by register number: what [`Self::occupied`]
+    /// reports for every encoder the block takes.
+    held: u32,
 }
 
 impl Default for VectorCache {
@@ -109,6 +113,7 @@ impl Default for VectorCache {
             derived_used: [0; DERIVED_HOSTS],
             deriving: NONE,
             fresh: false,
+            held: 0,
         }
     }
 }
@@ -130,6 +135,9 @@ impl VectorCache {
     /// The dirty homes, for a fault site here.
     pub(crate) fn dirty_homes(&self) -> DirtyHomes {
         let mut homes = [None; HOSTS];
+        if self.dirty == 0 {
+            return homes;
+        }
         for (index, owner) in self.owner.iter().enumerate() {
             if *owner != NONE && self.is_dirty(*owner) {
                 homes[index] = Some((*owner, FIRST_HOST + index as u8));
@@ -140,7 +148,16 @@ impl VectorCache {
     /// The pool registers that hold a guest vector: no recipe may write one,
     /// except the destination home it is writing.
     pub(crate) fn occupied(&self) -> u32 {
-        let occupied = self
+        debug_assert_eq!(self.held, self.scan_held(), "the held registers");
+        [self.writing, self.deriving]
+            .into_iter()
+            .filter(|host| *host != NONE)
+            .fold(self.held, |mask, host| mask & !(1 << host))
+    }
+    /// The registers `held` records, from the pool's owners and the bank's
+    /// values.
+    fn scan_held(&self) -> u32 {
+        let owned = self
             .owner
             .iter()
             .enumerate()
@@ -148,18 +165,13 @@ impl VectorCache {
             .fold(0, |mask, (index, _)| {
                 mask | 1 << (usize::from(FIRST_HOST) + index)
             });
-        let occupied = self
-            .derived
+        self.derived
             .iter()
             .enumerate()
             .filter(|(_, derived)| derived.is_some())
-            .fold(occupied, |mask, (index, _)| {
+            .fold(owned, |mask, (index, _)| {
                 mask | 1 << (usize::from(FIRST_DERIVED) + index)
-            });
-        [self.writing, self.deriving]
-            .into_iter()
-            .filter(|host| *host != NONE)
-            .fold(occupied, |mask, host| mask & !(1 << host))
+            })
     }
     fn touch(&mut self, index: usize) {
         self.clock += 1;
@@ -231,6 +243,7 @@ impl Code {
         };
         let host = FIRST_HOST + index as u8;
         self.vectors.owner[index] = vector;
+        self.vectors.held |= 1 << host;
         self.vectors.home[usize::from(vector)] = host;
         self.vectors.touch(index);
         host
@@ -293,6 +306,7 @@ impl Code {
         };
         let host = FIRST_DERIVED + index as u8;
         self.vectors.derived[index] = Some(derived);
+        self.vectors.held |= 1 << host;
         self.vectors.clock += 1;
         self.vectors.derived_used[index] = self.vectors.clock;
         self.vectors.deriving = host;
@@ -309,9 +323,10 @@ impl Code {
     }
     /// Forget the derived values computed from `vector`, which changes.
     fn invalidate_derived(&mut self, vector: u8) {
-        for kept in &mut self.vectors.derived {
+        for (index, kept) in self.vectors.derived.iter_mut().enumerate() {
             if kept.is_some_and(|derived| derived.source == Some(vector)) {
                 *kept = None;
+                self.vectors.held &= !(1 << (usize::from(FIRST_DERIVED) + index));
             }
         }
     }
@@ -328,6 +343,7 @@ impl Code {
             self.vectors.dirty &= !(1 << vector);
             self.vectors.home[usize::from(vector)] = NONE;
             self.vectors.owner[usize::from(host - FIRST_HOST)] = NONE;
+            self.vectors.held &= !(1 << host);
         }
     }
     /// Store `vector` if its home is dirty, keeping the home: for a
@@ -367,6 +383,7 @@ impl Code {
         }
         self.vectors.home[usize::from(vector)] = NONE;
         self.vectors.owner[usize::from(host - FIRST_HOST)] = NONE;
+        self.vectors.held &= !(1 << host);
     }
     /// Store every dirty home: the state block is then current, and the
     /// homes stay valid copies.

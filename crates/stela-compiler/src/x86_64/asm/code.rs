@@ -99,17 +99,21 @@ impl Span {
     }
 }
 
-/// Bytes a buffer starts with room for: most blocks' code, so emission
-/// rarely grows it (growth was a fifth of compile time).
-const INITIAL_BYTES: usize = 512;
+/// Bytes a buffer starts with room for: the code of 99 blocks in 100 of a
+/// kernel's, so emission rarely grows it (growth was a fifth of compile
+/// time).
+const INITIAL_BYTES: usize = 1024;
+/// Likewise the fault sites and guest-address fields of most blocks.
+const INITIAL_SITES: usize = 8;
+const INITIAL_RELOCATIONS: usize = 8;
 
 impl Code {
     pub(crate) fn new() -> Self {
         Self {
             bytes: Vec::with_capacity(INITIAL_BYTES),
             instructions: 0,
-            sites: Vec::new(),
-            relocations: Vec::new(),
+            sites: Vec::with_capacity(INITIAL_SITES),
+            relocations: Vec::with_capacity(INITIAL_RELOCATIONS),
             pinned: false,
             locals: None,
             dirty: Default::default(),

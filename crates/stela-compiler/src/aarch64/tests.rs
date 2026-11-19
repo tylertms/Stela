@@ -14,6 +14,65 @@ fn simd_and_fp_decoders_claim_only_words_with_bit_26() {
         );
     }
 }
+
+/// Whether a decoder [`Decoder::lift`] tries before [`lift_integer`] takes
+/// `word`.
+fn taken_before_integer(pc: GuestAddress, word: u32) -> bool {
+    let simd_fp = word & SIMD_FP != 0;
+    word == 0xd65f03c0
+        || word == 0xd503201f
+        || system::synchronization::decode(word).is_some()
+        || exclusive::decode(word).is_some()
+        || constrained::decode(word).is_some()
+        || pc_relative::decode(pc, word).is_some()
+        || bitfield::decode(word).is_some()
+        || conditional_select::decode(word).is_some()
+        || conditional_select::decode_compare(word).is_some()
+        || crc::decode(word).is_some()
+        || checked_pointer::decode(word).is_some()
+        || flags::decode(word).is_some()
+        || (simd_fp && fp_register::decode(word).is_some())
+        || integer_unary::decode(word).is_some()
+        || integer_minmax::decode(word).is_some()
+        || tag_arithmetic::decode(word).is_some()
+        || integer_math::decode(word).is_some()
+        || (simd_fp && FloatingPointOperation::decode(word).is_some())
+        || ordered::decode(word).is_some()
+        || atomic::decode(word).is_some()
+        || non_temporal::decode(word).is_some()
+        || unprivileged::decode(word).is_some()
+        || prefetch::decode(pc, word).is_some()
+        || literal::decode(pc, word).is_some()
+        || (simd_fp && simd::decode(word).is_some())
+        || register_offset::decode(word).is_some()
+}
+
+/// The words [`skips_decoders`] sends to [`lift_integer`] directly are
+/// ones no earlier decoder takes, so the lift is the one it would make in
+/// order. Every word of these classes was checked once; this samples them.
+#[test]
+fn direct_classes_skip_no_decoder() {
+    let classes = DIRECT.into_iter().chain([
+        (0x3f00_0000, 0x3900_0000),
+        (0x3e00_0000, 0x2800_0000),
+        (0x3f20_0000, 0x3800_0000),
+    ]);
+    let pc = GuestAddress(0x1000);
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    for (mask, class) in classes {
+        let mut direct = 0;
+        for _ in 0..100_000 {
+            state = state.wrapping_mul(0x5851_f42d_4c95_7f2d).wrapping_add(1);
+            let word = (state >> 32) as u32 & !mask | class;
+            if skips_decoders(pc, word) {
+                direct += 1;
+                assert!(!taken_before_integer(pc, word), "{word:#010x}");
+            }
+        }
+        assert!(direct > 50_000, "{mask:#010x} {class:#010x}");
+    }
+}
+
 #[test]
 fn synchronization_admits_only_context_independent_effects() {
     const YIELD_WORD: u32 = 0xd503_203f;

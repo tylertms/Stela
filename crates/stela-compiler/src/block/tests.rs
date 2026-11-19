@@ -2343,3 +2343,48 @@ fn self_loops_take_dc_zva_unconditional_back_branches_and_joins() {
         assert_eq!(linked.source_bytes, first);
     }
 }
+
+/// The words the parse sends to their integer decoder directly
+/// (`aarch64::skips_decoders`) are ones none of its own decoders takes, so
+/// each parses as it would through them. Every word was checked once; this
+/// samples them.
+#[test]
+fn direct_words_skip_the_block_decoders() {
+    let pc = GuestAddress(0x1000);
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut direct = 0;
+    for _ in 0..1_000_000 {
+        state = state.wrapping_mul(0x5851_f42d_4c95_7f2d).wrapping_add(1);
+        let word = (state >> 32) as u32;
+        if !crate::aarch64::skips_decoders(pc, word) {
+            continue;
+        }
+        direct += 1;
+        let synchronization = crate::aarch64::system::synchronization::decode(word);
+        assert!(synchronization.is_none(), "{word:#010x}");
+        assert_eq!(
+            decode_pointer_authentication(pc, word),
+            Ok(None),
+            "{word:#010x}"
+        );
+        assert_eq!(
+            system::decode_system_mode_with_sync(pc, word, synchronization),
+            Ok(None),
+            "{word:#010x}"
+        );
+        assert_eq!(
+            decode_system_instruction(pc, word),
+            Ok(None),
+            "{word:#010x}"
+        );
+        assert_eq!(decode_clock_instruction(pc, word), Ok(None), "{word:#010x}");
+        assert_eq!(
+            decode_thread_register_instruction(pc, word),
+            Ok(None),
+            "{word:#010x}"
+        );
+        assert_eq!(crate::amx::decode(pc, word), Ok(None), "{word:#010x}");
+        assert_eq!(decode_terminator(pc, word), Ok(None), "{word:#010x}");
+    }
+    assert!(direct > 100_000, "{direct}");
+}

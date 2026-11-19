@@ -238,6 +238,11 @@ pub(super) fn analyze_parsed(parsed: &ParsedBlock) -> BlockAnalysis {
 /// The forward conditional branches one system-mode block runs past.
 const MAX_SIDE_EXITS: usize = 4;
 
+/// The instructions a parse makes room for at first: 39 blocks in 40 of
+/// a kernel's code have at most this many, and the room stays under 1 KiB,
+/// which allocators keep at hand.
+const INSTRUCTIONS_HINT: usize = 24;
+
 pub(super) fn parse(
     source: &[u8],
     base: GuestAddress,
@@ -288,7 +293,8 @@ pub(super) fn parse_admitted(
             },
         });
     }
-    let mut instructions = Vec::new();
+    // Room for most blocks' instructions, rather than growing from empty.
+    let mut instructions = Vec::with_capacity((source.len() / 4).min(INSTRUCTIONS_HINT));
     let mut terminal = None;
     let mut source_bytes = 0;
     let mut side_exits = 0;
@@ -309,7 +315,11 @@ pub(super) fn parse_admitted(
             kind: CompileErrorKind::GuestAddressOverflow,
         })?);
         source_bytes += 4;
-        if full_system {
+        // The commonest integer words, which no decoder here takes either
+        // (`tests::direct_words_skip_the_block_decoders`), go to their
+        // decoder directly.
+        let direct = crate::aarch64::skips_decoders(pc, word);
+        if full_system && !direct {
             // PAuth hints share the hint space, so they are matched first.
             if let Some(decoded) =
                 decode_pointer_authentication(pc, word).map_err(|error| BlockAnalysisError {
@@ -399,6 +409,7 @@ pub(super) fn parse_admitted(
             }
         }
         if restricted_system
+            && !direct
             && let Some(decoded) =
                 decode_system_instruction(pc, word).map_err(|error| BlockAnalysisError {
                     pc,
@@ -416,6 +427,7 @@ pub(super) fn parse_admitted(
             break;
         }
         if !full_system
+            && !direct
             && pointer_authentication
             && let Some(decoded) =
                 decode_pointer_authentication(pc, word).map_err(|error| BlockAnalysisError {
@@ -428,6 +440,7 @@ pub(super) fn parse_admitted(
             break;
         }
         if profile.has(Features::CLOCK)
+            && !direct
             && let Some(decoded) =
                 decode_clock_instruction(pc, word).map_err(|error| BlockAnalysisError {
                     pc,
@@ -439,6 +452,7 @@ pub(super) fn parse_admitted(
             break;
         }
         if profile.has(Features::THREAD_REGISTERS)
+            && !direct
             && let Some(decoded) =
                 decode_thread_register_instruction(pc, word).map_err(|error| {
                     BlockAnalysisError {
@@ -452,6 +466,7 @@ pub(super) fn parse_admitted(
             break;
         }
         if profile.has(Features::AMX)
+            && !direct
             && let Some(decoded) =
                 crate::amx::decode(pc, word).map_err(|error| BlockAnalysisError {
                     pc,
@@ -473,15 +488,23 @@ pub(super) fn parse_admitted(
             terminal = Some((pc, Terminator::Amx(decoded)));
             break;
         }
-        if let Some(decoded) = decode_terminator(pc, word).map_err(|error| BlockAnalysisError {
-            pc,
-            encoding: Some(word),
-            kind: error.kind,
-        })? {
+        if !direct
+            && let Some(decoded) =
+                decode_terminator(pc, word).map_err(|error| BlockAnalysisError {
+                    pc,
+                    encoding: Some(word),
+                    kind: error.kind,
+                })?
+        {
             terminal = Some((pc, decoded));
             break;
         }
-        let instruction = Decoder.lift(pc, word).map_err(|error| BlockAnalysisError {
+        let instruction = if direct {
+            crate::aarch64::lift_direct(pc, word)
+        } else {
+            Decoder.lift(pc, word)
+        };
+        let instruction = instruction.map_err(|error| BlockAnalysisError {
             pc,
             encoding: Some(word),
             kind: CompileErrorKind::Unsupported(error),
