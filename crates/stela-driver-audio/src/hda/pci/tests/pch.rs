@@ -278,3 +278,75 @@ fn dsp_and_unknown_profiles_rejected() {
         );
     }
 }
+
+/// Unlink PCIe70 so the chain is PM50 -> MSI60 -> MSI-Xb0, the layout that
+/// chipset-integrated Intel HD Audio functions such as Tiger Lake 43c8 report.
+fn without_pcie(function: &mut Function<Model>) {
+    let msi = function.config().words[24];
+    function.config().words[24] = (msi & !0xff00) | 0xb000;
+    function.config().words[28] = 0;
+}
+
+#[test]
+fn integrated_pch_without_pcie_capability_clears_snoop() {
+    for device in [0x8c20, 0x9ca0, 0x1e20] {
+        let (mut function, timer, bar) = pch_fixture(device, 2, 9);
+        without_pcie(&mut function);
+        prepare_model(&mut function, &timer, bar).unwrap();
+        assert_eq!(function.config().words[30], 0xf91f_7255, "device {device:04x}");
+        assert!(
+            function
+                .config()
+                .writes
+                .iter()
+                .any(|(offset, width, value, _)| *offset == SCH_HDA_DEVC
+                    && *width == 2
+                    && *value == 0x7255)
+        );
+    }
+}
+
+#[test]
+fn modern_pch_without_pcie_capability_attaches() {
+    // Tiger Lake-H 43c8 (a real 11th-gen desktop log refused it with
+    // PcieOwnerMissing { found: None }) and Skylake a170.
+    for device in [0x43c8, 0xa170, 0xa0c8, 0x7ad0] {
+        let (mut function, timer, bar) = modern_pci_model_for(device);
+        without_pcie(&mut function);
+        // SAFETY: The PCI function and mapped byte vector are owned by this test;
+        // no firmware or background DMA can race them.
+        let adapter = unsafe {
+            prepare_with_registers(
+                &mut function,
+                bar,
+                &timer,
+                Ownership::ExclusiveLegacy,
+                MappedModel::new(),
+            )
+        }
+        .unwrap();
+        assert_eq!(adapter.config().reset_policy, ResetPolicy::IntelClockGate);
+        drop(adapter);
+        assert_eq!(function.config().words[30], 0xf91f_7255, "device {device:04x}");
+    }
+}
+
+#[test]
+fn misplaced_pcie_capability_still_refused() {
+    // PCIe at 0x60 makes 0x78 something other than Device Control.
+    let (mut function, timer, bar) = pch_fixture(0x8c20, 2, 9);
+    function.config().words[24] = 0x0092_b010;
+    function.config().words[28] = 0;
+    let refused = prepare_model(&mut function, &timer, bar).unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            AttachError::InvalidCapabilities(
+                CapabilityRefusal::PcieOwnerMissing { found: Some(0x60) }
+                    | CapabilityRefusal::ControlOverlap { .. }
+            )
+        ),
+        "{refused:?}"
+    );
+    assert!(function.config().writes.is_empty());
+}

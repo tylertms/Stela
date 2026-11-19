@@ -490,6 +490,8 @@ fn capabilities<C: ConfigSpace>(
     reset_policy: ResetPolicy,
 ) -> Result<Capabilities, AttachError> {
     let mut found = Capabilities::default();
+    // A header-only entry below the end of DEVC whose body cannot be sized.
+    let mut ambiguous_below_devc = false;
     let refuse = |refusal| Err(AttachError::InvalidCapabilities(refusal));
     let status = config.read16(regs::STATUS)?;
     if status == u16::MAX {
@@ -531,6 +533,9 @@ fn capabilities<C: ConfigSpace>(
         };
         let start = usize::from(offset16);
         let end = start + usize::from(entry.bytes);
+        if entry.layout != Layout::Sized && start < usize::from(SCH_HDA_DEVC + 2) {
+            ambiguous_below_devc = true;
+        }
         if reset_policy == ResetPolicy::IntelClockGate
             && ((start < usize::from(CGCTL + 4) && usize::from(CGCTL) < end)
                 // An unknown body's end cannot prove vendor-control ownership.
@@ -565,10 +570,21 @@ fn capabilities<C: ConfigSpace>(
             *slot = Some(offset16);
         }
     }
-    // PCH78 is Device Control, so require its known endpoint owner.
-    // Missing/unknown capabilities do not authorize writing an ambiguous body.
-    if controls.contains(&PCH_SNOOP) && found.pcie != Some(SCH_HDA_DEVC - 8) {
-        return refuse(CapabilityRefusal::PcieOwnerMissing { found: found.pcie });
+    // With a PCIe capability, PCH78 is its Device Control, so require the
+    // known endpoint owner at 0x70. Chipset-integrated PCH functions (Tiger
+    // Lake 43c8 and others) list no PCIe capability at all; there 0x78 is
+    // the vendor DEVC register that Linux azx_init_pci writes for every
+    // AZX_SNOOP_TYPE_SCH controller. That is only accepted when no
+    // header-only capability could hide a body reaching 0x78; sized bodies
+    // that alias it were already refused above.
+    if controls.contains(&PCH_SNOOP) {
+        let owned = match found.pcie {
+            Some(offset) => offset == SCH_HDA_DEVC - 8,
+            None => !ambiguous_below_devc,
+        };
+        if !owned {
+            return refuse(CapabilityRefusal::PcieOwnerMissing { found: found.pcie });
+        }
     }
     Ok(found)
 }
