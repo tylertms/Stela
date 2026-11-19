@@ -1533,6 +1533,16 @@ impl LookupTable {
     /// while a third that nothing reaches stayed: a random victim leaves
     /// that third the one out after a few rounds.
     pub fn insert(&mut self, slot: usize, entry: LookupEntry) {
+        self.insert_over(slot, entry, &|_| false);
+    }
+
+    /// [`Self::insert`], where an entry whose key `dead` names is a place
+    /// already free: no lookup reaches a context that left, so the
+    /// resident moves over a dead neighbour, and a dead resident is the one
+    /// out, before any live entry is put out at random. An ITLB of a busy
+    /// desktop evicted live pages while dead contexts' entries sat in their
+    /// sets (16% of its misses).
+    pub fn insert_over(&mut self, slot: usize, entry: LookupEntry, dead: &dyn Fn(u64) -> bool) {
         if self.grouping == Grouping::Pc {
             self.note_rekey(slot, &entry);
         }
@@ -1542,8 +1552,10 @@ impl LookupTable {
         }
         if resident.key != 0 && (resident.pc != entry.pc || resident.key != entry.key) {
             let beside = self.entry(neighbour(slot));
-            let keep_resident = if beside.key == 0 {
+            let keep_resident = if beside.key == 0 || dead(beside.key) {
                 true
+            } else if dead(resident.key) {
+                false
             } else {
                 self.victims ^= self.victims << 13;
                 self.victims ^= self.victims >> 7;
@@ -3586,6 +3598,39 @@ mod tests {
 
     fn itlb_salt(context: u64) -> u32 {
         super::itlb_salt(context, ITLB_MASK)
+    }
+
+    /// A full ITLB set gives up a dead context's entry, never a live one, to
+    /// a new page; with none dead it keeps its random choice.
+    #[test]
+    fn a_full_itlb_set_puts_out_a_dead_context_first() {
+        let mut itlb = LookupTable::itlb();
+        let set = |table: &LookupTable, pc: u64, context: u64| table.page_slot(pc, context) & !1;
+        // Three pages, two of context 1 and one of context 2, in one set.
+        let pages = || (0u64..1 << 20).map(|page| page << 14);
+        let a = pages().next().unwrap();
+        let wanted = set(&itlb, a, 1);
+        let b = pages().find(|&pc| set(&itlb, pc, 2) == wanted).unwrap();
+        let c = pages()
+            .find(|&pc| pc != a && set(&itlb, pc, 1) == wanted)
+            .unwrap();
+        let held = |table: &LookupTable, pc: u64, context: u64| {
+            let found = table.find(table.page_slot(pc, context), pc, context);
+            found.pc == pc && found.key == context
+        };
+        for (pc, context) in [(a, 1), (b, 2)] {
+            itlb.insert(
+                itlb.page_slot(pc, context),
+                LookupEntry::page(pc, context, 7),
+            );
+        }
+        assert!(held(&itlb, a, 1) && held(&itlb, b, 2));
+        // Context 2 left: its page gives way, whichever way it is in.
+        itlb.insert_over(itlb.page_slot(c, 1), LookupEntry::page(c, 1, 7), &|key| {
+            key == 2
+        });
+        assert!(held(&itlb, a, 1) && held(&itlb, c, 1));
+        assert!(!held(&itlb, b, 2));
     }
 
     /// Tables grow with the arena, in powers of two within their bounds

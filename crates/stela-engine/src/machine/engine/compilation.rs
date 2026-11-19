@@ -382,19 +382,28 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if resident.pc == page && resident.key != context && !self.live_context(resident.key) {
             self.itlb.set(slot, entry);
         } else {
+            // A context no lookup reaches any more gives its place first
+            // (`insert_over`): a dead resident leaves rather than a live
+            // neighbour.
+            let contexts = self.chain.contexts();
+            let spaces = &self.spaces;
+            let dead = |key: u64| {
+                !contexts.contains(&key) && !spaces.iter().any(|s| s.live(key).is_some())
+            };
             // What the resident's move takes the place of, unless it is the
-            // page's own older entry.
+            // page's own older entry, or the dead resident itself leaves.
             let lost = self.itlb.entry(slot ^ 1);
             if resident.key != 0
                 && (resident.pc, resident.key) != (page, context)
+                && !dead(resident.key)
                 && lost.key != 0
                 && (lost.pc, lost.key) != (page, context)
-                && (self.chain.contexts().contains(&lost.key) || self.live_context(lost.key))
+                && !dead(lost.key)
             {
                 self.statistics.itlb_drops[0] += 1;
                 note_itlb_ghost(&mut self.itlb_ghosts, &lost, ItlbMiss::Evicted);
             }
-            self.itlb.insert(slot, entry);
+            self.itlb.insert_over(slot, entry, &dead);
         }
     }
 
