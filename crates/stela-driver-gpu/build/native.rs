@@ -325,7 +325,7 @@ impl Linux {
                 .map(|spec| {
                     linux_capture::profile(
                         &common_build,
-                        Path::new("src/compat/stela/registration.h"),
+                        &Path::new("src/compat").join("stela/registration.h"),
                         *spec,
                         Path::new("../stela-linux"),
                     )
