@@ -1158,7 +1158,10 @@ pub const STAMP_COUNTS_BYTES: usize = 64;
 
 /// Entries of a PE's jump cache, in front of its stamp counts: targets its
 /// table probe entered, by guest PC, which a [`lookup_tail`] takes without
-/// a probe. Bits 2-9 of the PC pick the entry.
+/// a probe. Bits 2-11 of the PC pick the entry. With 256 a lookup site
+/// over 1024 targets (`transfer_path_costs`) missed 75% of its transfers
+/// into the table probe, 14.4 ns a transfer on an i7-12700KF; with 1024 it
+/// misses none, 8.8 ns, and 4096 gains nothing more. 64 KiB a PE.
 ///
 /// An entry holds across native runs, while the target's half has the
 /// context and ITLB drop epoch the entry names, as a stamp holds
@@ -1169,7 +1172,7 @@ pub const STAMP_COUNTS_BYTES: usize = 64;
 /// entry's last word again after it, taking the entry back when the word
 /// moved; the table's writer stores the entry, fences and then reads the
 /// caches, so one of the two sees the other.
-pub const JUMP_CACHE_ENTRIES: usize = 256;
+pub const JUMP_CACHE_ENTRIES: usize = 1024;
 /// Bytes of one jump cache entry, a cache line: the PC, the block's code,
 /// its index and the table entry's last word as the probe read it, whose
 /// low byte is the BTYPEs the block accepts ([`LookupEntry`]), then the
