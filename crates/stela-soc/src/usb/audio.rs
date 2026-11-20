@@ -134,7 +134,9 @@ struct State {
     counters: Counters,
 }
 
-fn descriptors() -> Descriptors {
+pub const DEFAULT_NAME: &str = "Stela USB Audio";
+
+fn descriptors(name: String) -> Descriptors {
     let device = [
         18,
         DEVICE,
@@ -284,11 +286,7 @@ fn descriptors() -> Descriptors {
         // High speed: 2^(4-1) microframes, 1 ms; full speed: one frame.
         configuration: configuration(4),
         other_speed: Some((qualifier, configuration(1))),
-        strings: vec![
-            String::from("Stela"),
-            String::from("Stela USB Audio"),
-            String::from("0001"),
-        ],
+        strings: vec![String::from("Stela"), name, String::from("0001")],
     }
 }
 
@@ -316,8 +314,12 @@ impl Default for Audio {
 
 impl Audio {
     pub fn new() -> Self {
+        Self::named(String::from(DEFAULT_NAME))
+    }
+
+    pub fn named(name: String) -> Self {
         Self {
-            control: Control::new(descriptors()),
+            control: Control::new(descriptors(name)),
             state: State {
                 alternate: 0,
                 muted: false,

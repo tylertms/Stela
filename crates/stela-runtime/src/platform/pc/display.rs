@@ -96,12 +96,40 @@ const PREFERRED_TIMING: usize = 0x36;
 /// checksum is wrong, or whose first descriptor is not a detailed timing
 /// (pixel clock 0).
 fn preferred_timing(edid: &[u8]) -> Option<&[u8]> {
-    let block = edid.get(..EDID_BLOCK)?;
-    if block[..8] != EDID_HEADER || block.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)) != 0 {
-        return None;
-    }
+    let block = base_block(edid)?;
     let d = &block[PREFERRED_TIMING..PREFERRED_TIMING + 18];
     (d[0] != 0 || d[1] != 0).then_some(d)
+}
+
+fn base_block(edid: &[u8]) -> Option<&[u8]> {
+    let block = edid.get(..EDID_BLOCK)?;
+    (block[..8] == EDID_HEADER && block.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)) == 0)
+        .then_some(block)
+}
+
+/// The printable product name in a monitor's EDID base block, if supplied.
+pub fn product_name(edid: &[u8]) -> Option<&str> {
+    let block = base_block(edid)?;
+    block[PREFERRED_TIMING..126]
+        .chunks_exact(18)
+        .find_map(|descriptor| {
+            if descriptor[..5] != [0, 0, 0, 0xfc, 0] {
+                return None;
+            }
+            let text = descriptor[5..]
+                .split(|byte| matches!(*byte, b'\n' | 0))
+                .next()?;
+            if !text
+                .iter()
+                .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+            {
+                return None;
+            }
+            core::str::from_utf8(text)
+                .ok()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+        })
 }
 
 /// The active width and height of an EDID's preferred timing: the panel's
@@ -310,6 +338,19 @@ pub fn choose(modes: &[Mode], current: u32, native: Option<(u32, u32)>) -> Optio
 mod tests {
     use super::*;
     use stela_soc::scanout::{Mode as ScanoutMode, PixelFormat};
+
+    #[test]
+    fn monitor_name_requires_a_valid_printable_edid_descriptor() {
+        let mut bytes = edid(1920, 1080);
+        bytes[72..90].copy_from_slice(b"\0\0\0\xfc\0LED Cinema\n  ");
+        reseal(&mut bytes);
+        assert_eq!(product_name(&bytes), Some("LED Cinema"));
+        assert_eq!(product_name(&bytes[..90]), None);
+        bytes[77] = 1;
+        assert_eq!(product_name(&bytes), None);
+        reseal(&mut bytes);
+        assert_eq!(product_name(&bytes), None);
+    }
 
     fn mode(index: u32, width: u32, height: u32) -> Mode {
         Mode {

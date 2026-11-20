@@ -3786,6 +3786,45 @@ fn mounted_usb_dma_service_failure_is_protected_from_survey_substitution() {
 }
 
 #[test]
+fn native_usb_hub_exposes_an_optional_audio_output() {
+    use crate::usb::hub::Ports;
+
+    let mut devices = AppleDevices::new();
+    let dart = devices
+        .add_dart(
+            Range {
+                physical: 0x382f00000,
+                bytes: 0x4000,
+            },
+            16,
+            None,
+            None,
+        )
+        .unwrap();
+    add_usb_phy(&mut devices);
+    let placement = usb_placement();
+    devices.add_usb(&placement, dart).unwrap();
+    devices
+        .attach_input(placement.port, UsbCables::default())
+        .unwrap();
+    assert!(devices.usb_audio().is_none());
+
+    devices
+        .attach_input(
+            placement.port,
+            UsbCables {
+                audio: Some(crate::usb::audio::DEFAULT_NAME.into()),
+                ..UsbCables::default()
+            },
+        )
+        .unwrap();
+    let hub = devices.usb_masters[0].peripheral.as_mut().unwrap();
+    assert_eq!(hub.ports.count(), 2);
+    assert_eq!(hub.ports.speed(1), crate::usb::Speed::High);
+    assert_eq!(devices.usb_audio().unwrap().queued(), 0);
+}
+
+#[test]
 fn phy_clock_and_kept_supply_freeze_usb_time_while_quiesce_does_not() {
     use coverage::{Domain, DomainId};
     use stela_soc_data::board::PowerResource;

@@ -775,6 +775,9 @@ impl IsaBridge {
 pub struct Devices {
     /// Native UAC2 playback/capture owners, awaiting explicit runtime PCM use.
     pub audio: Vec<crate::usb::audio::UsbAudio>,
+    /// PCI HDA functions observed by the scan, with display siblings marked.
+    /// This metadata does not admit a controller or discover its codecs.
+    pub audio_pci: Vec<(crate::bus::pci::Identity, bool)>,
     pub disks: Vec<Box<dyn BlockDevice>>,
     /// Display controllers, inventoried without changing firmware scanout.
     /// These are not initialized accelerators; each records its missing port.
@@ -1877,7 +1880,11 @@ pub unsafe fn probe_observed(
                 devices.gpus.push(adapter);
                 continue;
             }
-            if display_audio(function.class, address, &displays) {
+            let gpu_audio = display_audio(function.class, address, &displays);
+            if function.class[..2] == [0x04, 0x03] {
+                devices.audio_pci.push((function.identity(), gpu_audio));
+            }
+            if gpu_audio {
                 devices
                     .unsupported
                     .push((address, function.class, DISPLAY_AUDIO));

@@ -49,8 +49,13 @@ impl Device {
     }
     /// A name for logs: the product string, or the IDs.
     pub fn name(&self) -> String {
-        match &self.product {
-            Some(product) => product.clone(),
+        match self
+            .product
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(product) => String::from(product),
             None => self.ids(),
         }
     }

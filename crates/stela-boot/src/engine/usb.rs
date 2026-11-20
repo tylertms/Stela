@@ -40,10 +40,14 @@ use stela_drivers::{
     input::InputDevice,
     probe::native::usb4,
     usb::{
+        audio::UsbAudio,
         storage::UsbStorage,
         xhci::{self, Found},
     },
 };
+
+mod playback;
+pub(super) use playback::due as playback_due;
 
 /// Firmware events serviced per USB4 host per poll.
 const USB4_EVENTS: usize = 16;
@@ -172,6 +176,7 @@ pub struct HostUsb {
     /// The storage interfaces probe configured, whose disks the mount
     /// opened: their class owners outlive `open`.
     _storage: Vec<UsbStorage>,
+    audio: Option<playback::Playback>,
     /// The timed poll's timer: a poll put off stays due ([`PollTimer`]).
     timer: PollTimer,
     /// Where the last poll's time went ([`Self::split`]).
@@ -183,6 +188,8 @@ impl HostUsb {
         hosts: Vec<xhci::Host>,
         usb4: Vec<usb4::Host>,
         storage: Vec<UsbStorage>,
+        audio: Vec<UsbAudio>,
+        audio_inventory: &[xhci::Device],
         dma: RegionAllocator,
         firmware: &'static Requests,
         root: u64,
@@ -213,8 +220,25 @@ impl HostUsb {
             root,
             kept: Vec::new(),
             _storage: storage,
+            audio: playback::Playback::select(audio, audio_inventory),
             timer: PollTimer::new(tsc_hz / POLL_HZ, super::host::rdtsc()),
             split: Split::new(PIECE_NAMES),
+        }
+    }
+
+    pub(super) fn audio_name(&self) -> Option<&str> {
+        self.audio.as_ref().and_then(playback::Playback::guest_name)
+    }
+
+    pub(super) fn step_audio(&mut self, board: &super::parallel::Board, boot: bool) {
+        if let Some(audio) = &mut self.audio {
+            audio.step(self.root, board, boot);
+        }
+    }
+
+    pub(super) fn stop_audio(&mut self) {
+        if let Some(audio) = &mut self.audio {
+            audio.stop(self.root);
         }
     }
 

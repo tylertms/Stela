@@ -13,6 +13,10 @@
 pub(crate) mod font;
 mod mode;
 
+pub(crate) fn monitor_audio_name() -> Option<alloc::string::String> {
+    mode::monitor_name()
+}
+
 use crate::ui;
 use alloc::{string::String, vec, vec::Vec};
 use core::{

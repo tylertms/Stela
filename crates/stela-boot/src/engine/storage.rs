@@ -2180,10 +2180,28 @@ pub unsafe fn open(
         devices: core::mem::take(&mut devices.nics),
         root,
     };
+    let display_audio_count = devices
+        .audio_pci
+        .iter()
+        .filter(|(_, display)| *display)
+        .count();
+    let monitor = (display_audio_count == 1)
+        .then(crate::console::monitor_audio_name)
+        .flatten();
+    for (function, display) in &devices.audio_pci {
+        let id = alloc::format!("PCI {:04x}:{:04x}", function.vendor, function.device);
+        let name = (*display)
+            .then_some(monitor.as_deref())
+            .flatten()
+            .unwrap_or(&id);
+        output::arguments(format_args!("AUDIO OUTPUT {name} (not supported)\n"));
+    }
     let usb = super::usb::HostUsb::new(
         core::mem::take(&mut devices.usb_hosts),
         core::mem::take(&mut devices.usb4_hosts),
         core::mem::take(&mut devices.usb_storage),
+        core::mem::take(&mut devices.audio),
+        &devices.usb_devices,
         dma,
         firmware,
         root,

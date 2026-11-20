@@ -180,6 +180,9 @@ impl Service {
     /// Store what the guest committed since the last service, the caller
     /// waiting: at the stop, before the PC restarts or turns off.
     pub(super) fn stop(&mut self) {
+        if let Some(usb) = &mut self.usb {
+            usb.stop_audio();
+        }
         if let Some(nor) = self.nor.as_mut() {
             let repair = super::bundle_repair::change_pending();
             let (mut dirty, anchor, image) = self.devices.with(|devices| {
@@ -291,6 +294,7 @@ impl Service {
         };
         let inputs_due = due(INPUTS, false, &mut turn);
         if let Some(usb) = usb.as_mut().filter(|_| inputs_due) {
+            usb.step_audio(devices, boot);
             let arrived = usb.poll();
             if let Some(input) = input.as_mut() {
                 input.add(arrived);
@@ -805,6 +809,9 @@ pub(super) fn serve(boot: bool, step: bool, watch: &GuestWatch) {
 /// [`REQUESTED_MILLIS`] with a device's request `requested`.
 pub(super) fn starved(requested: bool) -> bool {
     if SHUTDOWN.pending() {
+        return true;
+    }
+    if usb::playback_due() {
         return true;
     }
     let millis = if requested {

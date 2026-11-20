@@ -15,6 +15,7 @@ pub mod aperture;
 pub mod apic;
 pub mod assigned_topology;
 pub mod audio_check_samples;
+pub mod audio_pcm;
 pub mod beat_pace;
 pub mod bluetooth_dsbr;
 pub mod boot_exit;

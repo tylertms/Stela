@@ -35,6 +35,24 @@ fn stream(a: &mut Audio, alternate: u16) {
 }
 
 #[test]
+fn named_speaker_publishes_the_physical_product_string() {
+    let name = "FIFINE Headset";
+    let mut audio = Audio::named(name.into());
+    let descriptor = transfer(
+        &mut audio,
+        setup(0x80, GET_DESCRIPTOR, 0x0302, 0x0409, 255),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(descriptor[1], 3);
+    let text: Vec<_> = descriptor[2..]
+        .chunks_exact(2)
+        .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+        .collect();
+    assert!(text.into_iter().eq(name.encode_utf16()));
+}
+
+#[test]
 fn descriptors_describe_one_stereo_uac2_output_without_capture() {
     let mut a = configured();
     let config = transfer(&mut a, setup(0x80, GET_DESCRIPTOR, 0x200, 0, 512), &[]).unwrap();
@@ -261,6 +279,7 @@ fn a_uac2_host_driver_plays_through_the_isochronous_endpoint() {
             pcm.extend_from_slice(&value.to_le_bytes()[..subslot]);
         }
         audio.start_playback(index, RATE, &pcm, true).unwrap();
+        assert_eq!(audio.buffered_playback_frames(), frames);
         let mut drained = false;
         for _ in 0..20_000 {
             if audio.poll().unwrap().playback_drained {
@@ -269,6 +288,7 @@ fn a_uac2_host_driver_plays_through_the_isochronous_endpoint() {
             }
         }
         assert!(drained, "{:?}", audio.progress());
+        assert_eq!(audio.buffered_playback_frames(), 0);
         let model = &mut bench.model.borrow_mut().function.ports.0;
         // A finite stream ends by selecting the zero-bandwidth setting.
         assert!(!model.streaming());

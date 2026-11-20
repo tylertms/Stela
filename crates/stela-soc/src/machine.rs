@@ -389,6 +389,8 @@ pub struct UsbCables {
     pub network: Option<Mac>,
     /// A USB Bluetooth controller.
     pub bluetooth: Option<UsbBluetooth>,
+    /// The product name of a USB Audio Class speaker backed by host audio.
+    pub audio: Option<alloc::string::String>,
 }
 
 /// The USB Bluetooth controller on the native hub.
@@ -417,6 +419,7 @@ struct Attachments {
     input: Peripheral,
     network: Option<Ecm>,
     bluetooth: Option<Hci>,
+    audio: Option<crate::usb::audio::Audio>,
     disks: Vec<MassStorage>,
 }
 
@@ -424,6 +427,7 @@ impl hub::Ports for Attachments {
     fn count(&self) -> usize {
         1 + usize::from(self.network.is_some())
             + usize::from(self.bluetooth.is_some())
+            + usize::from(self.audio.is_some())
             + self.disks.len()
     }
     fn speed(&self, port: usize) -> Speed {
@@ -434,7 +438,12 @@ impl hub::Ports for Attachments {
         let network = self.network.iter_mut().map(|f| f as &mut dyn Function);
         let bluetooth = self.bluetooth.iter_mut().map(|f| f as &mut dyn Function);
         let disks = self.disks.iter_mut().map(|f| f as &mut dyn Function);
-        let mut functions = input.chain(network).chain(bluetooth).chain(disks);
+        let audio = self.audio.iter_mut().map(|f| f as &mut dyn Function);
+        let mut functions = input
+            .chain(network)
+            .chain(bluetooth)
+            .chain(disks)
+            .chain(audio);
         functions.nth(port).expect("a port of the hub's count")
     }
     fn function_ref(&self, port: usize) -> &dyn Function {
@@ -442,7 +451,12 @@ impl hub::Ports for Attachments {
         let network = self.network.iter().map(|f| f as &dyn Function);
         let bluetooth = self.bluetooth.iter().map(|f| f as &dyn Function);
         let disks = self.disks.iter().map(|f| f as &dyn Function);
-        let mut functions = input.chain(network).chain(bluetooth).chain(disks);
+        let audio = self.audio.iter().map(|f| f as &dyn Function);
+        let mut functions = input
+            .chain(network)
+            .chain(bluetooth)
+            .chain(disks)
+            .chain(audio);
         functions.nth(port).expect("a port of the hub's count")
     }
 }

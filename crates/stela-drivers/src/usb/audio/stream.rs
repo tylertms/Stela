@@ -99,7 +99,7 @@ pub struct Progress {
 }
 
 pub struct AudioDevice<T: Transport> {
-    transport: T,
+    pub(super) transport: T,
     binding: Binding,
     output: Lane<T::Ticket>,
     input: Lane<T::Ticket>,
@@ -226,6 +226,22 @@ impl<T: Transport> AudioDevice<T> {
         p.queued_playback = self.output.queued();
         p.queued_capture = self.input.queued();
         p
+    }
+
+    /// Frames accepted for playback that have not reported completion yet.
+    /// Includes software PCM and submitted USB packets.
+    pub fn buffered_playback_frames(&self) -> usize {
+        let Some(playback) = &self.playback else {
+            return 0;
+        };
+        let submitted: usize = self
+            .output
+            .packets
+            .iter()
+            .filter(|packet| packet.ticket.is_some())
+            .map(|packet| packet.bytes)
+            .sum();
+        (self.output_pcm.len() + submitted) / playback.format.frame_bytes()
     }
     fn ready(&self) -> Result<(), Error> {
         self.transport.validate()?;

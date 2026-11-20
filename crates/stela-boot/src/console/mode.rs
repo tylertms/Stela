@@ -50,6 +50,15 @@ static SIZE: Global<Option<(u32, u32)>> = Global(RefCell::new(None));
 
 /// The monitor's identity, from the EDID [`select`] read.
 static MONITOR: Global<Option<MonitorId>> = Global(RefCell::new(None));
+static MONITOR_NAME: Global<Option<String>> = Global(RefCell::new(None));
+
+pub(super) fn monitor_name() -> Option<String> {
+    MONITOR_NAME
+        .0
+        .try_borrow()
+        .ok()
+        .and_then(|name| name.clone())
+}
 
 /// The monitor's image size in millimetres, when its EDID reports one: the
 /// size of the screen whatever mode it runs.
@@ -125,6 +134,12 @@ fn choose(handle: Handle, gop: &mut GraphicsOutput) {
         *slot = edid
             .as_ref()
             .and_then(|(bytes, _)| MonitorId::from_edid(bytes));
+    }
+    if let Ok(mut slot) = MONITOR_NAME.0.try_borrow_mut() {
+        *slot = edid
+            .as_ref()
+            .and_then(|(bytes, _)| display::product_name(bytes))
+            .map(String::from);
     }
     if let Some((width, height)) = size {
         output::arguments(format_args!("DISPLAY EDID image {width}x{height} mm\n"));
