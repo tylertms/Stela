@@ -46,7 +46,7 @@ fn rt_mutex_child() {
         // SAFETY: this child is the sole producer on the CPU the model checks.
         let queue = unsafe { Queue::<16>::new(cpu.clone(), f.clone()) }.unwrap();
         let executor =
-            Executor::new_hosted_service_for_test(queue, stacks_count(&dropped, 16 * 1024, 6))
+            Executor::new_hosted_service_for_test(queue, stacks_count(&dropped, THREAD, 6))
                 .unwrap();
         let runtime = executor.runtime();
         f.runtime.store(

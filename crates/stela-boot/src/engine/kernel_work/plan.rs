@@ -65,7 +65,8 @@ impl Plan {
 }
 pub(super) fn profile() -> Result<work::StackProfile, Error> {
     let kernel = stela_linux::task::stack_requirement().map_err(Error::Work)?;
-    if kernel != work::StackRequirement::exact(16 * 1024, 16 * 1024, 4096).map_err(Error::Work)? {
+    let bytes = native_smp::resources::LINUX_TASK_STACK_BYTES as usize;
+    if kernel != work::StackRequirement::exact(bytes, bytes, 4096).map_err(Error::Work)? {
         return Err(Error::Geometry);
     }
     work::StackProfile::new(

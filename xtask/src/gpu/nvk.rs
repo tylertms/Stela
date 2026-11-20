@@ -215,7 +215,13 @@ pub(super) const RADV: Driver = Driver {
         "metro_exodus_GetSemaphoreCounterValue",
         "radv_metro_exodus_GetSemaphoreCounterValue",
     )],
-    options: &["-Damd-use-llvm=false"],
+    // RADV keys its pipeline caches by its build ID, which it finds in its
+    // ELF notes or a file's timestamp; the image has neither, so it is given
+    // the note `compat/mesa/build_id.c` holds, as #163's build did.
+    options: &[
+        "-Damd-use-llvm=false",
+        "-Dradv-build-id=5374656c6120737461746963616c6c79",
+    ],
     host_tools: true,
     // AMD's stack gives no Vulkan driver yet.
     released: false,

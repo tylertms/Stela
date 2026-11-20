@@ -7,7 +7,12 @@
 #include <asm/page.h>
 
 /* Exact admitted Linux usable stack size; Runtime retains the real backing. */
-#define THREAD_SIZE_ORDER 2
+/* 64 KiB, four times x86-64 Linux's 16 KiB: Linux's own stacks hold only
+ * Linux, while these also carry the host's log, storage and USB paths a
+ * driver's printk reaches. amdgpu's probe on a Navi 48, at IP discovery,
+ * overran 16 KiB there, and the overrun stopped the boot with no report.
+ * stela_boot_core::native_resources::LINUX_TASK_STACK_BYTES is the same. */
+#define THREAD_SIZE_ORDER 4
 #define THREAD_SIZE (PAGE_SIZE << THREAD_SIZE_ORDER)
 
 struct task_struct;
