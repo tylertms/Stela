@@ -855,6 +855,9 @@ fn merged_mail_removes_every_entry_its_tlbis_remove() {
     };
     for round in 0..40 {
         let mut mail = Mail::default();
+        // Half the rounds for a PE with global pages around the lower
+        // half's third place, which merges go around.
+        let globals = (round / 3 % 2 == 1).then_some((2 << 36, (3 << 36) - 1));
         let mut sent = Vec::new();
         let count = [20, 300, 2000][round % 3];
         for _ in 0..count {
@@ -881,7 +884,7 @@ fn merged_mail_removes_every_entry_its_tlbis_remove() {
                 unreachable!()
             };
             sent.push(scope);
-            mail.keep(Maintenance::Tlb(scope));
+            mail.keep(Maintenance::Tlb(scope), globals);
         }
         let all = mail
             .maintenance
@@ -943,6 +946,218 @@ fn merged_mail_removes_every_entry_its_tlbis_remove() {
 /// The canonical VA of 4 KiB page number `page`.
 fn canonical_page(page: u64) -> u64 {
     mmu::tlbi::canonical(page << 12)
+}
+
+/// A process's TLBIs by page below and above a PE's global pages (its
+/// image and stacks, its heaps, around the shared cache) never merge into
+/// one range across them while a merge on one side can take them, full
+/// mailbox or not: the PE's shared pages' entries outlive them. Every sent
+/// scope is still held by a kept one of its ASID, and the mailbox keeps no
+/// more scopes than before.
+#[test]
+fn a_mailbox_merges_no_scope_across_the_pes_global_pages() {
+    use crate::machine::system::TlbiKind::VA;
+    const GLOBALS: (u64, u64) = (0x1_8000_0000, 0x2_7fff_ffff);
+    const BELOW: u64 = 0x1_0000_0000;
+    const ABOVE: u64 = 0x6_0000_0000;
+    let mut mail = Mail::default();
+    let mut sent = Vec::new();
+    // Bursts above, each followed by one page below: the last kept scopes
+    // are all above when the page below comes.
+    for n in 0..4 * MAIL_TLB_SCOPES as u64 {
+        let va = if n % 20 == 19 {
+            BELOW + n * 0x10_0000
+        } else {
+            ABOVE + n * 0x10_0000
+        };
+        let Maintenance::Tlb(scope) = tlbi(VA, 9 << 48 | va >> 12) else {
+            unreachable!()
+        };
+        sent.push(scope);
+        mail.keep(Maintenance::Tlb(scope), Some(GLOBALS));
+    }
+    let kept: Vec<tlbi::Scope> = mail
+        .maintenance
+        .iter()
+        .map(|kept| match kept {
+            Maintenance::Tlb(scope) => *scope,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(kept.len(), MAIL_TLB_SCOPES);
+    assert_eq!(kept.len() + mail.merged as usize, sent.len());
+    for scope in &kept {
+        let (first, last) = scope.span().unwrap();
+        assert!(last < GLOBALS.0 || first > GLOBALS.1, "{scope:x?}");
+        assert_eq!(scope.named_asid(), Some(9));
+    }
+    for scope in &sent {
+        let (first, last) = scope.span().unwrap();
+        assert!(
+            kept.iter().any(|kept| {
+                let (kept_first, kept_last) = kept.span().unwrap();
+                kept_first <= first && last <= kept_last
+            }),
+            "{scope:x?}"
+        );
+    }
+    // Without global pages, or when every merge bridges them, the
+    // narrowest merge of the last kept scopes takes the page, as before.
+    let mut mail = Mail::default();
+    for n in 0..MAIL_TLB_SCOPES as u64 {
+        mail.keep(
+            tlbi(VA, 9 << 48 | (ABOVE + n * 0x10_0000) >> 12),
+            Some(GLOBALS),
+        );
+    }
+    mail.keep(tlbi(VA, 9 << 48 | BELOW >> 12), Some(GLOBALS));
+    assert_eq!(mail.maintenance.len(), MAIL_TLB_SCOPES);
+    assert_eq!(mail.merged, 1);
+    // Until full, merges reach at most three granules across, global pages
+    // or not, and runs of pages among global pages merge as before.
+    let mut mail = Mail::default();
+    for va in [0x1_7fff_f000, 0x1_8000_4000, 0x1_8000_5000, 0x1_8000_8000] {
+        mail.keep(tlbi(VA, 9 << 48 | va >> 12), Some(GLOBALS));
+    }
+    assert_eq!((mail.maintenance.len(), mail.merged), (1, 3));
+}
+
+/// Another PE's TLBI by VA or range reaches this PE through its mail and
+/// drops the ITLB entries it covers alone: a global page's for any ASID,
+/// a page of an ASID for that ASID or every ASID. A page remapped behind
+/// such a TLBI translates anew at the PE's next fetch.
+#[test]
+fn a_tlbi_another_pe_broadcasts_drops_the_pages_it_covers_alone() {
+    use super::super::tests::{
+        BASE, CODE_ASID, SPACES_TABLES, asid_code_pages, page_descriptor, va_operand, write_entry,
+    };
+    use crate::machine::system::TlbiKind::{RVA, VA, VAA};
+    const RET: u32 = 0xd65f_03c0;
+    const MOVZ: u32 = 0xd280_0020; // movz x0, #1
+    const PAGES: u64 = 16;
+    let (hub, _) = hub(2);
+    let mut machine = first_of_two(&[RET], &hub);
+    asid_code_pages(&mut machine, PAGES as usize, 8);
+    let page = |n: u64| BASE + n * 0x1000;
+    let fetch_all = |machine: &mut Machine<_, _>| {
+        for n in 0..PAGES {
+            assert!(matches!(
+                machine.fetch_block(page(n), false),
+                Ok(super::super::Fetched::Block(_))
+            ));
+        }
+    };
+    let held = |machine: &Machine<_, _>| -> Vec<u64> {
+        (0..PAGES)
+            .filter(|&n| machine.current_key(page(n)).is_some())
+            .collect()
+    };
+    let other = CODE_ASID + 1;
+    // TG 4 KiB, SCALE 0, NUM 1: four pages.
+    let four = |asid, va| va_operand(asid, va) | 1 << 46 | 1 << 39;
+    let cases: [(_, u64, &[u64]); 7] = [
+        (VA, va_operand(other, page(3)), &[3]),
+        (VA, va_operand(other, page(9)), &[]),
+        (VA, va_operand(CODE_ASID, page(10)), &[10]),
+        (VAA, va_operand(0, page(11)), &[11]),
+        (RVA, four(other, page(4)), &[4, 5, 6, 7]),
+        (RVA, four(other, page(12)), &[]),
+        (RVA, four(CODE_ASID, page(12)), &[12, 13, 14, 15]),
+    ];
+    for (kind, operand, gone) in cases {
+        fetch_all(&mut machine);
+        assert_eq!(held(&machine), (0..PAGES).collect::<Vec<_>>());
+        hub.broadcast(1, &[tlbi(kind, operand)]);
+        machine.read_mail().unwrap();
+        let kept: Vec<u64> = (0..PAGES).filter(|n| !gone.contains(n)).collect();
+        assert_eq!(held(&machine), kept, "{kind:?} {operand:#x}");
+    }
+    machine.host.ram[0x1000..0x1004].copy_from_slice(&MOVZ.to_le_bytes());
+    machine.host.ram[0x1004..0x1008].copy_from_slice(&RET.to_le_bytes());
+    fetch_all(&mut machine);
+    let [_, _, l3] = SPACES_TABLES[0];
+    write_entry(
+        &mut machine,
+        l3 + 3 * 8,
+        page_descriptor(BASE + 0x1000, false),
+    );
+    hub.broadcast(1, &[tlbi(VA, va_operand(other, page(3)))]);
+    machine.read_mail().unwrap();
+    let Ok(super::super::Fetched::Block(block)) = machine.fetch_block(page(3), false) else {
+        panic!("a block");
+    };
+    assert_eq!(machine.code.blocks[block].physical, BASE + 0x1000);
+}
+
+/// Counter benchmark: a PE runs a loop over global pages (a shared cache's)
+/// while another PE's process sends TLBIs by page of its own pages below and
+/// above them, past what the first PE's mailbox keeps: the PE reads them at
+/// each round's start. No merge of the mailbox reaches across the PE's
+/// global pages, so no round drops, refills or fills one, or exits for one.
+/// (`cargo test -p stela-engine --lib itlb_bench -- --nocapture` prints the
+/// counts.)
+#[test]
+fn itlb_bench_a_full_mailbox_leaves_a_pes_shared_pages() {
+    use super::super::tests::{BASE, asid_code_pages, dispatched, va_operand};
+    use super::super::{FetchPath, ItlbSource};
+    use crate::machine::system::TlbiKind::VA;
+    const RET: u32 = 0xd65f_03c0;
+    const PAGES: u64 = 64;
+    const ROUNDS: u64 = 20;
+    const BELOW: u64 = 0x1_0000_0000;
+    const ABOVE: u64 = 0x40_0000_0000;
+    let (hub, _) = hub(2);
+    let mut machine = first_of_two(&[RET], &hub);
+    asid_code_pages(&mut machine, PAGES as usize, PAGES as usize);
+    let page = |n: u64| BASE + n * 0x1000;
+    let round = |machine: &mut Machine<_, _>| {
+        machine.read_mail().unwrap();
+        let mut exits = 0;
+        for n in 0..PAGES {
+            if !dispatched(machine, page(n)) {
+                exits += 1;
+                assert!(matches!(
+                    machine.fetch_block(page(n), false),
+                    Ok(super::super::Fetched::Block(_))
+                ));
+            }
+        }
+        exits
+    };
+    let warm = round(&mut machine);
+    let counts = |machine: &Machine<_, _>| {
+        let statistics = &machine.statistics;
+        [
+            statistics.itlb_drops[1],
+            statistics.itlb_sources[ItlbSource::DropGlobal as usize],
+            statistics.itlb[0],
+            statistics.itlb_sources[ItlbSource::Refilled as usize],
+            statistics.fetch_paths[FetchPath::ItlbMiss as usize],
+            statistics.lookup_forgets[2],
+        ]
+    };
+    let before = counts(&machine);
+    let sends = MAIL_TLB_SCOPES as u64 + 64;
+    let mut exits = 0;
+    for round_number in 0..ROUNDS {
+        // ASID 9's pages, 1 MiB apart: bursts above, then one below.
+        for n in 0..sends {
+            let at = (round_number * sends + n) * 0x10_0000;
+            let va = if n % 20 == 19 { BELOW + at } else { ABOVE + at };
+            hub.broadcast(1, &[tlbi(VA, va_operand(9, va))]);
+        }
+        exits += round(&mut machine);
+    }
+    let after = counts(&machine);
+    let [drops, global, fills, refilled, misses, reached] =
+        [0, 1, 2, 3, 4, 5].map(|n| after[n] - before[n]);
+    eprintln!(
+        "ITLB bench, two PEs, {PAGES} shared pages x {ROUNDS} rounds, {sends} TLBI VALE1IS \
+         of another process a round: warm-up exits {warm}; then exits {exits}, drop_tlbi \
+         {drops}, drop_global {global}, ITLB fills {fills}, refilled {refilled}, fetch \
+         itlb_miss {misses}, forget_va {reached}",
+    );
+    assert_eq!([drops, global, fills, refilled, misses, exits], [0; 6]);
 }
 
 #[test]

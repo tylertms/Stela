@@ -276,6 +276,45 @@ impl GlobalSpan {
     fn overlaps(&self, first: u64, last: u64) -> bool {
         self.first.load(Ordering::SeqCst) <= last && self.last.load(Ordering::SeqCst) >= first
     }
+
+    /// The span as it is now, `None` while the PE took no lower-half global
+    /// translation: what a mailbox merges around ([`Mail::keep`]). A hint
+    /// only: a merge removes at least what its scopes remove, wherever it
+    /// lies, so a span widened since changes no TLBI's effect.
+    fn now(&self) -> Option<(u64, u64)> {
+        let (first, last) = (
+            self.first.load(Ordering::Relaxed),
+            self.last.load(Ordering::Relaxed),
+        );
+        (first <= last).then_some((first, last))
+    }
+}
+
+/// Whether the range a merge of the spans `held` and `new` makes takes in,
+/// besides the 16 KiB granules (the largest) they touch, an address of
+/// `globals`, the lower-half span a PE may hold global translations of
+/// ([`GlobalSpan`]): the granules between two spans of one ASID, which
+/// neither TLBI reaches, are all the merged range adds, and at a global
+/// page's address it removes that page's entry in every address space (Arm
+/// `TLBIMatch`: an entry with nG 0 matches any ASID). The shared cache's
+/// pages lie between a process's own (its image and stacks below, its heaps
+/// above), so such a merge drops each PE's whole shared region.
+fn bridges(globals: Option<(u64, u64)>, held: (u64, u64), new: (u64, u64)) -> bool {
+    const GRANULE: u64 = 0x4000;
+    let Some((first, last)) = globals else {
+        return false;
+    };
+    let (low, high) = if held.0 <= new.0 {
+        (held, new)
+    } else {
+        (new, held)
+    };
+    let (after, before) = (low.1 | (GRANULE - 1), high.0 & !(GRANULE - 1));
+    // Spans in the same granule or the next add nothing between them.
+    if after.saturating_add(1) >= before {
+        return false;
+    }
+    first < before && last > after
 }
 
 /// Maintenance one PE broadcasts to the others.
@@ -340,10 +379,20 @@ impl Mail {
     /// past [`MAIL_TLB_SCOPES`], it merges into
     /// the one of the last [`MAIL_NEAR`] that makes the narrowest range,
     /// and one that merges with none of them makes a whole invalidation.
+    ///
+    /// A full mailbox's scopes merge at any distance, but none across the
+    /// PE's lower-half global pages (`globals`, its [`GlobalSpan`] now)
+    /// while another merge does not ([`bridges`]): a process's TLBIs below
+    /// and above the shared cache, merged, would remove the PE's every
+    /// shared-cache entry, which a TLBI with an ASID reaches at its own VAs
+    /// alone. Such a scope merges into the narrowest of all kept scopes that
+    /// bridges nothing, and only where none does into the narrowest of the
+    /// last [`MAIL_NEAR`] as before.
+    ///
     /// Every kept scope removes at least what the TLBIs it stands for
     /// remove, and TLB invalidations commute: the PE applies all its mail
     /// before it translates again.
-    fn keep(&mut self, maintenance: Maintenance) {
+    fn keep(&mut self, maintenance: Maintenance, globals: Option<(u64, u64)>) {
         let held = |kind: fn(&Maintenance) -> bool, list: &[Maintenance]| {
             list.iter().filter(|posted| kind(posted)).count()
         };
@@ -373,28 +422,53 @@ impl Mail {
                 let scopes = |posted: &Maintenance| matches!(posted, Maintenance::Tlb(_));
                 let full = held(scopes, &self.maintenance) >= MAIL_TLB_SCOPES;
                 let gap = if full { u64::MAX } else { MAIL_MERGE_GAP };
-                // The narrowest merge with one of the last kept scopes.
-                let nearest = self
-                    .maintenance
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .filter_map(|(at, posted)| match posted {
-                        Maintenance::Tlb(held) => Some((at, *held)),
-                        _ => None,
+                // The merges with kept scopes from the most recent on, past
+                // the first `skip`, each with whether it bridges `globals`.
+                let kept = &self.maintenance;
+                let merges = move |skip: usize| {
+                    kept.iter()
+                        .enumerate()
+                        .rev()
+                        .filter_map(|(at, posted)| match posted {
+                            Maintenance::Tlb(held) => Some((at, *held)),
+                            _ => None,
+                        })
+                        .skip(skip)
+                        .filter_map(move |(at, held)| Some((at, held, held.merged(scope, gap)?)))
+                        // Until the mailbox is full a merge keeps an ASID
+                        // either scope named: one of every ASID would drop
+                        // those VAs in every process's lookup contexts,
+                        // which share the shared cache's addresses.
+                        .filter(move |(_, held, merged)| {
+                            full || merged.named_asid().is_some()
+                                || held.named_asid().is_none() && scope.named_asid().is_none()
+                        })
+                        .map(move |(at, held, merged)| {
+                            let bridging = match (held.span(), scope.span()) {
+                                (Some(held), Some(new)) if full => bridges(globals, held, new),
+                                _ => false,
+                            };
+                            (at, merged, bridging)
+                        })
+                };
+                let width = |merged: &tlbi::Scope| merged.span().map(|(first, last)| last - first);
+                let narrowest = |merges: &mut dyn Iterator<Item = (usize, tlbi::Scope, bool)>,
+                                 bridging: bool| {
+                    merges
+                        .filter(|&(_, _, bridges)| bridging || !bridges)
+                        .min_by_key(|(_, merged, _)| width(merged))
+                        .map(|(at, merged, _)| (at, merged))
+                };
+                // The narrowest merge with one of the last kept scopes that
+                // bridges nothing (until full, none does); when full, with
+                // an older one, and then the narrowest with one of the last.
+                let nearest = narrowest(&mut merges(0).take(MAIL_NEAR), false).or_else(|| {
+                    full.then(|| {
+                        narrowest(&mut merges(MAIL_NEAR), false)
+                            .or_else(|| narrowest(&mut merges(0).take(MAIL_NEAR), true))
                     })
-                    .take(MAIL_NEAR)
-                    .filter_map(|(at, held)| Some((at, held, held.merged(scope, gap)?)))
-                    // Until the mailbox is full a merge keeps an ASID either
-                    // scope named: one of every ASID would drop those VAs in
-                    // every process's lookup contexts, which share the
-                    // shared cache's addresses.
-                    .filter(|(_, held, merged)| {
-                        full || merged.named_asid().is_some()
-                            || held.named_asid().is_none() && scope.named_asid().is_none()
-                    })
-                    .map(|(at, _, merged)| (at, merged))
-                    .min_by_key(|(_, merged)| merged.span().map(|(first, last)| last - first));
+                    .flatten()
+                });
                 if let Some((at, merged)) = nearest {
                     self.maintenance[at] = Maintenance::Tlb(merged);
                     self.merged += 1;
@@ -1216,11 +1290,12 @@ impl Hub {
         for pe in self.others(from) {
             let inbox = &self.inboxes[pe];
             let mut serial = 0;
+            let globals = inbox.lower_globals.now();
             self.leave(pe, |mail| {
                 mail.serial += 1;
                 serial = mail.serial;
                 for &maintenance in maintenance {
-                    mail.keep(maintenance);
+                    mail.keep(maintenance, globals);
                 }
             });
             inbox.posted.store(serial, Ordering::Release);

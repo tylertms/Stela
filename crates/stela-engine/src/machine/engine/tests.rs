@@ -4300,11 +4300,12 @@ fn table_entries(machine: &Machine<FakeHost, NoDevices>) -> usize {
 
 /// RAM offsets of the page tables [`paged_space`] builds: two address
 /// spaces, each a level 1, level 2 and level 3 table.
-const SPACES_TABLES: [[u64; 3]; 2] = [[0xf000, 0xe000, 0xd000], [0xc000, 0xb000, 0xa000]];
+pub(super) const SPACES_TABLES: [[u64; 3]; 2] =
+    [[0xf000, 0xe000, 0xd000], [0xc000, 0xb000, 0xa000]];
 
 /// A level 3 descriptor of the 4 KiB page at `frame`, executable at EL1
 /// unless `pxn`.
-fn page_descriptor(frame: u64, pxn: bool) -> u64 {
+pub(super) fn page_descriptor(frame: u64, pxn: bool) -> u64 {
     const PXN: u64 = 1 << 53;
     frame | 1 << 10 | 3 << 8 | 0b11 | if pxn { PXN } else { 0 }
 }
@@ -4557,7 +4558,7 @@ fn a_translated_frame_gives_the_pages_the_itlb_holds_a_new_key() {
 /// its half, and the block table holds `pc` with that key. A cell probe
 /// translates the same way and holds a table entry
 /// (`chain::lookup_dispatcher`).
-fn dispatched(machine: &Machine<FakeHost, NoDevices>, pc: u64) -> bool {
+pub(super) fn dispatched(machine: &Machine<FakeHost, NoDevices>, pc: u64) -> bool {
     machine.current_key(pc).is_some_and(|key| {
         let entry = machine
             .code
@@ -4721,6 +4722,208 @@ fn a_tlbi_by_va_and_asid_leaves_the_entries_of_other_asids() {
     );
     tlbi(&mut machine);
     assert_eq!(held(&machine), [false, false]);
+}
+
+/// TLBI VAE1IS, VALE1IS, VAAE1IS, RVALE1IS and VMALLE1IS, of X0.
+pub(super) const TLBI_VAE1IS_X0: u32 = 0xd508_8320;
+pub(super) const TLBI_VALE1IS_X0: u32 = 0xd508_83a0;
+pub(super) const TLBI_VAAE1IS_X0: u32 = 0xd508_8360;
+pub(super) const TLBI_RVALE1IS_X0: u32 = 0xd508_82a0;
+pub(super) const TLBI_VMALLE1IS: u32 = 0xd508_831f;
+
+/// The ASID [`asid_code_pages`] names in TTBR0_EL1.
+pub(super) const CODE_ASID: u64 = 5;
+
+/// `pages` 4 KiB code pages from BASE, each mapping the frame at BASE, the
+/// first `global` of them global and the others of [`CODE_ASID`], which
+/// TTBR0_EL1 then names.
+pub(super) fn asid_code_pages<D: Devices>(
+    machine: &mut Machine<FakeHost, D>,
+    pages: usize,
+    global: usize,
+) {
+    const MSR_TTBR0_EL1_X0: u32 = 0xd518_2000;
+    const NG: u64 = 1 << 11;
+    paged_space(machine, 0, &vec![BASE; pages]);
+    let [l1, _, l3] = SPACES_TABLES[0];
+    for page in global..pages {
+        write_entry(
+            machine,
+            l3 + 8 * page as u64,
+            page_descriptor(BASE, false) | NG,
+        );
+    }
+    machine.cpu.state.x[0] = (BASE + l1) | CODE_ASID << 48;
+    machine.system_instruction(MSR_TTBR0_EL1_X0).unwrap();
+}
+
+/// Execute the TLBI `word` of the operand `x0`.
+pub(super) fn tlbi_x0<D: Devices>(machine: &mut Machine<FakeHost, D>, word: u32, x0: u64) {
+    machine.cpu.state.x[0] = x0;
+    machine.system_instruction(word).unwrap();
+}
+
+/// The operand of a TLBI by VA of the page at `va` for `asid`.
+pub(super) fn va_operand(asid: u64, va: u64) -> u64 {
+    asid << 48 | (va & ((1 << 56) - 1)) >> 12
+}
+
+/// The operand of a range TLBI of the four 4 KiB pages from `va` for
+/// `asid`: TG 4 KiB, SCALE 0, NUM 1, no level hint.
+fn four_pages_operand(asid: u64, va: u64) -> u64 {
+    va_operand(asid, va) | 1 << 46 | 1 << 39
+}
+
+/// Each TLBI by VA or range drops the ITLB entries of the pages it covers
+/// (Arm `TLBIMatch`) and no other: a global page's whatever the ASID the
+/// TLBI names, a page of an ASID only for that ASID or every ASID, by the
+/// last level or every level alike, as the ITLB holds leaves alone. A TLBI
+/// of everything drops them all. A page remapped behind a TLBI translates
+/// anew at its next fetch and runs its new frame.
+#[test]
+fn tlbis_by_va_drop_only_the_itlb_entries_they_cover() {
+    const RET: u32 = 0xd65f_03c0;
+    const MOVZ: u32 = 0xd280_0020; // movz x0, #1
+    const PAGES: u64 = 16;
+    let mut machine = machine(&[RET]);
+    asid_code_pages(&mut machine, PAGES as usize, 8);
+    let page = |n: u64| BASE + n * 0x1000;
+    let fetch_all = |machine: &mut Machine<FakeHost, NoDevices>| {
+        for n in 0..PAGES {
+            assert!(matches!(
+                machine.fetch_block(page(n), false),
+                Ok(Fetched::Block(_))
+            ));
+        }
+    };
+    let held = |machine: &Machine<FakeHost, NoDevices>| -> Vec<u64> {
+        (0..PAGES)
+            .filter(|&n| machine.current_key(page(n)).is_some())
+            .collect()
+    };
+    let other = CODE_ASID + 1;
+    let cases: [(u32, u64, &[u64]); 11] = [
+        // Another ASID's TLBI by VA reaches a global page, not a page of
+        // ASID 5; ASID 5's reaches its own.
+        (TLBI_VALE1IS_X0, va_operand(other, page(3)), &[3]),
+        (TLBI_VALE1IS_X0, va_operand(other, page(9)), &[]),
+        (TLBI_VAE1IS_X0, va_operand(CODE_ASID, page(10)), &[10]),
+        // Every ASID's.
+        (TLBI_VAAE1IS_X0, va_operand(0, page(11)), &[11]),
+        (TLBI_VAAE1IS_X0, va_operand(0, page(1)), &[1]),
+        // Four pages: the global ones for any ASID, ASID 5's for its own.
+        (
+            TLBI_RVALE1IS_X0,
+            four_pages_operand(other, page(4)),
+            &[4, 5, 6, 7],
+        ),
+        (TLBI_RVALE1IS_X0, four_pages_operand(other, page(12)), &[]),
+        (
+            TLBI_RVALE1IS_X0,
+            four_pages_operand(CODE_ASID, page(12)),
+            &[12, 13, 14, 15],
+        ),
+        (
+            TLBI_RVALE1IS_X0,
+            four_pages_operand(CODE_ASID, page(6)),
+            &[6, 7, 8, 9],
+        ),
+        // A page no fetch came from, beside the code and far from it.
+        (TLBI_VALE1IS_X0, va_operand(CODE_ASID, page(PAGES)), &[]),
+        (TLBI_VALE1IS_X0, va_operand(CODE_ASID, page(512)), &[]),
+    ];
+    for (word, operand, gone) in cases {
+        fetch_all(&mut machine);
+        assert_eq!(held(&machine), (0..PAGES).collect::<Vec<_>>());
+        let drops = machine.statistics.itlb_drops[1];
+        tlbi_x0(&mut machine, word, operand);
+        let kept: Vec<u64> = (0..PAGES).filter(|n| !gone.contains(n)).collect();
+        assert_eq!(held(&machine), kept, "{word:#x} {operand:#x}");
+        assert_eq!(machine.statistics.itlb_drops[1] - drops, gone.len() as u64);
+    }
+    fetch_all(&mut machine);
+    tlbi_x0(&mut machine, TLBI_VMALLE1IS, 0);
+    // Its contexts went: the ones the PE takes next hold no page.
+    let variant = machine.current_variant(false, false);
+    let contexts = machine.contexts(machine.cpu.pstate.el, variant);
+    machine.chain.set_contexts(contexts);
+    assert!(held(&machine).is_empty());
+    // Page 3 goes to the frame after BASE's, behind another ASID's TLBI by
+    // VA, which a global page's entry takes.
+    machine.host.ram[0x1000..0x1004].copy_from_slice(&MOVZ.to_le_bytes());
+    machine.host.ram[0x1004..0x1008].copy_from_slice(&RET.to_le_bytes());
+    fetch_all(&mut machine);
+    let [_, _, l3] = SPACES_TABLES[0];
+    write_entry(
+        &mut machine,
+        l3 + 3 * 8,
+        page_descriptor(BASE + 0x1000, false),
+    );
+    tlbi_x0(&mut machine, TLBI_VALE1IS_X0, va_operand(other, page(3)));
+    let Ok(Fetched::Block(block)) = machine.fetch_block(page(3), false) else {
+        panic!("a block");
+    };
+    assert_eq!(machine.code.blocks[block].physical, BASE + 0x1000);
+    assert_eq!(
+        chain::key_frame(target_key(&machine, page(3))),
+        (BASE + 0x1000) >> 12
+    );
+}
+
+/// Counter benchmark: a loop over code pages, global and of an ASID, with a
+/// TLBI VALE1IS of a page it does not run after every few: past the first
+/// round, every transfer finds its block through the ITLB as a dispatcher
+/// would, and no TLBI drops, fills or refills a page, or sends a fetch down
+/// the slow path. (`cargo test -p stela-engine --lib itlb_bench --
+/// --nocapture` prints the counts.)
+#[test]
+fn itlb_bench_a_tlbi_of_an_unrelated_page_leaves_a_loops_pages() {
+    const RET: u32 = 0xd65f_03c0;
+    const PAGES: u64 = 64;
+    const ROUNDS: u64 = 50;
+    let mut machine = machine(&[RET]);
+    asid_code_pages(&mut machine, PAGES as usize, PAGES as usize / 2);
+    let page = |n: u64| BASE + n * 0x1000;
+    let round = |machine: &mut Machine<FakeHost, NoDevices>| {
+        let mut exits = 0;
+        for n in 0..PAGES {
+            if !dispatched(machine, page(n)) {
+                exits += 1;
+                assert!(matches!(
+                    machine.fetch_block(page(n), false),
+                    Ok(Fetched::Block(_))
+                ));
+            }
+            if n % 8 == 7 {
+                // One page past the loop's, and one in another GiB.
+                let unrelated = [page(PAGES + n), page(n) + (1 << 30)][(n / 8 % 2) as usize];
+                tlbi_x0(machine, TLBI_VALE1IS_X0, va_operand(CODE_ASID, unrelated));
+            }
+        }
+        exits
+    };
+    let warm = round(&mut machine);
+    let counts = |machine: &Machine<FakeHost, NoDevices>| {
+        let statistics = &machine.statistics;
+        [
+            statistics.itlb[0],
+            statistics.itlb_sources[ItlbSource::Refilled as usize]
+                + statistics.itlb_sources[ItlbSource::LeafFills as usize],
+            statistics.fetch_paths[FetchPath::ItlbMiss as usize],
+            statistics.itlb_drops[1],
+        ]
+    };
+    let before = counts(&machine);
+    let exits: u64 = (0..ROUNDS).map(|_| round(&mut machine)).sum();
+    let after = counts(&machine);
+    let [fills, refills, misses, drops] = [0, 1, 2, 3].map(|n| after[n] - before[n]);
+    eprintln!(
+        "ITLB bench, one PE, {PAGES} pages x {ROUNDS} rounds, {} unrelated TLBI VALE1IS: \
+         warm-up exits {warm}; then exits {exits}, ITLB fills {fills}, refills {refills}, \
+         fetch itlb_miss {misses}, drop_tlbi {drops}",
+        ROUNDS * PAGES / 8
+    );
+    assert_eq!([exits, fills, refills, misses, drops], [0; 5]);
 }
 
 #[test]
