@@ -242,7 +242,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // Between blocks a broadcast does not wait for this PE
         // (`Hub::applied`): mail that came meanwhile is read first, and the
         // block fetched again.
-        let Some(hub) = self.parallel.clone() else {
+        //
+        // The hub is borrowed twice rather than cloned around the act: a
+        // clone and its drop are two locked writes to the hub's reference
+        // count, one cache line every PE wrote at each of its runs, which
+        // the PEs then passed between them (most of a run's fixed cost on
+        // two PEs or more). Both borrows find the same hub: a machine's hub
+        // is set once, when it enters or starts parallel, each of which
+        // refuses a machine that has one, and nothing the act does takes it.
+        let Some(hub) = &self.parallel else {
             return self.act_on(fetched, pc, single, pacm);
         };
         if !hub.enter_active(self.current) {
@@ -250,7 +258,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         self.set_doing(step_timing::BLOCKER_ENTERING);
         let step = self.act_on(fetched, pc, single, pacm);
-        hub.leave_active(self.current);
+        if let Some(hub) = &self.parallel {
+            hub.leave_active(self.current);
+        }
         step
     }
 
