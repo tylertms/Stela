@@ -24,13 +24,13 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     // of Navi 21.
     if Ports::BUILT == Ports::ALL {
         assert_eq!(count + 4, recipes().count());
-        // The recipes' recorded lengths: 121 files, 184.9 MiB.
-        assert_eq!((count, bytes), (121, 193_887_456), "{count} {bytes}");
+        // The recipes' recorded lengths: 122 files, 187.4 MiB.
+        assert_eq!((count, bytes), (122, 196_531_782), "{count} {bytes}");
     }
     if Ports::BUILT == Ports::NONE {
         assert_eq!(count + 2, recipes().count());
-        // Without the AMD port: 88 files, 177.0 MiB.
-        assert_eq!((count, bytes), (88, 185_584_904), "{count} {bytes}");
+        // Without the AMD port: 89 files, 179.5 MiB.
+        assert_eq!((count, bytes), (89, 188_229_230), "{count} {bytes}");
     }
     // The GPU's large images come last, for a volume short of room.
     assert_eq!(objects.last().unwrap().length, 64_116_464);
@@ -472,6 +472,16 @@ fn a_build_without_the_amd_port_bundles_none_of_its_firmware() {
         objects().iter().any(|artifact| theirs(artifact.member)),
         Ports::BUILT.amd
     );
+}
+
+#[test]
+fn bundle_selects_8852c_for_c852_function() {
+    let wanted = select(&[pci(0x10ec, 0xc852, 0x02)]);
+    assert!(members(&wanted).contains(&"rtw89/rtw8852c_fw-2.bin"));
+    assert!(wanted.unknown.is_empty());
+    // A function of another device does not ask for it.
+    let other = select(&[pci(0x10ec, 0xb852, 0x02)]);
+    assert!(!members(&other).contains(&"rtw89/rtw8852c_fw-2.bin"));
 }
 
 #[test]

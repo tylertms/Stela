@@ -18,6 +18,20 @@ const SECURITY_SECTION: u8 = 9;
 const SECURITY_SIGNATURE: usize = 512;
 const NORMAL: u8 = 1;
 const NORMAL_CE: u8 = 5;
+const FORMATTED_MSSC: u8 = 0xff;
+const MSS_POOL_HEADER: usize = 32;
+const MSS_POOL_DEFAULT_KEYSETS: usize = 8;
+const MSS_SIGNATURE: [u8; 8] = *b"MSSKPOOL";
+/// `FWDL_SECTION_PER_PKT_LEN`, the AX download chunk size.
+const AX_PART_BYTES: usize = 2020;
+
+/// Whether an `Rtw89::parse` may take a CE (type 5) image before a normal one.
+/// RTL8852B sets `try_ce_fw`; RTL8852C does not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ce {
+    Prefer,
+    Never,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseError {
@@ -170,9 +184,53 @@ pub struct Section<'a> {
     pub signatures: &'a [u8],
 }
 
+/// One section the AX download sends: signature bytes and any formatted MSS
+/// pool are already skipped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AxSection<'a> {
+    pub address: u32,
+    pub kind: u8,
+    pub checksum: bool,
+    pub bytes: &'a [u8],
+}
+
+/// `__parse_formatted_mssc`: the byte length of the MSS pool that follows a
+/// security section whose `mssc` is 0xFF. `content` starts at the section;
+/// `len` is its length. The v0 header has no DSP checksum.
+fn formatted_pool_len(content: &[u8], len: usize) -> Option<usize> {
+    let pool = content.get(len..)?;
+    let header = pool.get(..MSS_POOL_HEADER)?;
+    if header[..8] != MSS_SIGNATURE || header[20] != 0 {
+        return None;
+    }
+    let defen = header[16] != 0;
+    let (devices, keypairs) = (usize::from(header[21]), usize::from(le16(header, 22).ok()?));
+    let (customers, keys) = (
+        usize::from(le16(header, 24).ok()?),
+        usize::from(le16(header, 26).ok()?),
+    );
+    let mut table = keys.checked_mul(customers)?.checked_mul(devices)? >> 3;
+    if defen {
+        table += MSS_POOL_DEFAULT_KEYSETS;
+    }
+    if table.checked_add(MSS_POOL_HEADER)? != le32(header, 12).ok()? as usize {
+        return None;
+    }
+    let mut sign = usize::from(le16(content, 60).ok()? >> 2);
+    if sign == 0 {
+        sign = SECURITY_SIGNATURE;
+    }
+    let total = MSS_POOL_HEADER
+        .checked_add(table)?
+        .checked_add(keypairs.checked_mul(sign)?)?;
+    (pool.len() >= total).then_some(total)
+}
+
 #[derive(Debug)]
 pub struct AxImage<'a> {
     pub header: &'a [u8],
+    /// The fixed header and every section descriptor, without the dynamic part.
+    base_header: &'a [u8],
     pub dynamic_header: &'a [u8],
     pub version: [u8; 4],
     pub commit_id: u32,
@@ -226,13 +284,16 @@ impl<'a> AxImage<'a> {
             } else {
                 0
             };
-            if kind == SECURITY_SECTION && mssc & 255 == 255 {
-                return Err(ParseError::UnsupportedFormattedSecurity(mssc));
-            }
-            let signature_bytes = (mssc as usize)
-                .checked_mul(SECURITY_SIGNATURE)
-                .ok_or(ParseError::ResourceLimit)?;
             let section = bytes(data, offset, length)?;
+            let signature_bytes =
+                if kind == SECURITY_SECTION && mssc & 255 == u32::from(FORMATTED_MSSC) {
+                    formatted_pool_len(&data[offset..], length)
+                        .ok_or(ParseError::UnsupportedFormattedSecurity(mssc))?
+                } else {
+                    (mssc as usize)
+                        .checked_mul(SECURITY_SIGNATURE)
+                        .ok_or(ParseError::ResourceLimit)?
+                };
             let signatures = bytes(data, offset + length, signature_bytes)?;
             download_address
                 .checked_add(length as u32)
@@ -256,13 +317,57 @@ impl<'a> AxImage<'a> {
         }
         Ok(Self {
             header: fixed,
+            base_header: &data[..base],
             dynamic_header,
             version: fixed[4..8].try_into().unwrap(),
             commit_id: le32(data, 8)?,
             idmem_share_mode: ((w7 >> 18) & 15) as u8,
-            part_bytes: 2020,
+            part_bytes: AX_PART_BYTES,
             sections,
         })
+    }
+}
+
+impl<'a> AxImage<'a> {
+    /// The header packet `__rtw89_fw_download_hdr` sends: the fixed header and
+    /// section descriptors, without the dynamic header, with W7[15:0] set to
+    /// the 2020-byte chunk size (`__rtw89_fw_download_tweak_hdr_v0`).
+    pub fn header_packet(&self) -> Vec<u8> {
+        let mut packet = self.base_header.to_vec();
+        packet[28..30].copy_from_slice(&(AX_PART_BYTES as u16).to_le_bytes());
+        packet
+    }
+
+    /// The sections the download sends, in order. A formatted-MSS firmware
+    /// keeps only its first security section (`fw.c:347-357`).
+    pub fn sections(&self) -> Result<Vec<AxSection<'a>>, ParseError> {
+        let mut security_seen = false;
+        let mut kept = Vec::with_capacity(self.sections.len());
+        for section in &self.sections {
+            if section.kind == SECURITY_SECTION {
+                if section.mssc & 255 == u32::from(FORMATTED_MSSC) && security_seen {
+                    continue;
+                }
+                security_seen = true;
+            }
+            kept.push(AxSection {
+                address: section.download_address,
+                kind: section.kind,
+                checksum: section.checksum,
+                bytes: section.data,
+            });
+        }
+        Ok(kept)
+    }
+
+    /// (major, minor, sub, idx) from header W1.
+    pub fn version(&self) -> (u8, u8, u8, u8) {
+        let [major, minor, sub, idx] = self.version;
+        (major, minor, sub, idx)
+    }
+
+    pub fn idmem_share_mode(&self) -> u8 {
+        self.idmem_share_mode
     }
 }
 
@@ -277,7 +382,7 @@ pub struct Rtw89<'a> {
     pub trailing_elements: &'a [u8],
 }
 impl<'a> Rtw89<'a> {
-    pub fn parse(data: &'a [u8], observed_cut: u8) -> Result<Self, ParseError> {
+    pub fn parse(data: &'a [u8], observed_cut: u8, ce: Ce) -> Result<Self, ParseError> {
         image_limit(data)?;
         let mut entries = Vec::new();
         let (container_header, end) = if data.first() == Some(&0xff) {
@@ -333,10 +438,13 @@ impl<'a> Rtw89<'a> {
             }
             selected
         };
-        // RTL8852B sets try_ce_fw: prefer CE, then ordinary normal firmware.
-        let selected = best(NORMAL_CE)
-            .or_else(|| best(NORMAL))
-            .ok_or(ParseError::NoCompatibleFirmware { cut: observed_cut })?;
+        // try_ce_fw (RTL8852B) prefers CE, then ordinary normal firmware.
+        let selected = match ce {
+            Ce::Prefer => best(NORMAL_CE),
+            Ce::Never => None,
+        }
+        .or_else(|| best(NORMAL))
+        .ok_or(ParseError::NoCompatibleFirmware { cut: observed_cut })?;
         let image = AxImage::parse(entries[selected].data)?;
         Ok(Self {
             container_header,
@@ -404,6 +512,150 @@ pub(super) mod tests {
         }
         b.extend_from_slice(&[0xa5; 17]);
         b
+    }
+    /// A security section whose key-signature length field (bytes 60..62) is
+    /// zero, which `__parse_formatted_mssc` reads as 512.
+    fn security_content() -> [u8; 64] {
+        let mut content = [0x33; 64];
+        content[60..62].fill(0);
+        content
+    }
+    /// A v0 image of type 2 (4 bytes), type 1 (3 bytes) and `security`
+    /// 64-byte security sections with `mssc` 0xFF, each followed by a
+    /// formatted MSS pool of one table byte and two 512-byte keys.
+    fn formatted_fixture(security: usize) -> Vec<u8> {
+        let count = 2 + security;
+        let mut b = vec![0u8; 32 + count * 16];
+        b[4..8].copy_from_slice(&[0, 29, 29, 18]);
+        b[24..28].copy_from_slice(&((count as u32) << 8).to_le_bytes());
+        b[28..32].copy_from_slice(&(0x1234u32 | 1 << 18).to_le_bytes());
+        let mut rows = vec![
+            (0xa000_0000u32, 4u32 | 2 << 24, 0u32),
+            (0xa100_0000, 3 | 1 << 24, 0),
+        ];
+        for index in 0..security {
+            rows.push((0xa200_0000 + index as u32 * 0x1000, 64 | 9 << 24, 0xff));
+        }
+        for (index, (address, flags, mssc)) in rows.into_iter().enumerate() {
+            let at = 32 + index * 16;
+            b[at..at + 4].copy_from_slice(&address.to_le_bytes());
+            b[at + 4..at + 8].copy_from_slice(&flags.to_le_bytes());
+            b[at + 8..at + 12].copy_from_slice(&mssc.to_le_bytes());
+        }
+        b.extend_from_slice(&[0x11; 4]);
+        b.extend_from_slice(&[0x22; 3]);
+        for _ in 0..security {
+            b.extend_from_slice(&security_content());
+            let mut pool = vec![0xee; 32 + 1 + 2 * 512];
+            pool[..8].copy_from_slice(b"MSSKPOOL");
+            pool[8..12].copy_from_slice(&32u32.to_le_bytes());
+            pool[12..16].copy_from_slice(&33u32.to_le_bytes());
+            pool[16..20].fill(0);
+            pool[20] = 0;
+            pool[21] = 1;
+            pool[22..24].copy_from_slice(&2u16.to_le_bytes());
+            pool[24..26].copy_from_slice(&1u16.to_le_bytes());
+            pool[26..28].copy_from_slice(&8u16.to_le_bytes());
+            b.extend_from_slice(&pool);
+        }
+        b
+    }
+    /// An MFW container of `(cv, type)` entries, each holding `ax_fixture`.
+    fn mfw(entries: &[(u8, u8)]) -> Vec<u8> {
+        let image = ax_fixture();
+        let mut b = vec![0u8; 16 + entries.len() * 16];
+        b[0] = 255;
+        b[1] = entries.len() as u8;
+        for (i, (cut, kind)) in entries.iter().enumerate() {
+            let at = 16 + i * 16;
+            let offset = b.len();
+            b[at] = *cut;
+            b[at + 1] = *kind;
+            b[at + 4..at + 8].copy_from_slice(&(offset as u32).to_le_bytes());
+            b[at + 8..at + 12].copy_from_slice(&(image.len() as u32).to_le_bytes());
+            b.extend_from_slice(&image);
+        }
+        b
+    }
+    #[test]
+    fn selects_largest_cv_not_above_cut() {
+        let b = mfw(&[(0, 1), (1, 1), (2, 1), (1, 3)]);
+        for (cut, cv) in [(0, 0), (1, 1), (2, 2), (3, 2), (15, 2)] {
+            let p = Rtw89::parse(&b, cut, Ce::Never).unwrap();
+            assert_eq!(p.entries[p.selected].cut, cv, "cut {cut}");
+            assert_eq!(p.entries[p.selected].kind, 1);
+        }
+    }
+    #[test]
+    fn ce_never_ignores_normal_ce_entries() {
+        let b = mfw(&[(0, 5)]);
+        assert_eq!(
+            Rtw89::parse(&b, 0, Ce::Never).unwrap_err(),
+            ParseError::NoCompatibleFirmware { cut: 0 }
+        );
+        assert_eq!(Rtw89::parse(&b, 0, Ce::Prefer).unwrap().selected, 0);
+        let b = mfw(&[(0, 1), (0, 5)]);
+        assert_eq!(Rtw89::parse(&b, 0, Ce::Never).unwrap().selected, 0);
+        assert_eq!(Rtw89::parse(&b, 0, Ce::Prefer).unwrap().selected, 1);
+    }
+    #[test]
+    fn sections_skip_formatted_mss_pool() {
+        let b = formatted_fixture(1);
+        let image = AxImage::parse(&b).unwrap();
+        let sections = image.sections().unwrap();
+        assert_eq!(sections.len(), 3);
+        assert_eq!(
+            sections
+                .iter()
+                .map(|s| (s.address, s.kind))
+                .collect::<Vec<_>>(),
+            [(0x0000_0000, 2), (0x0100_0000, 1), (0x0200_0000, 9)]
+        );
+        assert_eq!(sections[0].bytes, &[0x11; 4]);
+        assert_eq!(sections[1].bytes, &[0x22; 3]);
+        assert_eq!(sections[2].bytes, &security_content()[..]);
+        assert!(!sections[2].checksum);
+        assert_eq!(image.sections[2].signatures.len(), 32 + 1 + 1024);
+        assert_eq!(image.version(), (0, 29, 29, 18));
+        assert_eq!(image.idmem_share_mode(), 1);
+        // A pool that is not what the header promises is not skipped blindly.
+        let mut bad = b.clone();
+        let at = 32 + 48 + 4 + 3 + 64;
+        bad[at] = b'X';
+        assert_eq!(
+            AxImage::parse(&bad).unwrap_err(),
+            ParseError::UnsupportedFormattedSecurity(255)
+        );
+        assert!(AxImage::parse(&b[..b.len() - 1]).is_err());
+    }
+    #[test]
+    fn only_the_first_formatted_security_section_is_kept() {
+        let b = formatted_fixture(2);
+        let image = AxImage::parse(&b).unwrap();
+        assert_eq!(image.sections.len(), 4);
+        let kept = image.sections().unwrap();
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept[2].address, 0x0200_0000);
+    }
+    #[test]
+    fn header_packet_patches_chunk_size() {
+        let mut b = formatted_fixture(1);
+        let packet = AxImage::parse(&b).unwrap().header_packet();
+        assert_eq!(packet.len(), 32 + 16 * 3);
+        assert_eq!(le16(&packet, 28).unwrap(), 2020);
+        // The rest of W7 and every other byte are untouched.
+        assert_eq!(le32(&packet, 28).unwrap() >> 16, 1 << 2);
+        assert_eq!(packet[..28], b[..28]);
+        assert_eq!(packet[32..], b[32..80]);
+        // A dynamic header is removed from the packet.
+        b[28..32].copy_from_slice(&(1u32 << 16).to_le_bytes());
+        b[14] = 84;
+        b.splice(80..80, [4u8, 0, 0, 0]);
+        let image = AxImage::parse(&b).unwrap();
+        assert_eq!(image.dynamic_header, &[4, 0, 0, 0]);
+        let packet = image.header_packet();
+        assert_eq!(packet.len(), 32 + 16 * 3);
+        assert_eq!(le32(&packet, 28).unwrap(), 1 << 16 | 2020);
     }
     #[test]
     fn legacy_layout_borrows_exact_checksum_inclusive_memory_regions() {
@@ -474,7 +726,7 @@ pub(super) mod tests {
     fn closest_production_ce_cut_wins_independently_of_entry_order() {
         let b = container_fixture();
         for cut in 1..16 {
-            let p = Rtw89::parse(&b, cut).unwrap();
+            let p = Rtw89::parse(&b, cut, Ce::Prefer).unwrap();
             assert_eq!(p.selected, 1);
             assert_eq!(p.entries.len(), 4);
             assert_eq!(p.trailing_elements, &[0xa5; 17]);
@@ -482,19 +734,22 @@ pub(super) mod tests {
             assert_eq!(p.entries[2].mp, 1);
         }
         assert_eq!(
-            Rtw89::parse(&b, 0).unwrap_err(),
+            Rtw89::parse(&b, 0, Ce::Prefer).unwrap_err(),
             ParseError::NoCompatibleFirmware { cut: 0 }
         );
         let mut f = b.clone();
         f[16 + 16 + 1] = 3;
-        let p = Rtw89::parse(&f, 2).unwrap();
+        let p = Rtw89::parse(&f, 2, Ce::Prefer).unwrap();
         assert_eq!(p.selected, 0);
         let mut f = b.clone();
         f[16 + 4..16 + 8].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(Rtw89::parse(&f, 2).is_err());
+        assert!(Rtw89::parse(&f, 2, Ce::Prefer).is_err());
         let mut f = b;
         f[1] = 0;
-        assert_eq!(Rtw89::parse(&f, 2).unwrap_err(), ParseError::EmptyContainer);
+        assert_eq!(
+            Rtw89::parse(&f, 2, Ce::Prefer).unwrap_err(),
+            ParseError::EmptyContainer
+        );
     }
     #[test]
     fn dynamic_header_length_is_checked_before_any_section_payload() {
@@ -526,7 +781,7 @@ pub(super) mod tests {
         );
         let b = std::fs::read(root.join("rtw89/rtw8852b_fw-2.bin")).unwrap();
         for cut in 1..16 {
-            let p = Rtw89::parse(&b, cut).unwrap();
+            let p = Rtw89::parse(&b, cut, Ce::Prefer).unwrap();
             assert_eq!(p.entries.len(), 5);
             assert_eq!(p.entries[p.selected].cut, cut.min(2));
             assert_eq!(p.entries[p.selected].kind, 5);
@@ -534,6 +789,49 @@ pub(super) mod tests {
             assert_eq!(p.image.dynamic_header.len(), 64);
             assert!(!p.trailing_elements.is_empty());
             assert_eq!(p.image.version, [0, 29, 29, 18]);
+        }
+    }
+
+    #[test]
+    #[ignore = "oracle: STELA_REALTEK_WIFI_IMAGES"]
+    fn real_8852c_fw_2_matches_spec() {
+        extern crate std;
+        let root = std::path::PathBuf::from(std::env::var("STELA_REALTEK_WIFI_IMAGES").unwrap());
+        let b = std::fs::read(root.join("rtw89/rtw8852c_fw-2.bin")).unwrap();
+        assert_eq!(b.len(), 2_644_326);
+        let p = Rtw89::parse(&b, 0, Ce::Never).unwrap();
+        let entry = &p.entries[p.selected];
+        assert_eq!(
+            (entry.cut, entry.kind, entry.range.start, entry.data.len()),
+            (0, 1, 128, 365_736)
+        );
+        let sections = p.image.sections().unwrap();
+        assert_eq!(
+            sections
+                .iter()
+                .map(|s| (s.address, s.bytes.len(), s.kind))
+                .collect::<Vec<_>>(),
+            [
+                (0x0010_0000, 348_480, 2),
+                (0x0021_b000, 14_832, 1),
+                (0x0023_7c00, 960, 9)
+            ]
+        );
+        assert_eq!(p.image.idmem_share_mode(), 1);
+        assert!(!p.image.dynamic_header.is_empty());
+        for (cut, shift, size) in [
+            (1, 365_864, 338_128),
+            (2, 703_992, 334_064),
+            (3, 703_992, 334_064),
+        ] {
+            let p = Rtw89::parse(&b, cut, Ce::Never).unwrap();
+            let entry = &p.entries[p.selected];
+            assert_eq!(
+                (entry.range.start, entry.data.len()),
+                (shift, size),
+                "cut {cut}"
+            );
+            assert_eq!(p.image.header_packet().len(), 32 + 16 * 3);
         }
     }
 
@@ -564,7 +862,7 @@ pub(super) mod tests {
         for cut in 0..16 {
             assert_eq!(word(&trace, &mut at), u32::from(cut));
             let status = word(&trace, &mut at);
-            let parsed = Rtw89::parse(&ax, cut);
+            let parsed = Rtw89::parse(&ax, cut, Ce::Prefer);
             if status != 0 {
                 assert_eq!(
                     parsed.unwrap_err(),

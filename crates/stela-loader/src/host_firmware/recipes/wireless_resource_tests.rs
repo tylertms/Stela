@@ -160,9 +160,12 @@ fn signed_regdb_resources_keep_the_observed_global_target_and_immutable_commit()
 fn approved_downloads_match_recipe_and_license_content_pins() {
     let root =
         std::path::PathBuf::from(std::env::var("STELA_WIRELESS_PROVISIONING_EVIDENCE").unwrap());
+    // REALTEK_WIFI[2] and [3] are rtw89/rtw8852b_fw-2.bin and
+    // rtw89/rtw8852c_fw-2.bin.
     for (recipe, directory) in [
         (&REALTEK_WIFI[1], "linux-firmware"),
         (&REALTEK_WIFI[2], "linux-firmware"),
+        (&REALTEK_WIFI[3], "linux-firmware"),
         (&REGULATORY[1], "wireless-regdb"),
     ] {
         let image = std::fs::read(root.join(directory).join(recipe.image.member)).unwrap();
@@ -311,4 +314,84 @@ fn a_wifi_network_requires_every_image_an_intel_device_can_select() {
         }
     }
     assert_eq!(listed, 26);
+}
+
+const RTL8852C_IMAGE: &str = "rtw89/rtw8852c_fw-2.bin";
+
+#[test]
+fn c852_request_selects_8852c_firmware() {
+    let observed = request(
+        "realtek-wifi",
+        RTL8852C_IMAGE,
+        "pci:10ec:c852:subsys:1a3b:5603:rev:01",
+        "syscfg1-XXXXXXXX:cut-00",
+    );
+    // The placeholder is not hex: only a real observation selects.
+    assert!(select(core::slice::from_ref(&observed)).is_err());
+    for (raw, cut) in [(0x0000_0000u32, 0u32), (0x0000_2000, 2), (0x0080_a000, 10)] {
+        let observed = request(
+            "realtek-wifi",
+            RTL8852C_IMAGE,
+            "pci:10ec:c852:subsys:1a3b:5603:rev:01",
+            &format!("syscfg1-{raw:08x}:cut-{cut:02x}"),
+        );
+        let plan = select(core::slice::from_ref(&observed)).unwrap();
+        let selected = &plan.selections()[0];
+        assert_eq!(selected.request, observed);
+        assert_eq!(selected.recipe.image.member, RTL8852C_IMAGE);
+        assert_eq!(selected.recipe.image.length, 2644326);
+        assert_eq!(
+            selected.recipe.image.sha256,
+            "916e87d1470bce5400712f53d419ae68a0f44d858670c57e118d4f0b1d89c5b4"
+        );
+        assert_eq!(selected.recipe.image.revision, WIFI_FIRMWARE_REVISION);
+        assert_eq!(selected.recipe.license, &REALTEK_WIFI_LICENSE);
+        assert_eq!(plan.artifacts().len(), 2);
+    }
+    // Nothing but the 8852C's own container, and a consistent observation.
+    for (name, hardware, revision) in [
+        (
+            "rtw89/rtw8852b_fw-2.bin",
+            "pci:10ec:c852:subsys:1a3b:5603:rev:01",
+            "syscfg1-00002000:cut-02",
+        ),
+        (
+            "rtw89/rtw8852c_fw-1.bin",
+            "pci:10ec:c852:subsys:1a3b:5603:rev:01",
+            "syscfg1-00002000:cut-02",
+        ),
+        (
+            RTL8852C_IMAGE,
+            "pci:10ec:c852:subsys:1a3b:5603:rev:01",
+            "syscfg1-00002000:cut-03",
+        ),
+        (
+            RTL8852C_IMAGE,
+            "pci:10ec:c853:subsys:1a3b:5603:rev:01",
+            "syscfg1-00002000:cut-02",
+        ),
+    ] {
+        assert!(select(&[request("realtek-wifi", name, hardware, revision)]).is_err());
+    }
+}
+
+#[test]
+fn c852_chip_binding_falls_back() {
+    let observed = request(
+        "realtek-wifi",
+        RTL8852C_IMAGE,
+        "pci:10ec:c852",
+        "linux-firmware",
+    );
+    let plan = select(core::slice::from_ref(&observed)).unwrap();
+    assert_eq!(plan.selections()[0].request, observed);
+    assert_eq!(plan.selections()[0].recipe.image.member, RTL8852C_IMAGE);
+    // The binding holds the 8852C's file alone, and only under its own words.
+    for (name, hardware, revision) in [
+        ("rtw89/rtw8852b_fw-2.bin", "pci:10ec:c852", "linux-firmware"),
+        (RTL8852C_IMAGE, "pci:10ec:c852", "observed"),
+        (RTL8852C_IMAGE, "pci:10ec:b852", "linux-firmware"),
+    ] {
+        assert!(select(&[request("realtek-wifi", name, hardware, revision)]).is_err());
+    }
 }

@@ -41,7 +41,8 @@ pub fn reason(vendor: u16, device: u16) -> Option<&'static str> {
         (0x14c3, 0x7603 | 0x7602 | 0x7612 | 0x7662 | 0x7610 | 0x7630 | 0x7650) => {
             "MediaTek MT76x0, MT76x2 or MT7603 (Linux mt76): no driver here"
         }
-        // rtw88 and rtw89. Only RTL8822C runs a station here.
+        // rtw88 and rtw89. Only RTL8822C runs a station here; RTL8852CE
+        // (10ec:c852) is brought up to running firmware.
         (0x10ec, 0xb822) => "Realtek RTL8822BE (Linux rtw88_8822be): no driver here",
         (0x10ec, 0xb821 | 0xc821) => "Realtek RTL8821CE (Linux rtw88_8821ce): no driver here",
         (0x10ec, 0xd723) => "Realtek RTL8723DE (Linux rtw88_8723de): no driver here",
@@ -51,7 +52,6 @@ pub fn reason(vendor: u16, device: u16) -> Option<&'static str> {
             "Realtek RTL8852BE (Linux rtw89_8852be): firmware is parsed but no station driver here"
         }
         (0x10ec, 0xb520) => "Realtek RTL8852BE-VT (Linux rtw89_8852bte): no driver here",
-        (0x10ec, 0xc852) => "Realtek RTL8852CE (Linux rtw89_8852ce): no driver here",
         (0x10ec, 0xb851) => "Realtek RTL8851BE (Linux rtw89_8851be): no driver here",
         (0x10ec, 0x8922 | 0x892b) => "Realtek RTL8922AE (Linux rtw89_8922ae): no driver here",
         // rtlwifi.
@@ -156,13 +156,14 @@ mod tests {
 
     #[test]
     fn chips_a_driver_here_runs_have_no_reason_and_others_name_the_linux_driver() {
-        // MT7925, RTL8822CE, and an Intel device the Intel driver lists,
-        // which reports its own radio and step.
+        // MT7925, RTL8822CE, RTL8852CE, and an Intel device the Intel driver
+        // lists, which reports its own radio and step.
         for (vendor, device) in [
             (0x14c3, 0x7925),
             (0x14c3, 0x0717),
             (0x10ec, 0xc822),
             (0x10ec, 0xc82f),
+            (0x10ec, 0xc852),
             (0x8086, 0x2725),
             (0x8086, 0x51f0),
             (0x8086, 0x272b),
@@ -192,5 +193,12 @@ mod tests {
             assert!(text.contains(driver), "{text}");
         }
         assert_eq!(reason(0x1234, 0x5678), None);
+    }
+
+    /// The RTL8852CE is brought up to running firmware on a Wi-Fi boot, so
+    /// it is no longer named as a chip without a driver here.
+    #[test]
+    fn c852_has_no_unsupported_reason() {
+        assert_eq!(reason(0x10ec, 0xc852), None);
     }
 }

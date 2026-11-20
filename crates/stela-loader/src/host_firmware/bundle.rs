@@ -656,6 +656,10 @@ pub fn select_for(functions: &[Pci], ports: Ports) -> Selection {
                 selection.members(recipes::REALTEK_WIFI, &["rtw89/rtw8852b_fw-2.bin"], &why);
                 true
             }
+            (0x10ec, 0xc852) => {
+                selection.members(recipes::REALTEK_WIFI, &["rtw89/rtw8852c_fw-2.bin"], &why);
+                true
+            }
             (vendor, device) => {
                 recipes::require_wifi(&mut inventory, vendor, device).unwrap_or(false)
             }

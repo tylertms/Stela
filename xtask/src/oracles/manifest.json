@@ -2254,6 +2254,16 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "real_8852c_fw_2_matches_spec",
+    "source": "crates/stela-driver-net/src/wifi/realtek/firmware.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES"
+    ],
+    "reason": "requires STELA_REALTEK_WIFI_IMAGES from pinned linux-firmware"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "unchanged_linux_selection_and_complete_payloads_agree",
     "source": "crates/stela-driver-net/src/wifi/realtek/firmware.rs",
     "kind": "oracle",

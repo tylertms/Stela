@@ -796,6 +796,12 @@ pub const REALTEK_WIFI: &[Recipe] = &[
         "6ff6aeb56bb5b85cba333b755f8cc1dbfe9ff6e5b16e39f6ba01ce7f1eaa7714",
         &REALTEK_WIFI_LICENSE,
     ),
+    wifi(
+        "rtw89/rtw8852c_fw-2.bin",
+        2644326,
+        "916e87d1470bce5400712f53d419ae68a0f44d858670c57e118d4f0b1d89c5b4",
+        &REALTEK_WIFI_LICENSE,
+    ),
 ];
 
 const REGULATORY_LICENSE: Artifact = Artifact {
@@ -2209,6 +2215,13 @@ fn select_realtek_wifi(request: &Request) -> Option<&'static Recipe> {
                 )
         });
     }
+    // The RTL8852C chip's binding (`identity::Profile::chip_target`): the one
+    // container rtw89 names for it.
+    if request.target.hardware == "pci:10ec:c852" && request.target.revision == "linux-firmware" {
+        return REALTEK_WIFI.iter().find(|recipe| {
+            recipe.image.member == request.name && request.name == "rtw89/rtw8852c_fw-2.bin"
+        });
+    }
     let pci: Vec<_> = request.target.hardware.split(':').collect();
     if pci.len() != 8
         || pci[0] != "pci"
@@ -2252,6 +2265,8 @@ fn select_realtek_wifi(request: &Request) -> Option<&'static Recipe> {
             // different early file-format fallback.
             request.name == "rtw89/rtw8852b_fw-2.bin"
         }
+        // The one container `rtw89_8852ce_info` names; the driver parses it.
+        "c852" => request.name == "rtw89/rtw8852c_fw-2.bin",
         _ => false,
     };
     if !chip_matches {

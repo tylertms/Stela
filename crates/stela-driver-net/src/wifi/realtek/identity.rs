@@ -3,7 +3,7 @@
 // Copyright(c) 2019-2020 Realtek Corporation
 // Copyright(c) 2020-2022 Realtek Corporation
 //! Exact PCI candidates and SYS_CFG1 observations from pinned rtw88/89.
-use super::firmware::{Layout, ParseError};
+use super::firmware::{Ce, Layout, ParseError};
 use crate::firmware::{self, Image, Provider, Requirement, Target};
 use alloc::{format, string::String};
 
@@ -11,6 +11,7 @@ use alloc::{format, string::String};
 pub enum Chip {
     Rtl8822C,
     Rtl8852B,
+    Rtl8852C,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +65,8 @@ impl Profile {
         let chip = match observed.device {
             device if RTL8822C_DEVICES.contains(&device) => Chip::Rtl8822C,
             0xb852 | 0xb85b => Chip::Rtl8852B,
+            // rtw8852ce_id_table.
+            0xc852 => Chip::Rtl8852C,
             _ => return Err(IdentityError::UnsupportedPci),
         };
         if observed.sys_cfg1 == u32::MAX {
@@ -90,6 +93,7 @@ impl Profile {
         match self.chip {
             Chip::Rtl8822C => "rtw88/rtw8822c_fw.bin",
             Chip::Rtl8852B => "rtw89/rtw8852b_fw-2.bin",
+            Chip::Rtl8852C => "rtw89/rtw8852c_fw-2.bin",
         }
     }
     pub fn hardware_key(self) -> String {
@@ -114,6 +118,7 @@ impl Profile {
             hardware: match self.chip {
                 Chip::Rtl8822C => "pci:10ec:c822",
                 Chip::Rtl8852B => "pci:10ec:b852",
+                Chip::Rtl8852C => "pci:10ec:c852",
             },
             revision: CHIP_REVISION,
             board: None,
@@ -149,7 +154,7 @@ impl Profile {
             },
             minimum_bytes: match self.chip {
                 Chip::Rtl8822C => 64,
-                Chip::Rtl8852B => 32,
+                Chip::Rtl8852B | Chip::Rtl8852C => 32,
             },
         };
         let chip = Requirement {
@@ -171,9 +176,16 @@ impl Profile {
         };
         let layout = match self.chip {
             Chip::Rtl8822C => Layout::Rtw88(super::firmware::Rtw88::parse(image.bytes())?),
-            Chip::Rtl8852B => {
-                Layout::Rtw89(super::firmware::Rtw89::parse(image.bytes(), self.cut())?)
-            }
+            Chip::Rtl8852B => Layout::Rtw89(super::firmware::Rtw89::parse(
+                image.bytes(),
+                self.cut(),
+                Ce::Prefer,
+            )?),
+            Chip::Rtl8852C => Layout::Rtw89(super::firmware::Rtw89::parse(
+                image.bytes(),
+                self.cut(),
+                Ce::Never,
+            )?),
         };
         Ok(Staged {
             profile: self,
@@ -232,6 +244,21 @@ pub(crate) mod tests {
         o = observed(0xb852, 1);
         o.vendor = 0x8086;
         assert_eq!(Profile::select(o), Err(IdentityError::UnsupportedPci));
+    }
+
+    #[test]
+    fn rtl8852c_selects_from_c852() {
+        let profile = Profile::select(observed(0xc852, 2)).unwrap();
+        assert_eq!(profile.chip(), Chip::Rtl8852C);
+        assert_eq!(profile.firmware_name(), "rtw89/rtw8852c_fw-2.bin");
+        let target = profile.chip_target();
+        assert_eq!(target.hardware, "pci:10ec:c852");
+        assert_eq!(target.revision, CHIP_REVISION);
+        assert_ne!(
+            target,
+            Profile::select(observed(0xb852, 2)).unwrap().chip_target()
+        );
+        assert_eq!(profile.cut(), 2);
     }
 
     #[test]

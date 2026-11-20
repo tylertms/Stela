@@ -75,6 +75,8 @@ pub enum Error {
     IntelWifi(net::wifi::intel::attach::AttachError),
     MediatekWifi(net::wifi::mediatek::attach::AttachError),
     RealtekWifi(net::wifi::realtek::attach::AttachError),
+    /// An RTL8852CE whose bring-up to running firmware failed.
+    Rtw89Wifi(net::wifi::realtek::ax::BringUpError),
     IntelBluetooth(crate::bluetooth::intel_pcie::Error),
     Bcm4377(crate::bluetooth::bcm4377::Error),
     Ehci(usb::ehci::Error),
@@ -108,6 +110,7 @@ impl fmt::Display for Error {
             Self::IntelWifi(error) => write!(f, "iwlwifi: {error}"),
             Self::MediatekWifi(error) => write!(f, "mt76: {error}"),
             Self::RealtekWifi(error) => write!(f, "rtw88: {error}"),
+            Self::Rtw89Wifi(error) => write!(f, "rtw89: {error}"),
             Self::IntelBluetooth(error) => write!(f, "btintel_pcie: {error}"),
             Self::Bcm4377(error) => write!(f, "hci_bcm4377: {error}"),
             Self::Ehci(error) => write!(f, "EHCI: {error}"),
@@ -261,9 +264,12 @@ impl fmt::Display for PlatformError {
 }
 
 /// Nonfatal diagnostics keep controller-specific values through discovery.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Warning {
     Message(&'static str),
+    /// A report composed at run time, such as an RTL8852CE's running
+    /// firmware, cut and MAC address.
+    Text(String),
     /// An xHCI controller stopped answering: what it was doing, and whether
     /// it was reset and attached again or this was the second attachment.
     XhciDied(Option<xhci::Death>, bool),
@@ -282,6 +288,7 @@ impl fmt::Display for Warning {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Message(message) => f.write_str(message),
+            Self::Text(text) => f.write_str(text),
             Self::XhciDied(death, again) => {
                 f.write_str(if *again {
                     XHCI_DIED_AGAIN
@@ -920,6 +927,43 @@ const XHCI_DIED_AGAIN: &str = "xHCI: the controller stopped answering again afte
 /// Why a Wi-Fi adapter is left alone.
 const NO_WIFI_NETWORK: &str = "Wi-Fi adapter stays off: no --wifi network";
 
+/// What an RTL8852CE whose firmware ran is, as no network link.
+const RTW89_VERIFIED: &str = "RTL8852CE firmware verified; no station driver yet";
+
+/// Said when an RTL8852CE's MAC was found powered on.
+const RTW89_WAS_ON: &str =
+    "RTL8852CE: its MAC was left powered on; Stela powered it off before taking the device over";
+
+/// Record an RTL8852CE whose firmware ran. It is powered off again and runs
+/// no station, so it joins no links: like the other functions found but not
+/// driven to a device, it is listed with why, and its running firmware is
+/// reported. Its requester, domain, BAR2 and rings stay kept.
+fn rtw89_started(devices: &mut Devices, address: Address, class: [u8; 3], up: native::Rtw89Up) {
+    if up.was_on {
+        devices
+            .warnings
+            .push((address, Warning::Message(RTW89_WAS_ON)));
+    }
+    devices
+        .warnings
+        .push((address, Warning::Text(alloc::format!("{}", up.running))));
+    devices.unsupported.push((address, class, RTW89_VERIFIED));
+    devices.owners.push(up.kept);
+}
+
+/// Record an RTL8852CE whose bring-up failed: whether its MAC had been left
+/// on and was powered off, as on success, then the failure. Whatever it
+/// claimed stays kept.
+fn rtw89_failed(devices: &mut Devices, address: Address, down: native::Rtw89Down) {
+    if down.was_on {
+        devices
+            .warnings
+            .push((address, Warning::Message(RTW89_WAS_ON)));
+    }
+    devices.failures.push((address, down.error));
+    devices.owners.extend(down.kept);
+}
+
 /// The function a driver here claimed whose start is being accounted for,
 /// with the count of outcomes recorded before it started.
 #[derive(Default)]
@@ -1063,7 +1107,10 @@ impl Devices {
             // The r8169 Ethernet driver's; a Realtek card reader fails as a
             // device.
             Error::Realtek(_) | Error::Tg3(_) | Error::Aqtion(_) | Error::Pch(_) => "network",
-            Error::IntelWifi(_) | Error::MediatekWifi(_) | Error::RealtekWifi(_) => "Wi-Fi",
+            Error::IntelWifi(_)
+            | Error::MediatekWifi(_)
+            | Error::RealtekWifi(_)
+            | Error::Rtw89Wifi(_) => "Wi-Fi",
             Error::IntelBluetooth(_) | Error::Bcm4377(_) => "Bluetooth",
             Error::Sfh(_) | Error::SfhCold(_) | Error::Ish(_) | Error::IshCold(_) => "sensors",
             Error::Ehci(_) => "USB",
@@ -1280,6 +1327,7 @@ fn plain(error: &Error) -> impl fmt::Display + '_ {
                 Error::IntelWifi(error) => error.fmt(f),
                 Error::MediatekWifi(error) => error.fmt(f),
                 Error::RealtekWifi(error) => error.fmt(f),
+                Error::Rtw89Wifi(error) => error.fmt(f),
                 error => error.fmt(f),
             }
         }
@@ -1857,6 +1905,7 @@ pub unsafe fn probe_observed(
                             native::Kind::IntelWifi
                                 | native::Kind::MediatekWifi
                                 | native::Kind::RealtekWifi
+                                | native::Kind::Rtw89Wifi
                         )
                     )
                 {
@@ -2729,6 +2778,25 @@ unsafe fn attach_native(
                     devices.failures.push((address, error));
                     devices.owners.extend(kept);
                 }
+            }
+            return;
+        }
+        native::Kind::Rtw89Wifi => {
+            let Some(wifi) = inputs.wifi else {
+                devices
+                    .unsupported
+                    .push((address, function.class, NO_WIFI_NETWORK));
+                return;
+            };
+            let rtw89 = native::Rtw89Inputs {
+                firmware: wifi.firmware,
+                pages: services.pages(),
+                clock: wifi.clock,
+            };
+            // SAFETY: as for tg3 below.
+            match unsafe { native::rtw89_wifi(services, address, rtw89) } {
+                Ok(up) => rtw89_started(devices, address, function.class, up),
+                Err(down) => rtw89_failed(devices, address, down),
             }
             return;
         }
@@ -4089,6 +4157,218 @@ mod tests {
             ))
         ));
         assert!(services.requests.borrow().is_empty());
+    }
+
+    /// One bus of ECAM with an RTL8852CE Wi-Fi function at 00:00.0 and
+    /// nothing else.
+    fn rtl8852ce_ecam() -> Vec<u32> {
+        let mut ecam = alloc::vec![u32::MAX; (1 << 20) / 4];
+        ecam[..4096 / 4].fill(0);
+        ecam[0] = 0xc852_10ec;
+        ecam[2] = 0x0280_0000;
+        ecam
+    }
+
+    /// Probe `ecam` with refusing native services, for `network` if any.
+    fn probe_rtl8852ce(
+        ecam: &mut [u32],
+        services: &services::tests::Refusing,
+        network: Option<&Network>,
+    ) -> Devices {
+        let window = EcamWindow {
+            base: ecam.as_mut_ptr() as u64,
+            segment: 0,
+            start_bus: 0,
+            end_bus: 0,
+        };
+        let handoff = Handoff {
+            ecam: alloc::vec![window],
+            mapped: alloc::vec![window.range()],
+            dma: 0..0,
+            clock: Clock {
+                ticks_per_microsecond: 1,
+            },
+            firmware: None,
+            completion: None,
+            network: None,
+        };
+        // SAFETY: the empty region can allocate no DMA pages.
+        let mut dma = unsafe { crate::bus::dma::RegionAllocator::new(0..0) };
+        // SAFETY: ECAM is the live fixture above, the function has no BAR
+        // and every native service refuses, so nothing reaches hardware.
+        unsafe {
+            probe_with_provider(
+                &handoff,
+                PlatformCaptures::default(),
+                &mut dma,
+                handoff_provider(&handoff),
+                Some(services),
+                network,
+            )
+        }
+    }
+
+    /// Without `--wifi` an RTL8852CE is listed as staying off and is never
+    /// claimed, its configuration space untouched; with one, its bring-up
+    /// starts with the claim.
+    #[test]
+    fn rtw89_without_wifi_network_is_unsupported_not_touched() {
+        let address = Address {
+            segment: 0,
+            bus: 0,
+            device: 0,
+            function: 0,
+        };
+        let mut ecam = rtl8852ce_ecam();
+        let services = services::tests::Refusing::default();
+        let devices = probe_rtl8852ce(&mut ecam, &services, None);
+        assert_eq!(
+            devices.unsupported,
+            [(address, [2, 0x80, 0], NO_WIFI_NETWORK)]
+        );
+        assert!(devices.failures.is_empty(), "{:?}", devices.failures);
+        assert!(services.requests.borrow().is_empty());
+        assert!(services.preparations.borrow().is_empty());
+        // Command and status, as the fixture left them.
+        assert_eq!(ecam[1], 0);
+
+        let network = Network {
+            ssid: b"test".to_vec(),
+            secret: crate::net::wifi::network::Secret::parse(b"test passphrase").unwrap(),
+            country: None,
+        };
+        let mut ecam = rtl8852ce_ecam();
+        let services = services::tests::Refusing::minimum_only();
+        let devices = probe_rtl8852ce(&mut ecam, &services, Some(&network));
+        assert!(devices.unsupported.is_empty(), "{:?}", devices.unsupported);
+        assert_eq!(*services.preparations.borrow(), [address]);
+        assert!(matches!(
+            devices.failures.as_slice(),
+            [(found, Error::Native(ServiceError::Unavailable))] if *found == address
+        ));
+        assert_eq!(devices.subsystem(address, &devices.failures[0].1), "Wi-Fi");
+    }
+
+    /// An RTL8852CE whose firmware ran, left on by firmware, is reported by
+    /// its firmware and why it is no link, and its owner is kept.
+    #[test]
+    fn an_rtl8852ce_whose_firmware_ran_is_accounted_for_plainly() {
+        let wifi = identity(3, 0, 0x10ec, 0xc852, 0x02_80_00);
+        let mut devices = Devices {
+            network_functions: alloc::vec![wifi],
+            ..Devices::default()
+        };
+        let up = native::Rtw89Up {
+            running: net::wifi::realtek::ax::Running {
+                cut: 2,
+                firmware: (0, 27, 56, 14),
+                mac: [0x00, 0xe0, 0x4c, 0x88, 0x52, 0xc0],
+                secure_boot: false,
+            },
+            was_on: true,
+            kept: Box::new(()),
+        };
+        rtw89_started(&mut devices, wifi.address, wifi.class, up);
+        assert_eq!(
+            devices.network_account(),
+            ["0000:03:00.0 10ec:c852 Wi-Fi: RTL8852CE firmware verified; no station driver yet"]
+        );
+        let warnings: Vec<String> = devices
+            .warnings
+            .iter()
+            .map(|(address, warning)| format!("HOST WARNING pci={address}: {warning}"))
+            .collect();
+        assert_eq!(
+            warnings,
+            [
+                "HOST WARNING pci=0000:03:00.0: RTL8852CE: its MAC was left powered on; Stela \
+                 powered it off before taking the device over",
+                "HOST WARNING pci=0000:03:00.0: RTL8852CE firmware running: cut 2, firmware \
+                 0.27.56.14, MAC 00:e0:4c:88:52:c0, secure boot off",
+            ]
+        );
+        assert_eq!(devices.owners.len(), 1);
+        assert!(devices.failures.is_empty());
+    }
+
+    /// An RTL8852CE whose MAC was left on and powered off, then whose
+    /// bring-up failed, still says its MAC was left on, before the failure,
+    /// and its owner is kept.
+    #[test]
+    fn an_rtl8852ce_that_failed_after_its_mac_was_powered_off_says_so() {
+        use net::wifi::realtek::ax::{AxError, BringUpError, Earlier};
+        let wifi = identity(3, 0, 0x10ec, 0xc852, 0x02_80_00);
+        let mut devices = Devices {
+            network_functions: alloc::vec![wifi],
+            ..Devices::default()
+        };
+        let down = native::Rtw89Down {
+            error: Error::Rtw89Wifi(BringUpError {
+                step: "firmware download",
+                error: AxError::FirmwareStatus {
+                    what: "not ready",
+                    fw_ctrl: 0x0000_0007,
+                },
+                earlier: Earlier::First {
+                    tries: 5,
+                    error: AxError::Timeout {
+                        register: 0x1080,
+                        mask: 0x0FFF_0000,
+                    },
+                },
+            }),
+            was_on: true,
+            kept: Some(Box::new(())),
+        };
+        rtw89_failed(&mut devices, wifi.address, down);
+        let warnings: Vec<String> = devices
+            .warnings
+            .iter()
+            .map(|(address, warning)| format!("HOST WARNING pci={address}: {warning}"))
+            .collect();
+        assert_eq!(
+            warnings,
+            [
+                "HOST WARNING pci=0000:03:00.0: RTL8852CE: its MAC was left powered on; Stela \
+              powered it off before taking the device over"
+            ]
+        );
+        assert_eq!(devices.failures.len(), 1);
+        assert_eq!(
+            format!("{}", devices.failures[0].1),
+            "rtw89: RTL8852CE bring-up: firmware download: not ready (0x01E0=0x00000007) (first \
+             of 5 attempts: timeout waiting on register 0x1080 mask 0xfff0000)"
+        );
+        assert_eq!(devices.owners.len(), 1);
+    }
+
+    /// A warning of owned text prints on the boot log's `HOST WARNING`
+    /// line, as an RTL8852CE's running firmware does.
+    #[test]
+    fn warning_text_prints_as_host_warning() {
+        let running = net::wifi::realtek::ax::Running {
+            cut: 2,
+            firmware: (0, 27, 56, 14),
+            mac: [0x00, 0xe0, 0x4c, 0x88, 0x52, 0xc0],
+            secure_boot: false,
+        };
+        let address = Address {
+            segment: 0,
+            bus: 3,
+            device: 0,
+            function: 0,
+        };
+        let warning = Warning::Text(running.to_string());
+        // As stela-boot prints `devices.warnings`.
+        assert_eq!(
+            format!("HOST WARNING pci={address}: {warning}"),
+            "HOST WARNING pci=0000:03:00.0: RTL8852CE firmware running: cut 2, firmware \
+             0.27.56.14, MAC 00:e0:4c:88:52:c0, secure boot off"
+        );
+        assert_eq!(
+            Warning::Text(String::from("x")),
+            Warning::Text(String::from("x"))
+        );
     }
 
     #[test]

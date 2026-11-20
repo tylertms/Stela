@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2018-2019 Realtek Corporation
 // Copyright(c) 2019-2020 Realtek Corporation
-//! Native Realtek PCIe Wi-Fi: RTL8822C stations by rtw88, with RTL8852B's
-//! firmware layout from rtw89 and nothing more of it yet. Pinned rtw88/rtw89 are
+//! Native Realtek PCIe Wi-Fi: RTL8822C stations by rtw88, RTL8852B's
+//! firmware layout from rtw89, and the RTL8852CE's rtw89 bring-up to running
+//! firmware ([`ax`]), with no station for it yet. Pinned rtw88/rtw89 are
 //! hardware references, not a Linux kernel interface.
 pub mod attach;
+pub mod ax;
 pub mod beacon;
 pub mod bit_rate;
 pub mod bootstrap;
