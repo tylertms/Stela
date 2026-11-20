@@ -160,9 +160,8 @@ impl AppleDevices {
             bluetooth,
             audio,
         } = cables;
-        let extras = usize::from(network.is_some())
-            + usize::from(bluetooth.is_some())
-            + usize::from(audio);
+        let extras =
+            usize::from(network.is_some()) + usize::from(bluetooth.is_some()) + usize::from(audio);
         if 1 + extras + disks.len() > hub::MAX_PORTS {
             return Err(refuse!("the native hub has seven ports"));
         }

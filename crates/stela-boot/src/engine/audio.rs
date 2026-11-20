@@ -14,9 +14,7 @@
 //! behind LPIB so short sounds never loop on the next cyclic lap.
 use super::{output, storage::RestoreRoot};
 use alloc::{string::String, vec, vec::Vec};
-use stela_boot_core::audio_bridge::{
-    self, CHANNELS, FRAME_BYTES, RingBridge, TARGET_LEAD_BYTES,
-};
+use stela_boot_core::audio_bridge::{self, CHANNELS, FRAME_BYTES, RingBridge, TARGET_LEAD_BYTES};
 use stela_drivers::{
     Clock,
     probe::native::hda::{Host as HdaHost, PlaybackInfo},

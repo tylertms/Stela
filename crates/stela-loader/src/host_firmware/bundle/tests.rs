@@ -622,14 +622,8 @@ fn the_nvidia_notice_claims_no_more_than_the_census_shows() {
         nvidia_notice(&[pci(0x10de, 0x2c02, 0x03), port(2)]),
         NvidiaNotice::Driven
     );
-    assert_eq!(
-        nvidia_notice(&[pascal, port(2)]),
-        NvidiaNotice::Driven
-    );
-    assert_eq!(
-        nvidia_notice(&[maxwell, pascal]),
-        NvidiaNotice::Driven
-    );
+    assert_eq!(nvidia_notice(&[pascal, port(2)]), NvidiaNotice::Driven);
+    assert_eq!(nvidia_notice(&[maxwell, pascal]), NvidiaNotice::Driven);
     // Every port has something below it: what the census shows is final.
     assert_eq!(
         nvidia_notice(&[intel, port(2), below(2)]),

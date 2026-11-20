@@ -441,7 +441,11 @@ impl hub::Ports for Attachments {
         let bluetooth = self.bluetooth.iter_mut().map(|f| f as &mut dyn Function);
         let audio = self.audio.iter_mut().map(|f| f as &mut dyn Function);
         let disks = self.disks.iter_mut().map(|f| f as &mut dyn Function);
-        let mut functions = input.chain(network).chain(bluetooth).chain(audio).chain(disks);
+        let mut functions = input
+            .chain(network)
+            .chain(bluetooth)
+            .chain(audio)
+            .chain(disks);
         functions.nth(port).expect("a port of the hub's count")
     }
     fn function_ref(&self, port: usize) -> &dyn Function {
@@ -450,7 +454,11 @@ impl hub::Ports for Attachments {
         let bluetooth = self.bluetooth.iter().map(|f| f as &dyn Function);
         let audio = self.audio.iter().map(|f| f as &dyn Function);
         let disks = self.disks.iter().map(|f| f as &dyn Function);
-        let mut functions = input.chain(network).chain(bluetooth).chain(audio).chain(disks);
+        let mut functions = input
+            .chain(network)
+            .chain(bluetooth)
+            .chain(audio)
+            .chain(disks);
         functions.nth(port).expect("a port of the hub's count")
     }
 }
@@ -1383,16 +1391,17 @@ impl Devices for AppleDevices {
     }
 
     fn take_host_service(&mut self) -> bool {
-        self.usb_masters
-            .iter_mut()
-            .fold(core::mem::take(&mut self.frame_presented), |due, master| {
+        self.usb_masters.iter_mut().fold(
+            core::mem::take(&mut self.frame_presented),
+            |due, master| {
                 let audio_due = master
                     .peripheral
                     .as_mut()
                     .and_then(|hub| hub.ports.audio.as_mut())
                     .is_some_and(Audio::take_due);
                 master.session.take_due() | audio_due | due
-            })
+            },
+        )
     }
 
     fn device_name(&self, physical: u64) -> Option<&'static str> {

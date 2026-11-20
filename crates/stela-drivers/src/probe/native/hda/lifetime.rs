@@ -424,7 +424,10 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
             }
         }
     }
-    pub fn start_playback(&mut self, codecs: &[Codec]) -> Result<super::PlaybackInfo, audio::Error> {
+    pub fn start_playback(
+        &mut self,
+        codecs: &[Codec],
+    ) -> Result<super::PlaybackInfo, audio::Error> {
         if self.phase != Phase::Active {
             return Err(audio::Error::Shutdown);
         }

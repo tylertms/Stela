@@ -442,7 +442,11 @@ fn write_live_pcm_refills_running_playback_stream_with_aligned_words() {
         Err(Error::StreamRunning)
     );
     controller
-        .write_live_pcm(playback, 16, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
+        .write_live_pcm(
+            playback,
+            16,
+            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+        )
         .unwrap();
     // Unaligned offset, unaligned length, out-of-bounds, and capture streams are rejected.
     assert_eq!(

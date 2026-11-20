@@ -293,7 +293,11 @@ fn integrated_pch_without_pcie_capability_clears_snoop() {
         let (mut function, timer, bar) = pch_fixture(device, 2, 9);
         without_pcie(&mut function);
         prepare_model(&mut function, &timer, bar).unwrap();
-        assert_eq!(function.config().words[30], 0xf91f_7255, "device {device:04x}");
+        assert_eq!(
+            function.config().words[30],
+            0xf91f_7255,
+            "device {device:04x}"
+        );
         assert!(
             function
                 .config()
@@ -327,7 +331,11 @@ fn modern_pch_without_pcie_capability_attaches() {
         .unwrap();
         assert_eq!(adapter.config().reset_policy, ResetPolicy::IntelClockGate);
         drop(adapter);
-        assert_eq!(function.config().words[30], 0xf91f_7255, "device {device:04x}");
+        assert_eq!(
+            function.config().words[30],
+            0xf91f_7255,
+            "device {device:04x}"
+        );
     }
 }
 
