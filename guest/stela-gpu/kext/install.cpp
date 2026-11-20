@@ -12,6 +12,7 @@
 #include "app_delivery.h"
 #include "compression.h"
 #include "files.h"
+#include "sandbox_cache.h"
 
 #include <IOKit/IOLib.h>
 #include <kern/thread.h>
@@ -114,6 +115,7 @@ StelaGPU::installPlugin(void *parameter, wait_result_t)
 	if (!stopping && context && buffer) {
 		gpu->setProperty(STELA_APP_PROPERTY, stelaDeliverApp(context, buffer));
 		stelaTellNoCompression(context, buffer);
+		stelaDeliverSandboxPatch(context, buffer);
 	}
 	if (buffer) {
 		IOFreeData(buffer, kStelaChunk);

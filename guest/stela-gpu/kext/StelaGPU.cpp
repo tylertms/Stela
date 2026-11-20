@@ -203,6 +203,9 @@ IOReturn
 StelaGPU::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
     IOUserClient **handler)
 {
+	if (type == kStelaGPUSandboxClientType) {
+		return newSandboxClient(owningTask, securityID, type, properties, handler);
+	}
 	IOReturn result = IOAccelerator::newUserClient(owningTask, securityID, type, properties, handler);
 	char event[64];
 	if (result == kIOReturnSuccess) {
