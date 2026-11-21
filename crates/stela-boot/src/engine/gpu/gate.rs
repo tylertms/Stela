@@ -1645,6 +1645,10 @@ pub(super) fn completed_through(index: usize, timeline: u64, value: u64) {
     if let Some(service) = shared().get(index) {
         service.completed_through(timeline, value);
     }
+    // The display's swap gate reads this between GPU calls, so a waiting
+    // frame is released by the GPU's own completion, not by the guest's
+    // next call.
+    stela_soc::dcp::gpu::note_completed(value);
 }
 
 /// Bring every GPU to rest before the PC resets or turns off, on the boot CPU

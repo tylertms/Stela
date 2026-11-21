@@ -22,6 +22,13 @@ pub fn submitted() -> u64 {
     SUBMITTED.load(Ordering::Acquire)
 }
 
+/// Note the GPU's last completed command buffer serial, from a waiter that
+/// saw the queue's timeline reach it: the display's look at a swap between
+/// GPU calls then sees the completion without a call of its own.
+pub fn note_completed(completed: u64) {
+    COMPLETED.fetch_max(completed, Ordering::Release);
+}
+
 /// The serial of the last command buffer seen complete.
 pub fn completed() -> u64 {
     COMPLETED.load(Ordering::Acquire)

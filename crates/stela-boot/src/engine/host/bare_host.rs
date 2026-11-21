@@ -585,7 +585,18 @@ impl Host for BareHost<'_> {
 
     fn invalidate_reach(&mut self, reach: Reach, everywhere: Everywhere) {
         let state = state();
-        if !state.kept.is_empty() {
+        let started = rdtsc();
+        // A TLBI of everything resets the whole shadow below, which drops
+        // every kept half (`State::clear`'s `drop_kept`). Visiting them
+        // first to unmap what the reset throws away is wasted work, and it
+        // was most of the time of the one XNU sends every few milliseconds.
+        let resetting = reach == Reach::All
+            && !matches!(everywhere, Everywhere::NonGlobal(_))
+            && state.legacy_translations_dirty;
+        if resetting && !state.kept.is_empty() {
+            state.maintained_kept_skipped += 1;
+        }
+        if !state.kept.is_empty() && !resetting {
             let bounds = state.half_range(LOWER);
             let entry_bits = 12 + 9 * layout::top_level();
             let pool = &state.pool;
@@ -607,10 +618,15 @@ impl Host for BareHost<'_> {
             state.kept_dropped += dropped as u64;
         }
         if reach == Reach::All {
-            return match everywhere {
+            match everywhere {
                 Everywhere::NonGlobal(_) => state.drop_non_global(),
                 _ => state.reset_shadow(Cause::Maintained),
-            };
+            }
+            state.maintains += 1;
+            state.maintain_ticks = state
+                .maintain_ticks
+                .wrapping_add(rdtsc().wrapping_sub(started));
+            return;
         }
         state.tlb.clear();
         // Most maintenance addresses reach a single extent, without a
@@ -679,6 +695,10 @@ impl Host for BareHost<'_> {
         } else {
             state.scoped += 1;
         }
+        state.maintains += 1;
+        state.maintain_ticks = state
+            .maintain_ticks
+            .wrapping_add(rdtsc().wrapping_sub(started));
     }
 
     fn profile_ticks(&mut self) -> u64 {

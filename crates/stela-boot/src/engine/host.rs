@@ -590,6 +590,11 @@ pub struct State {
     pub kept_dropped: u64,
     /// TLBIs that unmapped ranges rather than whole halves.
     pub scoped: u64,
+    /// TLBIs applied to the shadow, the ticks they took, and the kept
+    /// halves their walk left to the whole reset after it.
+    pub maintains: u64,
+    pub maintain_ticks: u64,
+    pub maintained_kept_skipped: u64,
     /// Pages mapped beside a fault's from the same leaf.
     pub prefills: u64,
     /// Pages mapped beside a fault's from the window's other leaves
@@ -803,6 +808,9 @@ pub unsafe fn install(config: Config) -> Result<HostOwner> {
             lower_found: 0,
             kept_dropped: 0,
             scoped: 0,
+            maintains: 0,
+            maintain_ticks: 0,
+            maintained_kept_skipped: 0,
             prefills: 0,
             around: 0,
             fill_ticks: 0,
@@ -859,6 +867,11 @@ pub struct Statistics {
     pub bank_misses: u64,
     pub view_switches: u64,
     pub scoped: u64,
+    /// TLBIs applied, the nanoseconds they took, and the kept halves a
+    /// whole reset dropped without the walk.
+    pub maintains: u64,
+    pub maintain_ns: u64,
+    pub maintained_kept_skipped: u64,
     pub stray: u64,
     /// The APIC timer frequency.
     pub apic_hz: u64,
@@ -897,6 +910,10 @@ pub fn statistics() -> Statistics {
         bank_misses: state.bank_misses,
         view_switches: state.view_switches,
         scoped: state.scoped,
+        maintains: state.maintains,
+        maintain_ns: (u128::from(state.maintain_ticks) * 1_000_000_000
+            / u128::from(state.tsc_hz.max(1))) as u64,
+        maintained_kept_skipped: state.maintained_kept_skipped,
         stray: state.stray,
         apic_hz: state.apic_hz,
         helper_calls: state.helper_calls,
