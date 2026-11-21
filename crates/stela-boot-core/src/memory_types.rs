@@ -122,7 +122,12 @@ impl Image {
                     Some(state)
                         if state.syscfg & amd::FIXED_DRAM != 0 && default & (1 << 10) != 0 =>
                     {
+                        // The legacy hole is never RAM; firmware may leave it WB routed to MMIO
+                        // (Lenovo IdeaPad Pro 5 16AKP10: MTRR 0x259 = 0x06), as Linux tolerates.
                         amd::fixed_type(kind, cap)
+                            || (amd::legacy_hole(index)
+                                && kind & !0x1f == 0
+                                && memory_type(kind & 7, cap))
                     }
                     Some(_) => kind & !0x1f == 0 && memory_type(kind & 7, cap),
                     None => memory_type(kind, cap),
@@ -334,6 +339,17 @@ mod tests {
             .unwrap();
         low.value ^= 0x08;
         assert!(image.compatible(&changed).is_err());
+        // VGA memory left WB with MMIO routing (Lenovo IdeaPad Pro 5 16AKP10, 0x259 = 0x06 a
+        // byte) is admitted; conventional memory with that routing is not.
+        for (index, admitted) in [(0x259, true), (0x258, false)] {
+            let mut changed = snapshot;
+            let msr = changed.msrs[..changed.msr_count as usize]
+                .iter_mut()
+                .find(|msr| msr.index == index)
+                .unwrap();
+            msr.value = 0x0606_0606_0606_0606;
+            assert_eq!(Image::from_snapshot(&changed).is_ok(), admitted);
+        }
     }
 
     #[test]
