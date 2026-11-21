@@ -13,10 +13,12 @@ pub enum RealtekFamily {
     Alc882,
     Alc662,
     Alc269,
+    Alc245,
 }
 
 pub(super) fn family(id: u32, revision: u32) -> Result<RealtekFamily, Error> {
     match id {
+        0x10ec_0245 => Ok(RealtekFamily::Alc245),
         0x10ec_0882 | 0x10ec_0883 | 0x10ec_0885 | 0x10ec_0887 | 0x10ec_0888 | 0x10ec_0889
         | 0x10ec_0899 | 0x10ec_0900 | 0x10ec_0b00 | 0x10ec_1168 | 0x10ec_1220 => {
             Ok(RealtekFamily::Alc882)
@@ -167,6 +169,7 @@ mod tests {
     use super::*;
     #[test]
     fn exact_family_revisions_and_complete_668_defaults() {
+        assert_eq!(family(0x10ec_0245, 0x100001), Ok(RealtekFamily::Alc245));
         assert_eq!(family(0x10ec_0662, 0x100101), Ok(RealtekFamily::Alc662));
         assert_eq!(family(0x10ec_0662, 0x100300), Ok(RealtekFamily::Alc662));
         assert_eq!(

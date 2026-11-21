@@ -335,3 +335,217 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         result
     }
 }
+
+// Dedicated Acer ALC245 startup based on the Linux alc225_init sequence.
+impl<R: Registers, T: Timer> Controller<R, T> {
+    pub fn configure_realtek_alc245_headphones(
+        &mut self,
+        graph: &CodecGraph,
+        primary: RealtekHeadphoneRoute<'_>,
+        secondary: Option<RealtekHeadphoneRoute<'_>>,
+    ) -> Result<RealtekDualHeadphoneReport, Error> {
+        self.minimum_guard()?;
+        self.realtek_common_guard(graph)?;
+
+        if graph.vendor_id != super::alc245::ALC245_VENDOR_ID {
+            return Err(Error::UnsupportedTopology);
+        }
+
+        self.preflight_analog_route(
+            graph,
+            primary.route,
+            primary.stream,
+            primary.channel,
+            primary.options,
+        )?;
+
+        if let Some(second) = secondary {
+            self.preflight_analog_route(
+                graph,
+                second.route,
+                second.stream,
+                second.channel,
+                second.options,
+            )?;
+
+            if second.route.pin() != 0x16
+                || second.route.direction() != Direction::Playback
+                || second.route.group_node() != 1
+                || second.channel != 0
+                || second.stream == primary.stream
+                || primary
+                    .route
+                    .nodes()
+                    .iter()
+                    .any(|node| second.route.nodes().contains(node))
+            {
+                return Err(Error::RouteInUse);
+            }
+        }
+
+        let pin_power = self.headphone_preflight(
+            graph,
+            primary.route,
+            primary.stream,
+            primary.channel,
+            primary.options,
+        )?;
+
+        let (codec_id, revision_id, subsystem_id, vendor_power) =
+            self.realtek_common_identity(graph)?;
+        let identity = super::alc245::Alc245Identity::detect(codec_id, revision_id)
+            .ok_or(Error::UnsupportedTopology)?;
+
+        if codec_id != 0x10ec_0245 || super::alc245::board_profile(subsystem_id).is_none() {
+            return Err(Error::UnsupportedTopology);
+        }
+
+        if self.realtek_parameter(graph.address, 0x51, 0)? != 0 {
+            return Err(Error::UnsupportedTopology);
+        }
+
+        let (second_power, second_caps) = self.fixed_second_pin_preflight(graph)?;
+
+        let result = (|| {
+            self.power_d0(graph.address, 1)?;
+
+            if vendor_power {
+                self.power_d0(graph.address, 0x20)?;
+            }
+
+            if pin_power {
+                self.power_d0(graph.address, primary.route.pin())?;
+            }
+
+            if second_power && primary.route.pin() != 0x16 {
+                self.power_d0(graph.address, 0x16)?;
+            }
+
+            let coefficient_zero = self.read_coefficient(graph.address, 0)?;
+
+            if identity.silicon_variant(coefficient_zero)
+                != super::alc245::Alc245SiliconVariant::Alc245
+            {
+                return Err(Error::UnsupportedTopology);
+            }
+
+            self.delay(30_000)?;
+
+            let first = self.poll_pin_sense(graph, primary.route.pin())?;
+
+            if second_caps & 2 != 0 {
+                self.verb(Verb::short(graph.address, 0x16, 0x709, 0)?)?;
+            }
+
+            let raw = self.verb(Verb::short(graph.address, 0x16, 0xf09, 0)?)?;
+
+            let code = raw & 0x7fff_ffff;
+
+            let second = PinSense {
+                raw,
+                present: raw & (1 << 31) != 0,
+                impedance_code: (second_caps & 1 != 0 && code != 0x7fff_ffff).then_some(code),
+            };
+
+            if second.present {
+                let pin = graph.widget(0x16).ok_or(Error::InvalidCodecGraph)?;
+
+                if second_caps & 0x14 != 0x14 || pin.channels() != 2 || pin.capabilities & 4 == 0 {
+                    return Err(Error::UnsupportedTopology);
+                }
+
+                let amp = self.realtek_parameter(
+                    graph.address,
+                    if pin.capabilities & 8 != 0 { 0x16 } else { 1 },
+                    0x12,
+                )?;
+
+                if amp == u32::MAX || pin.output_amplifier != Some(amp) {
+                    return Err(Error::InvalidCodecGraph);
+                }
+            }
+
+            if first.present || second.present {
+                self.delay(2_000)?;
+            }
+
+            // Node 0x57, coefficient 0x04: low-power mode.
+            self.depop_control(graph.address, DepopControl::HeadphonePower, 1)?;
+
+            for (pin, present) in [(primary.route.pin(), first.present), (0x16, second.present)] {
+                if present {
+                    self.verb(Verb::long(graph.address, pin, 3, 0xb080)?)?;
+
+                    for channel in [0xa000, 0x8000] {
+                        if self.verb(Verb::long(graph.address, pin, 11, channel)?)? != 0x80 {
+                            return Err(Error::RouteRejected);
+                        }
+                    }
+                }
+            }
+
+            if first.present || second.present {
+                self.delay(85_000)?;
+            }
+
+            if first.present {
+                self.route_control(graph.address, primary.route.pin(), 0x707, 0xf07, 0x40)?;
+            }
+
+            if second.present {
+                self.route_control(graph.address, 0x16, 0x707, 0xf07, 0x40)?;
+            }
+
+            if first.present || second.present {
+                self.delay(100_000)?;
+            }
+
+            let mut coefficients = alloc::vec::Vec::new();
+
+            coefficients.push(self.clear_coefficient_bits(graph.address, 0x4a, 3 << 10)?);
+
+            // Node 0x57, coefficient 0x04: restore high-power mode.
+            self.depop_control(graph.address, DepopControl::HeadphonePower, 4)?;
+
+            self.configure_analog_route(
+                graph,
+                primary.route,
+                primary.stream,
+                primary.channel,
+                primary.options,
+            )?;
+
+            if let Some(second) = secondary {
+                self.configure_analog_route(
+                    graph,
+                    second.route,
+                    second.stream,
+                    second.channel,
+                    second.options,
+                )?;
+            } else if !primary.route.nodes().contains(&0x16) {
+                self.codec_controls
+                    .push((primary.stream, graph.address, 0x16));
+            }
+
+            Ok(RealtekDualHeadphoneReport {
+                common: RealtekCommonReport {
+                    codec_id,
+                    revision_id,
+                    subsystem_id,
+                    coefficients,
+                },
+                coefficient_zero: Some(coefficient_zero),
+                boot_depop_performed: false,
+                headphone_pins: [primary.route.pin(), 0x16],
+                initial_senses: [first, second],
+            })
+        })();
+
+        if result.is_err() {
+            self.routing_failed = true;
+        }
+
+        result
+    }
+}

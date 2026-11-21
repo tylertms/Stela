@@ -66,6 +66,33 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 self.delay(75_000)?;
                 self.clear_coefficient_bits(address, 0x4a, 3 << 10)?;
             }
+        } else if id == 0x10ec_0245 {
+            let first = self.poll_pin_sense_policy(graph, primary, true)?.present;
+            let second = graph
+                .widget(0x16)
+                .and_then(|widget| widget.pin_capabilities)
+                .is_some()
+                && self.poll_pin_sense_policy(graph, 0x16, true)?.present;
+
+            if first || second {
+                self.update_coefficient(address, 0x4a, 0, 3 << 10)?;
+                self.delay(2_000)?;
+                if first {
+                    self.realtek_shutdown_mute(address, primary)?;
+                }
+                if second {
+                    self.realtek_shutdown_mute(address, 0x16)?;
+                }
+                self.delay(75_000)?;
+                if first {
+                    self.route_control(address, primary, 0x707, 0xf07, 0)?;
+                }
+                if second {
+                    self.route_control(address, 0x16, 0x707, 0xf07, 0)?;
+                }
+                self.delay(75_000)?;
+                self.clear_coefficient_bits(address, 0x4a, 3 << 10)?;
+            }
         } else {
             if matches!(id, 0x10ec_0255..=0x10ec_0257) {
                 self.depop_control(address, DepopControl::HeadphonePower, 1)?;

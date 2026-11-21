@@ -8,6 +8,7 @@ use super::{CodecGraph, Controller, Registers, Verb};
 use crate::{Error, Timer};
 use alloc::vec::Vec;
 
+mod alc245;
 mod family;
 pub use family::RealtekFamily;
 

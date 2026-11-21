@@ -391,6 +391,10 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         };
         let result = (|| {
             let common = match graph.vendor_id {
+                0x10ec_0245 => {
+                    self.configure_realtek_alc245_headphones(graph, primary, secondary)?
+                        .common
+                }
                 0x10ec_0269 => {
                     let report = self.initialize_realtek_alc269_common(graph)?;
                     self.configure_analog_route(
@@ -460,7 +464,11 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             }
             Ok(RealtekReport {
                 common,
-                family: RealtekFamily::Alc269,
+                family: if graph.vendor_id == 0x10ec_0245 {
+                    RealtekFamily::Alc245
+                } else {
+                    RealtekFamily::Alc269
+                },
                 oem: RealtekOem::Firmware,
                 coefficient_zero: zero,
                 eapd_pins,
