@@ -38,6 +38,7 @@ struct Model {
     fixed_timing: bool,
     fault_after: Option<(usize, u32)>,
     stop_after: Option<usize>,
+    stop_on_enable: bool,
     aborts: usize,
     accesses: Vec<(bool, usize, u32)>,
     delay_after_access: Option<usize>,
@@ -95,6 +96,7 @@ impl Model {
             fixed_timing: false,
             fault_after: None,
             stop_after: None,
+            stop_on_enable: false,
             aborts: 0,
             accesses: Vec::new(),
             delay_after_access: None,
@@ -248,6 +250,9 @@ impl Model {
                     }
                 } else if value & ENABLE_ON != 0 {
                     self.disable_at = None;
+                    if self.stop_on_enable {
+                        self.raw |= INTR_STOP_DET;
+                    }
                     if !self.freeze_enable {
                         self.enable_at = Some(self.time.get() + self.enable_delay);
                     }
@@ -623,6 +628,19 @@ fn enable_bus_acquisition_and_missing_stop_all_have_finite_failure_paths() {
         assert_eq!(error.recovery, Recovery::Disabled);
         assert!(state.borrow().time.get() <= 20_200);
     }
+}
+
+#[test]
+fn a_stop_before_any_command_is_queued_is_ignored() {
+    let (mut controller, state) = controller(16, 16);
+    state.borrow_mut().stop_on_enable = true;
+    let mut bytes = [0; 4];
+    controller
+        .transaction(
+            Address::SevenBit(0x2c),
+            &mut [Operation::Write(&[1, 0]), Operation::Read(&mut bytes)],
+        )
+        .unwrap();
 }
 
 #[test]

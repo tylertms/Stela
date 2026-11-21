@@ -382,6 +382,12 @@ impl<R: Registers, T: Timer> State<R, T> {
             loop {
                 let interrupts = self.faults()?;
                 self.transaction_deadline(start, Phase::Transfer)?;
+                if interrupts & INTR_STOP_DET != 0 && message == 0 && queued == 0 {
+                    // No command is on the wire yet, so this STOP is not ours
+                    // (seen on an AMD I2C touchpad right after enable). Drop it.
+                    self.read(CLR_STOP_DET)?;
+                    continue;
+                }
                 if interrupts & INTR_STOP_DET != 0 {
                     // A STOP cannot belong to our final byte while more
                     // commands remain in the hardware's TX FIFO. Merely
