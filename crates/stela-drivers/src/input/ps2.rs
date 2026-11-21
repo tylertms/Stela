@@ -778,8 +778,13 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         if value & KEYBOARD_DISABLED != 0 {
             self.collect_output()?;
         }
-        let actual = self.controller_response(READ_CONFIG)?;
+        let mut actual = self.controller_response(READ_CONFIG)?;
         let mask = IRQ_BITS | KEYBOARD_DISABLED | MOUSE_DISABLED | TRANSLATION;
+        if actual == ACK && actual & mask != value & mask {
+            // Some embedded controllers acknowledge the CTR write with an ACK
+            // that comes ahead of the CTR (Lenovo IdeaPad Pro 5 16AKP10).
+            actual = self.response(Port::Keyboard, self.timer.start(), self.config.io_timeout_us)?;
+        }
         if actual & mask != value & mask {
             return Err(ErrorKind::ControllerReply {
                 command: WRITE_CONFIG,

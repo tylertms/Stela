@@ -191,6 +191,8 @@ struct Hardware {
     output: VecDeque<(Port, u8, u8)>,
     config: u8,
     config_write: bool,
+    /// The controller answers a CTR write with an ACK, as some ECs do.
+    config_ack: bool,
     mouse_write: bool,
     argument: [Option<u8>; 2],
     scanning: [bool; 2],
@@ -244,6 +246,7 @@ impl Hardware {
             output: VecDeque::new(),
             config: IRQ_BITS,
             config_write: false,
+            config_ack: false,
             mouse_write: false,
             argument: [None, None],
             scanning: [true; 2],
@@ -691,6 +694,9 @@ impl Registers for Model {
         } else if h.config_write {
             h.config_write = false;
             h.config = value | if h.translation_stuck { TRANSLATION } else { 0 };
+            if h.config_ack {
+                h.emit(Port::Keyboard, ACK);
+            }
         } else {
             let port = if core::mem::take(&mut h.mouse_write) {
                 Port::Mouse
@@ -990,6 +996,18 @@ fn the_auxiliary_port_test_passes_with_fa_or_ff_as_linux_accepts() {
             received: 1
         }
     );
+}
+
+#[test]
+fn an_acknowledged_controller_config_write_still_initializes() {
+    for reset_on_start in [false, true] {
+        let (mut c, h) = controller(Config {
+            reset_on_start,
+            ..Config::default()
+        });
+        h.borrow_mut().config_ack = true;
+        c.initialize().unwrap();
+    }
 }
 
 #[test]
