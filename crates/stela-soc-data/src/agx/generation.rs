@@ -644,6 +644,23 @@ impl Gpu {
 mod tests {
     use super::*;
 
+    /// Setup must never install by default a build whose GFX interface this
+    /// model refuses: the guest would stall at the installer's "load sep os".
+    #[test]
+    fn unchecked_initdata_builds_are_never_the_setup_default() {
+        use stela_formats::builds;
+        for &(build, ..) in UNCHECKED_INITDATA {
+            assert!(builds::GPU_UNCHECKED.contains(&build), "{build}");
+            assert_ne!(builds::DEFAULT.build, build);
+        }
+        for build in builds::GPU_UNCHECKED {
+            assert!(
+                UNCHECKED_INITDATA.iter().any(|&(known, ..)| known == *build),
+                "{build}"
+            );
+        }
+    }
+
     #[test]
     fn an_unchecked_initdata_revision_is_no_modeled_familys_magic() {
         for &(build, family, magic) in UNCHECKED_INITDATA {

@@ -137,7 +137,8 @@ impl Stick {
 }
 
 /// The macOS a stick installs, by version (27.2), build (26B123) or
-/// `latest`, as the build.
+/// `latest`, as the build. `latest` is the recommended build
+/// ([`builds::DEFAULT`]): the newest one whose GPU interface Stela can boot.
 fn macos(value: &str) -> Result<String, String> {
     if value.eq_ignore_ascii_case("latest") {
         return Ok(builds::DEFAULT.build.into());

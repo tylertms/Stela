@@ -44,9 +44,29 @@ pub const SUPPORTED: &[Build] = &[
     },
 ];
 
-/// The native firmware build setup selects when none is named:
-/// the newest entry admitted by [`SUPPORTED`].
-pub const DEFAULT: &Build = &SUPPORTED[0];
+/// The native firmware build setup selects when none is named: the newest
+/// entry of [`SUPPORTED`] whose GFX firmware interface the GPU model has
+/// checked.
+///
+/// This is not simply the newest entry. 26B123's G14G kext writes a later
+/// initdata revision (`stela_soc_data::agx::generation::UNCHECKED_INITDATA`)
+/// that the GFX model refuses, so a guest that boots it stalls at the
+/// installer's "load sep os" stage with repeated GFX firmware DMA refusals.
+/// 26B123 stays selectable by name (`--macos 26B123`) for work on that
+/// revision. Once its layouts are checked, remove it from
+/// `UNCHECKED_INITDATA` and point this back at it.
+pub const DEFAULT: &Build = &SUPPORTED[1];
+
+/// Builds of [`SUPPORTED`] that may be selected by name but whose GFX
+/// firmware interface the GPU model has not checked, so new installs do not
+/// pick them by default. Kept in step with
+/// `stela_soc_data::agx::generation::UNCHECKED_INITDATA`.
+pub const GPU_UNCHECKED: &[&str] = &["26B123"];
+
+/// `build` is a tested build whose GPU interface the model has checked.
+pub fn gpu_checked(build: &str) -> bool {
+    tested(build) && !GPU_UNCHECKED.contains(&build)
+}
 
 /// The macOS major version Stela supports: every build of it is admitted.
 pub const MAJOR: u32 = 27;
@@ -171,11 +191,25 @@ mod tests {
         assert_eq!(find("26A434").unwrap().dcp_link_version, 211);
         assert_eq!(find("26A434").unwrap().rtkit_version, 12);
         assert_eq!(find("26B123").unwrap().dcp_link_version, 213);
-        assert_eq!(DEFAULT.build, "26B123");
+        assert_eq!(DEFAULT.build, "26A434");
         assert!(tested("26B123") && tested("26A434") && !tested("26B5040"));
         for entry in SUPPORTED {
             assert_eq!(version_major(entry.version), Some(MAJOR), "{}", entry.build);
             assert_eq!(build_major(entry.build), Some(MAJOR), "{}", entry.build);
+        }
+    }
+
+    #[test]
+    fn the_default_is_the_newest_build_whose_gpu_interface_is_checked() {
+        assert!(gpu_checked(DEFAULT.build));
+        assert!(!gpu_checked("26B123"));
+        let newest_checked = SUPPORTED
+            .iter()
+            .find(|entry| gpu_checked(entry.build))
+            .unwrap();
+        assert_eq!(DEFAULT, newest_checked);
+        for build in GPU_UNCHECKED {
+            assert!(tested(build), "{build}");
         }
     }
 

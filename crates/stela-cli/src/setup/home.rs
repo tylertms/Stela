@@ -813,8 +813,10 @@ fn update_text(environment: &Environment<'_>, record: Option<&Record>) -> String
     }
 }
 
-/// The newest tested macOS, when it is newer than the one `record`
-/// installs.
+/// The recommended macOS ([`builds::DEFAULT`]), when the stick installs
+/// another one of the same or an older macOS version. This also moves a
+/// stick that installs a build whose GPU interface is unchecked (such as
+/// 26B123, which stalls at "load sep os") back to the recommended one.
 fn newer_macos(record: &Record) -> Option<&'static builds::Build> {
     let newest = builds::DEFAULT;
     (record.build != newest.build
@@ -834,10 +836,18 @@ fn offer_macos(environment: &Environment<'_>, request: &Request, volume: &Path) 
     let offer = macos_text(environment, &record, newest.build);
     ui.info(&offer.text)?;
     let rows = super::ui::rows(&[("Yes", ""), ("Not now", "")]);
-    let question = format!(
-        "macOS {} is available. Use it for new installs?",
-        newest.version
-    );
+    let question = if builds::gpu_checked(&record.build) {
+        format!(
+            "macOS {} is available. Use it for new installs?",
+            newest.version
+        )
+    } else {
+        format!(
+            "This stick installs macOS {}, which Stela cannot boot yet. Use macOS {} for new installs?",
+            macos_name(&record.build),
+            newest.version
+        )
+    };
     match ui.select(&question, &rows, 1)? {
         0 => change_macos(environment, request, volume, newest.build, offer.named),
         _ => ui.outro(DONE),
