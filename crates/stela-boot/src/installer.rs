@@ -219,8 +219,9 @@ struct Picker {
 
 /// Choose the partition macOS is installed on; the plan that makes it, new
 /// if need be, and blank. `None` when the user leaves, or without a
-/// framebuffer or keyboard to choose with.
-pub fn choose() -> Option<Plan> {
+/// framebuffer or keyboard to choose with. `auto` takes the one blank disk
+/// whole, unasked, and falls back to the pages when there is not exactly one.
+pub fn choose(auto: bool) -> Option<Plan> {
     let Some((screen, font)) = Framebuffer::from_firmware().zip(font::console()) else {
         output::arguments(format_args!(
             "INSTALLER refused: no framebuffer to draw on\n"
@@ -273,6 +274,37 @@ pub fn choose() -> Option<Plan> {
             disk.table.as_ref().map_or(0, |t| t.partitions.len()),
             disk.refusal
         ));
+    }
+    let blank: Vec<_> = (0..picker.disks.len())
+        .filter(|&n| {
+            let disk = &picker.disks[n];
+            disk.refusal.is_none()
+                && !disk.foreign
+                && disk.table.as_ref().is_none_or(|t| t.partitions.is_empty())
+        })
+        .collect();
+    if let (true, &[n]) = (auto, blank.as_slice()) {
+        picker.disk = n;
+        // The presses a user makes: the disk, its free space, the largest
+        // size, then Install.
+        for press in [Press::Enter, Press::Enter, Press::Enter, Press::Right] {
+            picker.press(press);
+        }
+        if let Step::Confirm = picker.press(Press::Enter) {
+            match picker.plan() {
+                Ok(plan) => return Some(plan),
+                Err(error) => picker.notice = Some(error),
+            }
+        }
+    }
+    // An unattended run that waits at the picker says why in the log.
+    match (auto, &picker.notice) {
+        (false, _) => {}
+        (true, Some(why)) => output::arguments(format_args!("INSTALLER auto refused: {why}\n")),
+        (true, None) => output::arguments(format_args!(
+            "INSTALLER auto refused: {} blank disks\n",
+            blank.len()
+        )),
     }
     loop {
         picker.draw(&mut canvas);

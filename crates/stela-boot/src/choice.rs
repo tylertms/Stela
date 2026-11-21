@@ -46,6 +46,8 @@ const TICK: Duration = Duration::from_secs(1);
 /// starts without one: longer than a held key's repeat and a USB keyboard's
 /// polling, short enough not to be a wait.
 const GLANCE: Duration = Duration::from_millis(250);
+/// On the USB, asks Install macOS to take the PC's one blank disk unasked.
+const AUTO_FILE: &str = "\\EFI\\stela\\auto-install";
 
 pub(crate) enum Press {
     Up,
@@ -560,8 +562,21 @@ fn asked() -> bool {
 /// firmware entry chosen restarts the PC into it. `None` without console
 /// input to choose with.
 fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Option<Chosen> {
+    // An unattended install starts the setup entry at once, once, and only
+    // while the machine can only be set up: a later menu never reinstalls.
+    let mut auto = menu.held.is_some()
+        && CString16::try_from(AUTO_FILE)
+            .map(PathBuf::from)
+            .is_ok_and(|path| volume.try_exists(&path).unwrap_or(false));
     loop {
-        let index = menu.run()?;
+        let setup = menu.items.iter().position(|item| {
+            matches!(item, Item::Choice(n, ChoiceKind::Setup)
+                if unchosen(choices.entries[*n].options.as_bytes()))
+        });
+        let index = match setup.filter(|_| auto) {
+            Some(index) => index,
+            None => menu.run()?,
+        };
         let n = match &menu.items[index] {
             Item::Choice(n, ChoiceKind::Setup)
                 if unchosen(choices.entries[*n].options.as_bytes()) =>
@@ -581,7 +596,7 @@ fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Optio
                 continue;
             }
         };
-        let Some(plan) = crate::installer::choose() else {
+        let Some(plan) = crate::installer::choose(core::mem::take(&mut auto)) else {
             continue;
         };
         let disk = format!("{}:{}", plan.serial, plan.partition.guid);

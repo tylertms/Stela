@@ -70,6 +70,8 @@ use stela_loader::boot_selection::{
 };
 use stela_soc_data::nor::nvram::{Partition, Variables};
 
+/// The first member of a seed disk ([`steps`]).
+pub const SEED: &str = "stela-seed";
 /// The plugin's parent on the Data volume, as the kext looks for it.
 pub const PLUGINS: &str = "/System/Volumes/Data/Library/GPUBundles";
 
@@ -432,6 +434,20 @@ pub fn steps() -> Vec<Step> {
         step(format!("/usr/sbin/chown root:wheel {directories}"), 30),
         optional(format!("/usr/bin/chflags restricted {directories}"), 30),
         step("/bin/sync".into(), 120),
+        // A seed: a bare ustar whole disk whose first member is `stela-seed`,
+        // unpacked onto the Data volume as it is (owners, modes), so an
+        // unattended install stages its first-boot files with no typing.
+        // After the sync, so a stalled seed cannot cost the plugin; it says
+        // which disk it took, or `none`, and syncs its own files.
+        optional(
+            format!(
+                "f=none; r=0; for d in /dev/disk[0-9] /dev/disk[0-9][0-9]; do [ \"$(/usr/bin/tar \
+                 -tf $d 2>/dev/null | /usr/bin/head -1)\" = {SEED} ] || continue; f=$d; \
+                 /usr/bin/tar -xpf $d -C /System/Volumes/Data --exclude {SEED}; r=$?; /bin/sync; \
+                 break; done; echo {SEED}: $f; [ $r = 0 ]"
+            ),
+            180,
+        ),
         // Commits the volume and marks it clean, so the quick restart below
         // leaves nothing for the next mount to replay. Optional: the sync
         // already put every change on disk, and a busy volume refuses it.

@@ -126,18 +126,20 @@ fn the_steps_create_the_directories_the_manual_remedy_does() {
     assert!(!commands.iter().any(|command| command.contains("xattr")));
     let chflags = format!("/usr/bin/chflags restricted {all}");
     assert!(commands.contains(&chflags.as_str()));
-    // Only the restricted flag and the read-only remount after the sync are
-    // optional.
+    // Only the restricted flag, the seed and the read-only remount after
+    // the sync are optional.
     let remount = "/sbin/mount -u -r /System/Volumes/Data";
     for step in &steps {
         assert_eq!(
             step.required,
-            step.command != chflags && step.command != remount,
+            step.command != chflags && step.command != remount && !step.command.contains(SEED),
             "{}",
             step.command
         );
     }
-    assert_eq!(&commands[commands.len() - 2..], ["/bin/sync", remount]);
+    assert_eq!(commands[commands.len() - 3], "/bin/sync");
+    assert!(commands[commands.len() - 2].contains(SEED));
+    assert_eq!(commands[commands.len() - 1], remount);
     // The restart skips the unmount walk that stalled; the sync stays.
     assert_eq!(REBOOT, "/sbin/reboot -q");
     assert!(SYNC_AND_REBOOT.starts_with("/bin/sync; ") && SYNC_AND_REBOOT.ends_with(REBOOT));
@@ -330,6 +332,8 @@ impl Guest {
                 0
             }
             "/sbin/mount" | "/usr/libexec/init_data_protection" | "/bin/sync" => 0,
+            // No seed disk is attached: the loop finds none and succeeds.
+            "f=none;" => 0,
             "/bin/test" => u32::from(!self.directories.iter().any(|d| d == paths[0])),
             "/bin/mkdir" => {
                 for path in paths {
