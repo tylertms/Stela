@@ -3,7 +3,42 @@
 
 use super::*;
 use crate::Result;
+use stela_contracts::bus::Direction;
 use stela_contracts::refuse;
+
+struct T6020UnmodeledPmgr;
+
+impl MmioDevice for T6020UnmodeledPmgr {
+    fn name(&self) -> &'static str {
+        "t6020-unmodeled-pmgr"
+    }
+
+    fn read(&mut self, offset: u64, width: Width, _: &mut Access<'_>) -> Result<u64, MmioError> {
+        Err(stela_contracts::bus::refuse(
+            self.name(),
+            offset,
+            width,
+            Direction::Read,
+            "PMGR register effects are not modeled",
+        ))
+    }
+
+    fn write(
+        &mut self,
+        offset: u64,
+        width: Width,
+        _: u64,
+        _: &mut Access<'_>,
+    ) -> Result<(), MmioError> {
+        Err(stela_contracts::bus::refuse(
+            self.name(),
+            offset,
+            width,
+            Direction::Write,
+            "PMGR register effects are not modeled",
+        ))
+    }
+}
 
 impl AppleDevices {
     /// The PMGR power-state registers at `registers`, in `blocks` of guest
@@ -481,6 +516,40 @@ impl AppleDevices {
         self.bus
             .map(device, physical, fuse::FUSE_BYTES, 0)
             .map_err(|error| refuse!("eFuse placement: {error}", ?error))
+    }
+
+    /// Place only the three T6020 IDS words, not the surrounding PMGR bank.
+    pub fn add_rail_calibration(&mut self, physical: u64) -> Result<()> {
+        let device = self.bus.add(Box::new(fuse::RailCalibration));
+        self.bus
+            .map(device, physical, 12, 0)
+            .map_err(|error| refuse!("IDS calibration placement: {error}", ?error))
+    }
+
+    /// Place just the qualified 64-bit status/weight words. The virtual
+    /// complexes have no physical transition pending and no DVMR limit.
+    pub fn add_t6020_perf_boot(&mut self, words: &[u64]) -> Result<()> {
+        let bindings: Vec<_> = words.iter().map(|&physical| (physical, 8, 0)).collect();
+        self.bus
+            .install(Box::new(fuse::T6020PerfBoot), &bindings)
+            .map_err(|error| refuse!("T6020 PMGR boot register placement: {error}", ?error))?;
+        Ok(())
+    }
+
+    /// Retain the positively located PMGR bus targets after other devices
+    /// mount. Unimplemented accesses still refuse; no effects are retired.
+    pub fn add_t6020_unmodeled_pmgr(&mut self, ranges: &[(u64, u64)]) -> Result<()> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let device = self.bus.add(Box::new(T6020UnmodeledPmgr));
+        for &(base, bytes) in ranges {
+            match self.bus.map_gaps(device, base, bytes, base) {
+                Ok(()) | Err(MapError::Overlap { .. }) => {}
+                Err(error) => return Err(refuse!("T6020 unmodeled PMGR window: {error}", ?error)),
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn settle_phys(&mut self, cpu: CpuIndex, now: u64) {

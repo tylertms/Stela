@@ -827,6 +827,28 @@ fn revision_2_2_identifies_its_register_file_and_refuses_unrecovered_registers()
 }
 
 #[test]
+fn revision_2_0_walks_a_wide_dva_through_three_tables() {
+    let (mut dart, mut ram, mut sink) = setup_version(VERSION_2_0);
+    let mut access = Access::new(0, 0, &mut sink);
+    ram.put_u64(UPPER + 0x10 * 8, table_entry(ROOT));
+    let ttbr = ((UPPER >> PAGE_SHIFT) << TTBR_ADDRESS_SHIFT) as u32 | TTBR_VALID;
+    dart.write(
+        TCR + 12,
+        Width::Word,
+        u64::from(TCR_TRANSLATE | TCR_FOUR_LEVEL),
+        &mut access,
+    )
+    .unwrap();
+    dart.write(TTBR + 12, Width::Word, u64::from(ttbr), &mut access)
+        .unwrap();
+    let dva = HIGH + 0x200_4010;
+    assert_eq!(
+        dart.translate(&mut ram, 3, dva, dva + 3, false, &mut access),
+        Ok(FRAME + 0x10)
+    );
+}
+
+#[test]
 fn revision_2_2_walks_both_two_level_windows_and_three_four_level_tables() {
     let (mut d, mut ram, mut sink) = setup_version(VERSION_2_2);
     let mut a = Access::new(0, 0, &mut sink);

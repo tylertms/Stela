@@ -300,6 +300,7 @@ pub(super) fn shape_device_tree(
             .into(),
     );
     unresolved.extend(set_die_count(tree, target.chip_id)?);
+    publish_j414s_mcc_handoff(tree, target)?;
     unresolved.push(
         "/chosen/boot-object-manifests: no signed LocalPolicy or personalized manifest objects; \
          a supplied original boot manifest is forwarded separately"
@@ -308,6 +309,36 @@ pub(super) fn shape_device_tree(
     unresolved.push("preoslog: iBoot log region omitted".into());
     unresolved.push("other rows iBoot writes stay as the template ships them or absent".into());
     Ok(unresolved)
+}
+
+/// J414S iBoot 20457.41.3 (26B123, file 0x3b1c0..0x3b254) publishes
+/// these u64s on `mcc`. The IPSW tree lacks them, and the matching kernel's
+/// `_initMemHashParam` requires all three. These values describe SRAM geometry.
+fn publish_j414s_mcc_handoff(tree: &mut DeviceTree, target: &Target) -> Result<()> {
+    const PATH: &str = "/arm-io/mcc";
+    // The installed bundle may name the development Cryptex ticket instead
+    // of the original board. Its DeviceTree still describes the same MCC.
+    if target.chip_id != Some(0x6020)
+        || !matches!(target.device_class.as_str(), "j414sap" | "j414dev")
+        || target.product_type != "Mac14,9"
+        || target.product_build != "26B123"
+        || tree
+            .property(PATH, "compatible")
+            .map(|p| p.value.as_slice())
+            != Some(b"mcc,t6020\0")
+    {
+        return Ok(());
+    }
+    for (name, value) in [
+        ("ecs-nub-sram-base-0", 0x2_9ef0_0000u64),
+        ("ecs-nub-sram-base-1", 0x22_9ef0_0000),
+        ("ecs-nub-sram-size", 0x300),
+    ] {
+        if tree.property(PATH, name).is_none() {
+            tree.set_property(PATH, name, value.to_le_bytes().to_vec())?;
+        }
+    }
+    Ok(())
 }
 
 /// The ApChipIDs whose 26A434 iBoots carry no `die-count` row: every T8103
@@ -389,4 +420,47 @@ pub(super) fn cpu_nodes(tree: &DeviceTree) -> Result<Vec<String>> {
         .filter(|cpu| cpu.property("state").is_some())
         .filter_map(|cpu| cpu.name().map(|name| format!("/cpus/{name}")))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn j414s_mcc_sram_handoff_is_build_specific_and_keeps_source_properties() -> Result<()> {
+        const PATH: &str = "/arm-io/mcc";
+        for device_class in ["j414sap", "j414dev"] {
+            let mut target = Target {
+                product_type: "Mac14,9".into(),
+                device_class: device_class.into(),
+                product_version: "27.2".into(),
+                product_build: "26B124".into(),
+                variant: String::new(),
+                chip_id: Some(0x6020),
+                board_id: None,
+            };
+            let mut tree = DeviceTree {
+                root: crate::apple_device_tree::Node::named("device-tree")?,
+            };
+            tree.ensure_child("/", "arm-io")?;
+            tree.ensure_child("/arm-io", "mcc")?;
+            tree.set_property(PATH, "compatible", b"mcc,t6020\0".to_vec())?;
+            publish_j414s_mcc_handoff(&mut tree, &target)?;
+            assert!(tree.property(PATH, "ecs-nub-sram-base-0").is_none());
+
+            target.product_build = "26B123".into();
+            let source_size = 0x400u64.to_le_bytes();
+            tree.set_property(PATH, "ecs-nub-sram-size", source_size.to_vec())?;
+            publish_j414s_mcc_handoff(&mut tree, &target)?;
+            assert_eq!(
+                tree.property(PATH, "ecs-nub-sram-base-0").unwrap().value,
+                0x2_9ef0_0000u64.to_le_bytes()
+            );
+            assert_eq!(
+                tree.property(PATH, "ecs-nub-sram-size").unwrap().value,
+                source_size
+            );
+        }
+        Ok(())
+    }
 }

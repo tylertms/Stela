@@ -409,6 +409,30 @@ fn compatible_selection_never_aliases_a_different_native_family() {
 }
 
 #[test]
+fn wide_ranged_flush_on_a_small_t8110_window_selects_revision_2_0() {
+    let p = Profile::T8110;
+    assert_eq!(
+        p.for_device_window(0x4000, true, 1 << 40),
+        Some(Profile::T8110Rev20)
+    );
+    assert_eq!(p.for_device_window(0x4000, false, 1 << 40), Some(p));
+    assert_eq!(p.for_device_window(0x4000, true, 0x4000), Some(p));
+    assert_eq!(
+        p.for_device_window(0xc000, true, 1 << 40),
+        Some(Profile::T8110Rev22)
+    );
+
+    let mut sink = InterruptLatch::new();
+    let mut access = Access::new(0, 0, &mut sink);
+    let mut dart = Dart::for_profile(Profile::T8110Rev20, 16, None).unwrap();
+    assert_eq!(
+        dart.read(8, Width::Word, &mut access),
+        Ok(42 << 24 | 42 << 16 | 0x0200)
+    );
+    assert!(dart.read(0x4060, Width::Word, &mut access).is_err());
+}
+
+#[test]
 fn a_t8110_translation_window_selects_its_register_file_revision() {
     for (profile, bytes, expected) in [
         (Profile::T8110, 0x4000, Some(Profile::T8110)),

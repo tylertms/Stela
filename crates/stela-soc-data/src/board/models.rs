@@ -212,6 +212,7 @@ pub fn models<'a>(name: &str, property: impl Fn(&str) -> Option<&'a [u8]>) -> bo
         // Direct MCC has a native cold owner. Its descriptor must still pass
         // full source validation and mount requires that owner.
         memory_resources::COMPATIBLE,
+        memory_resources::t6020::COMPATIBLE,
         SPI,
         NOR,
         BOOT_FIRMWARE,

@@ -15,7 +15,11 @@
 //!   (0xfffffe0009b5b7b0..0xfffffe0009b5b8f4).
 //! - A CPM-prefixed record (0xfffffe0009b5b230..0xfffffe0009b5b2b8)
 //!   stores its ID, group and index in its complex (0xfffffe0009b5b2bc):
-//!   the cluster's owner.
+//!   the cluster's owner. J414s has device cluster IDs 1, 2 and 3 in
+//!   byte 25 of ECPM, PCPM0 and PCPM1. For records with byte 15 bit 6
+//!   clear, `ApplePMGR::_getDeviceClusterID` (0xfffffe0009b63310)
+//!   returns that byte. `initDriver` uses it for the separate cluster
+//!   power-gating lookup (0xfffffe0009b5b8f8), after writing the owner.
 //! - A virtual record (flags bit 4, 0xfffffe0009b5b108) owns no PS and
 //!   names its complex's `_deviceIDToCPUComplex` ID, once per complex
 //!   (0xfffffe0009b5b34c).
@@ -46,7 +50,7 @@ const COMPATIBLES: [&[u8]; 2] = [b"pmgr1,t6020\0", b"pmgr1,t6021\0"];
 /// the P CPMs.
 const CPM_FLAGS: [u8; 2] = [0, 0x2];
 
-pub(super) const EVIDENCE: &str = "26B123 mac14j SHA256 2d6520798a32bee6e377a2906d3dd02a788d4ed396ae9c6c5884dbe909d8a47e; mode1 complex 0xfffffe0009b594d4, prefixes 0xfffffe0009b5b198, core writer 0xfffffe0009b5b7b0, CPM writer 0xfffffe0009b5b2bc, virtual 0xfffffe0009b5b34c; die-major record order";
+pub(super) const EVIDENCE: &str = "26B123 mac14j SHA256 2d6520798a32bee6e377a2906d3dd02a788d4ed396ae9c6c5884dbe909d8a47e; mode1 complex 0xfffffe0009b594d4, prefixes 0xfffffe0009b5b198, core writer 0xfffffe0009b5b7b0, CPM writer 0xfffffe0009b5b2bc, virtual 0xfffffe0009b5b34c, device cluster ID 0xfffffe0009b63310; die-major record order";
 
 /// Whether this resolver owns the PMGR's family.
 pub(super) fn owns(root: &Node<'_>) -> bool {
@@ -234,7 +238,9 @@ pub(super) fn resolve(
             continue;
         };
         let complex = die * die_complexes.len() + local;
-        if row[1] != 0 || row[15] != 0 || row[25] != 0 {
+        // Byte 25 is the device cluster ID used by power gating. CPU
+        // ownership follows the perf domain and constructor order.
+        if row[1] != 0 || row[15] != 0 {
             return Err(Error::UnqualifiedGeometry(
                 "T6020 CPU record replication or die selector",
             ));
@@ -399,8 +405,13 @@ mod tests {
             }
         }
         let p_flags = if mutation == 5 { 0x4 } else { 0x2 };
-        rows.push(row(0x40, 2, 0, 4, "ECPM"));
-        rows.push(row(0x41, 5, p_flags, 5, "PCPM"));
+        let mut ecpm = row(0x40, 2, 0, 4, "ECPM");
+        let mut pcpm = row(0x41, 5, p_flags, 5, "PCPM");
+        if mutation == 7 {
+            ecpm[25] = 1;
+            pcpm[25] = 2;
+        }
+        rows.extend([ecpm, pcpm]);
         rows.push(row(0x50, 0, 0, 6, "SOC_DPE"));
         let mut descriptors = Vec::new();
         for (kind, id) in [(0u8, 1u8), (1, 2), (1, 5)] {
@@ -518,6 +529,17 @@ mod tests {
             }
         }
         assert!(!owners.iter().any(|o| o.domain.device == 0x50));
+    }
+
+    #[test]
+    fn t6020_device_cluster_ids_preserve_cpu_owners_and_die_placement() {
+        let (bytes, identities) = authored(0);
+        let expected = resolve_authored(&bytes, &identities, true).unwrap();
+        let (bytes, identities) = authored(7);
+        assert_eq!(
+            resolve_authored(&bytes, &identities, true).unwrap(),
+            expected
+        );
     }
 
     #[test]

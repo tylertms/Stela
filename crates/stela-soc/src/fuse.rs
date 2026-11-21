@@ -43,6 +43,84 @@ pub const FUSE_BYTES: u64 = 0x4000;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AonFuses;
 
+/// T6020 IDS fields are used for the guest's power estimates. A cacheless
+/// frontend has no physical die leakage to calibrate, as with AonFuses.
+pub(crate) struct RailCalibration;
+
+impl MmioDevice for RailCalibration {
+    fn name(&self) -> &'static str {
+        "t6020-rail-calibration"
+    }
+
+    fn read(&mut self, offset: u64, width: Width, _: &mut Access<'_>) -> Result<u64, MmioError> {
+        if width == Width::Word && matches!(offset, 0 | 4 | 8) {
+            Ok(0)
+        } else {
+            Err(refuse(
+                self.name(),
+                offset,
+                width,
+                Direction::Read,
+                "not a described IDS word",
+            ))
+        }
+    }
+
+    fn write(
+        &mut self,
+        offset: u64,
+        width: Width,
+        _: u64,
+        _: &mut Access<'_>,
+    ) -> Result<(), MmioError> {
+        Err(refuse(
+            self.name(),
+            offset,
+            width,
+            Direction::Write,
+            "IDS calibration is read-only",
+        ))
+    }
+}
+
+pub(crate) struct T6020PerfBoot;
+
+impl MmioDevice for T6020PerfBoot {
+    fn name(&self) -> &'static str {
+        "t6020-perf-boot"
+    }
+
+    fn read(&mut self, offset: u64, width: Width, _: &mut Access<'_>) -> Result<u64, MmioError> {
+        if offset == 0 && width == Width::Double {
+            Ok(0)
+        } else {
+            Err(refuse(
+                self.name(),
+                offset,
+                width,
+                Direction::Read,
+                "not a 64-bit boot status/weight read",
+            ))
+        }
+    }
+
+    fn write(
+        &mut self,
+        offset: u64,
+        width: Width,
+        _: u64,
+        _: &mut Access<'_>,
+    ) -> Result<(), MmioError> {
+        Err(refuse(
+            self.name(),
+            offset,
+            width,
+            Direction::Write,
+            "performance-control effects are not modeled",
+        ))
+    }
+}
+
 impl MmioDevice for AonFuses {
     fn name(&self) -> &'static str {
         NAME

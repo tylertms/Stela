@@ -925,6 +925,35 @@ impl Dwc3 {
         self.unavailable().is_none()
     }
 
+    /// Capture both control endpoints and their interrupt rings at a host timeout.
+    pub(crate) fn control_timeout(&self, port: u32, cause: Refusal) -> Refusal {
+        let mut report = refuse!(
+            "DWC3 control state",
+            port,
+            address = (self.dcfg >> 3) & 0x7f,
+            enabled = self.enabled & 3,
+            pending_events = self.pending.len()
+        );
+        for (name, ep) in ["ep0_out", "ep0_in"].into_iter().zip(&self.endpoints[..2]) {
+            let ring = &self.rings[ep.ring];
+            report = report.display(
+                name,
+                &format_args!(
+                    "configured={} trb={:x?} parked={} events={:#x} ring={} count={} masked={} irq={}",
+                    ep.configured,
+                    ep.active.map(|transfer| transfer.trb),
+                    ep.parked,
+                    ep.events,
+                    ep.ring,
+                    ring.count,
+                    ring.masked,
+                    ring.asserted
+                ),
+            );
+        }
+        report.because(cause)
+    }
+
     /// Why a host cannot reach the device personality now, if it cannot:
     /// the first unmet condition of [`Self::available`].
     pub fn unavailable(&self) -> Option<Refusal> {
