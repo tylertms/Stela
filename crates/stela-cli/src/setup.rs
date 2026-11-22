@@ -536,6 +536,9 @@ pub(crate) struct Request {
     new_ecid: bool,
     profile: bool,
     no_profile: bool,
+    /// `--maintenance-write`: the install boots with SIP filesystem
+    /// protection off, or on again.
+    maintenance_write: Option<bool>,
     verify_on_read: bool,
     install_volume: Option<PathBuf>,
     default_install: Option<String>,

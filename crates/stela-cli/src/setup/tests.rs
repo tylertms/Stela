@@ -1603,6 +1603,56 @@ fn full_install_requires_system_image() {
 }
 
 #[test]
+fn maintenance_write_survives_every_rewrite_of_the_choices() {
+    let mut f = fixture(64 * GIB, false);
+    add_installed_disk(&mut f, &[], &[]);
+    let mut create = installed_command(&f);
+    create.maintenance_write = Some(true);
+    setup(&environment(&f.host), create).unwrap();
+    // Only the install's own choice and stela.cfg boot with it: a restore
+    // has no preboot selection.
+    let lines = || {
+        let choices =
+            Choices::parse(&fs::read_to_string(f.esp.join(CHOICES_PATH)).unwrap()).unwrap();
+        let config = fs::read_to_string(f.esp.join("EFI/stela/stela.cfg")).unwrap();
+        let mut lines: Vec<(String, bool)> = choices
+            .entries
+            .into_iter()
+            .map(|e| (e.name, e.options.contains("--maintenance-write")))
+            .collect();
+        lines.push(("stela.cfg".into(), config.contains("--maintenance-write")));
+        lines
+    };
+    let on = lines();
+    assert!(on.iter().any(|(name, _)| name == "Install macOS"), "{on:?}");
+    for (name, flag) in &on {
+        assert_eq!(*flag, name == "macOS" || name == "stela.cfg", "{name}");
+    }
+    rerun(&f, |c| c.action = Action::Repair).unwrap();
+    rerun(&f, |c| {
+        c.action = Action::Configure;
+        c.profile = true;
+    })
+    .unwrap();
+    assert_eq!(lines(), on);
+    let off = rerun(&f, |c| {
+        c.action = Action::Configure;
+        c.maintenance_write = Some(false);
+    })
+    .unwrap();
+    assert!(off.contains("SIP filesystem protection on"), "{off}");
+    assert!(lines().iter().all(|(_, flag)| !flag));
+    let error = rerun(&f, |c| {
+        c.action = Action::Configure;
+        c.maintenance_write = Some(true);
+        c.install = Some("other".into());
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("no install named \"other\""), "{error}");
+}
+
+#[test]
 fn installed_disk_preserves_boot_choices_and_partitions() {
     let mut f = fixture(64 * GIB, false);
     add_installed_disk(&mut f, &[], &[]);

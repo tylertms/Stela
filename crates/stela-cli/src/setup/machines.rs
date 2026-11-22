@@ -34,6 +34,10 @@ pub(super) struct Install {
     /// None only for an install a schema 3 setup made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) ecid: Option<Ecid>,
+    /// Its boot turns off SIP filesystem protection
+    /// (`--maintenance-write`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) maintenance_write: bool,
     #[serde(flatten)]
     pub(super) disk: installed::InstalledDisk,
 }
@@ -234,6 +238,7 @@ pub(super) fn add(environment: &Environment<'_>, command: &Request) -> Result<St
             next.installs.push(Install {
                 name: name.clone(),
                 ecid: Some(ecid),
+                maintenance_write: command.maintenance_write == Some(true),
                 disk: checked.disk.clone(),
             });
             name
@@ -384,6 +389,17 @@ pub(super) fn configure(environment: &Environment<'_>, command: &Request) -> Res
                 true => "on: each heartbeat of the boot log times the engine's phases",
                 false => "off",
             }
+        )?;
+    }
+    if let Some(on) = command.maintenance_write {
+        let name = record.install(command.install.as_deref())?.name.clone();
+        for install in record.installs.iter_mut().filter(|i| i.name == name) {
+            install.maintenance_write = on;
+        }
+        writeln!(
+            text,
+            "  maintenance    install \"{name}\" boots with SIP filesystem protection {}",
+            if on { "off" } else { "on" }
         )?;
     }
     match command.chooser_timeout {

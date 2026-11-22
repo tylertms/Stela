@@ -687,6 +687,7 @@ pub(super) fn plan(
             |resume| resume.name.clone(),
         ),
         ecid: Some(ecid),
+        maintenance_write: command.maintenance_write == Some(true),
         disk: installed.disk.clone(),
     };
     machines::check_name(&install.name)?;

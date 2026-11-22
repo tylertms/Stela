@@ -433,6 +433,10 @@ pub(crate) struct Create {
     /// Have every startup choice time the engine (its `--profile`).
     #[arg(long, hide = true)]
     profile: bool,
+    /// Boot the install with SIP filesystem protection off, for maintenance
+    /// such as writing the system TCC database.
+    #[arg(long, hide = true)]
+    maintenance_write: bool,
     /// Have the install refuse an IPSW without recorded block hashes.
     #[arg(long, requires = "target", hide = true)]
     verify_on_read: bool,
@@ -463,6 +467,7 @@ impl Create {
             ecid: self.ecid,
             new_ecid: self.new_ecid,
             profile: self.profile,
+            maintenance_write: self.maintenance_write.then_some(true),
             verify_on_read: self.verify_on_read,
             translation_store_bytes: self.translation_store_bytes,
             confirm_disk: self.confirm_disk,
@@ -622,6 +627,13 @@ pub(crate) struct Settings {
     /// Turn the engine profile on or off for every startup choice.
     #[arg(long, value_name = "on|off", value_parser = clap::builder::BoolishValueParser::new(), hide = true)]
     profile: Option<bool>,
+    /// Turn SIP filesystem protection off or on for an install's boot.
+    #[arg(long, value_name = "on|off", value_parser = clap::builder::BoolishValueParser::new(), hide = true)]
+    maintenance_write: Option<bool>,
+    /// The install `--maintenance-write` changes: the default one unless
+    /// named.
+    #[arg(long, requires = "maintenance_write", hide = true)]
+    install: Option<String>,
 }
 
 impl Settings {
@@ -632,6 +644,8 @@ impl Settings {
             chooser_timeout: self.chooser_timeout,
             profile: self.profile == Some(true),
             no_profile: self.profile == Some(false),
+            maintenance_write: self.maintenance_write,
+            install: self.install,
             ..self.stick.request(Action::Configure)
         };
         self.wifi.apply(&mut request);

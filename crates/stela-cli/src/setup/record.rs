@@ -185,6 +185,7 @@ impl Record {
             self.installs.push(machines::Install {
                 name: machines::FIRST_NAME.into(),
                 ecid: None,
+                maintenance_write: false,
                 disk,
             });
         }
@@ -248,7 +249,9 @@ impl Record {
 
     /// The option line that boots `install`.
     pub(super) fn boot_line(&self, install: &machines::Install) -> Result<String> {
-        Ok(self.line(install.disk.options(install.ecid)?))
+        let mut system = install.disk.options(install.ecid)?;
+        system.maintenance_write = install.maintenance_write;
+        Ok(self.line(system))
     }
 
     /// `stela.cfg`: the default install. Every setup this `stela` reads

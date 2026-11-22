@@ -19,6 +19,7 @@ pub(super) fn named(request: &Request) -> bool {
         || request.chooser_timeout.is_some()
         || request.profile
         || request.no_profile
+        || request.maintenance_write.is_some()
 }
 
 /// Ask for the settings of `record`'s stick into `request`: `false` is a
