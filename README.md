@@ -48,6 +48,12 @@ and supports the Metal3 and Apple7 GPU families.
    stick.
 4. Boot the PC from the USB stick.
 
+For an unattended install, create an empty `EFI/stela/auto-install` file
+on the USB stick's EFI partition. On a PC with nothing installed yet, the
+boot menu then starts Install macOS on its own and takes the one blank disk
+whole. With no blank disk or several, it logs `INSTALLER auto refused:
+<why>` and shows the picker.
+
 ## Update
 
 Download the new `stela`, plug the USB stick in and run:
