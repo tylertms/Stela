@@ -568,7 +568,7 @@ fn an_attached_keyboard_enumerates_and_reports_keys_through_its_rings() {
     let mut device = [0u8; 18];
     assert!(b.ram.read(BUFFER, &mut device));
     assert_eq!(device[..2], [18, 1]);
-    assert_eq!(device[8..10], [0x09, 0x12]);
+    assert_eq!(device[8..12], [0xac, 0x05, 0x04, 0x02]);
     // The keyboard endpoint NAKs until a key goes down, and is polled
     // again only then, at its next interval.
     trb(

@@ -20,8 +20,12 @@
 //! (Keyboard/Keypad page 07h); host sources translate their own codes into
 //! them.
 //!
-//! The device identifies itself with the pid.codes open-source vendor ID
-//! 0x1209 and its test product ID 0x0001, as a self-powered device without
+//! The device identifies itself as Apple's USB Pro Keyboard (ANSI), vendor
+//! 0x05AC and product 0x0204: macOS knows the layout of an Apple keyboard by
+//! its IDs, and asks for any other's with Keyboard Setup Assistant on first
+//! boot. Its keyboard ID, 0xCC, is outside the ranges where macOS makes F12
+//! eject, as an unlisted Apple product's 0xC6 is not, and the report has no
+//! Fn usage, so the F-keys stay F-keys. It is a self-powered device without
 //! remote wakeup, so a host never suspends it waiting on a wake it cannot
 //! signal. Requests a full-speed HID device need not support (device
 //! qualifier, other-speed configuration, test mode, remote wakeup,
@@ -99,10 +103,10 @@ const DEVICE_DESCRIPTOR: [u8; 18] = [
     0,
     0, // class per interface
     EP0_PACKET as u8,
-    0x09,
-    0x12, // vendor 0x1209
-    0x01,
-    0x00, // product 0x0001
+    0xac,
+    0x05, // vendor 0x05ac
+    0x04,
+    0x02, // product 0x0204
     0x00,
     0x01, // release 1.00
     1,
