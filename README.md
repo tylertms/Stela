@@ -48,6 +48,21 @@ and supports the Metal3 and Apple7 GPU families.
    stick.
 4. Boot the PC from the USB stick.
 
+To copy files onto macOS's Data volume during the first repair after the
+install, write a ustar archive whose first member is an empty `stela-seed`
+file straight to a small disk (under 60 GB, so the installer never takes
+it). Lay the files out as under `/System/Volumes/Data`, with the owners and
+modes they need:
+
+```sh
+cd seed && touch stela-seed
+tar -cf ../stela-seed.tar --format=ustar --no-recursion stela-seed $(find * ! -type d ! -name stela-seed)
+```
+
+Only files go in, so folders that already exist on macOS keep their owner and
+mode. The boot log shows `stela-seed: /dev/diskN` when the files went in, or
+`stela-seed: none`.
+
 ## Update
 
 Download the new `stela`, plug the USB stick in and run:
